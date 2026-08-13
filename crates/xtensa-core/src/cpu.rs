@@ -1,0 +1,443 @@
+//! ESP32-S3 Xtensa LX7 CPU: register file, windowed registers, exceptions,
+//! step loop.
+//!
+//! Reference: QEMU espressif/qemu `target/xtensa` (GPLv2):
+//!   - `win_helper.c`: window overflow/underflow, retw, entry, movsp helpers
+//!   - `translate.c`: per-opcode translation semantics
+//!   - `cpu.h`: SR numbers, PS field layout
+//!   - `core-esp32s3/core-isa.h`: LX7 configuration (64 ARs, little-endian,
+//!     windowed, loops)
+//!
+//! Register-file model (identical semantics to QEMU's phys_regs/regs view):
+//! there is one physical 64-entry array; logical register aN maps to
+//! `phys[(wb * 4 + N) & 63]` where wb = WINDOW_BASE.  QEMU instead keeps a
+//! pre-rotated 16-register view (`env->regs[0..15]`) that is re-rotated at
+//! translation-block boundaries; the two are equivalent because every
+//! rotation in QEMU is a multiple of 4 registers (ISA RM, windowed
+//! registers).
+
+use crate::bus::Bus;
+use crate::exec::{self, Outcome};
+use crate::generated::{decode_inst, decode_inst16a, decode_inst16b, insn_len, opnds};
+
+// Special register numbers (QEMU cpu.h "SR enum").  ESP32-S3 has no NDEPC,
+// so double exceptions reuse EPC1.
+pub const SR_LBEG: u32 = 0;
+pub const SR_LEND: u32 = 1;
+pub const SR_LCOUNT: u32 = 2;
+pub const SR_SAR: u32 = 3;
+pub const SR_BR: u32 = 4;
+pub const SR_LITBASE: u32 = 5;
+pub const SR_SCOMPARE1: u32 = 12;
+pub const SR_ACCLO: u32 = 16;
+pub const SR_ACCHI: u32 = 17;
+pub const SR_M0: u32 = 32;
+pub const SR_M1: u32 = 33;
+pub const SR_M2: u32 = 34;
+pub const SR_M3: u32 = 35;
+pub const SR_PREFCTL: u32 = 40;
+pub const SR_MISC0: u32 = 48;
+pub const SR_MISC1: u32 = 49;
+pub const SR_MISC2: u32 = 50;
+pub const SR_MISC3: u32 = 51;
+pub const SR_WINDOW_BASE: u32 = 72;
+pub const SR_WINDOW_START: u32 = 73;
+pub const SR_PTEVADDR: u32 = 83;
+pub const SR_MMID: u32 = 89;
+pub const SR_RASID: u32 = 90;
+pub const SR_ITLBCFG: u32 = 91;
+pub const SR_DTLBCFG: u32 = 92;
+pub const SR_ERACCESS: u32 = 95;
+pub const SR_IBREAKENABLE: u32 = 96;
+pub const SR_MEMCTL: u32 = 97;
+pub const SR_CACHEATTR: u32 = 98;
+pub const SR_ATOMCTL: u32 = 99;
+pub const SR_DDR: u32 = 104;
+pub const SR_MEPC: u32 = 106;
+pub const SR_MEPS: u32 = 107;
+pub const SR_MESAVE: u32 = 108;
+pub const SR_MESR: u32 = 109;
+pub const SR_MECR: u32 = 110;
+pub const SR_MEVADDR: u32 = 111;
+pub const SR_IBREAKA0: u32 = 128;
+pub const SR_IBREAKA1: u32 = 129;
+pub const SR_DBREAKA0: u32 = 144;
+pub const SR_DBREAKA1: u32 = 145;
+pub const SR_DBREAKC0: u32 = 160;
+pub const SR_DBREAKC1: u32 = 161;
+pub const SR_CONFIGID0: u32 = 176;
+pub const SR_EPC1: u32 = 177;
+pub const SR_EPC2: u32 = 178;
+pub const SR_EPC3: u32 = 179;
+pub const SR_EPC4: u32 = 180;
+pub const SR_EPC5: u32 = 181;
+pub const SR_EPC6: u32 = 182;
+pub const SR_EPC7: u32 = 183;
+pub const SR_DEPC: u32 = 192;
+pub const SR_EPS2: u32 = 194;
+pub const SR_EPS3: u32 = 195;
+pub const SR_EPS4: u32 = 196;
+pub const SR_EPS5: u32 = 197;
+pub const SR_EPS6: u32 = 198;
+pub const SR_EPS7: u32 = 199;
+pub const SR_CONFIGID1: u32 = 208;
+pub const SR_EXCSAVE1: u32 = 209;
+pub const SR_EXCSAVE2: u32 = 210;
+pub const SR_EXCSAVE3: u32 = 211;
+pub const SR_EXCSAVE4: u32 = 212;
+pub const SR_EXCSAVE5: u32 = 213;
+pub const SR_EXCSAVE6: u32 = 214;
+pub const SR_EXCSAVE7: u32 = 215;
+pub const SR_CPENABLE: u32 = 224;
+pub const SR_INTERRUPT: u32 = 225;
+pub const SR_INTSET: u32 = 226;
+pub const SR_INTCLEAR: u32 = 227;
+pub const SR_INTENABLE: u32 = 228;
+pub const SR_PS: u32 = 230;
+pub const SR_VECBASE: u32 = 231;
+pub const SR_EXCCAUSE: u32 = 232;
+pub const SR_DEBUGCAUSE: u32 = 233;
+pub const SR_CCOUNT: u32 = 234;
+pub const SR_PRID: u32 = 235;
+pub const SR_ICOUNT: u32 = 236;
+pub const SR_ICOUNTLEVEL: u32 = 237;
+pub const SR_EXCVADDR: u32 = 238;
+pub const SR_CCOMPARE0: u32 = 240;
+pub const SR_CCOMPARE1: u32 = 241;
+pub const SR_CCOMPARE2: u32 = 242;
+
+// User SR space (RUR/WUR).  THREADPTR is a distinct physical register from
+// VECBASE even though both are numbered 231 (QEMU cpu.h has separate enums).
+pub const UR_THREADPTR: u32 = 231;
+pub const UR_SAR_BYTE: u32 = 232;
+pub const UR_FCR: u32 = 233;
+pub const UR_FSR: u32 = 234;
+pub const UR_FFT_BIT_WIDTH: u32 = 235;
+pub const UR_ACCX_0: u32 = 236;
+pub const UR_ACCX_1: u32 = 237;
+pub const UR_QACC_H_0: u32 = 238;
+pub const UR_QACC_H_1: u32 = 239;
+pub const UR_QACC_H_2: u32 = 240;
+pub const UR_QACC_H_3: u32 = 241;
+pub const UR_QACC_H_4: u32 = 242;
+pub const UR_QACC_L_0: u32 = 243;
+pub const UR_QACC_L_1: u32 = 244;
+pub const UR_QACC_L_2: u32 = 245;
+pub const UR_QACC_L_3: u32 = 246;
+pub const UR_QACC_L_4: u32 = 247;
+pub const UR_UA_STATE_0: u32 = 248;
+pub const UR_UA_STATE_1: u32 = 249;
+pub const UR_UA_STATE_2: u32 = 250;
+pub const UR_UA_STATE_3: u32 = 251;
+pub const UR_GPIO_OUT: u32 = 252;
+
+// PS fields (QEMU cpu.h; ISA RM "Processor State (PS) Register").
+pub const PS_INTLEVEL: u32 = 0xf;
+pub const PS_EXCM: u32 = 0x10;
+pub const PS_UM: u32 = 0x20;
+pub const PS_RING: u32 = 0xc0;
+pub const PS_RING_SHIFT: u32 = 6;
+pub const PS_OWB: u32 = 0xf00;
+pub const PS_OWB_SHIFT: u32 = 8;
+pub const PS_CALLINC: u32 = 0x30000;
+pub const PS_CALLINC_SHIFT: u32 = 16;
+pub const PS_WOE: u32 = 0x40000;
+
+// EXCCAUSE values (ISA RM, "EXCCAUSE Register").
+pub const ILLEGAL_INSTRUCTION_CAUSE: u32 = 0;
+pub const SYSCALL_CAUSE: u32 = 1;
+pub const INSTRUCTION_FETCH_ERROR_CAUSE: u32 = 2;
+pub const LOAD_STORE_ERROR_CAUSE: u32 = 3;
+pub const ALLOCA_CAUSE: u32 = 5;
+pub const INTEGER_DIVIDE_BY_ZERO_CAUSE: u32 = 6;
+pub const PC_VALUE_ERROR_CAUSE: u32 = 7;
+pub const PRIVILEGED_CAUSE: u32 = 8;
+pub const LOAD_STORE_ALIGNMENT_CAUSE: u32 = 9;
+pub const WINDOW_OVERFLOW4_CAUSE: u32 = 32;
+pub const WINDOW_UNDERFLOW4_CAUSE: u32 = 33;
+pub const WINDOW_OVERFLOW8_CAUSE: u32 = 34;
+pub const WINDOW_UNDERFLOW8_CAUSE: u32 = 35;
+pub const WINDOW_OVERFLOW12_CAUSE: u32 = 36;
+pub const WINDOW_UNDERFLOW12_CAUSE: u32 = 37;
+
+// Exception vector offsets from VECBASE (ESP32-S3 core-isa.h:
+// XCHAL_WINDOW_VECTORS_VADDR 0x40000000, KERNEL 0x40000300, USER 0x40000340,
+// DOUBLE 0x400003C0; VECBASE reset value 0x40000000).
+pub const VEC_OF4: u32 = 0x000;
+pub const VEC_UF4: u32 = 0x040;
+pub const VEC_OF8: u32 = 0x080;
+pub const VEC_UF8: u32 = 0x0c0;
+pub const VEC_OF12: u32 = 0x100;
+pub const VEC_UF12: u32 = 0x140;
+pub const VEC_KERNEL: u32 = 0x300;
+pub const VEC_USER: u32 = 0x340;
+pub const VEC_DOUBLE: u32 = 0x3c0;
+
+/// Reset vector address (ESP32-S3 ROM at 0x4000_0000, IRAM at 0x4008_0000).
+pub const RESET_VECTOR: u32 = 0x4000_0000;
+
+pub struct Cpu {
+    pub pc: u32,
+    phys: [u32; 64],
+    sregs: [u32; 256],
+    user_sregs: [u32; 256],
+    pub(crate) windowbase_next: Option<u32>,
+    pub icount: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepResult {
+    Ok,
+    /// An exception was raised; EPC1/EXCCAUSE/PS and PC are already set.
+    Exception {
+        cause: u32,
+    },
+    Unimplemented(&'static str),
+}
+
+impl Cpu {
+    pub fn new() -> Self {
+        // Reset state: vectors at 0x4000_0000, window 0 active (the reset
+        // boot code on real silicon sets WINDOWSTART=1 before the first
+        // windowed call).
+        let mut cpu = Cpu {
+            pc: RESET_VECTOR,
+            phys: [0; 64],
+            sregs: [0; 256],
+            user_sregs: [0; 256],
+            windowbase_next: None,
+            icount: 0,
+        };
+        cpu.sregs[SR_VECBASE as usize] = RESET_VECTOR;
+        cpu.sregs[SR_WINDOW_START as usize] = 1;
+        cpu
+    }
+
+    // --- register file -----------------------------------------------------
+
+    #[inline]
+    pub fn windowbase(&self) -> u32 {
+        self.sregs[SR_WINDOW_BASE as usize] & 0xf
+    }
+
+    /// Logical register aN (ISA RM: aN = phys[(WINDOW_BASE*4 + N) & 63]).
+    #[inline]
+    pub fn reg(&self, n: u32) -> u32 {
+        self.phys[((self.windowbase() * 4 + n) & 63) as usize]
+    }
+
+    #[inline]
+    pub fn set_reg(&mut self, n: u32, v: u32) {
+        let i = ((self.windowbase() * 4 + n) & 63) as usize;
+        self.phys[i] = v;
+    }
+
+    #[inline]
+    pub fn sreg(&self, n: u32) -> u32 {
+        self.sregs[n as usize]
+    }
+
+    #[inline]
+    pub fn set_sreg(&mut self, n: u32, v: u32) {
+        self.sregs[n as usize] = v;
+    }
+
+    #[inline]
+    pub fn user_sreg(&self, n: u32) -> u32 {
+        self.user_sregs[n as usize]
+    }
+
+    #[inline]
+    pub fn set_user_sreg(&mut self, n: u32, v: u32) {
+        self.user_sregs[n as usize] = v;
+    }
+
+    #[inline]
+    pub fn ps(&self) -> u32 {
+        self.sregs[SR_PS as usize]
+    }
+
+    /// WINDOWSTART replicated to 16 bits: `ws | (ws << (nareg / 4))`
+    /// (QEMU xtensa_replicate_windowstart, cpu.h).
+    #[inline]
+    fn windowstart_replicated(&self) -> u32 {
+        let ws = self.sregs[SR_WINDOW_START as usize];
+        ws | (ws << 16)
+    }
+
+    /// Number of active window units above the current base, capped at 3
+    /// (QEMU: `ctz32(windowstart >> (wb + 1)) | 0x8` in
+    /// xtensa_tr_init_disas_context, translate.c).
+    #[inline]
+    pub(crate) fn window(&self) -> u32 {
+        let ws = self.windowstart_replicated() >> (self.windowbase() + 1);
+        (ws | 0x8).trailing_zeros()
+    }
+
+    /// Rotate the window by `delta` window units (multiples of 4 registers).
+    /// Physical regs are not moved; only WINDOW_BASE changes (equivalent to
+    /// QEMU's xtensa_rotate_window, which rotates a view array).
+    #[inline]
+    pub(crate) fn rotate(&mut self, delta: i32) {
+        let wb = (self.windowbase() as i32 + delta) & 0xf;
+        self.sregs[SR_WINDOW_BASE as usize] = wb as u32;
+    }
+
+    /// Apply a deferred window-base change (QEMU defers rotations to
+    /// translation-block boundaries via `windowbase_next`; we defer to the
+    /// end of the instruction, which is equivalent in an interpreter).
+    #[inline]
+    fn sync_windowbase(&mut self) {
+        if let Some(wb) = self.windowbase_next.take() {
+            self.sregs[SR_WINDOW_BASE as usize] = wb & 0xf;
+        }
+    }
+
+    /// Window overflow (QEMU HELPER(window_check), win_helper.c): rotate to
+    /// the first free unit above the active chain, save OWB, take the
+    /// WINDOW_OVERFLOW4/8/12 vector.  Returns the EXCCAUSE value.
+    pub(crate) fn window_overflow(&mut self, pc: u32) -> u32 {
+        let wb_old = self.windowbase();
+        let ws = self.windowstart_replicated() >> (wb_old + 1);
+        let n = ws.trailing_zeros() + 1;
+
+        self.rotate(n as i32);
+        self.sregs[SR_PS as usize] =
+            (self.sregs[SR_PS as usize] & !PS_OWB) | (wb_old << PS_OWB_SHIFT) | PS_EXCM;
+        self.sregs[SR_EPC1 as usize] = pc;
+        let cause = match (ws >> n).trailing_zeros() {
+            0 => WINDOW_OVERFLOW4_CAUSE,
+            1 => WINDOW_OVERFLOW8_CAUSE,
+            _ => WINDOW_OVERFLOW12_CAUSE,
+        };
+        self.sregs[SR_EXCCAUSE as usize] = cause;
+        self.pc =
+            self.sregs[SR_VECBASE as usize] + VEC_OF4 + (cause - WINDOW_OVERFLOW4_CAUSE) * 0x80;
+        cause
+    }
+
+    /// Window underflow (QEMU HELPER(test_underflow_retw), win_helper.c):
+    /// rotate back, save OWB, take the WINDOW_UNDERFLOW4/8/12 vector.
+    pub(crate) fn window_underflow(&mut self, pc: u32, n: u32) -> u32 {
+        let wb_old = self.windowbase();
+        self.rotate(-(n as i32));
+        self.sregs[SR_PS as usize] =
+            (self.sregs[SR_PS as usize] & !PS_OWB) | (wb_old << PS_OWB_SHIFT) | PS_EXCM;
+        self.sregs[SR_EPC1 as usize] = pc;
+        let cause = match n {
+            1 => WINDOW_UNDERFLOW4_CAUSE,
+            2 => WINDOW_UNDERFLOW8_CAUSE,
+            _ => WINDOW_UNDERFLOW12_CAUSE,
+        };
+        self.sregs[SR_EXCCAUSE as usize] = cause;
+        self.pc = self.sregs[SR_VECBASE as usize] + VEC_UF4 + (n - 1) * 0x80;
+        cause
+    }
+
+    /// Generic exception (QEMU HELPER(exception_cause), exc_helper.c).
+    /// ESP32-S3 has no NDEPC: EPC1 is always used, even for double
+    /// exceptions.
+    pub(crate) fn raise_cause(&mut self, pc: u32, cause: u32) {
+        self.sregs[SR_EPC1 as usize] = pc;
+        let vec = if self.sregs[SR_PS as usize] & PS_EXCM != 0 {
+            VEC_DOUBLE
+        } else if self.sregs[SR_PS as usize] & PS_UM != 0 {
+            VEC_USER
+        } else {
+            VEC_KERNEL
+        };
+        self.sregs[SR_EXCCAUSE as usize] = cause;
+        self.sregs[SR_PS as usize] |= PS_EXCM;
+        self.pc = self.sregs[SR_VECBASE as usize] + vec;
+    }
+
+    /// Execute one instruction.  Returns a StepResult describing what
+    /// happened (see StepResult).
+    pub fn step<B: Bus>(&mut self, bus: &mut B) -> StepResult {
+        let pc = self.pc;
+        let b0 = bus.read8(pc) as u8;
+        let len = insn_len(b0);
+        let raw = match len {
+            2 => bus.read16(pc),
+            _ => bus.read32(pc),
+        };
+
+        // 16-bit slot selection: op0 (low nibble of b0) 8..=11 is inst16a
+        // (QRST), 12..=13 is inst16b (QRI); insn_len already restricted b0
+        // to 8..=13 for two-byte instructions (ISA RM, instruction formats).
+        let (opc, insn) = match len {
+            2 => {
+                let opc = if b0 & 0xf <= 11 {
+                    decode_inst16a(raw)
+                } else {
+                    decode_inst16b(raw)
+                };
+                (opc, raw)
+            }
+            _ => (decode_inst(raw), raw),
+        };
+
+        let opc = match opc {
+            Some(o) => o,
+            None => {
+                self.raise_cause(pc, ILLEGAL_INSTRUCTION_CAUSE);
+                return StepResult::Exception {
+                    cause: ILLEGAL_INSTRUCTION_CAUSE,
+                };
+            }
+        };
+
+        let o = opnds(opc, insn, pc);
+
+        // Generic window-overflow check: QEMU ORs 1<<v for every AR
+        // register operand (visible and hidden) of the instruction and
+        // raises WINDOW_OVERFLOWx if (highest bit)/4 > active window units.
+        let mut wmask = 0u32;
+        for op in o.iter() {
+            if op.is_reg {
+                wmask |= 1u32 << (op.value & 31);
+            }
+        }
+        if wmask != 0 {
+            let r = 31 - wmask.leading_zeros();
+            if r / 4 > self.window() {
+                let cause = self.window_overflow(pc);
+                return StepResult::Exception { cause };
+            }
+        }
+
+        match exec::execute(self, bus, opc, &o, len) {
+            Outcome::Seq => {
+                let next_pc = pc.wrapping_add(len);
+                // Zero-overhead loop check (QEMU gen_check_loop_end): when
+                // the sequential continuation reaches LEND and LCOUNT != 0,
+                // decrement and jump to LBEG.  Taken branches/jumps do NOT
+                // trigger the check.
+                if next_pc == self.sregs[SR_LEND as usize] && self.sregs[SR_LCOUNT as usize] != 0 {
+                    self.sregs[SR_LCOUNT as usize] -= 1;
+                    self.pc = self.sregs[SR_LBEG as usize];
+                } else {
+                    self.pc = next_pc;
+                }
+            }
+            Outcome::Jump(t) => {
+                self.pc = t;
+            }
+            Outcome::Exception(cause) => {
+                return StepResult::Exception { cause };
+            }
+            Outcome::Unimplemented => {
+                return StepResult::Unimplemented("opcode");
+            }
+        }
+        self.sync_windowbase();
+        self.icount += 1;
+        StepResult::Ok
+    }
+}
+
+impl Default for Cpu {
+    fn default() -> Self {
+        Self::new()
+    }
+}

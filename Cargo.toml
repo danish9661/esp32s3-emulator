@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/xtensa-core",
+    "crates/esp32s3-soc",
+    "crates/esp32s3-emu",
+    "crates/wasm-bridge",
+]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1
