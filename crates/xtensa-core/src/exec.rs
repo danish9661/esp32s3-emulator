@@ -283,11 +283,9 @@ pub(crate) fn execute<B: Bus>(
             Outcome::Seq
         }
         Opcode::OPCODE_ADDMI => {
-            // addmi t, s, imm8: s + (imm8 << 8).
-            cpu.set_reg(
-                o[0].value,
-                cpu.reg(o[1].value).wrapping_add(o[2].value << 8),
-            );
+            // addmi t, s, imm8: t = s + (sext8(imm8) << 8).  opnds already
+            // pre-shifts the immediate, so add it as-is (no extra << 8).
+            cpu.set_reg(o[0].value, cpu.reg(o[1].value).wrapping_add(o[2].value));
             Outcome::Seq
         }
         Opcode::OPCODE_MOVI => {

@@ -6540,8 +6540,13 @@ pub fn opnds(opc: Opcode, insn: u32, pc: u32) -> [Opnd; MAX_OPERANDS] {
         }
         Opcode::OPCODE_L32R => {
             o[0] = Opnd::reg(fld_inst::t(insn));
+            // ISA RM L32R: the 16-bit offset is sign-extended before <<2.
+            // QEMU's C emits the tensilica idiom `(((0xffff)<<16)|v)<<2`,
+            // which equals sext16(v)<<2 only when v >= 0x8000 (pools before
+            // code); forward l32r would compute base - 0x40000 + v*4. This
+            // deviation is implemented in tools/gen_decode.py too.
             o[1] = Opnd::imm(
-                ((((0xffffu32) << 0x10u32) | (fld_inst::imm16(insn) & 0xffff)) << 0x2u32)
+                (sext(fld_inst::imm16(insn), 16u32) << 0x2u32)
                     .wrapping_add((pc.wrapping_add(3)) & !3),
             );
         }

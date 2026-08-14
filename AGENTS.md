@@ -137,5 +137,62 @@ Core design:
     imm12<<12|s<<8|m<<6|1<<4|6; SSR = op2=4, r=t=0; SLLI requires op1=1;
     movi.n (inst16b): dest=s[11:8], imm7={z,n[5:4],r[15:12]}; entry imm12 =
     N>>3 at [19:12]; wsr = op0=0 op1=3 op2=1.
+- 2026-08-15: P2 SoC + machine glue lands: 6/6 machine tests green.
+  - `esp32s3-soc`: memmap.rs (DRAM/IRAM alias the same 512KB SRAM; IROM
+    read-only; APB devices), uart.rs (FIFO TX/FIFO_CNT/STATUS/conf, tx stream
+    out), gpio.rs (OUT/W1TS/W1TC/ENABLE/W1TS/STRAP), timg.rs (64-bit T0/T1,
+    tick(cycles), T0LOAD/UPDATE/ALARM, INT_RAW/ENA/ST/CLR), intc.rs (matrix
+    table only). `esp32s3-emu`: machine.rs (`Esp32S3` = Cpu+Soc, `step`
+    = tick_timers(1) then cpu.step, `load_image` DRAM/IRAM/IROM, boot pc =
+    0x40000000).
+  - Hand-assembled tests: uart0_hello_world ("Hi"), gpio_out_w1ts_w1tc,
+    timg0_load_and_read, timg0_counts_on_tick, bus_sanity, boot_reset_vector.
+  - Fixed xtensa-core ADDMI double-shift bug (opnds pre-shifts imm8<<8; exec
+    must not shift again).
+  - Encoding gotchas learned this session (LE word = b0|b1<<8|b2<<16):
+    MOVI byte1 = (r<<4)|imm_hi (`movi a2,0x60` = 0x0060A022); SLLI byte2 =
+    (op2<<4)|op1 with op2=[23:20], sal={bit20,[7:4]}, shift=32-sal
+    (`slli a4,a4,12` = 0x00114440); ADD = RRR op0=0 op1=[19:16]=0
+    op2=[23:20]=8, r=[15:12] dest, s=[11:8], t=[7:4] (`add a2,a2,a4` =
+    0x00802240; words with op1=8 decode as LSX -> ILLEGAL); movi.n imm7 =
+    {n[5:4]<<4 | r[15:12]} (`movi.n a4,5` = 0x0000540C, r lives in byte1
+    [15:12], NOT the low nibble); l32r target = ((pc+3)&~3)+((0xFFFF0000|
+    imm16)<<2) so the literal pool must precede the code (code pc =
+    IRAM_BASE+4/+8 after pool); j . = 0x00FFFF06 (offset -4); s32i/l32i
+    imm = r=[15:12] in BYTES (`s32i a4,a5,1` = 0x00016542); `nop.n` not
+    decoded -> pad with `movi.n aX,0` = 0x00X0_0C.
+  - Clippy clean (fixed in_range! macro to Range::contains, Default impls
+    for Intc/Timg, is_multiple_of), fmt clean, `cargo build --workspace
+    --target wasm32-unknown-unknown` passes.
+- 2026-08-15: P3 boot path lands: `boot_path_loads_app_from_flash` green
+  (15/15 esp32s3-emu, 12/12 xtensa-core, clippy/fmt/wasm32 clean).
+  - `rom_stub.rs` (hand-assembled at 0x40000000): reset li a1,STACK_TOP
+    (0x3FC88000) + j loader; loader li a2,0x3C010000, l8ui a3,a2,1,
+    l32i a4,a2,4 (entry), addi a5,a2,24, seg_loop/copy_loop/seg_next
+    (copies each esp_image_header_t segment from flash to DRAM/IRAM,
+    loops on segment_count, jx a4); rom_puts @0x40000500 (li a5,0x60000000
+    = movi+slli+slli = 9B, l8ui a4,a2,0, beqz a4,done, s32i UART FIFO,
+    addi a2,1, j, ret).
+  - `machine.rs`: `boot_from_flash` (flash8 window, 0x0000000 reserved,
+    0xE9 magic check, parse_partition_table → entry/segments), `load_image`
+    now writes IROM storage directly (Bus write path is read-only).
+  - `partition.rs`: 32-bit aligned partition-table parsing (magic 0xAA50,
+    type/subtype/map, entry_addr + load_addr from app partition) — 3 tests.
+  - `asm.rs`: callx0 (0x3C0), jx, j (24-bit, 3 bytes), l32r + patch_l32r,
+    bytes_mut for literal patching, beqz/BNEZ 12-bit byte-offset
+    (target = pc+4+sext(imm12), NOT <<2).
+  - Verified vs QEMU/ISA: CALLX0/RET/JX low 2 bits of the target are
+    masked (`& !3`) → return addresses must be 4-aligned: place a 3-byte
+    call at pc ≡ 1 (mod 4) so pc+3 ≡ 0 (mod 4), else the masked return
+    fetches garbage mid-instruction. JX/CALLX0 decode: JX = RRR t=0xA,
+    RET = t=0x8, RETW = t=0x9, CALLX0 = t=0xC, CALLX4 = t=0xD (m=3,n=1).
+  - L32R deviation from QEMU documented: QEMU's `((0xffff<<16)|imm16)<<2`
+    equals sext16(imm16)<<2 only when bit 15 is set; we emit the ISA-RM
+    sext form (forward l32r would be wrong). KAT test updated.
+  - Encoding gotchas: l32i/s32i imm is a BYTE offset (imm8 = off>>2);
+    esp_image_header_t is 24 bytes (our synthetic images pad); the 24-bit
+    `j` is 3 bytes (off = target-pc-4, 18-bit field [23:6], opnds
+    sext14 + pc+4 — bytes, no <<2); rom_puts beqz skips s32i+addi+j+ret
+    = 12 bytes.
 - 2026-08-13: Environment verified. Research done (no Xtensa Rust crate;
   QEMU = only reference). AGENTS.md created. Workspace scaffold next.

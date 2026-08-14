@@ -26,8 +26,13 @@ mod tests {
         assert_eq!(enc(insn), Some(Opcode::OPCODE_L32R));
         let o = opnds(Opcode::OPCODE_L32R, insn, 0x4000_0100);
         assert_eq!((o[0].value, o[0].is_reg), (3, true));
-        // (((0xffff<<16) | imm16) << 2) + ((pc+3) & ~3)  (unsigned 16-bit imm)
-        assert_eq!(o[1].value, 0xfffc_48d0u32.wrapping_add(0x4000_0100));
+        // ISA RM L32R: sext16(imm16) << 2 + ((pc+3) & ~3). (QEMU's C emits
+        // the tensilica idiom `((0xffff<<16)|imm16)<<2`, which equals sext
+        // only when bit 15 of imm16 is set; forward l32r would be wrong.)
+        assert_eq!(
+            o[1].value,
+            0x48d0u32.wrapping_add((0x4000_0100u32 + 3) & !3)
+        );
     }
 
     #[test]

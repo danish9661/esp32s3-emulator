@@ -1,14 +1,19 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! ESP32-S3 SoC: peripherals + full address-space `Bus` implementation.
+//!
+//! P2 scope (see AGENTS.md roadmap): memory map, UART0/1/2 (console TX),
+//! GPIO, timer groups (TIMG0/1), interrupt matrix. Peripheral register
+//! layouts are ported from QEMU's open-source ESP32-S3 models
+//! (espressif/qemu, GPLv2) and the public ESP32-S3 TRM.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#![no_std]
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+extern crate alloc;
+
+pub mod gpio;
+pub mod intc;
+pub mod memmap;
+pub mod soc;
+pub mod timg;
+pub mod uart;
+
+pub use soc::Soc;

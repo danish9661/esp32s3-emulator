@@ -5,10 +5,17 @@ version = 4
 [[package]]
 name = "esp32s3-emu"
 version = "0.1.0"
+dependencies = [
+ "esp32s3-soc",
+ "xtensa-core",
+]
 
 [[package]]
 name = "esp32s3-soc"
 version = "0.1.0"
+dependencies = [
+ "xtensa-core",
+]
 
 [[package]]
 name = "wasm-bridge"
