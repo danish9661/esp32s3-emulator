@@ -31,6 +31,20 @@ pub const SPI3_BASE: u32 = 0x6002_8000;
 /// LEDC (LED PWM controller), TRM LEDC chapter.
 pub const LEDC_BASE: u32 = 0x6001_9000;
 
+/// SENS RTC controller — the SAR ADC oneshot path (SAR ADC chapter of the
+/// TRM; sens_struct.h).  NOT page-aligned: it sits in the 0x6000_8000 page
+/// alongside RTC_CNTL (0x000) / RTC_IO (0x400) / RTC_MEM (0xC00).
+pub const SENS_BASE: u32 = 0x6000_8800;
+
+/// APB_SARADC digital controller (SAR ADC continuous/DMA path,
+/// apb_saradc_struct.h).
+pub const APB_SARADC_BASE: u32 = 0x6004_0000;
+
+/// I2C0 (I2C EXT0), TRM I2C chapter.
+pub const I2C0_BASE: u32 = 0x6001_3000;
+/// I2C1 (I2C EXT1), 0x14000 apart from I2C0.
+pub const I2C1_BASE: u32 = 0x6002_7000;
+
 /// RTC fast memory (8 KB, data alias in APB space).
 pub const RTC_FAST_BASE: u32 = 0x600F_E000;
 pub const RTC_FAST_SIZE: u32 = 0x0000_2000;

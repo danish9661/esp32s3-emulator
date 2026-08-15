@@ -9,7 +9,9 @@
 
 extern crate alloc;
 
+pub mod adc;
 pub mod gpio;
+pub mod i2c;
 pub mod intc;
 pub mod ledc;
 pub mod memmap;

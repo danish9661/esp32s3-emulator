@@ -712,6 +712,213 @@ fn spi2_shifts_out_0xa5_on_gpio_pins() {
 }
 
 #[test]
+fn i2c0_master_write_nacks_and_stops() {
+    use crate::asm::Asm;
+    use alloc::vec::Vec;
+    use esp32s3_soc::memmap::{GPIO_BASE, I2C0_BASE};
+
+    // Firmware: route I2CEXT0_SCL (89) -> GPIO1, I2CEXT0_SDA (90) -> GPIO2,
+    // configure I2C0 as master (ms_mode), push address 0xA0 (0x50<<1|W) and
+    // data 0xAA into the TX FIFO, then run the command list
+    // RSTART|WRITE(1)|WRITE(1)|STOP|END via ctr.trans_start and stash.  The
+    // stash precedes the trigger (like the SPI test): the host syncs on the
+    // START condition (SDA falling while SCL high) and recovers the 18 SCL
+    // pulses with their SDA levels (8 addr bits + NACK + 8 data bits + NACK),
+    // then verifies the STOP condition and bus idle.
+    // Timing: scl_low_period=1 -> 2 APB cycles low, scl_high_period=1
+    // (wait=0) -> 1 APB cycle high, start/stop holds = 0 -> 1 cycle.
+    const STASH: u32 = 0x3FC8_0100;
+    let mut a = Asm::new(IRAM_BASE);
+    let l_i2c = a.offset();
+    a.lit(0);
+    let l_gpio = a.offset();
+    a.lit(0);
+    let l_stash = a.offset();
+    a.lit(0);
+    let code_start = a.pc();
+    let p = a.l32r(2); // I2C0_BASE
+    a.patch_l32r(p, IRAM_BASE + l_i2c as u32);
+    let p = a.l32r(3); // GPIO_BASE
+    a.patch_l32r(p, IRAM_BASE + l_gpio as u32);
+    a.movi_n(4, 6);
+    a.s32i(4, 3, 0x20); // ENABLE bits 1,2
+    a.li(4, 89);
+    a.s32i(4, 3, 0x58); // GPIO1 FUNC_OUT_SEL = I2CEXT0_SCL
+    a.li(4, 90);
+    a.s32i(4, 3, 0x5C); // GPIO2 FUNC_OUT_SEL = I2CEXT0_SDA
+    a.li(4, 1 << 4);
+    a.s32i(4, 2, 0x04); // I2C_CTR: ms_mode
+    a.movi_n(4, 1);
+    a.s32i(4, 2, 0x00); // scl_low_period = 1 -> 2 APB cycles low
+    a.s32i(4, 2, 0x38); // scl_high_period = 1 -> 1 APB cycle high
+    a.s32i(4, 2, 0x40); // scl_start_hold = 0 -> 1
+    a.s32i(4, 2, 0x48); // scl_stop_hold = 0 -> 1
+    a.s32i(4, 2, 0x4C); // scl_stop_setup = 0 -> 1
+    a.li(4, 0xA0);
+    a.s32i(4, 2, 0x1C); // I2C_DATA: TX FIFO byte 1 (address 0x50<<1|W)
+    a.li(4, 0xAA);
+    a.s32i(4, 2, 0x1C); // I2C_DATA: TX FIFO byte 2
+    a.li(4, 0xCAFE);
+    let p = a.l32r(5); // STASH
+    a.patch_l32r(p, IRAM_BASE + l_stash as u32);
+    a.s32i(4, 5, 0);
+    a.li(4, 6 << 11);
+    a.s32i(4, 2, 0x58); // comd0: RSTART
+    a.li(4, (1 << 11) | 1);
+    a.s32i(4, 2, 0x5C); // comd1: WRITE 1 byte
+    a.s32i(4, 2, 0x60); // comd2: WRITE 1 byte
+    a.li(4, 2 << 11);
+    a.s32i(4, 2, 0x64); // comd3: STOP
+    a.li(4, 4 << 11);
+    a.s32i(4, 2, 0x68); // comd4: END
+    a.li(4, (1 << 5) | (1 << 4));
+    a.s32i(4, 2, 0x04); // I2C_CTR: trans_start -> run the command list
+    let done = a.pc();
+    a.j(done);
+    a.bytes_mut()[l_i2c..l_i2c + 4].copy_from_slice(&I2C0_BASE.to_le_bytes());
+    a.bytes_mut()[l_gpio..l_gpio + 4].copy_from_slice(&GPIO_BASE.to_le_bytes());
+    a.bytes_mut()[l_stash..l_stash + 4].copy_from_slice(&STASH.to_le_bytes());
+
+    let mut m = Esp32S3::new();
+    m.load_image(IRAM_BASE, a.bytes());
+    m.cpu.pc = code_start;
+    // Sample encoding: bit0 = GPIO1 = SCL, bit1 = GPIO2 = SDA.
+    let pins = |m: &Esp32S3| {
+        let out = m.gpio_output();
+        ((out >> 1) & 1) | (((out >> 2) & 1) << 1)
+    };
+    for _ in 0..600 {
+        if m.soc.read32(STASH) == 0xCAFE {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.soc.read32(STASH), 0xCAFE, "firmware configured I2C0");
+    // The stash precedes the trans_start write: sample the whole
+    // transaction (57 cycles) plus margin.
+    let mut samples = Vec::new();
+    for _ in 0..200 {
+        samples.push(pins(&m));
+        m.step();
+    }
+    // START condition: SDA falls while SCL is high (1,1) -> (1,0).
+    let start = samples
+        .windows(2)
+        .position(|w| w[0] == 3 && w[1] == 1)
+        .expect("START condition (SDA falling while SCL high)");
+    // Recover bits at each SCL rising edge: 8 addr bits + NACK + 8 data
+    // bits + NACK = 18 pulses.
+    let mut bits = Vec::new();
+    for k in start + 1..samples.len() {
+        if samples[k] & 1 == 1 && samples[k - 1] & 1 == 0 {
+            bits.push(samples[k] >> 1);
+        }
+    }
+    assert_eq!(bits.len(), 18, "18 SCL pulses (addr + NACK + data + NACK)");
+    let expected = [
+        1, 0, 1, 0, 0, 0, 0, 0, // 0xA0 = addr 0x50, write
+        1, // NACK (no device)
+        1, 0, 1, 0, 1, 0, 1, 0, // 0xAA
+        1, // NACK
+    ];
+    for (k, e) in expected.iter().enumerate() {
+        assert_eq!(bits[k], *e, "SDA level at pulse {k}");
+    }
+    // STOP condition: SDA rises while SCL is high after the last pulse.
+    let last_edge = (start + 1..samples.len())
+        .filter(|&k| samples[k] & 1 == 1 && samples[k - 1] & 1 == 0)
+        .nth(17)
+        .unwrap();
+    let stop = samples[last_edge + 1..]
+        .windows(2)
+        .position(|w| w[0] == 1 && w[1] == 3)
+        .expect("STOP condition (SDA rising while SCL high)");
+    assert!(stop > 0, "STOP after the ACK pulse");
+    // Bus idle high afterwards.
+    for s in samples.iter().skip(last_edge + 1 + stop + 2) {
+        assert_eq!(*s, 3, "bus idle (1,1) after STOP");
+    }
+    // Controller state: NACK latched, all command slots done, trans
+    // complete interrupt raw raised, TX FIFO drained.
+    assert_eq!(m.soc.read32(I2C0_BASE + 0x08) & 1, 1, "resp_rec = NACK");
+    for off in [0x58, 0x5C, 0x60, 0x64, 0x68] {
+        assert_ne!(
+            m.soc.read32(I2C0_BASE + off) & (1 << 31),
+            0,
+            "comd {off:#x} done"
+        );
+    }
+    assert_ne!(
+        m.soc.read32(I2C0_BASE + 0x20) & (1 << 7),
+        0,
+        "trans_complete raw"
+    );
+}
+
+#[test]
+fn adc1_oneshot_reads_injected_voltage() {
+    use crate::asm::Asm;
+    use esp32s3_soc::memmap::SENS_BASE;
+
+    // Firmware drives the RTC oneshot path exactly like ESP-IDF's
+    // adc_oneshot driver: select the RTC controller, set the channel bitmap
+    // + SW start force, spin on sar_slave_addr1.meas_status, then start
+    // (start_sar 0 -> 1), spin on meas1_done_sar and stash the raw result.
+    // The host injects 825 mV on ADC1 channel 2 at 0 dB (full-scale 1.1 V)
+    // -> 825 * 4095 / 1100 = 3071.
+    const STASH: u32 = 0x3FC8_0200;
+    let mut a = Asm::new(IRAM_BASE);
+    let l_sens = a.offset();
+    a.lit(0);
+    let l_stash = a.offset();
+    a.lit(0);
+    let code_start = a.pc();
+    let p = a.l32r(2); // SENS_BASE
+    a.patch_l32r(p, IRAM_BASE + l_sens as u32);
+    let p = a.l32r(3); // STASH
+    a.patch_l32r(p, IRAM_BASE + l_stash as u32);
+    a.movi_n(4, 0);
+    a.s32i(4, 2, 0x10); // meas1_mux = 0: RTC controller (dig_force = 0)
+    a.s32i(4, 2, 0x14); // sar_atten1 = 0: channel 2 at 0 dB
+    a.li(4, (1 << 31) | (1 << 18) | (1 << 21)); // en_pad_force|start_force|ch2
+    a.s32i(4, 2, 0x0C); // meas1_ctrl2
+    let poll = a.pc();
+    a.l32i(4, 2, 0x40); // slave_addr1: meas_status
+    a.li(5, 0xFF << 22);
+    a.and(4, 4, 5);
+    a.bnez(4, poll); // wait for the shared SAR FSM idle
+    a.li(4, (1 << 31) | (1 << 18) | (1 << 21));
+    a.s32i(4, 2, 0x0C); // start_sar = 0
+    a.li(4, (1 << 31) | (1 << 18) | (1 << 21) | (1 << 17)); // start_sar = 1
+    a.s32i(4, 2, 0x0C);
+    let done = a.pc();
+    a.l32i(4, 2, 0x0C); // meas1_ctrl2
+    a.li(5, 1 << 16); // meas1_done_sar
+    a.and(4, 4, 5);
+    a.beqz(4, done); // spin until the conversion is done
+    a.l32i(4, 2, 0x0C);
+    a.li(5, 0xFFFF); // meas1_data_sar [15:0]
+    a.and(4, 4, 5);
+    a.s32i(4, 3, 0); // stash the raw result
+    let halt = a.pc();
+    a.j(halt);
+    a.bytes_mut()[l_sens..l_sens + 4].copy_from_slice(&SENS_BASE.to_le_bytes());
+    a.bytes_mut()[l_stash..l_stash + 4].copy_from_slice(&STASH.to_le_bytes());
+
+    let mut m = Esp32S3::new();
+    m.soc.adc_inject_voltage(0, 2, 825);
+    m.load_image(IRAM_BASE, a.bytes());
+    m.cpu.pc = code_start;
+    for _ in 0..400 {
+        if m.soc.read32(STASH) != 0 {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.soc.read32(STASH), 825 * 4095 / 1100, "ADC1 oneshot raw");
+}
+
+#[test]
 fn flash_xip_reads_and_readonly() {
     use esp32s3_soc::memmap::{FLASH_DATA_BASE, FLASH_INST_BASE};
     let mut m = Esp32S3::new();

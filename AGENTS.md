@@ -107,6 +107,96 @@ Core design:
 
 ## Status log (append, newest last)
 
+- 2026-08-15: P4 SAR ADC lands: 23/23 emu, 16/16 core, 22/22 soc tests green
+  (62 total incl. wasm-bridge).
+  - `esp32s3-soc` adc.rs: SENS RTC oneshot controller (0x6000_8800 — NOT
+    the classic-ESP32 0x6000E000; QEMU esp32s3_reg.h + esp32s3-hal agree)
+    + APB_SARADC digital controller (0x6004_0000). Oneshot (adc_oneshot
+    driver): measN_ctrl2 (0x0C/0x30) data_sar [15:0] / done [16] / start
+    [17] / start_force [18] / en_pad [30:19] / en_pad_force [31]; controller
+    select sar1_dig_force (meas1_mux 0x10); sar_attenN 2-bit per channel;
+    shared meas_status [29:22] in sar_slave_addr1 (0x40) busy while the FSM
+    runs (adc_oneshot_ll_start polls it, ADC2 skips the gate). Digital:
+    ctrl (0x00) work_mode [4:3] (0=single,1=double,2=alternate), sar_sel
+    [5], sar_clk_gated [6] gate, sarN_patt_len [18:15]/[22:19]; start is a
+    self-clearing pulse (like SPI usr); sarN_patt_tab[4] holds 4 one-byte
+    items/word = atten[1:0] | channel[6:2]; ctrl2 (0x04) timer_en [24] +
+    timer_sel [11] triggers one pass every (timer_target+1) cycles; results
+    in apb_saradcN_data_status (0x40/0x78); done flags are the TOP int bits
+    adc1_done = 1<<31 / adc2_done = 1<<30 (NOT bit 0/1 — struct packs the
+    flags at the end of the word). DMA NOT modeled — continuous firmware
+    reads data_status directly.
+  - Voltage scaling: host injects mV per (unit, channel) via
+    `adc_inject_voltage`; raw = mv/fs*4095 with full-scale per atten code
+    0dB=1100 / 2.5dB=1500 / 6dB=2200 / 11dB=3900 mV (TRM SAR ADC); data_inv
+    (readerN_ctrl bits 28/29) bitwise-inverts the 12-bit result. Oneshot
+    latency fixed at 8 APB cycles (regi2c sample times not modeled).
+  - soc.rs: SENS is NOT page-aligned — the 0x6000_8000 page also holds
+    RTC_CNTL (0x000)/RTC_IO (0x400)/RTC_MEM (0xC00), so the mmio dispatch
+    matches page 0x6000_8000 + off in 0x800..0xC00 (SENS window).
+  - Machine test `adc1_oneshot_reads_injected_voltage`: firmware drives the
+    oneshot flow (mux=0 RTC, atten=0, en_pad ch2, spin meas_status, start
+    0->1, spin done, stash raw); host injects 825 mV -> 3071
+    (825*4095/1100). asm.rs gained `and` (RRR op0=0 op1=0 op2=1).
+  - Gotchas this session: l32i/s32i take BYTE offsets in the asm API — a
+    first draft passed word-shifted offsets and read the mux instead of
+    slave_addr1; `(0 << n)` field-marker literals in tests/adc.rs need the
+    file-level `#![allow(clippy::identity_op)]` (like the generated.rs
+    header); my test expectations initially saturated (voltage > full-scale)
+    and swapped the pattern byte's atten/channel fields (byte = atten |
+    channel<<2, so ch2 atten0 = 0x08).
+  - fmt/clippy (0 warnings)/wasm32 clean. Next P4 items: dual-core, PSRAM;
+    P5 golden traces.
+
+- 2026-08-15: P4 I2C master lands: 22/22 emu, 16/16 core, 15/15 soc tests green.
+  - `esp32s3-soc` i2c.rs: I2CEXT0 @ 0x6001_3000, I2CEXT1 @ 0x6002_7000
+    (0x14000 apart). Registers per i2c_struct.h member order: ctr(0x04,
+    ms_mode=4, trans_start=5), data(0x1C = FIFO port: write pushes TX,
+    read pops RX — i2c_ll_write_txfifo), scl_low_period(0x00, low =
+    value+1 module clocks), scl_high_period(0x38, high = value +
+    scl_wait_high_period[15:9] — IDF measures high without the +1),
+    scl_start_hold(0x40)/scl_stop_hold(0x48)/scl_stop_setup(0x4C),
+    clk_conf(0x54, module = APB/(sclk_div_num+1)), comd[8](0x58),
+    txfifo_mem(0x100)/rxfifo_mem(0x180).
+  - **CRITICAL S3 comd layout (IDF i2c_ll_hw_cmd_t — NOT classic ESP32):**
+    byte_num[7:0], ack_en[8], ack_exp[9], ack_val[10], op_code[13:11],
+    done[31]. Op codes: RSTART=6, WRITE=1, READ=3, STOP=2, END=4 (the
+    i2c_struct.h comment "0:RSTART,1:WRITE,2:READ,3:STOP,4:END" is stale —
+    i2c_ll.h is what drives real silicon). Trigger = ctr.trans_start write
+    builds the pending queue from comd slots with done clear, executes in
+    order, sets each slot's done as it finishes, halts at END; END raises
+    INT_RAW.trans_complete (bit 7).
+  - Master FSM phase machine (per-bit: low half then high half, ACK =
+    cycle 8): START = SDA falls while SCL high (start_hold), then SCL
+    falls; WRITE = 8 SCL pulses + ACK cycle (SDA released -> NACK 1,
+    latched SR.resp_rec), byte from TX FIFO; READ = 8 pulses sampling
+    undriven SDA (reads 1 -> 0xFF bytes into RX FIFO), master drives
+    comd.ack_val after; STOP = SDA driven low (stop_hold) then raised
+    (stop_setup) while SCL high; END instant. bus_busy (SR bit 4) while
+    FSM running.
+  - soc.rs: I2C0/1 mmio arms + tick + signal routing (I2CEXT0 SCL/SDA =
+    89/90, I2CEXT1 = 91/92 — S3 gpio_sig_map.h). Machine test
+    `i2c0_master_write_nacks_and_stops`: I2CEXT0_SCL(89)->GPIO1,
+    I2CEXT0_SDA(90)->GPIO2; comd list RSTART|WRITE|WRITE|STOP|END, stash
+    BEFORE trans_start; host samples 200 cycles, syncs on START (SDA
+    falling while SCL high — the STOP's SDA dip is a (1,0)->(1,1) window,
+    distinguishable because START's (1,0) is followed by SCL falling),
+    recovers 18 pulses (0xA0 addr + NACK + 0xAA data + NACK), STOP (SDA
+    rising while SCL high), idle (1,1), all comd done bits, NACK in
+    resp_rec, trans_complete raw.
+  - Gotchas this session: unit tests must sample the idle (1,1) state
+    BEFORE trans_start or the START detector latches the STOP dip; the
+    READ advance's scl==0 branch must NOT reset sda=1 (it clobbers the
+    master ACK level — data lows release high, ACK low drives op.ack);
+    the RSTART->next-command seam drops SCL with no (0,0) sample (the
+    next command's first low phase covers it); finish_op needs the
+    completing slot passed in (op is cleared before it runs). Borrow
+    checker: precompute timing lens before as_mut()ing the op; inline
+    fifo/reg side effects (method calls on &mut self conflict with the
+    live op borrow).
+  - fmt/clippy (0 warnings)/wasm32 clean. Next P4 items: ADC, dual-core,
+    PSRAM; P5 golden traces.
+
 - 2026-08-15: P4 GPSPI2/3 SPI master lands: 21/21 emu, 16/16 core,
   10/10 soc tests green.
   - `esp32s3-soc` spi.rs: GPSPI2 @ 0x6002_4000, GPSPI3 @ 0x6002_8000

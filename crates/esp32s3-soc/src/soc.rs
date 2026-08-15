@@ -14,7 +14,9 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use xtensa_core::Bus;
 
+use crate::adc::Adc;
 use crate::gpio::Gpio;
+use crate::i2c::I2c;
 use crate::intc::Intc;
 use crate::ledc::Lcdc;
 use crate::memmap::*;
@@ -44,6 +46,8 @@ pub struct Soc {
     gpio: Gpio,
     ledc: Lcdc,
     spi: [Spi; 2],
+    i2c: [I2c; 2],
+    adc: Adc,
     timg: [Timg; 2],
     intc: Intc,
 }
@@ -60,6 +64,8 @@ impl Soc {
             gpio: Gpio::new(),
             ledc: Lcdc::new(),
             spi: [Spi::new(0), Spi::new(1)],
+            i2c: [I2c::new(0), I2c::new(1)],
+            adc: Adc::new(),
             timg: [Timg::new(), Timg::new()],
             intc: Intc::new(),
         }
@@ -86,6 +92,12 @@ impl Soc {
     /// Push one received byte into UART `n`'s RX FIFO (host console input).
     pub fn uart_inject_rx(&mut self, n: usize, byte: u8) {
         self.uarts[n].inject_rx(byte);
+    }
+
+    /// Inject an analog voltage (mV) on an ADC unit/channel (host
+    /// frontend — drives what the firmware reads from the SAR ADC).
+    pub fn adc_inject_voltage(&mut self, unit: usize, channel: usize, milli_volts: u32) {
+        self.adc.inject_voltage(unit, channel, milli_volts);
     }
 
     /// Snapshot of driven output-pin state (host LED visualization).  A
@@ -115,6 +127,9 @@ impl Soc {
             self.ledc.tick(1);
             self.spi[0].tick(1);
             self.spi[1].tick(1);
+            self.i2c[0].tick(1);
+            self.i2c[1].tick(1);
+            self.adc.tick(1);
         }
     }
 
@@ -153,13 +168,17 @@ impl Soc {
     }
 
     /// GPIO matrix output signal level for a peripheral signal index.
-    /// LEDC occupies 73..80, GPSPI2 (FSPI) 101..105 + CS 110/111, GPSPI3
-    /// 66..72 (S3 gpio_sig_map.h); everything else reads 0.
+    /// LEDC occupies 73..80, I2CEXT0 SCL/SDA = 89/90, I2CEXT1 = 91/92,
+    /// GPSPI2 (FSPI) 101..105 + CS 110/111, GPSPI3 66..72 (S3
+    /// gpio_sig_map.h); everything else reads 0.
     fn signal_level(&self, sig: u32) -> u32 {
         if (73..=80).contains(&sig) {
             self.ledc.signal_level(sig)
         } else {
-            self.spi[0].signal_level(sig) | self.spi[1].signal_level(sig)
+            self.spi[0].signal_level(sig)
+                | self.spi[1].signal_level(sig)
+                | self.i2c[0].signal_level(sig)
+                | self.i2c[1].signal_level(sig)
         }
     }
 
@@ -206,6 +225,38 @@ impl Soc {
                     0
                 } else {
                     self.spi[n].read32(off)
+                }
+            }
+            I2C0_BASE | I2C1_BASE => {
+                let n = if dev == I2C0_BASE { 0 } else { 1 };
+                if is_write {
+                    self.i2c[n].write32(off, value);
+                    0
+                } else {
+                    self.i2c[n].read32(off)
+                }
+            }
+            // Page 0x6000_8000 holds RTC_CNTL (0x000), RTC_IO (0x400),
+            // SENS (0x800, the SAR ADC RTC oneshot controller) and
+            // RTC_MEM (0xC00); only SENS is modeled.
+            0x6000_8000 => {
+                if in_range!(off, 0x800, 0x400) {
+                    if is_write {
+                        self.adc.sens_write32(off - 0x800, value);
+                        0
+                    } else {
+                        self.adc.sens_read32(off - 0x800)
+                    }
+                } else {
+                    0
+                }
+            }
+            APB_SARADC_BASE => {
+                if is_write {
+                    self.adc.apb_write32(off, value);
+                    0
+                } else {
+                    self.adc.apb_read32(off)
                 }
             }
             TIMG0_BASE | TIMG1_BASE => {

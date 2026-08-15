@@ -87,6 +87,16 @@ impl Asm {
         );
     }
 
+    // ── 24-bit RRR (op0=0): logical ops, op1=0, op2 = AND=1, OR=2, XOR=3 ──
+
+    /// and t, s, u — t & u (RRR op2=1).
+    pub fn and(&mut self, t: u8, s: u8, u: u8) {
+        self.insn(
+            (1 << 20) | ((t as u32) << 12) | ((s as u32) << 8) | ((u as u32) << 4),
+            3,
+        );
+    }
+
     /// slli t, s, shift (1..=31). t=[15:12], s=[11:8], sal={bit20, bits[7:4]}
     /// (verified: `slli a2,a2,24` = 0x0001_2280 in machine_tests).
     pub fn slli(&mut self, t: u8, s: u8, shift: u32) {
