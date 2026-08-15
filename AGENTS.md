@@ -107,6 +107,79 @@ Core design:
 
 ## Status log (append, newest last)
 
+- 2026-08-15: P4 GPSPI2/3 SPI master lands: 21/21 emu, 16/16 core,
+  10/10 soc tests green.
+  - `esp32s3-soc` spi.rs: GPSPI2 @ 0x6002_4000, GPSPI3 @ 0x6002_8000
+    (0x1000 apart). Registers per S3 spi_struct.h: CMD(0x00, usr=bit 24
+    self-clears), CLOCK(0x0C, clk_equ_sysclk=31, clkdiv_pre[21:18],
+    clkcnt_n[17:12], clkcnt_h[11:6]), USER(0x10, usr_command=31,
+    usr_addr=30, usr_dummy=29, usr_miso=28, usr_mosi=27, doutdin=0),
+    USER1(0x14, addr_bitlen[31:27], dummy_cyclelen[7:0]), USER2(0x18,
+    cmd_bitlen[31:28], cmd_value[15:0]), MS_DLEN(0x1C, data bitlen[17:0]),
+    MISC(0x20, ck_idle_edge=29, cs0_dis=0, cs1_dis=1), data_buf[16] @
+    0x98 (left-aligned MSB-first shift register), CLK_GATE(0xE8, clk_en).
+    CPU-controlled USR transfers: phases cmd/addr/dummy/data, bit rate =
+    (clkdiv_pre+1)*(clkcnt_n+1) APB cycles (clock high (clkcnt_h+1) of
+    each (clkcnt_n+1)-cycle period, mode 0 idle low); clk_en gate must
+    be set or usr hangs. MISO reads back zeros (no device). No DMA.
+  - GPIO-matrix signal indices (S3 gpio_sig_map.h — CRITICAL): LEDC =
+    73..80 (NOT 96..103 — that is classic ESP32!), GPSPI2 = FSPI
+    CLK/Q/D/HD/WP 101..105 + CS0/CS1 110/111, GPSPI3 = 66..72.
+    ledc.rs signal constants fixed to 73..80 + machine test FUNC_OUT_SEL
+    96 -> 73.
+  - soc.rs: SPI2/3 mmio arms + tick, signal_level routes LEDC 73..80 and
+    both SPIs.
+  - Machine test `spi2_shifts_out_0xa5_on_gpio_pins`: firmware routes
+    FSPICLK(101)->GPIO1, FSPID(103)->GPIO2, FSPICS0(110)->GPIO3;
+    CLOCK=0x1000 (2 cyc/bit), MS_DLEN=7, W0=0xA5<<24, USER=usr_mosi,
+    CLK_GATE=1, CMD.usr last instruction. Host syncs on CS0 falling edge
+    (= elapsed 0, since the trigger is the instruction AFTER the stash)
+    then samples: 8 pulses, CS low for 16 cycles then released, bits at
+    ck-high midpoints = 0xA5, usr cleared. First attempt failed because
+    the pins closure shifted wrong bits AND the transfer had already
+    started mid-window — CS-falling sync + stash-before-trigger fixes it.
+  - Soc unit tests (tests/spi.rs): MSB-first 8-bit shift, pre/n divider
+    (2 clock periods per bit slot with pre=1), MISO zeros, clk_equ_sysclk,
+    clk gate halt. Gotchas: bit_cycles=(pre+1)*(n+1) with the clock
+    period (n+1) repeating per slot; usr clears on the tick that finishes
+    the last cycle (not the next one).
+  - fmt/clippy/wasm32 clean. Next P4 items: I2C/ADC, dual-core, PSRAM;
+    P5 golden traces.
+
+
+- 2026-08-15: P4 LEDC PWM lands: 20/20 emu, 16/16 core, 5/5 soc tests green.
+  - `esp32s3-soc` ledc.rs: 4 timers + 8 channels at base 0x6001_9000.
+    Timing per ESP-IDF `ledc_calculate_divisor`: div_param =
+    (src_clk<<8)/(freq*2^resolution) lives in {clock_divider[17:8],
+    [7:0] frac}; tick = src_clk*256/div_param APB cycles via a
+    256-scale fractional accumulator; counter wraps at 2^resolution
+    (resolution = duty_resolution field + 1, TRM LEDC_TIMERx_CONF);
+    channel high while counter < (CH_DUTY >> (18-resolution)).
+    TIMER_CONF.pause/rst (rst resets counter), CH_CONF0 duty_start
+    (rising edge resets the timer) / sig_out_en / timer_sel [5:4];
+    TIMERx_VALUE returns the live counter; sig_out_en=0 holds output
+    low. LEDC_CH0..CH7 = GPIO-matrix signals 96..103 (TRM signal
+    table); `signal_level(sig)`.
+  - gpio.rs: FUNC_OUT_SEL_CFG at 0x54+4*i (value 128 = GPIO_OUT drive);
+    enabled()/out_bit()/out_sel() use u64 shifts — GPIO bits live above
+    31 (46 pins), `1u32 << 45` overflows (debug panic, not caught by
+    the old output() which never shifted).
+  - soc.rs: LEDC_BASE mmio arm + ledc tick inside tick_timers;
+    `gpio_output()` now routes pins: FUNC_OUT_SEL != 0x80 → LEDC signal
+    level instead of GPIO_OUT (ENABLE-gated).
+  - Machine test `ledc_pwm_blinks_gpio0_at_50_percent_duty`: TIMER0_CONF
+    = 0x0024_0100 (div 1.0, 10-bit period), CH0_DUTY 0x20000 (50%),
+    CONF0 = 0xC (duty_start|sig_out_en), GPIO0 ENABLE + OUT_SEL 96;
+    measures 512/512 cycle phases. Gotcha: measurement must sync on a
+    FALLING edge first — the counter resets to 0 at duty_start so the
+    pin is already high when the firmware finishes configuring.
+  - Soc unit tests (tests/ledc.rs): 50% toggle run-lengths 512/512,
+    low-before-duty-start, TIMER_VALUE live counter (VALUE offset check
+    is % 8 == 0, not 4), signal→channel mapping.
+  - fmt/clippy/wasm32 clean. Next P4 items: SPI/I2C/ADC, dual-core,
+    PSRAM; P5 golden traces.
+
+
 - 2026-08-15: P4 interrupt hardening + UART RX: 36/36 tests green.
   - xtensa-core: `interrupt_preemption_level4_takes_in_level3_handler`
     (line 22 = L3 + line 24 = L4; L4 preempts inside the L3 handler —

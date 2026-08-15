@@ -6,6 +6,10 @@
 //! IN (reads strap value; no input devices yet), STATUS/W1TS/W1TC.
 //! All other offsets are latched (P2 scope: register-level model only).
 
+/// First FUNC_OUT_SEL_CFG register (GPIO_FUNC_OUT_SEL_CFG_REG, one per
+/// pin, 4-byte stride; value 128 = default GPIO_OUT drive).
+pub const GPIO_FUNC_OUT_SEL_0: u32 = 0x54;
+
 // GPIO register offsets (TRM GPIO chapter).
 pub const GPIO_OUT: u32 = 0x04;
 pub const GPIO_OUT_W1TS: u32 = 0x08;
@@ -55,9 +59,31 @@ impl Gpio {
         }
     }
 
+    /// Is pin `i`'s output driver enabled (GPIO_ENABLE)?
+    pub fn enabled(&self, i: usize) -> bool {
+        // u64 shift: GPIO bits live above 31 (46 pins).
+        self.regs[(GPIO_ENABLE / 4) as usize] as u64 & (1u64 << i) != 0
+    }
+
+    /// Pin `i` GPIO_OUT register bit.
+    pub fn out_bit(&self, i: usize) -> u32 {
+        // u64 shift: GPIO bits live above 31 (46 pins).
+        ((self.regs[(GPIO_OUT / 4) as usize] as u64 >> i) & 1) as u32
+    }
+
+    /// GPIO matrix output signal selected for pin `i` (FUNC_OUT_SEL [7:0];
+    /// 128 = the pin follows GPIO_OUT instead of a peripheral signal).
+    pub fn out_sel(&self, i: usize) -> u32 {
+        let reg = self.regs[(GPIO_FUNC_OUT_SEL_0 / 4) as usize + i];
+        reg & 0x7F
+    }
+
     /// Snapshot of the output-pin state (host LED visualization later).
     pub fn output(&self) -> u32 {
-        self.regs[(GPIO_OUT / 4) as usize] & self.regs[(GPIO_ENABLE / 4) as usize]
+        // u64 shifts: GPIO bits live above 31 (46 pins).
+        let out = self.regs[(GPIO_OUT / 4) as usize] as u64;
+        let en = self.regs[(GPIO_ENABLE / 4) as usize] as u64;
+        (out & en) as u32
     }
 
     pub fn pin_count(&self) -> usize {

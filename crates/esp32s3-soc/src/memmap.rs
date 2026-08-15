@@ -23,6 +23,14 @@ pub const DRAM_SIZE: u32 = 0x0008_0000;
 pub const RTC_SLOW_BASE: u32 = 0x5000_0000;
 pub const RTC_SLOW_SIZE: u32 = 0x0000_2000;
 
+/// GPSPI2 (general-purpose SPI), TRM GPSPI chapter.
+pub const SPI2_BASE: u32 = 0x6002_4000;
+/// GPSPI3.
+pub const SPI3_BASE: u32 = 0x6002_8000;
+
+/// LEDC (LED PWM controller), TRM LEDC chapter.
+pub const LEDC_BASE: u32 = 0x6001_9000;
+
 /// RTC fast memory (8 KB, data alias in APB space).
 pub const RTC_FAST_BASE: u32 = 0x600F_E000;
 pub const RTC_FAST_SIZE: u32 = 0x0000_2000;

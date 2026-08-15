@@ -532,6 +532,186 @@ fn uart_rx_interrupt_echo() {
 }
 
 #[test]
+fn ledc_pwm_blinks_gpio0_at_50_percent_duty() {
+    use crate::asm::Asm;
+    use esp32s3_soc::memmap::LEDC_BASE;
+
+    // Firmware: TIMER0 with divider 1.0 and duty_resolution field 9 (10-bit
+    // period = 1024 timer ticks, one tick per APB cycle), channel 0 duty =
+    // 0x20000 (50% of 18 bits) with duty_start | sig_out_en, then routes
+    // LEDC_CH0 (GPIO-matrix signal 96) to GPIO0 and enables the pad.  The
+    // host measures the pad: 512 cycles high / 512 cycles low.
+    const STASH: u32 = 0x3FC8_0100;
+    let mut a = Asm::new(IRAM_BASE);
+    let l_ledc = a.offset();
+    a.lit(0);
+    let l_gpio = a.offset();
+    a.lit(0);
+    let l_stash = a.offset();
+    a.lit(0);
+    let code_start = a.pc();
+    let p = a.l32r(2); // LEDC_BASE
+    a.patch_l32r(p, IRAM_BASE + l_ledc as u32);
+    a.li(3, 0x0024_0100);
+    a.s32i(3, 2, 0); // TIMER0_CONF: clock_divider 1.0, duty_resolution 9
+    a.li(3, 0x2_0000);
+    a.s32i(3, 2, 0x28); // CH0_DUTY = 50% of the 18-bit range
+    a.movi_n(3, 12);
+    a.s32i(3, 2, 0x20); // CH0_CONF0: duty_start | sig_out_en
+    let p = a.l32r(2); // GPIO_BASE
+    a.patch_l32r(p, IRAM_BASE + l_gpio as u32);
+    a.movi_n(3, 1);
+    a.s32i(3, 2, 0x20); // ENABLE bit 0
+    a.li(3, 73);
+    a.s32i(3, 2, 0x54); // GPIO0 FUNC_OUT_SEL = LEDC_CH0 (signal 73)
+    a.li(4, 0xCAFE);
+    let p = a.l32r(5); // STASH
+    a.patch_l32r(p, IRAM_BASE + l_stash as u32);
+    a.s32i(4, 5, 0);
+    let done = a.pc();
+    a.j(done);
+    a.bytes_mut()[l_ledc..l_ledc + 4].copy_from_slice(&LEDC_BASE.to_le_bytes());
+    a.bytes_mut()[l_gpio..l_gpio + 4].copy_from_slice(&GPIO_BASE.to_le_bytes());
+    a.bytes_mut()[l_stash..l_stash + 4].copy_from_slice(&STASH.to_le_bytes());
+
+    let mut m = Esp32S3::new();
+    m.load_image(IRAM_BASE, a.bytes());
+    m.cpu.pc = code_start;
+    let pin = |m: &Esp32S3| (m.gpio_output() & 1) != 0;
+    for _ in 0..500 {
+        if m.soc.read32(STASH) == 0xCAFE {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.soc.read32(STASH), 0xCAFE, "firmware configured LEDC");
+    for _ in 0..2 {
+        // Sync on a falling edge, then a rising edge: we may already be
+        // mid-phase when the firmware finished configuring.
+        while pin(&m) {
+            m.step();
+        }
+        while !pin(&m) {
+            m.step();
+        }
+        let mut high = 0u32;
+        while pin(&m) {
+            m.step();
+            high += 1;
+        }
+        let mut low = 0u32;
+        while !pin(&m) {
+            m.step();
+            low += 1;
+        }
+        assert!((510..=514).contains(&high), "high phase ~512, got {high}");
+        assert!((510..=514).contains(&low), "low phase ~512, got {low}");
+    }
+}
+
+#[test]
+fn spi2_shifts_out_0xa5_on_gpio_pins() {
+    use crate::asm::Asm;
+    use esp32s3_soc::memmap::{GPIO_BASE, SPI2_BASE};
+
+    // Firmware: route FSPICLK (101) -> GPIO1, FSPID (103) -> GPIO2,
+    // FSPICS0 (110) -> GPIO3, then run an 8-bit MOSI-only CPU transfer of
+    // 0xA5 on GPSPI2 at (clkdiv_pre+1)*(clkcnt_n+1) = 2 APB cycles per bit
+    // and stash.  The host samples the pins and recovers the bit stream.
+    const STASH: u32 = 0x3FC8_0100;
+    let mut a = Asm::new(IRAM_BASE);
+    let l_spi = a.offset();
+    a.lit(0);
+    let l_gpio = a.offset();
+    a.lit(0);
+    let l_stash = a.offset();
+    a.lit(0);
+    let code_start = a.pc();
+    let p = a.l32r(2); // SPI2_BASE
+    a.patch_l32r(p, IRAM_BASE + l_spi as u32);
+    let p = a.l32r(3); // GPIO_BASE
+    a.patch_l32r(p, IRAM_BASE + l_gpio as u32);
+    a.movi_n(4, 14);
+    a.s32i(4, 3, 0x20); // ENABLE bits 1,2,3
+    a.li(4, 101);
+    a.s32i(4, 3, 0x58); // GPIO1 FUNC_OUT_SEL = FSPICLK
+    a.li(4, 103);
+    a.s32i(4, 3, 0x5C); // GPIO2 FUNC_OUT_SEL = FSPID
+    a.li(4, 110);
+    a.s32i(4, 3, 0x60); // GPIO3 FUNC_OUT_SEL = FSPICS0
+    a.li(4, 0x1000);
+    a.s32i(4, 2, 0x0C); // SPI_CLOCK: clkdiv_pre=0, clkcnt_n=1 -> 2 cyc/bit
+    a.movi_n(4, 7);
+    a.s32i(4, 2, 0x1C); // SPI_MS_DLEN: 8 data bits
+    a.li(4, 0xA5 << 24);
+    a.s32i(4, 2, 0x98); // SPI_W0: left-aligned MSB-first data
+    a.li(4, 1 << 27);
+    a.s32i(4, 2, 0x10); // SPI_USER: usr_mosi
+    a.movi_n(4, 1);
+    a.s32i(4, 2, 0xE8); // SPI_CLK_GATE: clk_en
+    a.li(4, 0xCAFE);
+    let p = a.l32r(5); // STASH
+    a.patch_l32r(p, IRAM_BASE + l_stash as u32);
+    a.s32i(4, 5, 0);
+    a.li(4, 1 << 24);
+    a.s32i(4, 2, 0x00); // SPI_CMD: usr -> trigger transfer (last)
+    let done = a.pc();
+    a.j(done);
+    a.bytes_mut()[l_spi..l_spi + 4].copy_from_slice(&SPI2_BASE.to_le_bytes());
+    a.bytes_mut()[l_gpio..l_gpio + 4].copy_from_slice(&GPIO_BASE.to_le_bytes());
+    a.bytes_mut()[l_stash..l_stash + 4].copy_from_slice(&STASH.to_le_bytes());
+
+    let mut m = Esp32S3::new();
+    m.load_image(IRAM_BASE, a.bytes());
+    m.cpu.pc = code_start;
+    // Sample encoding per pin: bit0 = GPIO1 = SPICLK, bit1 = GPIO2 =
+    // SPID (MOSI), bit2 = GPIO3 = FSPICS0.
+    let pins = |m: &Esp32S3| {
+        let out = m.gpio_output();
+        let ck = (out >> 1) & 1;
+        let d = (out >> 2) & 1;
+        let cs = (out >> 3) & 1;
+        ck | (d << 1) | (cs << 2)
+    };
+    for _ in 0..500 {
+        if m.soc.read32(STASH) == 0xCAFE {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.soc.read32(STASH), 0xCAFE, "firmware configured SPI2");
+    // The CMD write is the instruction after the stash: step until CS0
+    // goes low = the first cycle of the transaction (elapsed 0).
+    while pins(&m) & 4 != 0 {
+        m.step();
+    }
+    // Sample before each step: sample j sees the bus at elapsed j.
+    let mut samples = [0u32; 40];
+    for s in samples.iter_mut() {
+        *s = pins(&m);
+        m.step();
+    }
+    // 8 bits at 2 APB cycles each: bit i's midpoint (clock high) is
+    // sample 2i+1, MSB first.
+    let mut bits = 0u32;
+    for i in 0..8 {
+        let s = samples[2 * i + 1];
+        assert_eq!(s & 1, 1, "mid-sample must be clock-high (slot {i})");
+        assert_eq!(s & 4, 0, "CS0 active low (slot {i})");
+        bits = (bits << 1) | ((s >> 1) & 1);
+    }
+    assert_eq!(bits, 0xA5, "MOSI bit stream");
+    assert_eq!(samples[16] & 4, 4, "CS0 released after 16 cycles");
+    assert_eq!(samples[16] & 1, 0, "clock idles low");
+    // 8 bits * 2 cycles = 16 APB cycles: usr must self-clear afterwards.
+    assert_eq!(
+        m.soc.read32(SPI2_BASE) & (1 << 24),
+        0,
+        "CMD.usr self-clears"
+    );
+}
+
+#[test]
 fn flash_xip_reads_and_readonly() {
     use esp32s3_soc::memmap::{FLASH_DATA_BASE, FLASH_INST_BASE};
     let mut m = Esp32S3::new();

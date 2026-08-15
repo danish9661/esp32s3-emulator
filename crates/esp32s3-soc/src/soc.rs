@@ -16,7 +16,9 @@ use xtensa_core::Bus;
 
 use crate::gpio::Gpio;
 use crate::intc::Intc;
+use crate::ledc::Lcdc;
 use crate::memmap::*;
+use crate::spi::Spi;
 use crate::timg::{INT_T0, INT_T1, INT_WDT, Timg};
 use crate::uart::Uart;
 
@@ -40,6 +42,8 @@ pub struct Soc {
     rtc_fast: Box<[u8; RTC_FAST_SIZE as usize]>,
     uarts: [Uart; 3],
     gpio: Gpio,
+    ledc: Lcdc,
+    spi: [Spi; 2],
     timg: [Timg; 2],
     intc: Intc,
 }
@@ -54,6 +58,8 @@ impl Soc {
             rtc_fast: Box::new([0; RTC_FAST_SIZE as usize]),
             uarts: [Uart::new(), Uart::new(), Uart::new()],
             gpio: Gpio::new(),
+            ledc: Lcdc::new(),
+            spi: [Spi::new(0), Spi::new(1)],
             timg: [Timg::new(), Timg::new()],
             intc: Intc::new(),
         }
@@ -82,9 +88,23 @@ impl Soc {
         self.uarts[n].inject_rx(byte);
     }
 
-    /// Snapshot of driven output-pin state (host LED visualization).
+    /// Snapshot of driven output-pin state (host LED visualization).  A
+    /// pin whose FUNC_OUT_SEL selects a peripheral signal (LEDC 96..103)
+    /// follows that signal instead of GPIO_OUT (TRM GPIO matrix).
     pub fn gpio_output(&self) -> u32 {
-        self.gpio.output()
+        let mut out = 0u32;
+        for i in 0..self.gpio.pin_count() {
+            if !self.gpio.enabled(i) {
+                continue;
+            }
+            let sel = self.gpio.out_sel(i);
+            out |= if sel == 0x80 {
+                self.gpio.out_bit(i)
+            } else {
+                self.signal_level(sel)
+            } << i;
+        }
+        out
     }
 
     /// Advance timer groups by `cycles` (frontend time source).
@@ -92,6 +112,9 @@ impl Soc {
         for _ in 0..cycles {
             self.timg[0].tick(1);
             self.timg[1].tick(1);
+            self.ledc.tick(1);
+            self.spi[0].tick(1);
+            self.spi[1].tick(1);
         }
     }
 
@@ -129,6 +152,17 @@ impl Soc {
         self.sram[idx] = val;
     }
 
+    /// GPIO matrix output signal level for a peripheral signal index.
+    /// LEDC occupies 73..80, GPSPI2 (FSPI) 101..105 + CS 110/111, GPSPI3
+    /// 66..72 (S3 gpio_sig_map.h); everything else reads 0.
+    fn signal_level(&self, sig: u32) -> u32 {
+        if (73..=80).contains(&sig) {
+            self.ledc.signal_level(sig)
+        } else {
+            self.spi[0].signal_level(sig) | self.spi[1].signal_level(sig)
+        }
+    }
+
     fn mmio32(&mut self, addr: u32, is_write: bool, value: u32) -> u32 {
         let base = addr & !3;
         let off = base & 0xFFF;
@@ -155,6 +189,23 @@ impl Soc {
                     0
                 } else {
                     self.gpio.read32(off)
+                }
+            }
+            LEDC_BASE => {
+                if is_write {
+                    self.ledc.write32(off, value);
+                    0
+                } else {
+                    self.ledc.read32(off)
+                }
+            }
+            SPI2_BASE | SPI3_BASE => {
+                let n = if dev == SPI2_BASE { 0 } else { 1 };
+                if is_write {
+                    self.spi[n].write32(off, value);
+                    0
+                } else {
+                    self.spi[n].read32(off)
                 }
             }
             TIMG0_BASE | TIMG1_BASE => {

@@ -11,8 +11,10 @@ extern crate alloc;
 
 pub mod gpio;
 pub mod intc;
+pub mod ledc;
 pub mod memmap;
 pub mod soc;
+pub mod spi;
 pub mod timg;
 pub mod uart;
 
