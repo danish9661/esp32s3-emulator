@@ -467,6 +467,16 @@ def emit_expr(expr, indent, seen_cast):
                 return f"sext({emit_expr(l[2][1], indent, seen_cast)}, {emit_expr(r, indent, seen_cast)})"
             return f"(({ls}) >> {rs})"
         if op == "<<":
+            # ISA-correct sign-extension for L32R's pc-relative offset.
+            # QEMU's C emits the tensilica idiom `(((0xffff) << 16) | v) << 2`,
+            # which equals sext16(v)<<2 ONLY when bit 15 of v is set (pools
+            # precede code). The Xtensa ISA RM says the 16-bit offset is
+            # sign-extended; forward l32r (positive offset) needs sext for ALL
+            # v. Deviation from the C tables is documented in generated.rs.
+            if (r == ("n", 2)
+                    and l[0] == "binop" and l[1] == "|"
+                    and l[2] == ("binop", "<<", ("n", 0xffff), ("n", 16))):
+                return f"((sext({emit_expr(l[3], indent, seen_cast)}, 16u32)) << 2)"
             return f"(({ls}) << {rs})"
         if op == "&":
             return f"(({ls}) & {rs})"

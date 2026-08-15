@@ -13,7 +13,7 @@ pub use cpu::{Cpu, StepResult};
 
 #[cfg(test)]
 mod tests {
-    use crate::generated::*;
+    use crate::generated::{decode_inst, *};
 
     fn enc(insn: u32) -> Option<Opcode> {
         decode_inst(insn)
@@ -153,7 +153,7 @@ mod cpu_tests {
     }
 
     /// Step until pc reaches `end` (or an exception/unimplemented occurs).
-    fn run(cpu: &mut Cpu, bus: &mut RamBus, end: u32) {
+    fn run<B: Bus>(cpu: &mut Cpu, bus: &mut B, end: u32) {
         for _ in 0..10_000 {
             if cpu.pc >= end {
                 return;
@@ -172,6 +172,56 @@ mod cpu_tests {
             "run did not reach {end:#010x}, pc stuck at {:#010x}",
             cpu.pc
         );
+    }
+
+    /// RamBus with externally-driven CPU interrupt lines.
+    struct IntBus {
+        mem: HashMap<u32, u8>,
+        lines: u32,
+    }
+
+    impl IntBus {
+        fn load(prog: &[(u32, u32)], lines: u32) -> Self {
+            let mut mem = HashMap::new();
+            for (addr, insn) in prog {
+                mem.insert(*addr, (insn & 0xff) as u8);
+                mem.insert(*addr + 1, ((insn >> 8) & 0xff) as u8);
+                mem.insert(*addr + 2, ((insn >> 16) & 0xff) as u8);
+                mem.insert(*addr + 3, ((insn >> 24) & 0xff) as u8);
+            }
+            IntBus { mem, lines }
+        }
+    }
+
+    impl Bus for IntBus {
+        fn read8(&mut self, addr: u32) -> u32 {
+            self.mem.get(&addr).copied().unwrap_or(0) as u32
+        }
+        fn read16(&mut self, addr: u32) -> u32 {
+            self.read8(addr) | (self.read8(addr + 1) << 8)
+        }
+        fn read32(&mut self, addr: u32) -> u32 {
+            self.read8(addr)
+                | (self.read8(addr + 1) << 8)
+                | (self.read8(addr + 2) << 16)
+                | (self.read8(addr + 3) << 24)
+        }
+        fn write8(&mut self, addr: u32, val: u32) {
+            self.mem.insert(addr, val as u8);
+        }
+        fn write16(&mut self, addr: u32, val: u32) {
+            self.write8(addr, val);
+            self.write8(addr + 1, val >> 8);
+        }
+        fn write32(&mut self, addr: u32, val: u32) {
+            self.write8(addr, val);
+            self.write8(addr + 1, val >> 8);
+            self.write8(addr + 2, val >> 16);
+            self.write8(addr + 3, val >> 24);
+        }
+        fn int_pending(&mut self) -> u32 {
+            self.lines
+        }
     }
 
     /// Assemble one instruction at `*addr`, advancing by its real length
@@ -401,5 +451,204 @@ mod cpu_tests {
         assert_eq!(bus.read8(0x100), 0xff);
         assert_eq!(bus.read8(0x101), 0x55);
         assert_eq!(bus.read16(0x102), 0xffff);
+    }
+
+    #[test]
+    fn interrupt_preemption_level4_takes_in_level3_handler() {
+        // Main enables line 22 (level 3) and line 24 (level 4).  A level-3
+        // take runs its handler with PS.INTLEVEL = 3 | EXCM; a level-4 line
+        // then preempts (cintlevel = max(3, 3) = 3 < 4).  rfi 4 returns to the
+        // level-3 handler, rfi 3 returns to the main program.
+        let mut prog = Vec::new();
+        let mut a = 0x4000_0000u32;
+        put(&mut prog, &mut a, 0x0001_A032); // movi a3, 1
+        put(&mut prog, &mut a, 0x0001_3380); // slli a3, a3, 24     ; 0x1000000 (line 24, L4)
+        put(&mut prog, &mut a, 0x0080_A022); // movi a2, 0x80
+        put(&mut prog, &mut a, 0x0011_2210); // slli a2, a2, 15     ; 0x400000 (line 22, L3)
+        put(&mut prog, &mut a, 0x0020_2230); // or a2, a2, a3       ; 0x1400000
+        put(&mut prog, &mut a, 0x0013_E420); // wsr intenable a2
+        put(&mut prog, &mut a, 0x0000_20F0); // nop                ; EPC3 = 0x12
+        put(&mut prog, &mut a, 0x0000_20F0); // nop
+        put(&mut prog, &mut a, 0x0007_A032); // movi a3, 7
+        let end = a;
+        let mut h3 = 0x4000_01C0u32; // level 3 vector
+        put(&mut prog, &mut h3, 0x0033_A342); // movi a4, 0x333
+        put(&mut prog, &mut h3, 0x0000_20F0); // nop
+        put(&mut prog, &mut h3, 0x0000_20F0); // nop                ; EPC4 = rfi's address
+        put(&mut prog, &mut h3, 0x0000_3310); // rfi 3
+        let mut h4 = 0x4000_0200u32; // level 4 vector
+        put(&mut prog, &mut h4, 0x0044_A452); // movi a5, 0x444
+        put(&mut prog, &mut h4, 0x0000_3410); // rfi 4
+
+        let mut bus = IntBus::load(&prog, 1 << 22);
+        let mut cpu = Cpu::new();
+        for _ in 0..6 {
+            cpu.step(&mut bus); // 5 builders + wsr (take at end)
+        }
+        assert_eq!(cpu.sreg(SR_INTENABLE), 0x140_0000, "intenable");
+        assert_eq!(cpu.pc, 0x4000_01C0, "level 3 vector");
+        assert_eq!(cpu.sreg(SR_PS), 0x13, "PS: INTLEVEL 3 | EXCM");
+        for _ in 0..2 {
+            cpu.step(&mut bus); // movi a4, nop
+        }
+        bus.lines = (1 << 22) | (1 << 24);
+        cpu.step(&mut bus); // nop -> level 4 preempts (cintlevel 3)
+        assert_eq!(cpu.pc, 0x4000_0200, "level 4 vector");
+        assert_eq!(cpu.sreg(SR_PS), 0x14, "PS: INTLEVEL 4 | EXCM");
+        assert_eq!(cpu.sreg(SR_EPC4), 0x4000_01C9, "EPC4 = inside L3 handler");
+        assert_eq!(cpu.sreg(SR_EPS4), 0x13, "EPS4 = L3 handler PS");
+        cpu.step(&mut bus); // movi a5
+        bus.lines = 1 << 22; // L4 handler "clears" its peripheral (INT_CLR)
+        cpu.step(&mut bus); // rfi 4 -> back into L3 handler
+        assert_eq!(cpu.pc, 0x4000_01C9, "rfi 4 resumed L3 handler");
+        assert_eq!(cpu.sreg(SR_PS), 0x13, "rfi 4 restored L3 PS");
+        bus.lines = 0; // L3 handler "clears" its peripheral (INT_CLR)
+        cpu.step(&mut bus); // rfi 3 -> back to main
+        assert_eq!(cpu.pc, 0x4000_0012, "rfi 3 resumed main");
+        assert_eq!(cpu.sreg(SR_PS), 0, "rfi 3 restored PS");
+        run(&mut cpu, &mut bus, end);
+        assert_eq!(cpu.reg(3), 7, "main finished");
+        assert_eq!(cpu.reg(4), 0x333, "L3 handler marker");
+        assert_eq!(cpu.reg(5), 0x444, "L4 handler marker");
+    }
+
+    #[test]
+    fn interrupt_level2_take_and_rfi() {
+        // wsr intenable (bit 19 = line 19, level 2); the asserted line 19
+        // is taken at the end of the wsr itself: EPC2/EPS2 capture the
+        // nop, PS = INTLEVEL 2 | EXCM, pc = VECBASE + 0x180.  The handler
+        // disables the line and returns with rfi 2.
+        let mut prog = Vec::new();
+        let mut a = 0x4000_0000u32;
+        put(&mut prog, &mut a, 0x0008_A022); // movi a2, 8
+        put(&mut prog, &mut a, 0x0011_2200); // slli a2, a2, 16     ; 0x80000 (bit 19)
+        put(&mut prog, &mut a, 0x0013_E420); // wsr intenable a2   ; take at its end
+        put(&mut prog, &mut a, 0x0000_20F0); // nop                ; EPC2 = 9
+        put(&mut prog, &mut a, 0x0007_A032); // movi a3, 7
+        let end = a;
+        let mut h = 0x4000_0180u32; // level 2 vector
+        put(&mut prog, &mut h, 0x0000_A042); // movi a4, 0
+        put(&mut prog, &mut h, 0x0013_E440); // wsr intenable a4    ; mask the line
+        put(&mut prog, &mut h, 0x0000_3210); // rfi 2
+
+        let mut bus = IntBus::load(&prog, 1 << 19);
+        let mut cpu = Cpu::new();
+        for _ in 0..3 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.pc, 0x4000_0180, "level 2 vector");
+        assert_eq!(cpu.sreg(SR_EPC2), 0x4000_0009, "EPC2 = next instruction");
+        assert_eq!(cpu.sreg(SR_EPS2), 0, "EPS2 = old PS");
+        assert_eq!(cpu.sreg(SR_PS), 0x12, "PS: INTLEVEL 2 | EXCM");
+        assert_eq!(cpu.sreg(SR_EPC1), 0, "EPC1 untouched");
+        assert_eq!(cpu.sreg(SR_EXCCAUSE), 0, "not an exception");
+
+        for _ in 0..3 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.pc, 0x4000_0009, "rfi 2 returned to EPC2");
+        assert_eq!(cpu.sreg(SR_PS), 0, "rfi restored PS");
+        run(&mut cpu, &mut bus, end);
+        assert_eq!(cpu.reg(3), 7, "returned past the interrupt");
+    }
+
+    #[test]
+    fn interrupt_masking_levels_and_nmi() {
+        // Line 19 (level 2): masked by PS.INTLEVEL=2, and by PS.EXCM
+        // (cintlevel = max(INTLEVEL, EXCM_LEVEL=3)); line 15 (level 3) is
+        // also masked by EXCM; line 24 (level 4) beats it.
+        let mut prog = Vec::new();
+        let mut a = 0x4000_0000u32;
+        put(&mut prog, &mut a, 0x0000_20F0); // nop (line 19 pending)
+        put(&mut prog, &mut a, 0x0000_20F0); // nop (lines 19+15 pending)
+        put(&mut prog, &mut a, 0x0000_20F0); // nop (line 24 added: taken)
+        let mut h = 0x4000_0200u32; // level 4 vector
+        put(&mut prog, &mut h, 0x0000_A042); // movi a4, 0
+        put(&mut prog, &mut h, 0x0013_E440); // wsr intenable a4
+        put(&mut prog, &mut h, 0x0000_3410); // rfi 4
+        let mut bus = IntBus::load(&prog, 1 << 19);
+        let mut cpu = Cpu::new();
+        cpu.set_sreg(SR_INTENABLE, (1 << 19) | (1 << 15) | (1 << 24));
+        cpu.set_sreg(SR_PS, 2); // INTLEVEL 2
+        cpu.step(&mut bus);
+        assert_eq!(cpu.pc, 0x4000_0003, "masked by INTLEVEL 2");
+        bus.lines = (1 << 19) | (1 << 15);
+        cpu.set_sreg(SR_PS, PS_EXCM); // EXCM, INTLEVEL 0
+        cpu.step(&mut bus);
+        assert_eq!(cpu.pc, 0x4000_0006, "masked by EXCM (cintlevel 3)");
+        bus.lines |= 1 << 24;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.pc, 0x4000_0200, "level 4 beats EXCM_LEVEL 3");
+        assert_eq!(cpu.sreg(SR_EPC4), 0x4000_0009, "EPC4 = next nop");
+        assert_eq!(cpu.sreg(SR_PS), 0x14, "PS: INTLEVEL 4 | EXCM");
+
+        // NMI (line 14) bypasses INTENABLE and INTLEVEL.
+        let mut prog2 = Vec::new();
+        let mut b = 0x4000_1000u32;
+        put(&mut prog2, &mut b, 0x0004_A022); // movi a2, 4
+        put(&mut prog2, &mut b, 0x0011_2240); // slli a2, a2, 12     ; 0x4000 (bit 14)
+        put(&mut prog2, &mut b, 0x0013_E220); // wsr intset a2       ; sticky NMI
+        let after = b;
+        put(&mut prog2, &mut b, 0x0000_20F0); // nop                ; interrupted target
+        let mut h2 = 0x4000_02C0u32; // NMI vector
+        put(&mut prog2, &mut h2, 0x0000_20F0); // nop (handler body)
+        let mut bus2 = IntBus::load(&prog2, 0); // no external lines
+        let mut cpu2 = Cpu::new();
+        cpu2.pc = 0x4000_1000;
+        for _ in 0..3 {
+            cpu2.step(&mut bus2);
+        }
+        assert_eq!(cpu2.pc, 0x4000_02C0, "NMI vector (INTENABLE = 0)");
+        assert_eq!(cpu2.sreg(SR_EPC7), after, "EPC7 = next instruction");
+        assert_eq!(cpu2.sreg(SR_PS), 0x17, "PS: NMI level 7 | EXCM");
+        assert_eq!(
+            cpu2.sreg(SR_INTSET) & (1 << 14),
+            0,
+            "NMI sticky bit cleared on take"
+        );
+        cpu2.step(&mut bus2); // handler nop; no re-take
+        assert_eq!(cpu2.pc, 0x4000_02C3, "no re-take after NMI cleared");
+    }
+
+    #[test]
+    fn interrupt_level1_is_kernel_exception() {
+        // Level-1 lines have no vector: delivered as a kernel exception
+        // with EXCCAUSE 4 (QEMU handle_interrupt else branch).
+        let mut prog = Vec::new();
+        let mut a = 0x4000_0000u32;
+        put(&mut prog, &mut a, 0x0001_A022); // movi a2, 1
+        put(&mut prog, &mut a, 0x0013_E420); // wsr intenable a2 (bit 0)
+        put(&mut prog, &mut a, 0x0000_20F0); // nop                ; interrupted target
+        let mut bus = IntBus::load(&prog, 1 << 0);
+        let mut cpu = Cpu::new();
+        cpu.step(&mut bus); // movi
+        cpu.step(&mut bus); // wsr intenable -> level 1 pending
+        assert_eq!(cpu.pc, 0x4000_0300, "kernel vector");
+        assert_eq!(cpu.sreg(SR_EXCCAUSE), LEVEL1_INTERRUPT_CAUSE);
+        assert_eq!(cpu.sreg(SR_EPC1), 0x4000_0006, "EPC1 = next instruction");
+        assert_ne!(cpu.sreg(SR_PS) & PS_EXCM, 0, "EXCM set");
+        assert_eq!(cpu.sreg(SR_PS) & PS_INTLEVEL, 0, "INTLEVEL untouched");
+    }
+
+    #[test]
+    fn wsr_intset_intclear_and_rsr_interrupt() {
+        // Sticky INTSET via wsr; rsr.interrupt reflects it; intclear
+        // removes it.  No take: INTENABLE stays 0.
+        let mut prog = Vec::new();
+        let mut a = 0x4000_0000u32;
+        put(&mut prog, &mut a, 0x0008_A022); // movi a2, 8
+        put(&mut prog, &mut a, 0x0011_2280); // slli a2, a2, 8        ; 0x800 (bit 11, level 3)
+        put(&mut prog, &mut a, 0x0013_E220); // wsr intset a2
+        put(&mut prog, &mut a, 0x0003_E230); // rsr interrupt a3
+        put(&mut prog, &mut a, 0x0013_E320); // wsr intclear a2
+        put(&mut prog, &mut a, 0x0003_E240); // rsr interrupt a4
+        let end = a;
+        let mut bus = RamBus::load(&prog);
+        let mut cpu = Cpu::new();
+        run(&mut cpu, &mut bus, end);
+        assert_eq!(cpu.reg(3), 0x800, "rsr.interrupt reflects wsr.intset");
+        assert_eq!(cpu.reg(4), 0, "intclear visible to rsr.interrupt");
+        assert_eq!(cpu.sreg(SR_INTSET), 0, "wsr.intclear removed the bit");
+        assert_eq!(cpu.pc, end, "no interrupt taken (INTENABLE = 0)");
     }
 }

@@ -107,6 +107,57 @@ Core design:
 
 ## Status log (append, newest last)
 
+- 2026-08-15: P4 interrupt hardening + UART RX: 36/36 tests green.
+  - xtensa-core: `interrupt_preemption_level4_takes_in_level3_handler`
+    (line 22 = L3 + line 24 = L4; L4 preempts inside the L3 handler —
+    cintlevel = max(3, PS.INTLEVEL) — rfi 4 → rfi 3 chain; pending lines
+    must be cleared like real INT_CLR or the level-triggered take re-fires
+    after rfi). Encodings: `or a2,a2,a3` = 0x0020_2230 (op0=0 op1=0 op2=2);
+    slli a3,a3,24 = 0x0001_3380 (bit 20 = sal[4] = 0 — 0x0010_3380 decodes
+    as AND a3,a3,a8!); movi imm12 = {insn[11:8]<<8 | insn[23:16]} so
+    `movi a4,0x333` = 0x0033_A342 (b1 = (0xA<<4)|imm[3:0] = 0xA3) and
+    `movi a5,0x444` = 0x0044_A452 (t = 5 → b0 = 0x52); imm12 caps at
+    0x7FF (0x3333 does NOT fit a movi). Unaligned 4-byte test-bus inserts
+    are harmless: byte 3 of each word is the next instruction's byte 0 and
+    all decode fields live in bits [23:0] (op0 = [3:0]!).
+  - esp32s3-emu machine test `timg1_alarm_delivers_level4_vector`: source
+    53 → matrix 4*53 = 0xD4 → line 24 (L4) → 0x40000200 handler → INT_CLR
+    → rfi 4 (CTR/STASH at 0x3FC8_0200/4, above the app image).
+  - esp32s3-soc UART RX: `inject_rx` (FIFO + RAW RXFIFO_FULL + STATUS
+    [29:24] count + RXD_CNT line counter); FIFO read pops, RAW drops when
+    empty (level-style); STATUS reset = ST_UTX_OUT bits [9:8] = 0x300
+    (was 1<<24 — that bit now belongs to the FIFO count field). Soc gains
+    `uart_inject_rx(n, byte)`.
+  - Machine test `uart_rx_interrupt_echo`: matrix source 27 → line 15 →
+    handler pops FIFO, stores to RXBUF, counts RXCNT (RXCNT = RXBUF - 4 so
+    one li covers both), echoes the byte on TX, INT_CLR, rfi 3; host
+    injects 'X' → stash 0xCAFE. Handler is 53 bytes (64-byte slot) — li of
+    a 0x3FC80xxx address costs 15 bytes; derive neighbors with addi.
+  - Next P4 items: SPI/I2C/PWM/ADC, dual-core, PSRAM; P5 golden traces.
+- 2026-08-15: P4 interrupt delivery lands: 17/17 emu, 15/15 core tests green.
+  - `xtensa-core`: `Bus::int_pending` default (0); cpu.rs `check_interrupts`
+    (highest pending level via INT_LEVEL_MASKS & INTSET & INTENABLE; NMI
+    line 14 bypasses both; cintlevel = PS.INTLEVEL or max(3) when EXCM;
+    level 1 → kernel/user exception EXCCAUSE=4; levels 2-6 → EPC1+lvl-1/
+    EPS2+lvl-2 + PS=(PS&~INTLEVEL)|lvl|EXCM + VECBASE+INT_VEC_OFFSETS;
+    NMI clears sticky bit 14). step() checks interrupts after
+    sync_windowbase/icount (take at instruction END → EPC = next insn).
+  - `exec.rs`: RSR INTERRUPT special case (reads live intset via
+    `intset_live(bus)`; SR 226 on ESP32-S3, no SR 225); WSR INTSET ORs,
+    WSR INTCLEAR ANDs the sticky sreg; both removed from generic arms.
+  - `esp32s3-soc`: `Intc::pending_lines(cpu, u64 bitmap)`; `Uart::int_st`
+    (RAW&ENA); `Soc::int_pending` (UART 27-29, TIMG0/1 50-55; bitmap is
+    u64 — sources ≥ 32 overflow u32!). `asm.rs`: wsr/rsr/rsil/rfi
+    encodings + roundtrip test; `movi_n` imm7 z-bit fixed (n = 3 bits,
+    `movi.n aX,0x40` was encoding 0!).
+  - Machine test `timer_interrupt_delivers_to_vector`: TIMG0 alarm every
+    64 cycles → source 50 → matrix line 15 (level 3) → 0x400001C0 handler
+    (a6-a9 only) → INT_CLR → rfi 3; main loop counts 3 interrupts then
+    stashes 0xCAFE. Gotchas: DRAM/IRAM alias means CTR in DRAM must sit
+    ABOVE the app image or the handler clobbers the literal pool; asm
+    l32i/s32i take BYTE offsets (off >> 2), NOT pre-shifted words.
+  - fmt/clippy/wasm32 clean. Next P4 items: SPI/I2C/PWM/ADC, dual-core,
+    PSRAM; P5 golden traces.
 - 2026-08-13: `gen_decode.py` produces compiling, tested decoder.
   - Fixed: `XTENSA_UNDEFINED` fallbacks now `return None;` (no enum variant);
     operand exprs emit `u32` literals (E0689 gone).

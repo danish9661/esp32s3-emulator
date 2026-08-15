@@ -219,6 +219,37 @@ impl Asm {
         self.insn(2 << 6, 3);
     }
 
+    /// rsil t, level (RRR op0=0 op1=0 op2=0 r=6; s=[11:8] = level,
+    /// t=[7:4] = dest; ISA RM "RSIL"; verified against generated.rs).
+    pub fn rsil(&mut self, t: u8, level: u32) {
+        self.insn((6 << 12) | ((level & 0xF) << 8) | ((t as u32) << 4), 3);
+    }
+
+    /// rfi level (RRR op0=0 op1=0 op2=0 r=3 t=1; s=[11:8] = level).
+    pub fn rfi(&mut self, level: u32) {
+        self.insn((3 << 12) | ((level & 0xF) << 8) | (1 << 4), 3);
+    }
+
+    /// rsr t, sr (RRR op0=0 op1=3 op2=0; sr = {r[15:12]<<4 | s[11:8]}).
+    pub fn rsr(&mut self, t: u8, sr: u32) {
+        self.insn(
+            (3 << 16) | (((sr >> 4) & 0xF) << 12) | ((sr & 0xF) << 8) | ((t as u32) << 4),
+            3,
+        );
+    }
+
+    /// wsr sr, t (RRR op0=0 op1=3 op2=1; source = t=[7:4]).
+    pub fn wsr(&mut self, sr: u32, t: u8) {
+        self.insn(
+            (1 << 20)
+                | (3 << 16)
+                | (((sr >> 4) & 0xF) << 12)
+                | ((sr & 0xF) << 8)
+                | ((t as u32) << 4),
+            3,
+        );
+    }
+
     /// beqz s, target (12-bit signed offset).
     pub fn beqz(&mut self, s: u8, target: u32) {
         let off = (target as i64 - self.pc() as i64 - 4) & 0xFFF;
@@ -236,10 +267,11 @@ impl Asm {
 
     // ── 16-bit (inst16b) ───────────────────────────────────────────────────────
 
-    /// movi.n s, imm7 (0..=0x3F; z/sign bit not supported here).
+    /// movi.n s, imm7 (0..=0x7F; imm7 = {z, n[5:4], r[15:12]} per
+    /// inst16b decode; z lives in bit [6:4]'s top bit, not bit 20).
     pub fn movi_n(&mut self, s: u8, imm7: u32) {
         let r = imm7 & 0xF;
-        let n = (imm7 >> 4) & 0x3;
+        let n = (imm7 >> 4) & 0x7;
         self.insn((r << 12) | ((s as u32) << 8) | (n << 4) | 0xC, 2);
     }
 
@@ -360,6 +392,40 @@ mod tests {
         let w = u32::from_le_bytes([a.bytes[0], a.bytes[1], a.bytes[2], 0]);
         assert_eq!(decode_inst(w), Some(Opcode::OPCODE_MOVI));
         assert_eq!(opnds(Opcode::OPCODE_MOVI, w, 0)[1], Opnd::imm(0xFFFF_FF9C));
+    }
+
+    #[test]
+    fn sr_and_interrupt_encodings_roundtrip() {
+        // wsr intenable (sr 228 = 0xE4), wsr intset (226), wsr intclear
+        // (227), rsil a4,0, rfi 3, rsr interrupt (decodes to SR 226).
+        let mut a = Asm::new(0x4000_0100);
+        a.wsr(228, 4);
+        a.wsr(226, 4);
+        a.wsr(227, 4);
+        a.rsil(4, 0);
+        a.rfi(3);
+        a.rsr(5, 226);
+        for w in a.bytes.chunks_exact(3) {
+            let word = u32::from_le_bytes([w[0], w[1], w[2], 0]);
+            assert!(decode_inst(word).is_some(), "word {word:#010x} decodes");
+            let op = decode_inst(word).unwrap();
+            let _ = opnds(op, word, 0);
+        }
+        let word = |i: usize| u32::from_le_bytes([a.bytes[i], a.bytes[i + 1], a.bytes[i + 2], 0]);
+        assert_eq!(decode_inst(word(0)), Some(Opcode::OPCODE_WSR_INTENABLE));
+        assert_eq!(decode_inst(word(3)), Some(Opcode::OPCODE_WSR_INTSET));
+        assert_eq!(decode_inst(word(6)), Some(Opcode::OPCODE_WSR_INTCLEAR));
+        assert_eq!(decode_inst(word(9)), Some(Opcode::OPCODE_RSIL));
+        assert_eq!(decode_inst(word(12)), Some(Opcode::OPCODE_RFI));
+        assert_eq!(decode_inst(word(15)), Some(Opcode::OPCODE_RSR_INTERRUPT));
+        // Operand extraction: rsil dest = t, level = s; rfi level = s.
+        assert_eq!(
+            opnds(Opcode::OPCODE_RSIL, word(9), 0)[0],
+            Opnd::reg(4),
+            "rsil dest a4"
+        );
+        assert_eq!(opnds(Opcode::OPCODE_RSIL, word(9), 0)[1], Opnd::imm(0));
+        assert_eq!(opnds(Opcode::OPCODE_RFI, word(12), 0)[0], Opnd::imm(3));
     }
 
     #[test]

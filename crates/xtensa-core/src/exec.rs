@@ -13,7 +13,7 @@
 use crate::bus::Bus;
 use crate::cpu::{
     ALLOCA_CAUSE, Cpu, ILLEGAL_INSTRUCTION_CAUSE, PS_CALLINC, PS_CALLINC_SHIFT, PS_EXCM, PS_OWB,
-    PS_WOE, SR_EPC1, SR_EPS2, SR_LBEG, SR_LCOUNT, SR_LEND, SR_PS, SR_SAR, SR_SCOMPARE1,
+    PS_WOE, SR_EPC1, SR_EPS2, SR_INTSET, SR_LBEG, SR_LCOUNT, SR_LEND, SR_PS, SR_SAR, SR_SCOMPARE1,
     SR_WINDOW_BASE, SR_WINDOW_START, SYSCALL_CAUSE, UR_ACCX_0, UR_ACCX_1, UR_FCR, UR_FFT_BIT_WIDTH,
     UR_FSR, UR_GPIO_OUT, UR_QACC_H_0, UR_QACC_H_1, UR_QACC_H_2, UR_QACC_H_3, UR_QACC_H_4,
     UR_QACC_L_0, UR_QACC_L_1, UR_QACC_L_2, UR_QACC_L_3, UR_QACC_L_4, UR_SAR_BYTE, UR_THREADPTR,
@@ -665,6 +665,14 @@ pub(crate) fn execute<B: Bus>(
         // with the sr_name guard: every enumerated variant below is valid on
         // the ESP32-S3 per core-esp32s3/xtensa-modules.inc.c).
         // ------------------------------------------------------------------
+        Opcode::OPCODE_RSR_INTERRUPT => {
+            // rsr.interrupt: live interrupt status = sticky INTSET bits
+            // ORed with the asserted SoC lines (QEMU keeps the live line
+            // state in INTSET itself — xtensa_irq — and this core's
+            // modules decode rsr.interrupt as SR 226).
+            cpu.set_reg(o[0].value, cpu.intset_live(bus));
+            Outcome::Seq
+        }
         Opcode::OPCODE_RSR_LBEG
         | Opcode::OPCODE_RSR_LEND
         | Opcode::OPCODE_RSR_LCOUNT
@@ -717,7 +725,6 @@ pub(crate) fn execute<B: Bus>(
         | Opcode::OPCODE_RSR_EXCSAVE6
         | Opcode::OPCODE_RSR_EXCSAVE7
         | Opcode::OPCODE_RSR_CPENABLE
-        | Opcode::OPCODE_RSR_INTERRUPT
         | Opcode::OPCODE_RSR_INTENABLE
         | Opcode::OPCODE_RSR_PS
         | Opcode::OPCODE_RSR_VECBASE
@@ -788,8 +795,6 @@ pub(crate) fn execute<B: Bus>(
         | Opcode::OPCODE_WSR_EXCSAVE6
         | Opcode::OPCODE_WSR_EXCSAVE7
         | Opcode::OPCODE_WSR_CPENABLE
-        | Opcode::OPCODE_WSR_INTSET
-        | Opcode::OPCODE_WSR_INTCLEAR
         | Opcode::OPCODE_WSR_INTENABLE
         | Opcode::OPCODE_WSR_PS
         | Opcode::OPCODE_WSR_VECBASE
@@ -803,6 +808,19 @@ pub(crate) fn execute<B: Bus>(
         | Opcode::OPCODE_WSR_CCOMPARE1
         | Opcode::OPCODE_WSR_CCOMPARE2 => {
             cpu.set_sreg(sr_of(opc), cpu.reg(o[0].value));
+            Outcome::Seq
+        }
+        Opcode::OPCODE_WSR_INTSET => {
+            // wsr.intset: OR the value into the sticky interrupt set
+            // (QEMU HELPER(intset) — software-interrupt writes; the
+            // ESP32-S3 has no software-inttype mask).
+            cpu.set_sreg(SR_INTSET, cpu.sreg(SR_INTSET) | cpu.reg(o[0].value));
+            Outcome::Seq
+        }
+        Opcode::OPCODE_WSR_INTCLEAR => {
+            // wsr.intclear: AND ~value into the sticky interrupt set
+            // (QEMU HELPER(intclear); the SoC line state is unaffected).
+            cpu.set_sreg(SR_INTSET, cpu.sreg(SR_INTSET) & !cpu.reg(o[0].value));
             Outcome::Seq
         }
         Opcode::OPCODE_WSR_WINDOWBASE | Opcode::OPCODE_XSR_WINDOWBASE => {
@@ -1281,7 +1299,9 @@ fn sr_of(opc: Opcode) -> u32 {
         Opcode::OPCODE_RSR_CPENABLE | Opcode::OPCODE_WSR_CPENABLE | Opcode::OPCODE_XSR_CPENABLE => {
             SR_CPENABLE
         }
-        Opcode::OPCODE_RSR_INTERRUPT => SR_INTERRUPT,
+        // This core's modules decode rsr.interrupt as SR 226 (INTSET) —
+        // there is no SR 225 access on the ESP32-S3.
+        Opcode::OPCODE_RSR_INTERRUPT => SR_INTSET,
         Opcode::OPCODE_WSR_INTCLEAR => SR_INTCLEAR,
         Opcode::OPCODE_RSR_INTENABLE
         | Opcode::OPCODE_WSR_INTENABLE

@@ -148,6 +148,7 @@ pub const ILLEGAL_INSTRUCTION_CAUSE: u32 = 0;
 pub const SYSCALL_CAUSE: u32 = 1;
 pub const INSTRUCTION_FETCH_ERROR_CAUSE: u32 = 2;
 pub const LOAD_STORE_ERROR_CAUSE: u32 = 3;
+pub const LEVEL1_INTERRUPT_CAUSE: u32 = 4;
 pub const ALLOCA_CAUSE: u32 = 5;
 pub const INTEGER_DIVIDE_BY_ZERO_CAUSE: u32 = 6;
 pub const PC_VALUE_ERROR_CAUSE: u32 = 7;
@@ -172,6 +173,33 @@ pub const VEC_UF12: u32 = 0x140;
 pub const VEC_KERNEL: u32 = 0x300;
 pub const VEC_USER: u32 = 0x340;
 pub const VEC_DOUBLE: u32 = 0x3c0;
+
+// Interrupt configuration (ESP32-S3 core-isa.h: XCHAL_NUM_INTLEVELS = 6,
+// XCHAL_EXCM_LEVEL = 3, XCHAL_NUM_EXTINTERRUPTS = 26; the 32 interrupt lines
+// are grouped into 6 levels + NMI as "level 7", which is how QEMU's
+// exc_helper.c treats them).
+/// Highest non-NMI interrupt level delivered to a vector; NMI is level 7.
+pub const INT_NUM_LEVELS: u32 = 6;
+/// Level used for cintlevel while PS.EXCM is set (XCHAL_EXCM_LEVEL).
+pub const EXCM_LEVEL: u32 = 3;
+/// Lines per level, index = level 0..=7 (XCHAL_INTLEVEL1..7_MASK).
+pub const INT_LEVEL_MASKS: [u32; 8] = [
+    0,
+    0x0006_37FF, // level 1: lines 0-10, 12, 13, 17, 18
+    0x0038_0000, // level 2: lines 19-21
+    0x28C0_8800, // level 3: lines 11, 15, 22, 23, 27, 29
+    0x5300_0000, // level 4: lines 24, 25, 28, 30
+    0x8401_0000, // level 5: lines 16, 26, 31
+    0,           // level 6: no lines
+    0x0000_4000, // level 7 (NMI): line 14
+];
+/// Interrupt vector offsets from VECBASE for levels 2..=7
+/// (XCHAL_INTLEVEL2..7_VECOFS).  Level 1 has no vector: it is delivered
+/// as a kernel/user/double exception (EXCCAUSE = LEVEL1_INTERRUPT_CAUSE).
+pub const INT_VEC_OFFSETS: [u32; 8] = [0, 0, 0x180, 0x1C0, 0x200, 0x240, 0x280, 0x2C0];
+/// NMI line (bit 14; XCHAL_INTLEVEL7_MASK) and the level QEMU uses for it.
+pub const NMI_LINE: u32 = 14;
+pub const NMI_LEVEL: u32 = 7;
 
 /// Reset vector address (ESP32-S3 ROM at 0x4000_0000, IRAM at 0x4008_0000).
 pub const RESET_VECTOR: u32 = 0x4000_0000;
@@ -351,6 +379,81 @@ impl Cpu {
         self.pc = self.sregs[SR_VECBASE as usize] + vec;
     }
 
+    /// Effective interrupt status: software-sticky INTSET bits ORed with
+    /// the interrupt lines asserted by the SoC (QEMU keeps the live line
+    /// state directly in INTSET via xtensa_irq; we keep them separate).
+    #[inline]
+    pub fn intset_live<B: Bus>(&self, bus: &mut B) -> u32 {
+        self.sregs[SR_INTSET as usize] | bus.int_pending()
+    }
+
+    /// Interrupt dispatch at the instruction boundary (QEMU
+    /// check_interrupts + handle_interrupt, exc_helper.c).  Returns true
+    /// if an interrupt was taken.
+    ///
+    /// Semantics (all verified against exc_helper.c:155-200):
+    /// - The pending level is the highest one with a bit in
+    ///   `INT_LEVEL_MASKS[level] & INTSET & INTENABLE`; the NMI (level 7,
+    ///   line 14) bypasses INTENABLE and the cintlevel comparison.
+    /// - cintlevel = PS.INTLEVEL, raised to EXCM_LEVEL (3) while PS.EXCM
+    ///   is set; the interrupt is only taken if level > cintlevel.
+    /// - Level 1: delivered as a kernel/user exception with EXCCAUSE =
+    ///   LEVEL1_INTERRUPT_CAUSE, EPC1 = pc, PS.EXCM set.
+    /// - Level 2..6: EPC[level] = pc, EPS[level] = old PS,
+    ///   PS = (PS & ~INTLEVEL) | level | EXCM, pc = VECBASE + vector.
+    /// - NMI: same as level 2..6 plus its sticky INTSET bit is cleared.
+    pub(crate) fn check_interrupts<B: Bus>(&mut self, bus: &mut B) -> bool {
+        let intset = self.intset_live(bus);
+        let intenable = self.sregs[SR_INTENABLE as usize];
+        let level = if intset & (1 << NMI_LINE) != 0 {
+            NMI_LEVEL
+        } else {
+            let mut l = 0;
+            for i in (1..=INT_NUM_LEVELS).rev() {
+                if INT_LEVEL_MASKS[i as usize] & intset & intenable != 0 {
+                    l = i;
+                    break;
+                }
+            }
+            l
+        };
+        if level == 0 {
+            return false;
+        }
+        let ps = self.sregs[SR_PS as usize];
+        let cintlevel = if ps & PS_EXCM != 0 {
+            (ps & PS_INTLEVEL).max(EXCM_LEVEL)
+        } else {
+            ps & PS_INTLEVEL
+        };
+        if level != NMI_LEVEL && level <= cintlevel {
+            return false;
+        }
+        let pc = self.pc;
+        if level == 1 {
+            self.sregs[SR_EXCCAUSE as usize] = LEVEL1_INTERRUPT_CAUSE;
+            self.sregs[SR_EPC1 as usize] = pc;
+            self.sregs[SR_PS as usize] |= PS_EXCM;
+            let vec = if ps & PS_UM != 0 {
+                VEC_USER
+            } else {
+                VEC_KERNEL
+            };
+            self.pc = self.sregs[SR_VECBASE as usize] + vec;
+        } else {
+            self.sregs[(SR_EPC1 + level - 1) as usize] = pc;
+            self.sregs[(SR_EPS2 + level - 2) as usize] = ps;
+            self.sregs[SR_PS as usize] = (ps & !PS_INTLEVEL) | level | PS_EXCM;
+            if level == NMI_LEVEL {
+                // The NMI is edge-like on this core: taking it clears its
+                // sticky INTSET bit (QEMU handle_interrupt nmi branch).
+                self.sregs[SR_INTSET as usize] &= !(1 << NMI_LINE);
+            }
+            self.pc = self.sregs[SR_VECBASE as usize] + INT_VEC_OFFSETS[level as usize];
+        }
+        true
+    }
+
     /// Execute one instruction.  Returns a StepResult describing what
     /// happened (see StepResult).
     pub fn step<B: Bus>(&mut self, bus: &mut B) -> StepResult {
@@ -432,6 +535,12 @@ impl Cpu {
         }
         self.sync_windowbase();
         self.icount += 1;
+        // Interrupt dispatch at the instruction boundary (QEMU runs
+        // check_interrupts before the next translation block).  pc has
+        // already advanced to the next instruction, so EPC[level] /
+        // EPS[level] let the handler return with RFE/RFI to the
+        // instruction after the one that took the interrupt.
+        self.check_interrupts(bus);
         StepResult::Ok
     }
 }

@@ -264,6 +264,274 @@ fn boot_path_loads_app_from_flash() {
 }
 
 #[test]
+fn timer_interrupt_delivers_to_vector() {
+    use crate::asm::Asm;
+    use esp32s3_soc::memmap::INT_MATRIX_BASE;
+
+    // App: literal pool first (CTR/STASH/INT_MATRIX/TIMG0), then code.
+    // Configures TIMG0 T0 to alarm every 64 cycles (EN|INCREASE|AUTORELOAD|
+    // ALARM, alarm = 0x40), routes source 50 (TG0_T0) to CPU line 15 (level
+    // 3) via the interrupt matrix, enables INTENABLE bit 15, then spins on
+    // CTR until the level-3 handler has run 3 times, then stashes 0xCAFE.
+    // DRAM/IRAM alias the same SRAM: keep CTR/STASH above the app
+    // image (0x3FC80000..0x3FC80060) so the handler write cannot clobber
+    // the app literal pool at 0x40370000.
+    const CTR: u32 = 0x3FC8_0100;
+    const STASH: u32 = 0x3FC8_0104;
+    let mut a = Asm::new(IRAM_BASE);
+    let l_ctr = a.offset();
+    a.lit(0);
+    let l_stash = a.offset();
+    a.lit(0);
+    let l_mat = a.offset();
+    a.lit(0);
+    let l_timg = a.offset();
+    a.lit(0);
+    let code_start = a.pc();
+    let p_l2 = a.l32r(2); // INT_MATRIX_BASE
+    a.patch_l32r(p_l2, IRAM_BASE + l_mat as u32);
+    a.movi_n(3, 15);
+    a.s32i(3, 2, 0xC8); // INT_MATRIX_BASE + 4*50: TG0_T0 -> line 15
+    let p_l2 = a.l32r(2); // TIMG0_BASE
+    a.patch_l32r(p_l2, IRAM_BASE + l_timg as u32);
+    a.movi_n(3, 0x40);
+    a.s32i(3, 2, 0x10); // T0ALARMLO = 64
+    a.li(3, 0xE000_0400u32 as i32); // T0CONFIG: EN|INCREASE|AUTORELOAD|ALARM
+    a.s32i(3, 2, 0);
+    a.movi_n(4, 1);
+    a.s32i(4, 2, 0x98); // INT_ENA bit 0
+    a.li(3, 0x8000); // INTENABLE bit 15
+    a.wsr(228, 3);
+    a.rsil(4, 0);
+    let loop_start = a.pc();
+    let p_l2 = a.l32r(2); // CTR
+    a.patch_l32r(p_l2, IRAM_BASE + l_ctr as u32);
+    a.l32i(3, 2, 0);
+    a.addi(4, 3, -3);
+    a.bnez(4, loop_start);
+    a.li(4, 0xCAFE);
+    let p_l5 = a.l32r(5); // STASH
+    a.patch_l32r(p_l5, IRAM_BASE + l_stash as u32);
+    a.s32i(4, 5, 0);
+    let done = a.pc();
+    a.j(done);
+    // Patch the literal pool (values must sit at their 4-aligned slots).
+    a.bytes_mut()[l_ctr..l_ctr + 4].copy_from_slice(&CTR.to_le_bytes());
+    a.bytes_mut()[l_stash..l_stash + 4].copy_from_slice(&STASH.to_le_bytes());
+    a.bytes_mut()[l_mat..l_mat + 4].copy_from_slice(&INT_MATRIX_BASE.to_le_bytes());
+    a.bytes_mut()[l_timg..l_timg + 4].copy_from_slice(&TIMG0_BASE.to_le_bytes());
+
+    // Level-3 handler at VECBASE + 0x1C0 (64-byte slot; uses only a6-a9 so
+    // the main loop's a2/a3/a4 stay live across the interrupt).
+    let mut h = Asm::new(0x4000_01C0);
+    h.li(6, CTR as i32);
+    h.l32i(7, 6, 0);
+    h.addi(7, 7, 1);
+    h.s32i(7, 6, 0); // CTR += 1
+    h.li(8, TIMG0_BASE as i32);
+    h.movi_n(9, 1);
+    h.s32i(9, 8, 0xA4); // INT_CLR
+    h.rfi(3);
+    assert!(
+        h.bytes().len() <= 0x40,
+        "handler fits the 64-byte vector slot"
+    );
+
+    let mut m = Esp32S3::new();
+    m.load_image(IRAM_BASE, a.bytes());
+    m.load_image(0x4000_01C0, h.bytes());
+    m.cpu.pc = code_start;
+    for _ in 0..2000 {
+        if m.cpu.pc == done {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.cpu.pc, done, "app finished its loop");
+    assert_eq!(m.soc.read32(STASH), 0xCAFE, "stash after 3 interrupts");
+    assert_eq!(m.soc.read32(CTR), 3, "handler ran 3 times");
+    assert_eq!(m.take_uart_tx(0), Bytes::new(), "UART0 silent");
+    assert_eq!(m.soc.read32(INT_MATRIX_BASE + 4 * 50), 15, "matrix write");
+}
+
+#[test]
+fn timg1_alarm_delivers_level4_vector() {
+    use crate::asm::Asm;
+    use esp32s3_soc::memmap::{INT_MATRIX_BASE, TIMG1_BASE};
+
+    // Same story as the level-3 test but through TIMG1: source 53 (TG1_T0)
+    // routed to CPU line 24 (level 4), handler at VECBASE + 0x200.  Proves
+    // the second timer group, a different matrix entry (4*53 = 0xD4) and the
+    // level-4 vector path end to end.
+    const CTR: u32 = 0x3FC8_0200;
+    const STASH: u32 = 0x3FC8_0204;
+    let mut a = Asm::new(IRAM_BASE);
+    let l_ctr = a.offset();
+    a.lit(0);
+    let l_stash = a.offset();
+    a.lit(0);
+    let l_mat = a.offset();
+    a.lit(0);
+    let l_timg = a.offset();
+    a.lit(0);
+    let code_start = a.pc();
+    let p = a.l32r(2); // INT_MATRIX_BASE
+    a.patch_l32r(p, IRAM_BASE + l_mat as u32);
+    a.movi_n(3, 24);
+    a.s32i(3, 2, 0xD4); // INT_MATRIX_BASE + 4*53: TG1_T0 -> line 24 (L4)
+    let p = a.l32r(2); // TIMG1_BASE
+    a.patch_l32r(p, IRAM_BASE + l_timg as u32);
+    a.movi_n(3, 0x40);
+    a.s32i(3, 2, 0x10); // T0ALARMLO = 64
+    a.li(3, 0xE000_0400u32 as i32); // T0CONFIG: EN|INCREASE|AUTORELOAD|ALARM
+    a.s32i(3, 2, 0);
+    a.movi_n(4, 1);
+    a.s32i(4, 2, 0x98); // INT_ENA bit 0
+    a.li(3, 0x100_0000); // INTENABLE bit 24
+    a.wsr(228, 3);
+    a.rsil(4, 0);
+    let loop_start = a.pc();
+    let p = a.l32r(2); // CTR
+    a.patch_l32r(p, IRAM_BASE + l_ctr as u32);
+    a.l32i(3, 2, 0);
+    a.addi(4, 3, -3);
+    a.bnez(4, loop_start);
+    a.li(4, 0xCAFE);
+    let p = a.l32r(5); // STASH
+    a.patch_l32r(p, IRAM_BASE + l_stash as u32);
+    a.s32i(4, 5, 0);
+    let done = a.pc();
+    a.j(done);
+    a.bytes_mut()[l_ctr..l_ctr + 4].copy_from_slice(&CTR.to_le_bytes());
+    a.bytes_mut()[l_stash..l_stash + 4].copy_from_slice(&STASH.to_le_bytes());
+    a.bytes_mut()[l_mat..l_mat + 4].copy_from_slice(&INT_MATRIX_BASE.to_le_bytes());
+    a.bytes_mut()[l_timg..l_timg + 4].copy_from_slice(&TIMG1_BASE.to_le_bytes());
+
+    // Level-4 handler at VECBASE + 0x200 (64-byte slot; a6-a9 only).
+    let mut h = Asm::new(0x4000_0200);
+    h.li(6, CTR as i32);
+    h.l32i(7, 6, 0);
+    h.addi(7, 7, 1);
+    h.s32i(7, 6, 0); // CTR += 1
+    h.li(8, TIMG1_BASE as i32);
+    h.movi_n(9, 1);
+    h.s32i(9, 8, 0xA4); // INT_CLR
+    h.rfi(4);
+    assert!(
+        h.bytes().len() <= 0x40,
+        "handler fits the 64-byte vector slot"
+    );
+
+    let mut m = Esp32S3::new();
+    m.load_image(IRAM_BASE, a.bytes());
+    m.load_image(0x4000_0200, h.bytes());
+    m.cpu.pc = code_start;
+    for _ in 0..2000 {
+        if m.cpu.pc == done {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.cpu.pc, done, "app finished its loop");
+    assert_eq!(m.soc.read32(STASH), 0xCAFE, "stash after 3 interrupts");
+    assert_eq!(m.soc.read32(CTR), 3, "handler ran 3 times");
+    assert_eq!(m.soc.read32(INT_MATRIX_BASE + 4 * 53), 24, "matrix write");
+}
+
+#[test]
+fn uart_rx_interrupt_echo() {
+    use crate::asm::Asm;
+    use esp32s3_soc::memmap::INT_MATRIX_BASE;
+
+    // UART0 RX path end to end: a host-injected byte latches
+    // INT_RXFIFO_FULL, source 27 routes to line 15 (level 3), the vector
+    // handler pops the byte (RXFIFO_FULL drops with the FIFO), echoes it
+    // back on TX, clears INT_CLR and rfi 3; the main loop counts 1 byte.
+    const RXCNT: u32 = 0x3FC8_0100;
+    const RXBUF: u32 = 0x3FC8_0104;
+    const STASH: u32 = 0x3FC8_0108;
+    let mut a = Asm::new(IRAM_BASE);
+    let l_cnt = a.offset();
+    a.lit(0);
+    let l_buf = a.offset();
+    a.lit(0);
+    let l_stash = a.offset();
+    a.lit(0);
+    let l_mat = a.offset();
+    a.lit(0);
+    let l_uart = a.offset();
+    a.lit(0);
+    let code_start = a.pc();
+    let p = a.l32r(2); // INT_MATRIX_BASE
+    a.patch_l32r(p, IRAM_BASE + l_mat as u32);
+    a.movi_n(3, 15);
+    a.s32i(3, 2, 0x6C); // INT_MATRIX_BASE + 4*27: UART0 -> line 15 (L3)
+    let p = a.l32r(2); // UART0_BASE
+    a.patch_l32r(p, IRAM_BASE + l_uart as u32);
+    a.movi_n(3, 1);
+    a.s32i(3, 2, 0x0C); // INT_ENA bit 0 (RXFIFO_FULL)
+    a.li(3, 0x8000); // INTENABLE bit 15
+    a.wsr(228, 3);
+    a.rsil(4, 0);
+    let loop_start = a.pc();
+    let p = a.l32r(2); // RXCNT
+    a.patch_l32r(p, IRAM_BASE + l_cnt as u32);
+    a.l32i(3, 2, 0);
+    a.addi(4, 3, -1);
+    a.bnez(4, loop_start);
+    a.li(4, 0xCAFE);
+    let p = a.l32r(5); // STASH
+    a.patch_l32r(p, IRAM_BASE + l_stash as u32);
+    a.s32i(4, 5, 0);
+    let done = a.pc();
+    a.j(done);
+    a.bytes_mut()[l_cnt..l_cnt + 4].copy_from_slice(&RXCNT.to_le_bytes());
+    a.bytes_mut()[l_buf..l_buf + 4].copy_from_slice(&RXBUF.to_le_bytes());
+    a.bytes_mut()[l_stash..l_stash + 4].copy_from_slice(&STASH.to_le_bytes());
+    a.bytes_mut()[l_mat..l_mat + 4].copy_from_slice(&INT_MATRIX_BASE.to_le_bytes());
+    a.bytes_mut()[l_uart..l_uart + 4].copy_from_slice(&UART0_BASE.to_le_bytes());
+
+    // Level-3 handler (a6-a9 only): pop FIFO, save to RXBUF (RXCNT sits 4
+    // bytes below it, so one li covers both), count up, echo the byte on
+    // TX, clear INT_CLR, rfi 3.
+    let mut h = Asm::new(0x4000_01C0);
+    h.li(6, UART0_BASE as i32);
+    h.l32i(7, 6, 0); // pop RX byte
+    h.li(8, RXBUF as i32);
+    h.s32i(7, 8, 0);
+    h.addi(8, 8, -4); // RXCNT = RXBUF - 4
+    h.l32i(9, 8, 0);
+    h.addi(9, 9, 1);
+    h.s32i(9, 8, 0);
+    h.s32i(7, 6, 0); // echo on TX
+    h.movi_n(9, 1);
+    h.s32i(9, 6, 0x10); // INT_CLR bit 0
+    h.rfi(3);
+    assert!(
+        h.bytes().len() <= 0x40,
+        "handler fits the 64-byte vector slot"
+    );
+
+    let mut m = Esp32S3::new();
+    m.load_image(IRAM_BASE, a.bytes());
+    m.load_image(0x4000_01C0, h.bytes());
+    m.cpu.pc = code_start;
+    m.soc.uart_inject_rx(0, b'X');
+    for _ in 0..2000 {
+        if m.cpu.pc == done {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.cpu.pc, done, "app finished its loop");
+    assert_eq!(m.soc.read32(RXCNT), 1, "one byte received");
+    assert_eq!(m.soc.read32(RXBUF), b'X' as u32, "handler saved the byte");
+    assert_eq!(m.take_uart_tx(0), b"X".to_vec(), "echo on TX");
+    assert_eq!(m.soc.read32(STASH), 0xCAFE, "stash after RX interrupt");
+    assert_eq!(m.soc.read32(INT_MATRIX_BASE + 4 * 27), 15, "matrix write");
+}
+
+#[test]
 fn flash_xip_reads_and_readonly() {
     use esp32s3_soc::memmap::{FLASH_DATA_BASE, FLASH_INST_BASE};
     let mut m = Esp32S3::new();

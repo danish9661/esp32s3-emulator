@@ -52,4 +52,20 @@ impl Intc {
         }
         Some((idx / INT_MATRIX_INPUTS, idx % INT_MATRIX_INPUTS))
     }
+
+    /// Resolve asserted peripheral sources (bitmap, bit n = matrix source
+    /// n high) to the CPU interrupt lines asserted on `cpu` (QEMU
+    /// esp32s3_intc.c irq_map: each source asserts the line stored in
+    /// INT_MATRIX(cpu, source); 32 lines, all values 0..=31 are legal
+    /// lines, 6 is merely the reset value).
+    pub fn pending_lines(&self, cpu: usize, sources: u64) -> u32 {
+        let mut lines = 0u32;
+        let mut s = sources;
+        while s != 0 {
+            let i = s.trailing_zeros() as usize;
+            s &= s - 1;
+            lines |= 1u32 << self.irq_map[cpu][i];
+        }
+        lines
+    }
 }

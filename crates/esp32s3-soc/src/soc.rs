@@ -17,7 +17,7 @@ use xtensa_core::Bus;
 use crate::gpio::Gpio;
 use crate::intc::Intc;
 use crate::memmap::*;
-use crate::timg::Timg;
+use crate::timg::{INT_T0, INT_T1, INT_WDT, Timg};
 use crate::uart::Uart;
 
 macro_rules! in_range {
@@ -75,6 +75,11 @@ impl Soc {
     /// Bytes emitted by UART `n` since the last call (host console output).
     pub fn take_uart_tx(&mut self, n: usize) -> Vec<u8> {
         self.uarts[n].take_tx()
+    }
+
+    /// Push one received byte into UART `n`'s RX FIFO (host console input).
+    pub fn uart_inject_rx(&mut self, n: usize, byte: u8) {
+        self.uarts[n].inject_rx(byte);
     }
 
     /// Snapshot of driven output-pin state (host LED visualization).
@@ -182,6 +187,35 @@ impl Default for Soc {
 }
 
 impl Bus for Soc {
+    fn int_pending(&mut self) -> u32 {
+        // Peripheral sources asserted per the TRM interrupt-source table
+        // (QEMU esp32s3_intc.h ETS_*_INTR_SOURCE numbers): UART0/1/2 =
+        // 27/28/29, TIMG0 T0/T1/WDT = 50/51/52, TIMG1 T0/T1/WDT =
+        // 53/54/55.  Each peripheral gates its line on INT_ST = RAW & ENA
+        // (QEMU esp32_timg.c / esp32_uart.c update_irq); the matrix then
+        // resolves the asserted sources to CPU lines for CPU 0.
+        let mut src = 0u64;
+        for (i, u) in self.uarts.iter().enumerate() {
+            if u.int_st() != 0 {
+                src |= 1 << (27 + i);
+            }
+        }
+        for (g, t) in self.timg.iter().enumerate() {
+            let st = t.int_st();
+            let base = 50 + g * 3;
+            if st & INT_T0 != 0 {
+                src |= 1 << base;
+            }
+            if st & INT_T1 != 0 {
+                src |= 1 << (base + 1);
+            }
+            if st & INT_WDT != 0 {
+                src |= 1 << (base + 2);
+            }
+        }
+        self.intc.pending_lines(0, src)
+    }
+
     fn read8(&mut self, addr: u32) -> u32 {
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE)
             || in_range!(addr, IRAM_BASE, SRAM_BASE_RANGE)
