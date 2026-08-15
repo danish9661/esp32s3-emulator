@@ -2,9 +2,10 @@
 //!
 //! Owns the internal SRAM (512 KB, aliased at the DRAM and IRAM windows —
 //! same physical RAM on real silicon), the boot ROM stub storage (IROM), the
-//! RTC memories, and all modeled peripherals (UART0/1/2, GPIO, TIMG0/1,
-//! interrupt matrix). Addresses and windows follow QEMU `esp32s3.c` +
-//! `esp32s3_reg.h` (mirrors the TRM memory map chapter).
+//! RTC memories, the SPI flash + PSRAM backing (reachable through the shared
+//! cache MMU windows), and all modeled peripherals (UART0/1/2, GPIO, TIMG0/1,
+//! interrupt matrix, cache/MMU). Addresses and windows follow QEMU `esp32s3.c`
+//! + `esp32s3_reg.h` (mirrors the TRM memory map chapter).
 //!
 //! Unimplemented APB addresses behave like QEMU's unimplemented devices but
 //! return 0 / ignore writes instead of trapping (firmware probes peripheral
@@ -15,6 +16,7 @@ use alloc::vec::Vec;
 use xtensa_core::Bus;
 
 use crate::adc::Adc;
+use crate::cache::{Cache, CacheTarget};
 use crate::gpio::Gpio;
 use crate::i2c::I2c;
 use crate::intc::Intc;
@@ -40,6 +42,8 @@ pub struct Soc {
     irom: Box<[u8; IROM_SIZE as usize]>,
     /// SPI flash backing store (read-only via the XIP cache windows).
     flash: Box<[u8; FLASH_SIZE as usize]>,
+    /// PSRAM backing store (read-write through MMU-mapped cache pages).
+    psram: Box<[u8; PSRAM_SIZE as usize]>,
     rtc_slow: Box<[u8; RTC_SLOW_SIZE as usize]>,
     rtc_fast: Box<[u8; RTC_FAST_SIZE as usize]>,
     uarts: [Uart; 3],
@@ -48,6 +52,7 @@ pub struct Soc {
     spi: [Spi; 2],
     i2c: [I2c; 2],
     adc: Adc,
+    cache: Cache,
     timg: [Timg; 2],
     intc: Intc,
 }
@@ -58,6 +63,7 @@ impl Soc {
             sram: Box::new([0; SRAM_BYTES]),
             irom: Box::new([0; IROM_SIZE as usize]),
             flash: Box::new([0; FLASH_SIZE as usize]),
+            psram: Box::new([0; PSRAM_SIZE as usize]),
             rtc_slow: Box::new([0; RTC_SLOW_SIZE as usize]),
             rtc_fast: Box::new([0; RTC_FAST_SIZE as usize]),
             uarts: [Uart::new(), Uart::new(), Uart::new()],
@@ -66,6 +72,7 @@ impl Soc {
             spi: [Spi::new(0), Spi::new(1)],
             i2c: [I2c::new(0), I2c::new(1)],
             adc: Adc::new(),
+            cache: Cache::new(),
             timg: [Timg::new(), Timg::new()],
             intc: Intc::new(),
         }
@@ -148,18 +155,40 @@ impl Soc {
         self.sram[Self::ram_index(addr)]
     }
 
-    /// Flash byte at `addr` (inside a cache window, beyond physical flash
-    /// returns 0 like an unmapped cache line).
-    fn flash8(&self, addr: u32) -> u8 {
-        let idx = if addr >= FLASH_INST_BASE {
-            (addr - FLASH_INST_BASE) as usize
+    /// Flash byte at a physical flash offset (past the 4 MB end -> 0 like an
+    /// unmapped flash region).
+    fn flash_byte(&self, off: u32) -> u8 {
+        if off >= FLASH_SIZE {
+            0
         } else {
-            (addr - FLASH_DATA_BASE) as usize
-        };
-        if idx >= FLASH_SIZE as usize {
-            return 0;
+            self.flash[off as usize]
         }
-        self.flash[idx]
+    }
+
+    /// Byte read through a cache window (data or instruction), translated by
+    /// the cache MMU to flash (read-only) or PSRAM (read-write) backing.
+    fn cache_read8(&self, addr: u32) -> u8 {
+        match self.cache.translate(addr) {
+            Some(CacheTarget::Flash(off)) => self.flash_byte(off),
+            Some(CacheTarget::Psram(off)) => {
+                if off >= PSRAM_SIZE {
+                    0
+                } else {
+                    self.psram[off as usize]
+                }
+            }
+            None => 0,
+        }
+    }
+
+    /// Byte write through a cache window: MMU-mapped PSRAM pages are
+    /// writable; flash pages (including the invalid-entry 1:1 alias) are
+    /// read-only and the write is dropped.
+    fn cache_write8(&mut self, addr: u32, val: u8) {
+        match self.cache.translate(addr) {
+            Some(CacheTarget::Psram(off)) if off < PSRAM_SIZE => self.psram[off as usize] = val,
+            _ => {}
+        }
     }
 
     fn ram_write8(&mut self, addr: u32, val: u8) {
@@ -276,6 +305,24 @@ impl Soc {
                     self.intc.read32(off)
                 }
             }
+            EXTMEM_BASE => {
+                if is_write {
+                    self.cache.write32(off, value);
+                    0
+                } else {
+                    self.cache.read32(off)
+                }
+            }
+            // Shared cache MMU table (512 x u32) sits one page past the
+            // EXTMEM control registers (esp32s3_cache.h MMU_TABLE_OFFSET).
+            MMU_TABLE_BASE => {
+                if is_write {
+                    self.cache.mmu_write32(off, value);
+                    0
+                } else {
+                    self.cache.mmu_read32(off)
+                }
+            }
             // Everything else in the APB space: no model yet.
             _ => 0,
         }
@@ -289,13 +336,14 @@ impl Default for Soc {
 }
 
 impl Bus for Soc {
-    fn int_pending(&mut self) -> u32 {
+    fn int_pending(&mut self, cpu: usize) -> u32 {
         // Peripheral sources asserted per the TRM interrupt-source table
         // (QEMU esp32s3_intc.h ETS_*_INTR_SOURCE numbers): UART0/1/2 =
         // 27/28/29, TIMG0 T0/T1/WDT = 50/51/52, TIMG1 T0/T1/WDT =
         // 53/54/55.  Each peripheral gates its line on INT_ST = RAW & ENA
         // (QEMU esp32_timg.c / esp32_uart.c update_irq); the matrix then
-        // resolves the asserted sources to CPU lines for CPU 0.
+        // resolves the asserted sources to the requesting CPU's lines
+        // (per-CPU core_0/core_1 maps, TRM interrupt matrix).
         let mut src = 0u64;
         for (i, u) in self.uarts.iter().enumerate() {
             if u.int_st() != 0 {
@@ -315,7 +363,7 @@ impl Bus for Soc {
                 src |= 1 << (base + 2);
             }
         }
-        self.intc.pending_lines(0, src)
+        self.intc.pending_lines(cpu, src)
     }
 
     fn read8(&mut self, addr: u32) -> u32 {
@@ -328,7 +376,7 @@ impl Bus for Soc {
         } else if in_range!(addr, FLASH_DATA_BASE, FLASH_WINDOW_SIZE)
             || in_range!(addr, FLASH_INST_BASE, FLASH_WINDOW_SIZE)
         {
-            self.flash8(addr) as u32
+            self.cache_read8(addr) as u32
         } else if in_range!(addr, RTC_SLOW_BASE, RTC_SLOW_SIZE) {
             self.rtc_slow[(addr - RTC_SLOW_BASE) as usize] as u32
         } else if in_range!(addr, RTC_FAST_BASE, RTC_FAST_SIZE) {
@@ -368,10 +416,10 @@ impl Bus for Soc {
             || in_range!(addr, FLASH_INST_BASE, FLASH_WINDOW_SIZE)
         {
             u32::from_le_bytes([
-                self.flash8(addr),
-                self.flash8(addr + 1),
-                self.flash8(addr + 2),
-                self.flash8(addr + 3),
+                self.cache_read8(addr),
+                self.cache_read8(addr + 1),
+                self.cache_read8(addr + 2),
+                self.cache_read8(addr + 3),
             ])
         } else if in_range!(addr, RTC_SLOW_BASE, RTC_SLOW_SIZE) {
             let o = (addr - RTC_SLOW_BASE) as usize;
@@ -403,6 +451,11 @@ impl Bus for Soc {
             self.ram_write8(addr, val as u8);
         } else if in_range!(addr, IROM_BASE, IROM_SIZE) {
             // ROM: read-only.
+        } else if in_range!(addr, FLASH_DATA_BASE, FLASH_WINDOW_SIZE)
+            || in_range!(addr, FLASH_INST_BASE, FLASH_WINDOW_SIZE)
+        {
+            // Cache windows: only MMU-mapped PSRAM pages are writable.
+            self.cache_write8(addr, val as u8);
         } else if in_range!(addr, RTC_SLOW_BASE, RTC_SLOW_SIZE) {
             self.rtc_slow[(addr - RTC_SLOW_BASE) as usize] = val as u8;
         } else if in_range!(addr, RTC_FAST_BASE, RTC_FAST_SIZE) {
@@ -434,6 +487,13 @@ impl Bus for Soc {
             }
         } else if in_range!(addr, IROM_BASE, IROM_SIZE) {
             // ROM: read-only.
+        } else if in_range!(addr, FLASH_DATA_BASE, FLASH_WINDOW_SIZE)
+            || in_range!(addr, FLASH_INST_BASE, FLASH_WINDOW_SIZE)
+        {
+            // Cache windows: only MMU-mapped PSRAM pages are writable.
+            for (i, b) in val.to_le_bytes().into_iter().enumerate() {
+                self.cache_write8(addr + i as u32, b);
+            }
         } else if in_range!(addr, RTC_SLOW_BASE, RTC_SLOW_SIZE) {
             let o = (addr - RTC_SLOW_BASE) as usize;
             self.rtc_slow[o..o + 4].copy_from_slice(&val.to_le_bytes());

@@ -444,7 +444,7 @@ mod tests {
         a.li(1, 0x3FC8_8000);
         a.li(2, 0x3C01_0000);
         a.li(3, 0x6000_0000);
-        let mut cpu = Cpu::new();
+        let mut cpu = Cpu::new(0);
         let mut bus = RamBus::load(a.bytes());
         run(&mut cpu, &mut bus, a.pc(), 64);
         assert_eq!(cpu.reg(1), 0x3FC8_8000);
@@ -463,7 +463,7 @@ mod tests {
         a.lit(0x4000_0000 + pool as u32 + 4);
         a.patch_l32r(p1, 0x4000_0000 + pool as u32);
         a.patch_l32r(p2, 0x4000_0000 + pool as u32 + 4);
-        let mut cpu = Cpu::new();
+        let mut cpu = Cpu::new(0);
         let mut bus = RamBus::load(a.bytes());
         // Stop before the pool so the literals are never executed.
         run(&mut cpu, &mut bus, 0x4000_0000 + pool as u32, 16);

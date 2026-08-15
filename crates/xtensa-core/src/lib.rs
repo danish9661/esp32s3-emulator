@@ -219,7 +219,7 @@ mod cpu_tests {
             self.write8(addr + 2, val >> 16);
             self.write8(addr + 3, val >> 24);
         }
-        fn int_pending(&mut self) -> u32 {
+        fn int_pending(&mut self, _cpu: usize) -> u32 {
             self.lines
         }
     }
@@ -300,7 +300,7 @@ mod cpu_tests {
         let end = a;
 
         let mut bus = RamBus::load(&prog);
-        let mut cpu = Cpu::new();
+        let mut cpu = Cpu::new(0);
         run(&mut cpu, &mut bus, end);
 
         assert_eq!(cpu.reg(2), 6, "add.n result");
@@ -357,7 +357,7 @@ mod cpu_tests {
         prog[(call_pc + 6 - 0x4000_1000) as usize / 3].1 = 0x0000_0006 | (j_off << 6);
 
         let mut bus = RamBus::load(&prog);
-        let mut cpu = Cpu::new();
+        let mut cpu = Cpu::new(0);
         cpu.pc = 0x4000_1000;
         run(&mut cpu, &mut bus, end);
 
@@ -395,7 +395,7 @@ mod cpu_tests {
         put(&mut prog, &mut h, 0x0000_3000); // rfe
 
         let mut bus = RamBus::load(&prog);
-        let mut cpu = Cpu::new();
+        let mut cpu = Cpu::new(0);
         assert!(matches!(cpu.step(&mut bus), StepResult::Ok));
         assert_eq!(cpu.pc, ill_pc, "reached ill");
         assert!(matches!(
@@ -441,7 +441,7 @@ mod cpu_tests {
         let end = a;
 
         let mut bus = RamBus::load(&prog);
-        let mut cpu = Cpu::new();
+        let mut cpu = Cpu::new(0);
         run(&mut cpu, &mut bus, end);
 
         assert_eq!(cpu.reg(4), 0xff, "l8ui");
@@ -481,7 +481,7 @@ mod cpu_tests {
         put(&mut prog, &mut h4, 0x0000_3410); // rfi 4
 
         let mut bus = IntBus::load(&prog, 1 << 22);
-        let mut cpu = Cpu::new();
+        let mut cpu = Cpu::new(0);
         for _ in 0..6 {
             cpu.step(&mut bus); // 5 builders + wsr (take at end)
         }
@@ -532,7 +532,7 @@ mod cpu_tests {
         put(&mut prog, &mut h, 0x0000_3210); // rfi 2
 
         let mut bus = IntBus::load(&prog, 1 << 19);
-        let mut cpu = Cpu::new();
+        let mut cpu = Cpu::new(0);
         for _ in 0..3 {
             cpu.step(&mut bus);
         }
@@ -567,7 +567,7 @@ mod cpu_tests {
         put(&mut prog, &mut h, 0x0013_E440); // wsr intenable a4
         put(&mut prog, &mut h, 0x0000_3410); // rfi 4
         let mut bus = IntBus::load(&prog, 1 << 19);
-        let mut cpu = Cpu::new();
+        let mut cpu = Cpu::new(0);
         cpu.set_sreg(SR_INTENABLE, (1 << 19) | (1 << 15) | (1 << 24));
         cpu.set_sreg(SR_PS, 2); // INTLEVEL 2
         cpu.step(&mut bus);
@@ -593,7 +593,7 @@ mod cpu_tests {
         let mut h2 = 0x4000_02C0u32; // NMI vector
         put(&mut prog2, &mut h2, 0x0000_20F0); // nop (handler body)
         let mut bus2 = IntBus::load(&prog2, 0); // no external lines
-        let mut cpu2 = Cpu::new();
+        let mut cpu2 = Cpu::new(0);
         cpu2.pc = 0x4000_1000;
         for _ in 0..3 {
             cpu2.step(&mut bus2);
@@ -620,7 +620,7 @@ mod cpu_tests {
         put(&mut prog, &mut a, 0x0013_E420); // wsr intenable a2 (bit 0)
         put(&mut prog, &mut a, 0x0000_20F0); // nop                ; interrupted target
         let mut bus = IntBus::load(&prog, 1 << 0);
-        let mut cpu = Cpu::new();
+        let mut cpu = Cpu::new(0);
         cpu.step(&mut bus); // movi
         cpu.step(&mut bus); // wsr intenable -> level 1 pending
         assert_eq!(cpu.pc, 0x4000_0300, "kernel vector");
@@ -644,11 +644,37 @@ mod cpu_tests {
         put(&mut prog, &mut a, 0x0003_E240); // rsr interrupt a4
         let end = a;
         let mut bus = RamBus::load(&prog);
-        let mut cpu = Cpu::new();
+        let mut cpu = Cpu::new(0);
         run(&mut cpu, &mut bus, end);
         assert_eq!(cpu.reg(3), 0x800, "rsr.interrupt reflects wsr.intset");
         assert_eq!(cpu.reg(4), 0, "intclear visible to rsr.interrupt");
         assert_eq!(cpu.sreg(SR_INTSET), 0, "wsr.intclear removed the bit");
         assert_eq!(cpu.pc, end, "no interrupt taken (INTENABLE = 0)");
+    }
+
+    #[test]
+    fn prid_reads_core_id() {
+        // PRID (SR 235) is the per-core read-only core number; each Cpu has
+        // its own value (QEMU xtensa_cpu_reset sets sregs[PRID] = core_id).
+        // rsr a2, PRID = 0x0003_EB20 (t=2); rsr a3, PRID = 0x0003_EB30.
+        let mut prog = Vec::new();
+        let mut a = 0x4000_1000u32;
+        put(&mut prog, &mut a, 0x0003_EB20); // rsr a2, PRID
+        put(&mut prog, &mut a, 0x0003_EB30); // rsr a3, PRID
+        let end = a;
+
+        let mut bus = RamBus::load(&prog);
+        let mut cpu0 = Cpu::new(0);
+        cpu0.pc = 0x4000_1000;
+        run(&mut cpu0, &mut bus, end);
+        assert_eq!(cpu0.reg(2), 0, "core 0 PRID");
+        assert_eq!(cpu0.reg(3), 0, "core 0 PRID");
+
+        let mut bus = RamBus::load(&prog);
+        let mut cpu1 = Cpu::new(1);
+        cpu1.pc = 0x4000_1000;
+        run(&mut cpu1, &mut bus, end);
+        assert_eq!(cpu1.reg(2), 1, "core 1 PRID");
+        assert_eq!(cpu1.reg(3), 1, "core 1 PRID");
     }
 }

@@ -206,6 +206,11 @@ pub const RESET_VECTOR: u32 = 0x4000_0000;
 
 pub struct Cpu {
     pub pc: u32,
+    /// Core ID (0 or 1): selects the interrupt-matrix column in
+    /// `Bus::int_pending` and seeds the PRID special register (the real
+    /// PRID is a read-only strapping of the core number, ISA RM PRID;
+    /// QEMU `xtensa_cpu_reset` sets env->sregs[PRID] = cpu->core_id).
+    core_id: usize,
     phys: [u32; 64],
     sregs: [u32; 256],
     user_sregs: [u32; 256],
@@ -224,12 +229,14 @@ pub enum StepResult {
 }
 
 impl Cpu {
-    pub fn new() -> Self {
+    /// Create a CPU for core `core_id` (0 or 1 on the ESP32-S3).
+    pub fn new(core_id: usize) -> Self {
         // Reset state: vectors at 0x4000_0000, window 0 active (the reset
         // boot code on real silicon sets WINDOWSTART=1 before the first
         // windowed call).
         let mut cpu = Cpu {
             pc: RESET_VECTOR,
+            core_id,
             phys: [0; 64],
             sregs: [0; 256],
             user_sregs: [0; 256],
@@ -238,6 +245,7 @@ impl Cpu {
         };
         cpu.sregs[SR_VECBASE as usize] = RESET_VECTOR;
         cpu.sregs[SR_WINDOW_START as usize] = 1;
+        cpu.sregs[SR_PRID as usize] = core_id as u32;
         cpu
     }
 
@@ -384,7 +392,7 @@ impl Cpu {
     /// state directly in INTSET via xtensa_irq; we keep them separate).
     #[inline]
     pub fn intset_live<B: Bus>(&self, bus: &mut B) -> u32 {
-        self.sregs[SR_INTSET as usize] | bus.int_pending()
+        self.sregs[SR_INTSET as usize] | bus.int_pending(self.core_id)
     }
 
     /// Interrupt dispatch at the instruction boundary (QEMU
@@ -547,6 +555,6 @@ impl Cpu {
 
 impl Default for Cpu {
     fn default() -> Self {
-        Self::new()
+        Self::new(0)
     }
 }

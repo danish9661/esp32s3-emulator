@@ -10,6 +10,7 @@
 extern crate alloc;
 
 pub mod adc;
+pub mod cache;
 pub mod gpio;
 pub mod i2c;
 pub mod intc;

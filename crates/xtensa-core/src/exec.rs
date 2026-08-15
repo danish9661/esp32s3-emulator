@@ -1320,6 +1320,8 @@ fn sr_of(opc: Opcode) -> u32 {
         Opcode::OPCODE_RSR_CCOUNT | Opcode::OPCODE_WSR_CCOUNT | Opcode::OPCODE_XSR_CCOUNT => {
             SR_CCOUNT
         }
+        // PRID is read-only strapping of the core number (no WSR/XSR form).
+        Opcode::OPCODE_RSR_PRID => SR_PRID,
         Opcode::OPCODE_RSR_ICOUNT | Opcode::OPCODE_WSR_ICOUNT | Opcode::OPCODE_XSR_ICOUNT => {
             SR_ICOUNT
         }

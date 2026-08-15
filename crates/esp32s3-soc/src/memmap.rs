@@ -49,16 +49,27 @@ pub const I2C1_BASE: u32 = 0x6002_7000;
 pub const RTC_FAST_BASE: u32 = 0x600F_E000;
 pub const RTC_FAST_SIZE: u32 = 0x0000_2000;
 
-/// SPI flash, memory-mapped read-only through the data-cache window (TRM
-/// memory map: 0x3C000000..0x3DFFFFFF). The same flash appears at the
-/// instruction-cache window (0x42000000..0x427FFFFF) once the MMU/cache is
-/// initialized; both windows alias one physical flash here.
+/// SPI flash / PSRAM cache windows. The data-cache window (0x3C000000) and
+/// instruction-cache window (0x42000000) are both 32 MB aliases over ONE
+/// shared cache MMU (QEMU esp32s3_cache.h: `ESP32S3_EXTMEM_REGION_SIZE
+/// 0x2000000`, both `dcache`/`icache` alias the same MMU IOMMU region). Each
+/// 64 KB virtual page maps through an MMU entry to a physical flash page
+/// (read-only) or PSRAM page (read-write); see `crate::cache`.
 pub const FLASH_DATA_BASE: u32 = 0x3C00_0000;
 pub const FLASH_INST_BASE: u32 = 0x4200_0000;
-/// Size of each cache window (16 MB virtual each).
-pub const FLASH_WINDOW_SIZE: u32 = 0x0100_0000;
+/// Size of each cache window (32 MB virtual each, QEMU ESP32S3_EXTMEM_REGION_SIZE).
+pub const FLASH_WINDOW_SIZE: u32 = 0x0200_0000;
 /// Physical flash size modeled (4 MB, ESP32-S3 flash is 2-16 MB).
 pub const FLASH_SIZE: u32 = 0x0040_0000;
+/// Physical PSRAM size modeled (8 MB, ESP32-S3 DevKit default).
+pub const PSRAM_SIZE: u32 = 0x0080_0000;
+/// Cache MMU virtual page size (64 KB, QEMU ESP32S3_PAGE_SIZE).
+pub const CACHE_PAGE_SIZE: u32 = 0x0001_0000;
+/// Shared cache MMU entry count (32 MB window / 64 KB page).
+pub const MMU_ENTRIES: usize = 512;
+/// Cache window offset mask: both bases share the low 25 bits, so the window
+/// offset is `vaddr & WINDOW_MASK` for either the data or instruction window.
+pub const WINDOW_MASK: u32 = FLASH_WINDOW_SIZE - 1;
 
 // ── Peripheral bases (QEMU esp32s3_reg.h) ───────────────────────────────────
 
@@ -77,6 +88,13 @@ pub const INT_MATRIX_BASE: u32 = 0x600C_2000;
 pub const INT_MATRIX_INPUTS: usize = 0x800 / 4;
 pub const INT_MATRIX_CPUS: usize = 2;
 pub const INT_MATRIX_SIZE: u32 = (INT_MATRIX_INPUTS * INT_MATRIX_CPUS * 4) as u32;
+
+/// Cache / MMU controller registers (EXTMEM, esp32s3_reg.h): dcache/icache
+/// enable, sync/preload/autoload/freeze handshakes, cache state.
+pub const EXTMEM_BASE: u32 = 0x600C_4000;
+/// Shared cache MMU table (512 x u32, 64 KB pages). `ESP32S3_MMU_TABLE_OFFSET`
+/// = DR_REG_MMU_TABLE - DR_REG_EXTMEM_BASE = 0x1000 (QEMU esp32s3_cache.h).
+pub const MMU_TABLE_BASE: u32 = 0x600C_5000;
 
 /// First/last APB peripheral address (everything inside is either handled by
 /// a device or returns 0 / ignores writes like QEMU's unimplemented regions).

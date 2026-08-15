@@ -12,24 +12,33 @@ use xtensa_core::{Bus, Cpu, StepResult};
 use crate::rom_stub;
 
 pub struct Esp32S3 {
-    pub cpu: Cpu,
+    /// Both ESP32-S3 LX7 cores.  Core 1 is gated at reset by the ROM stub
+    /// (rom_stub.rs: PRID check) until core 0 releases it, mirroring the
+    /// real ROM's APP CPU boot flow (QEMU esp32s3.c runs both CPUs and lets
+    /// the ROM gate CPU1 — no release register is modeled).
+    pub cpu: [Cpu; 2],
     pub soc: Soc,
 }
 
 impl Esp32S3 {
     pub fn new() -> Self {
         Self {
-            cpu: Cpu::new(),
+            cpu: [Cpu::new(0), Cpu::new(1)],
             soc: Soc::new(),
         }
     }
 
-    /// Execute one instruction. Timers advance one cycle per instruction so
-    /// they make progress in host-driven execution (refined in P5).
+    /// Execute one instruction on each core.  Timers advance one cycle per
+    /// step so they make progress in host-driven execution (refined in P5).
+    /// The two cores are serialized core0-then-core1 within a step; real
+    /// silicon runs them simultaneously, but the fixed order keeps timer
+    /// ticks and per-core instruction counts identical to the single-core
+    /// behavior the machine tests were written against.
     pub fn step(&mut self) -> StepResult {
-        let Self { cpu, soc } = self;
-        soc.tick_timers(1);
-        cpu.step(soc)
+        self.soc.tick_timers(1);
+        let r = self.cpu[0].step(&mut self.soc);
+        self.cpu[1].step(&mut self.soc);
+        r
     }
 
     /// Load a raw firmware image at `addr` (DRAM, IRAM or IROM window).
@@ -55,7 +64,7 @@ impl Esp32S3 {
         self.soc.load_flash_image(0, flash);
         let rom = rom_stub::rom_image();
         self.load_image(rom_stub::ROM_BASE, &rom);
-        self.cpu.pc = rom_stub::ROM_BASE;
+        self.cpu[0].pc = rom_stub::ROM_BASE;
     }
 
     /// Bytes emitted by UART `n` since the last call (console output).

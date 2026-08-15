@@ -77,7 +77,7 @@ Core design:
       interrupt controller; trivial IDF firmware prints via UART.
 - [ ] **P3 — Boot path**: flash image loading, ROM stubs (printf/UART/delay),
       second-stage bootloader, partition table → real IDF app boots.
-- [ ] **P4 — Peripherals**: SPI/I2C/PWM/ADC, dual-core, PSRAM.
+- [x] **P4 — Peripherals**: SPI/I2C/PWM/ADC, dual-core, PSRAM.
 - [ ] **P5 — Hardening**: golden-trace validation vs QEMU (PC/register diffs),
       exception correctness, interrupt timing.
 - [ ] **P6 — Frontend polish**: serial console UI, GPIO/LED visualization,
@@ -106,6 +106,92 @@ Core design:
 - Commit-ready, formatted with `cargo fmt`, clippy-clean.
 
 ## Status log (append, newest last)
+
+- 2026-08-15: P4 dual-core lands — **P4 complete**: 25/25 emu, 17/17 core,
+  32/32 soc tests green (75 total incl. wasm-bridge).
+  - `xtensa-core` cpu.rs: `Cpu` gains `core_id`; `Cpu::new(id)` seeds
+    `sregs[SR_PRID] = id` (PRID = read-only core strapping; QEMU
+    xtensa_cpu_reset sets sregs[PRID] = core_id). `Bus::int_pending` is now
+    `int_pending(&mut self, cpu: usize)` — each CPU reads its own
+    interrupt-matrix column (the `Intc` already kept per-CPU maps). SoC
+    `int_pending` passes the requesting core through to `pending_lines(cpu)`.
+  - **BUG FOUND + FIXED**: `sr_of()` (exec.rs) had NO `OPCODE_RSR_PRID` case
+    → `rsr PRID` fell through to `_ => 0` and read SR 0 (LBEG), so core 1
+    read PRID as 0 and ran the boot loader too (app printed "OK\n" twice in
+    the boot test). Added `OPCODE_RSR_PRID => SR_PRID`.
+  - `esp32s3-emu` machine.rs: `cpu: [Cpu; 2]`; `step()` = tick_timers(1),
+    then core 0, then core 1 (serialized per step). Fixed order preserves the
+    single-core timer-tick and per-core instruction counts the existing tests
+    rely on (round-robin would break timg0_load_and_read: two ticks between
+    core 0's T0LOAD and T0LO read). All tests changed `m.cpu.pc` →
+    `m.cpu[0].pc`.
+  - rom_stub.rs: reset now `rsr a2, PRID; bnez a2, CORE1_WAIT` before setting
+    SP; core 1 branches to a fixed spin (CORE1_WAIT = 0x40000400) polling
+    `CORE1_ENTRY` (0x3FC87F00, host-defined — QEMU S3 models NO release
+    register, `esp32s3_cpu_stall` is a stub) and `jx`es to whatever core 0
+    stores there. New `pad_to` helper: the 21-byte PRID + 21-byte core1_wait
+    sections made the pad gaps to CORE1_WAIT/ROM_PUTS odd, and 2-byte pad2s
+    alone overshoot the fixed addresses → one 3-byte `movi a15,0` covers an
+    odd gap.
+  - New tests: `dual_core_release_and_run` (boot_from_flash with a 2-segment
+    image: core 0 releases core 1 via CORE1_ENTRY, core 0 stashes 0xBEEF at
+    STASH0, core 1 stashes 0x1234 at STASH1, both land in their self-loops —
+    if PRID gating were broken, core 1 would run core 0's code and land at
+    here0 instead of here1) + `esp_app_image_multi` helper;
+    xtensa-core `prid_reads_core_id` (Cpu::new(0)/new(1) both roundtrip via
+    `rsr a2/a3, PRID` = 0x0003_EB20/30).
+  - Gotchas: non-ROM tests leave core 1 at 0x40000000 executing zeroed IROM
+    (`0x000000` = `neg a0,a0`, harmless self-loop); `xtensa_core::cpu::SR_PRID`
+    path (not re-exported at crate root); the loader ends at 0x40000051 (odd)
+    so `pad2`-only padding overshoots to 0x401.
+  - fmt/clippy (0 warnings)/wasm32 clean. **P4 complete** → P5 golden traces.
+
+- 2026-08-15: P4 PSRAM + cache MMU lands: 24/24 emu, 16/16 core, 32/32 soc
+  tests green (73 total incl. wasm-bridge).
+  - `esp32s3-soc` cache.rs: shared cache MMU + EXT_MEM controller. The data
+    window (0x3C00_0000) and instruction window (0x4200_0000) are BOTH 32 MB
+    aliases over ONE 512-entry MMU table (64 KB pages; QEMU esp32s3_cache.h
+    `dcache`/`icache` alias the same IOMMU, `ESP32S3_EXTMEM_REGION_SIZE
+    0x2000000` — our FLASH_WINDOW_SIZE was 16 MB, bumped to 32 MB). MMU entry
+    = page_number[13:0] | invalid[14] | type[15] (0=flash read-only, 1=PSRAM
+    read-write), reserved [31:16] forced 0 on write (QEMU
+    esp32s3_write_mmu_value). Registers at EXTMEM 0x600C_4000 (DCACHE/ICACHE
+    CTRL+CTRL1 enable at 0x000/0x004/0x060/0x064, SYNC_CTRL 0x028/0x088,
+    PRELOAD_CTRL 0x040/0x094, AUTOLOAD_CTRL 0x04C/0x0A0, FREEZE 0x150/0x154,
+    CACHE_STATE 0x130 idle (1<<0)|(1<<12)); the MMU table is the NEXT page
+    (MMU_TABLE_BASE 0x600C_5000, offset 0x1000 — DR_REG_MMU_TABLE).
+  - ena→done handshake mirrors QEMU `check_and_reset_ena`: WRITE stores ENA,
+    READ clears ENA + sets DONE (IDF cache_ll_sync writes INVALIDATE_ENA then
+    polls SYNC_DONE). Autoload/preload regs reset to DONE (ready) so IDF init
+    polls exit immediately (esp32s3_cache_reset_hold). FREEZE write toggles
+    only the DONE bit.
+  - soc.rs: `psram` 8 MB backing + `cache` device; window read8/16/32 route
+    through `Cache::translate` (flash or PSRAM), writes only land on
+    MMU-mapped PSRAM pages (flash stays read-only); EXTMEM + MMU_TABLE mmio
+    arms added.
+  - **DELIBERATE DEVIATION from QEMU**: QEMU's translate ignores `invalid`
+    and resolves every entry via page_number (unset → flash page 0). We map
+    invalid pages as 1:1 flash, preserving the pre-MMU contract (boot ROM
+    stub reads flash through the window without programming the MMU);
+    explicit entries always win. QEMU's on-demand flash_mr page fill is
+    unneeded — our flash backing is always resident.
+  - Machine test `psram_read_write_via_mmu_mapped_page`: firmware writes
+    mmu[0]=0x8000 (PSRAM page 0) + mmu[3]=0x8002 (PSRAM page 2), round-trips
+    a word through each mapped vpage via the data window, stashes both
+    (0xDEADBEEF / 0xCAFEBABE). Soc tests (tests/cache.rs, 10): reserved
+    cleared on MMU write, PSRAM r/w via data + inst window (shared table),
+    physical page selection, flash remap + read-only, unmapped 1:1 alias,
+    beyond-8 MB PSRAM reads 0 / writes dropped, sync/preload/autoload/freeze
+    done handshakes, CTRL enable readback.
+  - Gotchas: clippy collapsible_if in cache_write8 → match-with-guard; the
+    mmio page dispatch needs a SEPARATE arm for 0x600C_5000 (the MMU table is
+    one page past EXTMEM, so `off = base & 0xFFF` can't reach it);
+    0xDEADBEEF/0xCAFEBABE literals need `as i32` (overflowing_literals deny).
+    Back-compat verified: flash_xip + boot_path tests green with the 1:1
+    alias (window offset 0x1000000 boundary read still 0 after the 16→32 MB
+    window bump — flash_byte returns 0 past 4 MB).
+  - fmt/clippy (0 warnings)/wasm32 clean. Next P4 items: dual-core; then P5
+    golden traces.
 
 - 2026-08-15: P4 SAR ADC lands: 23/23 emu, 16/16 core, 22/22 soc tests green
   (62 total incl. wasm-bridge).

@@ -40,7 +40,7 @@ fn uart0_hello_world() {
     insn(&mut s, 0x0000_6232, 3); // s32i a3, a2, 0            UART_FIFO <- 'i'
     insn(&mut s, 0x00FF_FF06, 3); // j .                      (self-loop)
     m.load_image(IRAM_BASE, &s);
-    m.cpu.pc = IRAM_BASE;
+    m.cpu[0].pc = IRAM_BASE;
     for _ in 0..10 {
         m.step();
     }
@@ -76,7 +76,7 @@ fn gpio_out_w1ts_w1tc() {
     insn(&mut s, 0x0000_6642, 3); // s32i a4, a6, 0              stash -> B
     insn(&mut s, 0x00FF_FF06, 3); // j .
     m.load_image(IRAM_BASE, &s);
-    m.cpu.pc = IRAM_BASE + 8; // code starts after the literal pool
+    m.cpu[0].pc = IRAM_BASE + 8; // code starts after the literal pool
     for _ in 0..16 {
         m.step();
     }
@@ -118,7 +118,7 @@ fn timg0_load_and_read() {
     insn(&mut s, 0x0001_6542, 3); // s32i a4, a5, 1                stash T0HI
     insn(&mut s, 0x00FF_FF06, 3); // j .
     m.load_image(IRAM_BASE, &s);
-    m.cpu.pc = IRAM_BASE + 4; // code starts after the (single) literal
+    m.cpu[0].pc = IRAM_BASE + 4; // code starts after the (single) literal
     for _ in 0..22 {
         m.step();
     }
@@ -182,7 +182,10 @@ fn bus_sanity() {
 #[test]
 fn boot_reset_vector_is_irom() {
     let m = Esp32S3::new();
-    assert_eq!(m.cpu.pc, 0x4000_0000, "CPU boots at the ROM reset vector");
+    assert_eq!(
+        m.cpu[0].pc, 0x4000_0000,
+        "CPU boots at the ROM reset vector"
+    );
 }
 
 /// ESP-IDF-style app image: 24-byte esp_image_header_t + one segment
@@ -252,15 +255,85 @@ fn boot_path_loads_app_from_flash() {
     let mut m = Esp32S3::new();
     m.boot_from_flash(&flash);
     for _ in 0..1000 {
-        if m.cpu.pc == here {
+        if m.cpu[0].pc == here {
             break;
         }
         m.step();
     }
     assert_eq!(m.take_uart_tx(0), b"OK\n", "app printed via ROM rom_puts");
     assert_eq!(m.soc.read32(STASH), 0xCAFE, "app stash write");
-    assert_eq!(m.cpu.pc, here, "app reached its self-loop");
+    assert_eq!(m.cpu[0].pc, here, "app reached its self-loop");
     assert_eq!(parse_partition_table(&flash).unwrap().len(), 1);
+}
+
+/// ESP-IDF-style app image with multiple segments: 24-byte header (byte 1 =
+/// segment count) followed by `(load_addr, data)` segments read back-to-back
+/// (the ROM stub does not pad/checksum segments).
+fn esp_app_image_multi(entry: u32, segs: &[(u32, &[u8])]) -> Bytes {
+    let mut img = Bytes::from(&[0xE9, segs.len() as u8, 0, 0][..]); // magic, count, ...
+    img.extend_from_slice(&entry.to_le_bytes()); // entry_addr
+    img.extend_from_slice(&[0u8; 13]); // wp_pin + spi_pin_drv[3] + reserved[9]
+    img.extend_from_slice(&[0u8; 3]); // pad the 21-byte tail to the 24-byte header
+    for (addr, data) in segs {
+        img.extend_from_slice(&addr.to_le_bytes()); // segment load_addr
+        img.extend_from_slice(&(data.len() as u32).to_le_bytes()); // data_len
+        img.extend_from_slice(data);
+    }
+    img
+}
+
+#[test]
+fn dual_core_release_and_run() {
+    use crate::asm::Asm;
+    use crate::rom_stub::{APP_FLASH_OFFSET, CORE1_ENTRY};
+    use esp32s3_soc::memmap::IRAM_BASE;
+
+    // Core 0's app (the ROM loader jumps here): release core 1 by writing its
+    // entry point to CORE1_ENTRY, stash 0xBEEF, self-loop.
+    const CORE1_CODE: u32 = IRAM_BASE + 0x100;
+    const STASH0: u32 = 0x3FC8_0200;
+    const STASH1: u32 = 0x3FC8_0204;
+    let mut a0 = Asm::new(IRAM_BASE);
+    a0.li(6, CORE1_CODE as i32);
+    a0.li(7, CORE1_ENTRY as i32);
+    a0.s32i(6, 7, 0); // release core 1
+    a0.li(6, 0xBEEF);
+    a0.li(7, STASH0 as i32);
+    a0.s32i(6, 7, 0);
+    let here0 = a0.pc();
+    a0.j(here0);
+
+    // Core 1's firmware (runs only after core 0 releases it): stash 0x1234,
+    // self-loop.
+    let mut a1 = Asm::new(CORE1_CODE);
+    a1.li(6, 0x1234);
+    a1.li(7, STASH1 as i32);
+    a1.s32i(6, 7, 0);
+    let here1 = a1.pc();
+    a1.j(here1);
+
+    let img = esp_app_image_multi(
+        IRAM_BASE,
+        &[(IRAM_BASE, a0.bytes()), (CORE1_CODE, a1.bytes())],
+    );
+    let mut flash = std::vec![0xFFu8; 0x200_000];
+    flash[APP_FLASH_OFFSET as usize..APP_FLASH_OFFSET as usize + img.len()].copy_from_slice(&img);
+
+    let mut m = Esp32S3::new();
+    m.boot_from_flash(&flash);
+    for _ in 0..2000 {
+        if m.cpu[0].pc == here0 && m.cpu[1].pc == here1 {
+            break;
+        }
+        m.step();
+    }
+    // If core 1's PRID read returned 0, it would have run the loader and then
+    // core 0's code too, landing at here0 instead of here1 (its release gate
+    // would be dead code).
+    assert_eq!(m.cpu[0].pc, here0, "core 0 self-loop");
+    assert_eq!(m.cpu[1].pc, here1, "core 1 self-loop after release");
+    assert_eq!(m.soc.read32(STASH0), 0xBEEF, "core 0 stash");
+    assert_eq!(m.soc.read32(STASH1), 0x1234, "core 1 stash");
 }
 
 #[test]
@@ -340,14 +413,14 @@ fn timer_interrupt_delivers_to_vector() {
     let mut m = Esp32S3::new();
     m.load_image(IRAM_BASE, a.bytes());
     m.load_image(0x4000_01C0, h.bytes());
-    m.cpu.pc = code_start;
+    m.cpu[0].pc = code_start;
     for _ in 0..2000 {
-        if m.cpu.pc == done {
+        if m.cpu[0].pc == done {
             break;
         }
         m.step();
     }
-    assert_eq!(m.cpu.pc, done, "app finished its loop");
+    assert_eq!(m.cpu[0].pc, done, "app finished its loop");
     assert_eq!(m.soc.read32(STASH), 0xCAFE, "stash after 3 interrupts");
     assert_eq!(m.soc.read32(CTR), 3, "handler ran 3 times");
     assert_eq!(m.take_uart_tx(0), Bytes::new(), "UART0 silent");
@@ -425,14 +498,14 @@ fn timg1_alarm_delivers_level4_vector() {
     let mut m = Esp32S3::new();
     m.load_image(IRAM_BASE, a.bytes());
     m.load_image(0x4000_0200, h.bytes());
-    m.cpu.pc = code_start;
+    m.cpu[0].pc = code_start;
     for _ in 0..2000 {
-        if m.cpu.pc == done {
+        if m.cpu[0].pc == done {
             break;
         }
         m.step();
     }
-    assert_eq!(m.cpu.pc, done, "app finished its loop");
+    assert_eq!(m.cpu[0].pc, done, "app finished its loop");
     assert_eq!(m.soc.read32(STASH), 0xCAFE, "stash after 3 interrupts");
     assert_eq!(m.soc.read32(CTR), 3, "handler ran 3 times");
     assert_eq!(m.soc.read32(INT_MATRIX_BASE + 4 * 53), 24, "matrix write");
@@ -515,15 +588,15 @@ fn uart_rx_interrupt_echo() {
     let mut m = Esp32S3::new();
     m.load_image(IRAM_BASE, a.bytes());
     m.load_image(0x4000_01C0, h.bytes());
-    m.cpu.pc = code_start;
+    m.cpu[0].pc = code_start;
     m.soc.uart_inject_rx(0, b'X');
     for _ in 0..2000 {
-        if m.cpu.pc == done {
+        if m.cpu[0].pc == done {
             break;
         }
         m.step();
     }
-    assert_eq!(m.cpu.pc, done, "app finished its loop");
+    assert_eq!(m.cpu[0].pc, done, "app finished its loop");
     assert_eq!(m.soc.read32(RXCNT), 1, "one byte received");
     assert_eq!(m.soc.read32(RXBUF), b'X' as u32, "handler saved the byte");
     assert_eq!(m.take_uart_tx(0), b"X".to_vec(), "echo on TX");
@@ -576,7 +649,7 @@ fn ledc_pwm_blinks_gpio0_at_50_percent_duty() {
 
     let mut m = Esp32S3::new();
     m.load_image(IRAM_BASE, a.bytes());
-    m.cpu.pc = code_start;
+    m.cpu[0].pc = code_start;
     let pin = |m: &Esp32S3| (m.gpio_output() & 1) != 0;
     for _ in 0..500 {
         if m.soc.read32(STASH) == 0xCAFE {
@@ -663,7 +736,7 @@ fn spi2_shifts_out_0xa5_on_gpio_pins() {
 
     let mut m = Esp32S3::new();
     m.load_image(IRAM_BASE, a.bytes());
-    m.cpu.pc = code_start;
+    m.cpu[0].pc = code_start;
     // Sample encoding per pin: bit0 = GPIO1 = SPICLK, bit1 = GPIO2 =
     // SPID (MOSI), bit2 = GPIO3 = FSPICS0.
     let pins = |m: &Esp32S3| {
@@ -781,7 +854,7 @@ fn i2c0_master_write_nacks_and_stops() {
 
     let mut m = Esp32S3::new();
     m.load_image(IRAM_BASE, a.bytes());
-    m.cpu.pc = code_start;
+    m.cpu[0].pc = code_start;
     // Sample encoding: bit0 = GPIO1 = SCL, bit1 = GPIO2 = SDA.
     let pins = |m: &Esp32S3| {
         let out = m.gpio_output();
@@ -908,7 +981,7 @@ fn adc1_oneshot_reads_injected_voltage() {
     let mut m = Esp32S3::new();
     m.soc.adc_inject_voltage(0, 2, 825);
     m.load_image(IRAM_BASE, a.bytes());
-    m.cpu.pc = code_start;
+    m.cpu[0].pc = code_start;
     for _ in 0..400 {
         if m.soc.read32(STASH) != 0 {
             break;
@@ -947,4 +1020,70 @@ fn flash_xip_reads_and_readonly() {
     );
     // Reads beyond the 4 MB physical flash come back 0.
     assert_eq!(m.soc.read8(FLASH_DATA_BASE + 0x100_0000), 0, "beyond flash");
+}
+
+#[test]
+fn psram_read_write_via_mmu_mapped_page() {
+    use crate::asm::Asm;
+    use esp32s3_soc::memmap::{CACHE_PAGE_SIZE, FLASH_DATA_BASE, MMU_TABLE_BASE};
+
+    // Firmware programs the shared cache MMU (vpage 0 -> PSRAM physical
+    // page 0, vpage 3 -> PSRAM physical page 2; entry = type<<15 | page),
+    // then reads/writes the data window and stashes the round-trip words.
+    // The physical page field selecting the backing is what a real
+    // esp_rom_mmu_map does before ESP-IDF touches PSRAM.
+    const STASH: u32 = 0x3FC8_0200;
+    let mut a = Asm::new(IRAM_BASE);
+    let l_tab = a.offset();
+    a.lit(0);
+    let l_win = a.offset();
+    a.lit(0);
+    let l_win3 = a.offset();
+    a.lit(0);
+    let l_stash = a.offset();
+    a.lit(0);
+    let code_start = a.pc();
+    let p = a.l32r(2); // MMU_TABLE_BASE
+    a.patch_l32r(p, IRAM_BASE + l_tab as u32);
+    let p = a.l32r(3); // FLASH_DATA_BASE
+    a.patch_l32r(p, IRAM_BASE + l_win as u32);
+    let p = a.l32r(4); // FLASH_DATA_BASE + 3 * CACHE_PAGE_SIZE
+    a.patch_l32r(p, IRAM_BASE + l_win3 as u32);
+    let p = a.l32r(5); // STASH
+    a.patch_l32r(p, IRAM_BASE + l_stash as u32);
+    a.li(6, 0x8000); // PSRAM page 0 entry
+    a.s32i(6, 2, 0); // mmu[0]
+    a.li(6, 0x8002); // PSRAM page 2 entry
+    a.s32i(6, 2, 3 * 4); // mmu[3] (byte offset 12)
+    a.li(6, 0xDEAD_BEEFu32 as i32);
+    a.s32i(6, 3, 0); // PSRAM page 0 [0]
+    a.l32i(6, 3, 0);
+    a.s32i(6, 5, 0); // stash word 0
+    a.li(6, 0xCAFE_BABEu32 as i32);
+    a.s32i(6, 4, 0); // PSRAM page 2 [0]
+    a.l32i(6, 4, 0);
+    a.s32i(6, 5, 4); // stash word 1
+    let halt = a.pc();
+    a.j(halt);
+    a.bytes_mut()[l_tab..l_tab + 4].copy_from_slice(&MMU_TABLE_BASE.to_le_bytes());
+    a.bytes_mut()[l_win..l_win + 4].copy_from_slice(&FLASH_DATA_BASE.to_le_bytes());
+    a.bytes_mut()[l_win3..l_win3 + 4]
+        .copy_from_slice(&(FLASH_DATA_BASE + 3 * CACHE_PAGE_SIZE).to_le_bytes());
+    a.bytes_mut()[l_stash..l_stash + 4].copy_from_slice(&STASH.to_le_bytes());
+
+    let mut m = Esp32S3::new();
+    m.load_image(IRAM_BASE, a.bytes());
+    m.cpu[0].pc = code_start;
+    for _ in 0..100 {
+        if m.soc.read32(STASH + 4) != 0 {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.soc.read32(STASH), 0xDEAD_BEEF, "PSRAM page 0 round-trip");
+    assert_eq!(
+        m.soc.read32(STASH + 4),
+        0xCAFE_BABE,
+        "PSRAM page 2 round-trip"
+    );
 }

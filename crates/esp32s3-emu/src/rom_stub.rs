@@ -2,7 +2,10 @@
 //! the real ROM reset vector 0x40000000 (TRM memory map).
 //!
 //! Content (hand-assembled with `Asm`):
-//! - reset: set the stack pointer in DRAM, jump to the loader
+//! - reset: read PRID — core 1 branches to `CORE1_WAIT` and spins on the
+//!   `CORE1_ENTRY` flag until core 0 writes it (the real ROM's APP-CPU boot
+//!   flow; QEMU esp32s3.c models no release register and lets the ROM gate
+//!   CPU1).  Core 0 sets the stack pointer in DRAM and jumps to the loader.
 //! - loader: parse an ESP-IDF-style app image (esp_image_format.h: 24-byte
 //!   esp_image_header_t at flash offset `APP_FLASH_OFFSET`, then
 //!   esp_image_segment_header_t entries = load_addr u32, data_len u32, data),
@@ -10,6 +13,9 @@
 //!   are read back-to-back with no 16-byte padding/checksum (real IDF images
 //!   are padded; the real 2nd-stage bootloader handles that once we can
 //!   build ESP-IDF binaries).
+//! - core1_wait: APP-CPU release gate.  `CORE1_ENTRY` is a host-invented
+//!   flag (no QEMU/S3 register exists for it); core 1 polls it and jumps to
+//!   whatever core 0 stored there (the entry point of the core-1 firmware).
 //! - rom_puts: raw UART0 TX of a NUL-terminated string (stand-in for the ROM
 //!   printf family; IDF calls these via the fixed-address ROM API table).
 //!
@@ -32,9 +38,32 @@ pub const ROM_PUTS: u32 = 0x4000_0500;
 /// Stack pointer set by the reset vector (top of the internal SRAM DRAM
 /// region; the real ROM uses a stack near the top of internal SRAM).
 pub const STACK_TOP: u32 = 0x3FC8_8000;
+/// Fixed address of the APP-CPU release spin loop (the ROM stub pads the
+/// region below the ROM API table).  Core 1 lands here on `rsr PRID` != 0.
+pub const CORE1_WAIT: u32 = 0x4000_0400;
+/// Core-1 release flag: core 0 stores the APP-CPU entry address here, and
+/// core 1 jumps to it.  Host-defined (see module docs); sits in DRAM well
+/// below the core-0 stack top so nothing collides.
+pub const CORE1_ENTRY: u32 = 0x3FC8_7F00;
 /// Flash offset of the app image the ROM loader boots (the factory app slot;
 /// the real 2nd-stage bootloader reads the partition table at 0x8000 first).
 pub const APP_FLASH_OFFSET: u32 = 0x1_0000;
+
+/// Pad exactly to `target` with 2-byte `pad2`s, using one 3-byte `movi` if
+/// the gap is odd (the code sections above are odd-length, so the 2-byte
+/// pads alone would overshoot the fixed ROM API addresses).
+fn pad_to(a: &mut Asm, target: u32) {
+    let mut gap = target - a.pc();
+    if gap % 2 == 1 {
+        a.movi(15, 0); // 3-byte pad (movi a15, 0)
+        gap -= 3;
+    }
+    while gap > 0 {
+        a.pad2();
+        gap -= 2;
+    }
+    debug_assert_eq!(a.pc(), target);
+}
 
 /// Build the ROM stub bytes (installed at ROM_BASE).
 pub fn rom_image() -> Vec<u8> {
@@ -43,6 +72,8 @@ pub fn rom_image() -> Vec<u8> {
     // ── reset vector ─────────────────────────────────────────────────────────
     let reset = a.pc();
     debug_assert_eq!(reset, ROM_BASE);
+    a.rsr(2, xtensa_core::cpu::SR_PRID); // core 1: PRID != 0 -> APP-CPU spin
+    a.bnez(2, CORE1_WAIT); // 12-bit offset: 0x40000003 -> 0x40000400 = 0x3F9
     a.li(1, STACK_TOP as i32); // a1 = stack pointer
     let loader = a.pc() + 3; // after this 3-byte j
     a.j(loader);
@@ -72,10 +103,17 @@ pub fn rom_image() -> Vec<u8> {
     a.bnez(3, seg_loop);
     a.jx(4); // jump to app entry point
 
+    // ── core1_wait: APP-CPU release gate ─────────────────────────────────────
+    pad_to(&mut a, CORE1_WAIT);
+    debug_assert_eq!(a.pc(), CORE1_WAIT);
+    a.li(3, CORE1_ENTRY as i32);
+    let core1_poll = a.pc();
+    a.l32i(2, 3, 0); // poll CORE1_ENTRY until core 0 writes it
+    a.beqz(2, core1_poll);
+    a.jx(2); // jump to the stored core-1 entry point
+
     // ── rom_puts (fixed ROM API address) ─────────────────────────────────────
-    while a.pc() < ROM_PUTS {
-        a.pad2();
-    }
+    pad_to(&mut a, ROM_PUTS);
     debug_assert_eq!(a.pc(), ROM_PUTS);
     let puts_loop = a.pc();
     a.li(5, 0x6000_0000); // UART0 (TRM UART0_BASE)
