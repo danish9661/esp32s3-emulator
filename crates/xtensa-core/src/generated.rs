@@ -6540,13 +6540,18 @@ pub fn opnds(opc: Opcode, insn: u32, pc: u32) -> [Opnd; MAX_OPERANDS] {
         }
         Opcode::OPCODE_L32R => {
             o[0] = Opnd::reg(fld_inst::t(insn));
-            // ISA RM L32R: the 16-bit offset is sign-extended before <<2.
-            // QEMU's C emits the tensilica idiom `(((0xffff)<<16)|v)<<2`,
-            // which equals sext16(v)<<2 only when v >= 0x8000 (pools before
-            // code); forward l32r would compute base - 0x40000 + v*4. This
-            // deviation is implemented in tools/gen_decode.py too.
+            // QEMU (operand uimm16x4): (((0xffff)<<16)|v)<<2 — computed in
+            // u32 the top 16 ones force a NEGATIVE offset for every v, so
+            // L32R only ever references backward (literal pools precede
+            // code; the BFD assembler encodes backward targets as
+            // 0x10000 - (off>>2), e.g. 0x7E9A for -0x8166).  The ISA RM's
+            // "sign-extended offset" reading (sext16(v)<<2) is WRONG for
+            // fields with bit 15 clear: it yields a forward target and the
+            // literal read lands in the wrong flash page.  Dev matches
+            // QEMU exactly; implemented in tools/gen_decode.py too.
             o[1] = Opnd::imm(
-                (sext(fld_inst::imm16(insn), 16u32) << 0x2u32)
+                (0xFFFF_0000u32 | fld_inst::imm16(insn))
+                    .wrapping_shl(2)
                     .wrapping_add((pc.wrapping_add(3)) & !3),
             );
         }

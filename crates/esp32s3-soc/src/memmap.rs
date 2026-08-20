@@ -15,6 +15,32 @@ pub const IROM_SIZE: u32 = 0x0006_0000;
 pub const IRAM_BASE: u32 = 0x4037_0000;
 pub const IRAM_SIZE: u32 = 0x0008_0000;
 
+/// SRAM0 (32 KB): instruction-only internal SRAM (I-bus 0x40370000-
+/// 0x40377FFF).  NO data-bus window — the first 16/32 KB is the Icache
+/// storage for external memory when the instruction cache is on (Espressif
+/// "ESP32-S3 Memory map" pdf; ESP-IDF memory.ld.in `SRAM_IRAM_ORG =
+/// SRAM_IRAM_START + CONFIG_ESP32S3_INSTRUCTION_CACHE_SIZE`; heap
+/// memory_layout.c lists SRAM0 as IRAM-only with no DRAM alias).  The ROM
+/// loader still writes it through the I-bus addresses (D-port reaches the
+/// I-window), but the data-side addresses 0x3FC80000-0x3FC87FFF are a
+/// separate 32 KB D-only region (ROM data / boot stack area, QEMU DRAM
+/// region start).
+pub const SRAM0_SIZE: u32 = 0x0000_8000;
+
+/// D/IRAM: the 416 KB SRAM1 block, reachable from BOTH buses — data
+/// window 0x3FC88000-0x3FCEFFFF, instruction window 0x40378000-0x403DFFFF
+/// (Espressif "ESP32-S3 Memory map" pdf; ESP-IDF memory.ld.in
+/// `I_D_SRAM_OFFSET (SRAM_DIRAM_I_START - SRAM_DRAM_START) = 0x6F0000`).
+/// Alias: data = instruction - 0x6F0000.  The linker relies on it
+/// (esp32s3.ld dram0_0_seg is placed right after the text's data-side
+/// alias).  The final 64 KB of the old window (0x403E0000+) is unmapped.
+pub const DIRAM_DATA_BASE: u32 = 0x3FC8_8000;
+pub const DIRAM_INST_BASE: u32 = 0x4037_8000;
+pub const DIRAM_SIZE: u32 = 0x0006_8000;
+
+/// Instruction-window size that is actually backed (SRAM0 + D/IRAM).
+pub const IRAM_WINDOW_SIZE: u32 = SRAM0_SIZE + DIRAM_SIZE;
+
 /// Data-side internal SRAM (512 KB).
 pub const DRAM_BASE: u32 = 0x3FC8_0000;
 pub const DRAM_SIZE: u32 = 0x0008_0000;
@@ -22,6 +48,14 @@ pub const DRAM_SIZE: u32 = 0x0008_0000;
 /// RTC slow memory (8 KB, data).
 pub const RTC_SLOW_BASE: u32 = 0x5000_0000;
 pub const RTC_SLOW_SIZE: u32 = 0x0000_2000;
+
+/// SPI1 (SPIMEM1): the flash controller the CPU-side esp_flash driver talks
+/// to (TRM SPI chapter, spi_mem_struct.h; `spimem_flash_ll_get_hw` returns
+/// &SPIMEM1 for SPI1_HOST).
+pub const SPI1_BASE: u32 = 0x6000_2000;
+/// SPI0 (SPIMEM0): the cache-side flash controller, same register layout
+/// (QEMU esp32s3_soc.c creates both with the esp32s3_spi model).
+pub const SPIMEM0_BASE: u32 = 0x6000_3000;
 
 /// GPSPI2 (general-purpose SPI), TRM GPSPI chapter.
 pub const SPI2_BASE: u32 = 0x6002_4000;
@@ -45,9 +79,20 @@ pub const I2C0_BASE: u32 = 0x6001_3000;
 /// I2C1 (I2C EXT1), 0x14000 apart from I2C0.
 pub const I2C1_BASE: u32 = 0x6002_7000;
 
-/// RTC fast memory (8 KB, data alias in APB space).
-pub const RTC_FAST_BASE: u32 = 0x600F_E000;
-pub const RTC_FAST_SIZE: u32 = 0x0000_2000;
+/// RTC fast memory (32 KB on the S3 — NOT the classic ESP32's 8 KB: the
+/// boot ROM keeps its read-only tables at 0x3FF18C00+ (esp-rom-elfs
+/// esp32s3_rev0_rom.elf .rodata sections), so the data window must cover
+/// 0x3FF18000-0x3FF20000).
+pub const RTC_FAST_BASE: u32 = 0x600F_8000;
+/// RTC fast memory — data-space alias (TRM: RTC fast memory data).
+pub const RTC_FAST_DATA_BASE: u32 = 0x3FF1_8000;
+pub const RTC_FAST_SIZE: u32 = 0x0000_8000;
+
+/// USB-Serial-JTAG controller (0x60038000) — the boot ROM's console output
+/// goes through its TX FIFO (uart_tx_one_char @ 0x40048C30 writes
+/// 0x60038000); the ROM's status poll reads 0x60038004 bit 1 (writable).
+pub const USB_SERIAL_JTAG_BASE: u32 = 0x6003_8000;
+pub const USB_SERIAL_JTAG_SIZE: u32 = 0x80;
 
 /// SPI flash / PSRAM cache windows. The data-cache window (0x3C000000) and
 /// instruction-cache window (0x42000000) are both 32 MB aliases over ONE
@@ -70,6 +115,13 @@ pub const MMU_ENTRIES: usize = 512;
 /// Cache window offset mask: both bases share the low 25 bits, so the window
 /// offset is `vaddr & WINDOW_MASK` for either the data or instruction window.
 pub const WINDOW_MASK: u32 = FLASH_WINDOW_SIZE - 1;
+/// Window offset of the loader's scratch mapping: the app image is
+/// host-mapped here (64 KB pages above the app's own mappings) so the ROM
+/// stub can read it through the data window even after the app's
+/// flash-mapped pages are programmed (the I/D windows share one MMU table,
+/// so the app image at flash offset 0x10000 cannot stay readable at its 1:1
+/// offset once the instruction window maps those pages).
+pub const LOADER_SCRATCH_OFF: u32 = 0x001F_0000;
 
 // ── Peripheral bases (QEMU esp32s3_reg.h) ───────────────────────────────────
 
@@ -82,12 +134,20 @@ pub const GPIO_BASE: u32 = 0x6000_4000;
 pub const TIMG0_BASE: u32 = 0x6001_F000;
 pub const TIMG1_BASE: u32 = 0x6002_0000;
 
+/// System timer (esp32s3 reg_base.h DR_REG_SYSTIMER_BASE): 2× 52-bit
+/// counters, 3 alarm targets; esp_timer's clock source on the S3.
+pub const SYSTIMER_BASE: u32 = 0x6002_3000;
+
 /// Interrupt matrix: maps peripheral interrupt sources to CPU interrupt lines.
 /// Register space = 512 sources × 2 CPUs × 4 bytes.
 pub const INT_MATRIX_BASE: u32 = 0x600C_2000;
 pub const INT_MATRIX_INPUTS: usize = 0x800 / 4;
 pub const INT_MATRIX_CPUS: usize = 2;
 pub const INT_MATRIX_SIZE: u32 = (INT_MATRIX_INPUTS * INT_MATRIX_CPUS * 4) as u32;
+
+/// SYSTEM peripheral base (TRM memory map). Only APPCPU_CTRL_A
+/// (base + 0x04, the APP-CPU release register) is modeled by the SoC.
+pub const SYSTEM_BASE: u32 = 0x600C_0000;
 
 /// Cache / MMU controller registers (EXTMEM, esp32s3_reg.h): dcache/icache
 /// enable, sync/preload/autoload/freeze handshakes, cache state.

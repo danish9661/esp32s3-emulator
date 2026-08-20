@@ -151,15 +151,18 @@ fn timg0_counts_on_tick() {
         "up-count after load+3 ticks"
     );
     // INT_ST = RAW & ENA: nothing enabled yet.
-    assert_eq!(m.soc.read32(TIMG0_BASE + 0xA0), 0, "INT_ST empty");
+    assert_eq!(m.soc.read32(TIMG0_BASE + 0x78), 0, "INT_ST empty");
 }
 
 #[test]
 fn bus_sanity() {
     let mut m = Esp32S3::new();
-    // DRAM write visible through the IRAM alias (same physical SRAM).
-    m.soc.write32(0x3FC8_0000, 0xDEAD_BEEF);
-    assert_eq!(m.soc.read32(0x4037_0000), 0xDEAD_BEEF, "IRAM alias of DRAM");
+    // D/IRAM write visible through the instruction alias (same physical
+    // SRAM1 cells: data 0x3FC88000 == instruction 0x40378000, offset
+    // 0x6F0000).  SRAM0 (0x40370000) is instruction-only — NOT an alias.
+    m.soc.write32(0x3FC8_8000, 0xDEAD_BEEF);
+    assert_eq!(m.soc.read32(0x4037_8000), 0xDEAD_BEEF, "D/IRAM alias");
+    assert_eq!(m.soc.read32(0x4037_0000), 0, "SRAM0 has no DRAM alias");
     // Sub-word writes merge correctly.
     m.soc.write16(0x3FC8_0004, 0x1234);
     assert_eq!(m.soc.read32(0x3FC8_0004), 0x1234);
@@ -183,8 +186,8 @@ fn bus_sanity() {
 fn boot_reset_vector_is_irom() {
     let m = Esp32S3::new();
     assert_eq!(
-        m.cpu[0].pc, 0x4000_0000,
-        "CPU boots at the ROM reset vector"
+        m.cpu[0].pc, 0x4000_0400,
+        "CPU boots at the ROM reset vector (core-isa.h XCHAL_RESET_VECTOR_PADDR)"
     );
 }
 
@@ -285,17 +288,19 @@ fn esp_app_image_multi(entry: u32, segs: &[(u32, &[u8])]) -> Bytes {
 #[test]
 fn dual_core_release_and_run() {
     use crate::asm::Asm;
-    use crate::rom_stub::{APP_FLASH_OFFSET, CORE1_ENTRY};
+    use crate::rom_stub::APP_FLASH_OFFSET;
     use esp32s3_soc::memmap::IRAM_BASE;
 
     // Core 0's app (the ROM loader jumps here): release core 1 by writing its
-    // entry point to CORE1_ENTRY, stash 0xBEEF, self-loop.
+    // entry point to the APP-CPU release register (SYSTEM.APPCPU_CTRL_A,
+    // where our CORE1_WAIT / the real ROM fastboot polls), stash 0xBEEF,
+    // self-loop.
     const CORE1_CODE: u32 = IRAM_BASE + 0x100;
     const STASH0: u32 = 0x3FC8_0200;
     const STASH1: u32 = 0x3FC8_0204;
     let mut a0 = Asm::new(IRAM_BASE);
     a0.li(6, CORE1_CODE as i32);
-    a0.li(7, CORE1_ENTRY as i32);
+    a0.li(7, esp32s3_soc::memmap::SYSTEM_BASE as i32 + 4);
     a0.s32i(6, 7, 0); // release core 1
     a0.li(6, 0xBEEF);
     a0.li(7, STASH0 as i32);
@@ -372,7 +377,7 @@ fn timer_interrupt_delivers_to_vector() {
     a.li(3, 0xE000_0400u32 as i32); // T0CONFIG: EN|INCREASE|AUTORELOAD|ALARM
     a.s32i(3, 2, 0);
     a.movi_n(4, 1);
-    a.s32i(4, 2, 0x98); // INT_ENA bit 0
+    a.s32i(4, 2, 0x70); // INT_ENA bit 0
     a.li(3, 0x8000); // INTENABLE bit 15
     a.wsr(228, 3);
     a.rsil(4, 0);
@@ -403,7 +408,7 @@ fn timer_interrupt_delivers_to_vector() {
     h.s32i(7, 6, 0); // CTR += 1
     h.li(8, TIMG0_BASE as i32);
     h.movi_n(9, 1);
-    h.s32i(9, 8, 0xA4); // INT_CLR
+    h.s32i(9, 8, 0x7C); // INT_CLR
     h.rfi(3);
     assert!(
         h.bytes().len() <= 0x40,
@@ -459,7 +464,7 @@ fn timg1_alarm_delivers_level4_vector() {
     a.li(3, 0xE000_0400u32 as i32); // T0CONFIG: EN|INCREASE|AUTORELOAD|ALARM
     a.s32i(3, 2, 0);
     a.movi_n(4, 1);
-    a.s32i(4, 2, 0x98); // INT_ENA bit 0
+    a.s32i(4, 2, 0x70); // INT_ENA bit 0
     a.li(3, 0x100_0000); // INTENABLE bit 24
     a.wsr(228, 3);
     a.rsil(4, 0);
@@ -488,7 +493,7 @@ fn timg1_alarm_delivers_level4_vector() {
     h.s32i(7, 6, 0); // CTR += 1
     h.li(8, TIMG1_BASE as i32);
     h.movi_n(9, 1);
-    h.s32i(9, 8, 0xA4); // INT_CLR
+    h.s32i(9, 8, 0x7C); // INT_CLR
     h.rfi(4);
     assert!(
         h.bytes().len() <= 0x40,
@@ -636,7 +641,8 @@ fn ledc_pwm_blinks_gpio0_at_50_percent_duty() {
     a.movi_n(3, 1);
     a.s32i(3, 2, 0x20); // ENABLE bit 0
     a.li(3, 73);
-    a.s32i(3, 2, 0x54); // GPIO0 FUNC_OUT_SEL = LEDC_CH0 (signal 73)
+    a.li(6, (GPIO_BASE + 0x554) as i32); // FUNC_OUT_SEL base (S3 gpio_struct.h)
+    a.s32i(3, 6, 0); // GPIO0 FUNC_OUT_SEL = LEDC_CH0 (signal 73)
     a.li(4, 0xCAFE);
     let p = a.l32r(5); // STASH
     a.patch_l32r(p, IRAM_BASE + l_stash as u32);
@@ -706,12 +712,13 @@ fn spi2_shifts_out_0xa5_on_gpio_pins() {
     a.patch_l32r(p, IRAM_BASE + l_gpio as u32);
     a.movi_n(4, 14);
     a.s32i(4, 3, 0x20); // ENABLE bits 1,2,3
+    a.li(6, (GPIO_BASE + 0x554) as i32); // FUNC_OUT_SEL base (S3 gpio_struct.h)
     a.li(4, 101);
-    a.s32i(4, 3, 0x58); // GPIO1 FUNC_OUT_SEL = FSPICLK
+    a.s32i(4, 6, 4); // GPIO1 FUNC_OUT_SEL = FSPICLK
     a.li(4, 103);
-    a.s32i(4, 3, 0x5C); // GPIO2 FUNC_OUT_SEL = FSPID
+    a.s32i(4, 6, 8); // GPIO2 FUNC_OUT_SEL = FSPID
     a.li(4, 110);
-    a.s32i(4, 3, 0x60); // GPIO3 FUNC_OUT_SEL = FSPICS0
+    a.s32i(4, 6, 0xC); // GPIO3 FUNC_OUT_SEL = FSPICS0
     a.li(4, 0x1000);
     a.s32i(4, 2, 0x0C); // SPI_CLOCK: clkdiv_pre=0, clkcnt_n=1 -> 2 cyc/bit
     a.movi_n(4, 7);
@@ -815,10 +822,11 @@ fn i2c0_master_write_nacks_and_stops() {
     a.patch_l32r(p, IRAM_BASE + l_gpio as u32);
     a.movi_n(4, 6);
     a.s32i(4, 3, 0x20); // ENABLE bits 1,2
+    a.li(6, (GPIO_BASE + 0x554) as i32); // FUNC_OUT_SEL base (S3 gpio_struct.h)
     a.li(4, 89);
-    a.s32i(4, 3, 0x58); // GPIO1 FUNC_OUT_SEL = I2CEXT0_SCL
+    a.s32i(4, 6, 4); // GPIO1 FUNC_OUT_SEL = I2CEXT0_SCL
     a.li(4, 90);
-    a.s32i(4, 3, 0x5C); // GPIO2 FUNC_OUT_SEL = I2CEXT0_SDA
+    a.s32i(4, 6, 8); // GPIO2 FUNC_OUT_SEL = I2CEXT0_SDA
     a.li(4, 1 << 4);
     a.s32i(4, 2, 0x04); // I2C_CTR: ms_mode
     a.movi_n(4, 1);
@@ -1086,4 +1094,330 @@ fn psram_read_write_via_mmu_mapped_page() {
         0xCAFE_BABE,
         "PSRAM page 2 round-trip"
     );
+}
+
+#[test]
+fn udivdi3_umoddi3_helpers_return_correct_results() {
+    // The ROM __udivdi3 (0x40002544) / __umoddi3 (0x40002574) slots implement
+    // the libgcc di ABI (caller view): dividend a10:a11, divisor a12:a13;
+    // __udivdi3 returns the quotient in a10:a11 and the remainder in
+    // a12:a13, __umoddi3 the remainder in a10:a11.  Regression cases for the
+    // 2026-08-17 div-body fixes (bit63(dividend) -> r_lo, divisor word
+    // order, 64-bit quotient carry, umod early-exit removal).
+    use crate::asm::Asm;
+    use crate::rom_stub;
+    const STASH: u32 = 0x3FC8_0200;
+    const CODE: u32 = IRAM_BASE + 0x8000;
+    const SLOT_UDIV: u32 = 0x4000_2544;
+    const SLOT_UMOD: u32 = 0x4000_2574;
+
+    fn program(slot: u32, dividend: u64, divisor: u64) -> (Bytes, u32) {
+        let mut a = Asm::new(CODE);
+        a.li(1, 0x3FC8_8000); // SP: the helper spills a8-a11 below SP
+        a.li(3, 0x40000); // PS.WOE (bit 18): ENTRY/RETW are illegal
+        a.wsr(xtensa_core::cpu::SR_PS, 3); // without it; the ROM reset
+        // leaves PS = 0 (the ROM itself never uses windowed calls)
+        a.li(10, dividend as i32);
+        a.li(11, (dividend >> 32) as i32);
+        a.li(12, divisor as i32);
+        a.li(13, (divisor >> 32) as i32);
+        a.li(8, slot as i32);
+        a.callx8(8);
+        a.li(2, STASH as i32);
+        a.s32i(10, 2, 0); // result lo  (q or r)
+        a.s32i(11, 2, 4); // result hi
+        a.s32i(12, 2, 8); // remainder lo (__udivdi3 only)
+        a.s32i(13, 2, 12); // remainder hi
+        let halt = a.pc();
+        a.j(halt);
+        (a.bytes().to_vec(), halt)
+    }
+
+    fn run(slot: u32, dividend: u64, divisor: u64) -> (u64, u64) {
+        let mut m = Esp32S3::new();
+        let rom = rom_stub::rom_image();
+        m.load_image(rom_stub::ROM_BASE, &rom);
+        let (code, halt) = program(slot, dividend, divisor);
+        m.load_image(CODE, &code);
+        m.cpu[0].pc = CODE;
+        for _ in 0..10000 {
+            if m.cpu[0].pc == halt {
+                break;
+            }
+            m.step();
+        }
+        assert_eq!(m.cpu[0].pc, halt, "div helper must halt cleanly");
+        let lo = m.soc.read32(STASH) as u64;
+        let hi = m.soc.read32(STASH + 4) as u64;
+        (
+            lo | (hi << 32),
+            (m.soc.read32(STASH + 8) as u64) | ((m.soc.read32(STASH + 12) as u64) << 32),
+        )
+    }
+
+    // (dividend, divisor) — expectations computed with native u64 math
+    // (independent of the emulated long division).
+    let udiv_cases: &[(u64, u64)] = &[
+        (100_000_000, 4000),                  // rtc_clk_cal_internal replica
+        (0x0003_4260_07CF, 4000),             // rtc_clk_cal replica (boot blocker)
+        (0x0123_4567_89AB_CDEF, 1),           // 64-bit quotient (qshift carry)
+        (0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF), // q = 0x100000001
+        (5, 7),                               // dividend < divisor
+        (0x0123_4567_89AB_CDEF, 0x1234_5678), // 64-bit quotient + remainder
+    ];
+    for &(d, v) in udiv_cases {
+        // The real ROM __udivdi3 (libgcc di ABI) returns the quotient in
+        // a2:a3 only — the remainder is NOT delivered in a4:a5 (the stub's
+        // body used to return it there); __umoddi3 below covers remainders.
+        let (q, _r) = run(SLOT_UDIV, d, v);
+        assert_eq!(q, d / v, "udivdi3 q for {d:#x} / {v:#x}");
+    }
+    let umod_cases: &[(u64, u64)] = &[
+        (0x100, 3), // old body's early exit returned 0
+        (0x0003_4260_07CF, 4000),
+        (0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF),
+        (13, 5),
+    ];
+    for &(d, v) in umod_cases {
+        let (r, _) = run(SLOT_UMOD, d, v);
+        assert_eq!(r, d % v, "umoddi3 r for {d:#x} / {v:#x}");
+    }
+}
+
+#[test]
+fn shift_di3_helpers_return_correct_results() {
+    // __ashldi3 (0x400021B4) / __ashrdi3 (0x400021C0) / __lshrdi3
+    // (0x400023D0) slots: caller view a10:a11 = value, a12 = count; result
+    // in a10:a11.  Regression cases for the 2026-08-17 body fixes (double
+    // `entry` removed — the slot does the windowed entry; bgeu branch
+    // offset corrected for the count >= 32 path).
+    use crate::asm::Asm;
+    use crate::rom_stub;
+    const STASH: u32 = 0x3FC8_0200;
+    const CODE: u32 = IRAM_BASE + 0x8000;
+    const SLOT_ASHL: u32 = 0x4000_21B4;
+    const SLOT_ASHR: u32 = 0x4000_21C0;
+    const SLOT_LSHR: u32 = 0x4000_23D0;
+
+    fn program(slot: u32, value: u64, count: u32) -> (Bytes, u32) {
+        let mut a = Asm::new(CODE);
+        a.li(1, 0x3FC8_8000); // SP
+        a.li(3, 0x40000); // PS.WOE (bit 18)
+        a.wsr(xtensa_core::cpu::SR_PS, 3);
+        a.li(10, value as i32);
+        a.li(11, (value >> 32) as i32);
+        a.li(12, count as i32);
+        a.li(8, slot as i32);
+        a.callx8(8);
+        a.li(2, STASH as i32);
+        a.s32i(10, 2, 0); // result lo
+        a.s32i(11, 2, 4); // result hi
+        let halt = a.pc();
+        a.j(halt);
+        (a.bytes().to_vec(), halt)
+    }
+
+    fn run(slot: u32, value: u64, count: u32) -> u64 {
+        let mut m = Esp32S3::new();
+        let rom = rom_stub::rom_image();
+        m.load_image(rom_stub::ROM_BASE, &rom);
+        let (code, halt) = program(slot, value, count);
+        m.load_image(CODE, &code);
+        m.cpu[0].pc = CODE;
+        for _ in 0..10000 {
+            if m.cpu[0].pc == halt {
+                break;
+            }
+            m.step();
+        }
+        assert_eq!(m.cpu[0].pc, halt, "shift helper must halt cleanly");
+        let lo = m.soc.read32(STASH) as u64;
+        let hi = m.soc.read32(STASH + 4) as u64;
+        lo | (hi << 32)
+    }
+
+    // (value, count) — expectations computed with native u64 math
+    // (independent of the emulated shifts).  Counts span 0 / <32 / >=32
+    // to cover the beqz, main, and bgeu-tail paths.
+    let ashl_cases: &[(u64, u32)] = &[
+        (0x0123_4567_89AB_CDEF, 0),  // beqz path
+        (0x0123_4567_89AB_CDEF, 4),  // cross-word path
+        (0x0123_4567_89AB_CDEF, 40), // count >= 32 (bgeu tail)
+        (1, 63),
+        (0xFFFF_FFFF_FFFF_FFFF, 33),
+    ];
+    for &(v, c) in ashl_cases {
+        assert_eq!(run(SLOT_ASHL, v, c), v << c, "ashldi3 for {v:#x} << {c}");
+    }
+    let ashr_cases: &[(u64, u32)] = &[
+        (0x8000_0000_0000_0000, 8), // sign-fill, < 32
+        (0x8000_0000_0000_0000, 40),
+        (0xFFFF_FFFF_FFFF_FFFF, 1),
+        (0x0123_4567_89AB_CDEF, 12),
+        (0x0123_4567_89AB_CDEF, 33),
+    ];
+    for &(v, c) in ashr_cases {
+        assert_eq!(
+            run(SLOT_ASHR, v, c),
+            ((v as i64) >> c) as u64,
+            "ashrdi3 for {v:#x} >> {c}"
+        );
+    }
+    let lshr_cases: &[(u64, u32)] = &[
+        (0x8000_0000_0000_0000, 8),  // logical, not sign-filled
+        (0x8000_0000_0000_0000, 40), // count >= 32 (bgeu tail)
+        (0xFFFF_FFFF_FFFF_FFFF, 63),
+        (0, 5),
+        (0x0123_4567_89AB_CDEF, 32),
+    ];
+    for &(v, c) in lshr_cases {
+        assert_eq!(run(SLOT_LSHR, v, c), v >> c, "lshrdi3 for {v:#x} >> {c}");
+    }
+}
+
+#[test]
+fn ets_printf_mailbox_formats_and_prints() {
+    // The app's ets_printf call resolves to the 0x400005D0 __call_ets_printf
+    // wrapper (the real ROM's table — the stub's own 0x5D0 slot is past
+    // GLUE_END 0x570 and is NOT spliced), which l32r+jx's to the real ROM's
+    // ets_printf at 0x4004423C: vsnprintf + putc1 + uart_tx_one_char.  The
+    // real code formats the test's %s/%d/%02x and emits via the
+    // USB-Serial-JTAG FIFO (0x60038000), merged into UART0's stream by
+    // take_uart_tx(0).  load_rom_data pre-installs putc1 = uart_tx_one_char
+    // (the state the real bootloader leaves behind), so bare-metal callers
+    // print without calling ets_install_uart_printf first.
+    use crate::asm::Asm;
+    use crate::rom_stub;
+    const CODE: u32 = IRAM_BASE + 0x9000;
+    const FMT: u32 = CODE + 0x200;
+    const S1: u32 = CODE + 0x400;
+    let mut a = Asm::new(CODE);
+    a.li(1, 0x3FC8_8000); // SP
+    a.li(3, 0x40000); // PS.WOE (bit 18)
+    a.wsr(xtensa_core::cpu::SR_PS, 3);
+    a.li(10, FMT as i32); // fmt (caller a10 = callee a2)
+    a.li(11, S1 as i32); // %s
+    a.li(12, 42); // %d
+    a.li(13, 0x2A); // %02x
+    a.li(8, 0x4000_05D0); // ets_printf
+    a.callx8(8);
+    let halt = a.pc();
+    a.j(halt);
+    let mut m = Esp32S3::new();
+    let rom = rom_stub::rom_image();
+    m.load_image(rom_stub::ROM_BASE, &rom);
+    m.load_rom_data();
+    m.load_image(CODE, &a.bytes());
+    m.load_image(FMT, b"%s core %d val=0x%02x!\0");
+    m.load_image(S1, b"s1\0");
+    m.cpu[0].pc = CODE;
+    for _ in 0..10000 {
+        if m.cpu[0].pc == halt {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.cpu[0].pc, halt, "printf caller must halt cleanly");
+    assert_eq!(m.take_uart_tx(0), b"s1 core 42 val=0x2a!");
+    assert_eq!(m.soc.read32(rom_stub::HOST_PRINTF), 0, "mailbox cleared");
+}
+
+#[test]
+fn rom_qsort_sorts_via_windowed_comparator() {
+    // The ROM qsort symbol (0x40001488) must sort a table in place through
+    // the windowed call convention: the app calls via callx8 (args in
+    // a10..a13 -> callee a2..a5), the stub body calls the comparator via
+    // callx4 (callinc 1: args a6/a7 -> callee a2/a3, return in the
+    // callee's a2 = the caller's a6, caller a0 untouched).  heap_caps_init
+    // relies on this to sort its reserved memory regions.
+    use crate::asm::Asm;
+    use crate::rom_stub;
+    const CODE: u32 = IRAM_BASE + 0x9000;
+    const ARR: u32 = CODE + 0x200;
+    let mut a = Asm::new(CODE);
+    a.li(1, 0x3FC8_9000); // SP (clear of the ROM layout struct)
+    a.li(3, 0x40000); // PS.WOE
+    a.wsr(xtensa_core::cpu::SR_PS, 3);
+    a.li(10, ARR as i32); // callee a2 = base (callx8: caller a10..a13)
+    a.movi(11, 6); // callee a3 = nmemb
+    a.movi(12, 4); // callee a4 = size
+    a.li(13, (CODE + 0x80) as i32); // callee a5 = compar
+    a.li(8, 0x4000_1488); // qsort
+    a.callx8(8);
+    let halt = a.pc();
+    a.j(halt);
+    // comparator(int *a, int *b) -> *a - *b in a2 (GCC windowed ABI:
+    // return value in the callee's a2, which the callx4 caller reads
+    // from its own a6 — mirrors s_compare_reserved_regions' compiled
+    // `sub a2,a2,a8; retw.n`).
+    rom_stub::pad_to(&mut a, CODE + 0x80);
+    a.entry(1, 0);
+    a.l32i(2, 2, 0);
+    a.l32i(9, 3, 0);
+    a.sub(2, 2, 9);
+    a.retw();
+    let mut m = Esp32S3::new();
+    let rom = rom_stub::rom_image();
+    m.load_image(rom_stub::ROM_BASE, &rom);
+    m.load_image(CODE, &a.bytes());
+    let arr: [i32; 6] = [9, 7, 5, 6, 8, 4];
+    m.load_image(ARR, &arr.map(|v| v.to_le_bytes()).concat());
+    m.cpu[0].pc = CODE;
+    for _ in 0..20000 {
+        if m.cpu[0].pc == halt {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.cpu[0].pc, halt, "qsort caller must halt cleanly");
+    let vals: [i32; 6] = std::array::from_fn(|i| m.soc.read32(ARR + 4 * i as u32) as i32);
+    assert_eq!(vals, [4, 5, 6, 7, 8, 9]);
+}
+
+#[test]
+fn rom_qsort_sorts_size8_entries() {
+    // heap_caps_init sorts soc_reserved_region_t ({u32 start, u32 end} =
+    // 8-byte entries) with qsort(nmemb, 8, compar).  The ROM qsort body
+    // must honor the size argument from the stack (it previously
+    // hard-coded 4 and corrupted the array with overlapping byte swaps,
+    // which made the app abort in soc_get_available_memory_regions).
+    use crate::asm::Asm;
+    use crate::rom_stub;
+    const CODE: u32 = IRAM_BASE + 0x9000;
+    const ARR: u32 = CODE + 0x200;
+    let mut a = Asm::new(CODE);
+    a.li(1, 0x3FC8_9000); // SP (clear of the ROM layout struct)
+    a.li(3, 0x40000); // PS.WOE
+    a.wsr(xtensa_core::cpu::SR_PS, 3);
+    a.li(10, ARR as i32); // callee a2 = base (callx8: caller a10..a13)
+    a.movi(11, 6); // callee a3 = nmemb
+    a.movi(12, 8); // callee a4 = size (8-byte {start,end} entries)
+    a.li(13, (CODE + 0x80) as i32); // callee a5 = compar
+    a.li(8, 0x4000_1488); // qsort
+    a.callx8(8);
+    let halt = a.pc();
+    a.j(halt);
+    // comparator: return a->start - b->start (reads word [0] of each entry)
+    rom_stub::pad_to(&mut a, CODE + 0x80);
+    a.entry(1, 0);
+    a.l32i(2, 2, 0);
+    a.l32i(9, 3, 0);
+    a.sub(2, 2, 9);
+    a.retw();
+    let mut m = Esp32S3::new();
+    let rom = rom_stub::rom_image();
+    m.load_image(rom_stub::ROM_BASE, &rom);
+    m.load_image(CODE, &a.bytes());
+    let arr: [i32; 12] = [9, 90, 7, 70, 5, 50, 6, 60, 8, 80, 4, 40];
+    m.load_image(ARR, &arr.map(|v| v.to_le_bytes()).concat());
+    m.cpu[0].pc = CODE;
+    for _ in 0..20000 {
+        if m.cpu[0].pc == halt {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.cpu[0].pc, halt, "qsort caller must halt cleanly");
+    let vals: [i32; 12] = std::array::from_fn(|i| m.soc.read32(ARR + 4 * i as u32) as i32);
+    assert_eq!(vals, [4, 40, 5, 50, 6, 60, 7, 70, 8, 80, 9, 90]);
 }

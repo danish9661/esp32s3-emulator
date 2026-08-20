@@ -201,21 +201,32 @@ pub const INT_VEC_OFFSETS: [u32; 8] = [0, 0, 0x180, 0x1C0, 0x200, 0x240, 0x280, 
 pub const NMI_LINE: u32 = 14;
 pub const NMI_LEVEL: u32 = 7;
 
-/// Reset vector address (ESP32-S3 ROM at 0x4000_0000, IRAM at 0x4008_0000).
-pub const RESET_VECTOR: u32 = 0x4000_0000;
+/// Reset vector address (ESP32-S3 core-isa.h XCHAL_RESET_VECTOR_PADDR =
+/// 0x40000400 — the window vectors own 0x40000000-0x17F, the kernel/user
+/// vectors 0x300/0x340, and the ROM's reset code starts at 0x40000400;
+/// QEMU `xtensa_cpu_reset` sets env->pc = XCHAL_RESET_VECTOR_PADDR).
+pub const RESET_VECTOR: u32 = 0x4000_0400;
+/// VECBASE reset value: the window vectors live at 0x40000000
+/// (XCHAL_WINDOW_VECTORS_VADDR; core-isa.h) — NOT the reset vector.
+pub const VECBASE_RESET: u32 = 0x4000_0000;
 
 pub struct Cpu {
     pub pc: u32,
     /// Core ID (0 or 1): selects the interrupt-matrix column in
     /// `Bus::int_pending` and seeds the PRID special register (the real
     /// PRID is a read-only strapping of the core number, ISA RM PRID;
-    /// QEMU `xtensa_cpu_reset` sets env->sregs[PRID] = cpu->core_id).
+    /// the ESP32-S3 ROM's reset vector compares PRID against 0xCDCD
+    /// (core 0, `_start` stack select) and 0xABAB (core 1, the
+    /// APP-CPU fastboot check) — QEMU esp32s3.c uses the same values).
     core_id: usize,
     phys: [u32; 64],
     sregs: [u32; 256],
     user_sregs: [u32; 256],
     pub(crate) windowbase_next: Option<u32>,
     pub icount: u64,
+    /// Debug counters for interrupt-delivery diagnosis (run_flash probes).
+    pub dbg_irq_taken: u64,
+    pub dbg_irq_skipped_level0: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,10 +253,16 @@ impl Cpu {
             user_sregs: [0; 256],
             windowbase_next: None,
             icount: 0,
+            dbg_irq_taken: 0,
+            dbg_irq_skipped_level0: 0,
         };
-        cpu.sregs[SR_VECBASE as usize] = RESET_VECTOR;
+        cpu.sregs[SR_VECBASE as usize] = VECBASE_RESET;
         cpu.sregs[SR_WINDOW_START as usize] = 1;
-        cpu.sregs[SR_PRID as usize] = core_id as u32;
+        // PRID strapping: 0xCDCD (core 0) / 0xABAB (core 1) — the exact
+        // values the ESP32-S3 ROM compares against (reset vector 0x40045A,
+        // _start 0x40034C0B); the app derives its core index as
+        // (PRID >> 13) & 1 (core_intr_matrix_clear, xPortEnterCriticalTimeout).
+        cpu.sregs[SR_PRID as usize] = if core_id == 1 { 0xABAB } else { 0xCDCD };
         cpu
     }
 
@@ -347,8 +364,9 @@ impl Cpu {
             _ => WINDOW_OVERFLOW12_CAUSE,
         };
         self.sregs[SR_EXCCAUSE as usize] = cause;
-        self.pc =
-            self.sregs[SR_VECBASE as usize] + VEC_OF4 + (cause - WINDOW_OVERFLOW4_CAUSE) * 0x80;
+        self.pc = self.sregs[SR_VECBASE as usize]
+            + VEC_OF4
+            + ((cause - WINDOW_OVERFLOW4_CAUSE) / 2) * 0x80;
         cause
     }
 
@@ -426,6 +444,7 @@ impl Cpu {
             l
         };
         if level == 0 {
+            self.dbg_irq_skipped_level0 += 1;
             return false;
         }
         let ps = self.sregs[SR_PS as usize];
@@ -437,6 +456,7 @@ impl Cpu {
         if level != NMI_LEVEL && level <= cintlevel {
             return false;
         }
+        self.dbg_irq_taken += 1;
         let pc = self.pc;
         if level == 1 {
             self.sregs[SR_EXCCAUSE as usize] = LEVEL1_INTERRUPT_CAUSE;
@@ -465,6 +485,10 @@ impl Cpu {
     /// Execute one instruction.  Returns a StepResult describing what
     /// happened (see StepResult).
     pub fn step<B: Bus>(&mut self, bus: &mut B) -> StepResult {
+        // CCOUNT (SR 234) advances one cycle per instruction on real
+        // silicon — the boot ROM's delays (0x40041A76: `rsr.ccount; sub;
+        // bltu`) spin on it and would loop forever with a frozen counter.
+        self.sregs[SR_CCOUNT as usize] = self.sregs[SR_CCOUNT as usize].wrapping_add(1);
         let pc = self.pc;
         let b0 = bus.read8(pc) as u8;
         let len = insn_len(b0);
@@ -503,13 +527,18 @@ impl Cpu {
         // Generic window-overflow check: QEMU ORs 1<<v for every AR
         // register operand (visible and hidden) of the instruction and
         // raises WINDOW_OVERFLOWx if (highest bit)/4 > active window units.
+        // The check is ACTIVE only with WOE set and EXCM clear (QEMU
+        // xtensa_get_tb_cpu_state: `(PS & (WOE|EXCM)) == WOE`; otherwise the
+        // window field is 3, making r/4 > window inert for a0-a15) — the
+        // exception vectors run with EXCM, and the raw s32e/l32e/rfwo
+        // window-handler code must not re-trigger the overflow.
         let mut wmask = 0u32;
         for op in o.iter() {
             if op.is_reg {
                 wmask |= 1u32 << (op.value & 31);
             }
         }
-        if wmask != 0 {
+        if wmask != 0 && self.sregs[SR_PS as usize] & (PS_WOE | PS_EXCM) == PS_WOE {
             let r = 31 - wmask.leading_zeros();
             if r / 4 > self.window() {
                 let cause = self.window_overflow(pc);

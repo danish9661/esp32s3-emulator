@@ -4,12 +4,16 @@
 //! `esp32s3-soc::Soc` address space and exposes the host-facing API
 //! (load image, step, read console output / GPIO).
 
+use alloc::vec;
 use alloc::vec::Vec;
 use esp32s3_soc::Soc;
-use esp32s3_soc::memmap::{DRAM_BASE, IRAM_BASE, IROM_BASE, IROM_SIZE, SRAM_BYTES};
+use esp32s3_soc::memmap::{
+    DRAM_BASE, IRAM_BASE, IROM_BASE, IROM_SIZE, RTC_FAST_DATA_BASE, RTC_FAST_SIZE, SRAM_BYTES,
+};
 use xtensa_core::{Bus, Cpu, StepResult};
 
 use crate::rom_stub;
+use crate::rom_stub::HOST_PRINTF;
 
 pub struct Esp32S3 {
     /// Both ESP32-S3 LX7 cores.  Core 1 is gated at reset by the ROM stub
@@ -37,6 +41,14 @@ impl Esp32S3 {
     pub fn step(&mut self) -> StepResult {
         self.soc.tick_timers(1);
         let r = self.cpu[0].step(&mut self.soc);
+        if self.soc.rom_boot_mode()
+            && !(self.cpu[0].pc >= rom_stub::ROM_BASE && self.cpu[0].pc < rom_stub::ROM_END)
+        {
+            // The ROM stub's flash reads (via the data window) must bypass the
+            // MMU; once core 0 jumps into the app, the app's window reads go
+            // through the MMU again (see `Soc::rom_boot_mode`).
+            self.soc.set_rom_boot_mode(false);
+        }
         self.cpu[1].step(&mut self.soc);
         r
     }
@@ -47,6 +59,7 @@ impl Esp32S3 {
             let a = addr + i as u32;
             if (DRAM_BASE..DRAM_BASE + SRAM_BYTES as u32).contains(&a)
                 || (IRAM_BASE..IRAM_BASE + SRAM_BYTES as u32).contains(&a)
+                || (RTC_FAST_DATA_BASE..RTC_FAST_DATA_BASE + RTC_FAST_SIZE).contains(&a)
             {
                 self.soc.write8(a, *b as u32);
             } else if (IROM_BASE..IROM_BASE + IROM_SIZE).contains(&a) {
@@ -62,20 +75,274 @@ impl Esp32S3 {
     /// image from flash offset `APP_FLASH_OFFSET` and jumps to its entry.
     pub fn boot_from_flash(&mut self, flash: &[u8]) {
         self.soc.load_flash_image(0, flash);
+        // Pre-map the app's flash-mapped segments (.flash.text/.flash.rodata)
+        // in the cache MMU — the real 2nd-stage bootloader maps them instead
+        // of copying (the ROM stub's copy loop cannot write the read-only
+        // windows).
+        self.soc.map_app_flash_segments(rom_stub::APP_FLASH_OFFSET);
+        // The stub's own flash reads must NOT go through that MMU (it reads
+        // the image the way the real ROM reads flash — via SPI, MMU-free).
+        self.soc.set_rom_boot_mode(true);
         let rom = rom_stub::rom_image();
         self.load_image(rom_stub::ROM_BASE, &rom);
-        self.cpu[0].pc = rom_stub::ROM_BASE;
+        self.load_rom_data();
+        // ROM data: the ROM layout struct + its pointer in RTC fast memory
+        // (esp32s3.rom.ld maps ets_rom_layout_p = 0x3FF1FFFC); the app's
+        // heap init reads layout->dram0_rtos_reserved_start via it.  The
+        // S3's ets_rom_layout_t starts with magic then dram0_rtos_reserved_*
+        // (NOT the ESP32-classic dram0_stack0_* ordering) and the values
+        // are the HIGH-DRAM ROM area (Zephyr soc/espressif/esp32s3/memory.h:
+        // PRO stack 0x3FCE9710-0x3FCEB710, APP stack 0x3FCEB710-0x3FCED710,
+        // ROM .bss/.data 0x3FCED710-0x3FCF0000).  heap_caps_init's overlap
+        // check aborts unless dram0_rtos_reserved_start >= the app's bss end
+        // (0x3FC982C8) — the old value 0x3FC880A0 overlapped the app's
+        // IRAM-alias reserved region {0x3FC84000, 0x3FC92F00}.
+        self.soc.write32(rom_stub::ROM_LAYOUT, 0xC5A5_C5A5); // magic
+        self.soc.write32(rom_stub::ROM_LAYOUT + 4, 0x3FCE_9710); // dram0_rtos_reserved_start
+        self.soc.write32(rom_stub::ROM_LAYOUT + 8, 0x3FCF_0000); // dram0_rtos_reserved_end
+        self.soc.write32(rom_stub::ROM_LAYOUT + 24, 0x3FCE_9710); // dram0_stack0_start_addr
+        self.soc.write32(rom_stub::ROM_LAYOUT + 28, 0x3FCE_B710); // dram0_stack0_end_addr
+        self.soc.write32(rom_stub::ROM_LAYOUT + 32, 0x3FCE_B710); // dram0_stack1_start_addr
+        self.soc.write32(rom_stub::ROM_LAYOUT + 36, 0x3FCE_D710); // dram0_stack1_end_addr
+        self.soc.write32(0x3FF1_FFFC, rom_stub::ROM_LAYOUT);
+        // Reset pc = 0x40000400 (XCHAL_RESET_VECTOR_PADDR), not 0x40000000
+        // — the window vectors own the bottom of the ROM (core-isa.h).
+        self.cpu[0].pc = xtensa_core::cpu::RESET_VECTOR;
+    }
+
+    /// Load the real ROM's data state — rodata tables in RTC fast memory
+    /// (0x3FF18000, .rodata @ 0x3FF18C00), .data init values in high DRAM
+    /// (0x3FCD7E00-0x3FCF0000: xtos tables, spi_flash driver data, PRO/APP
+    /// stacks, shared buffers) and the console-init flags the ROM bootloader
+    /// leaves behind (putc1 = uart_tx_one_char @ 0x40000648 + the uart0
+    /// ready byte at 0x3FCEFFB8 — without them the real ets_printf no-ops on
+    /// [0x3FCEF750] and uart_tx_one_char on [0x3FCEFFB8]; the ROM console
+    /// then emits via the USB-Serial-JTAG FIFO @ 0x60038000, captured in
+    /// take_uart_tx(0)).  Called by `boot_from_flash` and the ROM-call tests.
+    pub fn load_rom_data(&mut self) {
+        self.load_image(0x3FF1_8000, rom_stub::rom_rodata_blob());
+        self.load_image(0x3FCD_7E00, rom_stub::rom_data_blob());
+        // NB: _putc1/_putc2 (0x3FCEF754/0x3FCEF750) are BSS — the real ROM's
+        // boot_prepare installs putc1 = ets_write_char_uart via
+        // ets_install_uart_printf and leaves putc2 = 0; writing putc2 here
+        // makes ets_write_char emit every char TWICE.
+        //
+        // The boot glue's loader does not run the real boot_prepare, so
+        // putc1 stays 0 here — the real ets_printf (0x4004423C, reached via
+        // the 0x400005D0 __call_ets_printf wrapper) early-returns and the
+        // console stays silent until the APP calls esp_rom_install_uart_
+        // printf (which sets putc1 itself — the real firmware boot works
+        // without this write; bare-metal tests must install putc1 first).
+        // Mirror the bootloader's state instead: putc1 = the real ROM's
+        // uart_tx_one_char @ 0x40000648 (the real silicon boot leaves this
+        // behind), so ROM-call tests printing before any install work too.
+        self.soc.write32(0x3FCE_F754, 0x4000_0648); // _putc1 = uart_tx_one_char
+        self.soc.write32(0x3FCE_FFB8, 1); // uart0 tx enabled
     }
 
     /// Bytes emitted by UART `n` since the last call (console output).
+    /// Also drains the ROM `ets_printf` mailbox (rom_stub::HOST_PRINTF):
+    /// formats the pending message and emits it via UART0.
     pub fn take_uart_tx(&mut self, n: usize) -> Vec<u8> {
-        self.soc.take_uart_tx(n)
+        let mut out = self.soc.take_uart_tx(n);
+        if n == 0 {
+            // The ROM's console (uart_tx_one_char) emits via the
+            // USB-Serial-JTAG FIFO, not UART0 — merge it into UART0's stream
+            // so console output lands in the same place the app's Serial
+            // prints go.
+            out.extend_from_slice(&self.soc.take_usb_serial_tx());
+        }
+        if n == 0 && self.soc.read32(HOST_PRINTF) != 0 {
+            let msg = self.format_host_printf();
+            self.soc.uart_push_tx(0, &msg);
+            out.extend_from_slice(&msg);
+        }
+        out
+    }
+    /// Format the pending `ets_printf` message (host printf mailbox) and
+    /// clear the mailbox.  `%d %u %x %X %p %s %c %%` with `-`/`0` flags,
+    /// decimal width and `l`/`h`/`z` length prefixes are supported — the
+    /// ESP-IDF panic/assert messages use these; `%f` and friends print as
+    /// `%f` verbatim.
+    fn format_host_printf(&mut self) -> Vec<u8> {
+        let fmt = self.soc.read32(HOST_PRINTF);
+        let mut args = [0u32; 5];
+        for (i, a) in args.iter_mut().enumerate() {
+            *a = self.soc.read32(HOST_PRINTF + 4 + 4 * i as u32);
+        }
+        self.soc.write32(HOST_PRINTF, 0);
+        let mut out = Vec::new();
+        let mut ai = 0usize;
+        let mut p = fmt;
+        loop {
+            let c = self.soc.read8(p) as u8;
+            if c == 0 {
+                break;
+            }
+            p += 1;
+            if c != b'%' {
+                out.push(c);
+                continue;
+            }
+            // flags
+            let mut left = false;
+            let mut zero = false;
+            loop {
+                match self.soc.read8(p) as u8 {
+                    b'-' => left = true,
+                    b'0' => zero = true,
+                    _ => break,
+                }
+                p += 1;
+            }
+            // width (digits)
+            let mut width = 0usize;
+            loop {
+                let d = self.soc.read8(p) as u8;
+                if !d.is_ascii_digit() {
+                    break;
+                }
+                width = width * 10 + (d - b'0') as usize;
+                p += 1;
+            }
+            // precision digits are consumed but ignored (rare in IDF logs)
+            if self.soc.read8(p) as u8 == b'.' {
+                p += 1;
+                loop {
+                    let d = self.soc.read8(p) as u8;
+                    if !d.is_ascii_digit() {
+                        break;
+                    }
+                    p += 1;
+                }
+            }
+            // length prefixes
+            while let b'l' | b'h' | b'L' | b'z' | b'j' | b't' = self.soc.read8(p) as u8 {
+                p += 1;
+            }
+            let conv = self.soc.read8(p) as u8;
+            p += 1;
+            if conv == b'%' {
+                out.push(b'%');
+                continue;
+            }
+            let arg = if ai < args.len() {
+                let v = args[ai];
+                ai += 1;
+                v
+            } else {
+                0
+            };
+            let field: Vec<u8> = match conv {
+                b's' => {
+                    let mut sp = arg;
+                    let mut s = Vec::new();
+                    loop {
+                        let b = self.soc.read8(sp) as u8;
+                        if b == 0 {
+                            break;
+                        }
+                        s.push(b);
+                        sp += 1;
+                    }
+                    s
+                }
+                b'c' => vec![arg as u8],
+                b'd' | b'i' => {
+                    let v = arg as i32;
+                    if v < 0 {
+                        let mut t = vec![b'-'];
+                        t.extend(itoa(v.wrapping_neg() as u32));
+                        t
+                    } else {
+                        itoa(v as u32)
+                    }
+                }
+                b'u' => itoa(arg),
+                b'x' | b'X' | b'p' => {
+                    let mut h = if conv == b'p' {
+                        b"0x".to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    h.extend(hex(arg, conv == b'X'));
+                    h
+                }
+                b'o' => oct(arg),
+                _ => vec![b'%', conv],
+            };
+            // width padding (zero-flag only makes sense for numeric fields)
+            let pad = width.saturating_sub(field.len());
+            if pad > 0 && !left {
+                for _ in 0..pad {
+                    out.push(if zero { b'0' } else { b' ' });
+                }
+            }
+            out.extend_from_slice(&field);
+            if pad > 0 && left {
+                out.extend(core::iter::repeat_n(b' ', pad));
+            }
+        }
+        out
     }
 
     /// Output-pin state (host LED visualization).
     pub fn gpio_output(&self) -> u32 {
         self.soc.gpio_output()
     }
+}
+
+/// Decimal digits of `n` (no sign).
+fn itoa(n: u32) -> Vec<u8> {
+    let mut buf = [0u8; 10];
+    let mut i = buf.len();
+    let mut n = n;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    buf[i..].to_vec()
+}
+
+/// Lower/upper hex digits of `n`.
+fn hex(n: u32, upper: bool) -> Vec<u8> {
+    let table: &[u8; 16] = if upper {
+        b"0123456789ABCDEF"
+    } else {
+        b"0123456789abcdef"
+    };
+    let mut buf = [0u8; 8];
+    let mut i = buf.len();
+    let mut n = n;
+    loop {
+        i -= 1;
+        buf[i] = table[(n & 0xF) as usize];
+        n >>= 4;
+        if n == 0 {
+            break;
+        }
+    }
+    buf[i..].to_vec()
+}
+
+/// Octal digits of `n`.
+fn oct(n: u32) -> Vec<u8> {
+    let mut buf = [0u8; 11];
+    let mut i = buf.len();
+    let mut n = n;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n & 7) as u8;
+        n >>= 3;
+        if n == 0 {
+            break;
+        }
+    }
+    buf[i..].to_vec()
 }
 
 impl Default for Esp32S3 {

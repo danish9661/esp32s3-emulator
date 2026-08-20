@@ -78,6 +78,16 @@ impl Uart {
         core::mem::take(&mut self.tx_out)
     }
 
+    /// Bytes queued (debug probe).
+    pub fn tx_len(&self) -> usize {
+        self.tx_out.len()
+    }
+
+    /// Append host-generated console bytes (printf mailbox path).
+    pub fn push_tx(&mut self, bytes: &[u8]) {
+        self.tx_out.extend_from_slice(bytes);
+    }
+
     /// Push one received byte into the RX FIFO (host console input).
     pub fn inject_rx(&mut self, byte: u8) {
         self.rx.push_back(byte);

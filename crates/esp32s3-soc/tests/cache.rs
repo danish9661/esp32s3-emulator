@@ -126,9 +126,10 @@ fn sync_ena_polls_to_done() {
     );
     // DONE stays set (read does not clear it; a fresh ENA re-arms).
     assert_ne!(soc.read32(EXTMEM_BASE + 0x88) & 0x2, 0);
-    // Same for the DCACHE sync controller.
+    // Same for the DCACHE sync controller (SYNC_DONE = bit 3, extmem_reg.h
+    // EXTMEM_DCACHE_SYNC_DONE — unlike ICACHE's bit 1).
     soc.write32(EXTMEM_BASE + 0x28, 0x1); // DCACHE_SYNC_CTRL.INVALIDATE_ENA
-    assert_ne!(soc.read32(EXTMEM_BASE + 0x28) & 0x2, 0);
+    assert_ne!(soc.read32(EXTMEM_BASE + 0x28) & 0x8, 0);
 }
 
 #[test]

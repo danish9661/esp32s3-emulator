@@ -73,12 +73,12 @@ pub(crate) fn execute<B: Bus>(
         // ------------------------------------------------------------------
         Opcode::OPCODE_ADD => rrr3!(|s: u32, t: u32| s.wrapping_add(t)),
         Opcode::OPCODE_SUB => rrr3!(|s: u32, t: u32| s.wrapping_sub(t)),
-        Opcode::OPCODE_ADDX2 => rrr3!(|s: u32, t: u32| s.wrapping_add(t << 1)),
-        Opcode::OPCODE_ADDX4 => rrr3!(|s: u32, t: u32| s.wrapping_add(t << 2)),
-        Opcode::OPCODE_ADDX8 => rrr3!(|s: u32, t: u32| s.wrapping_add(t << 3)),
-        Opcode::OPCODE_SUBX2 => rrr3!(|s: u32, t: u32| (t << 1).wrapping_sub(s)),
-        Opcode::OPCODE_SUBX4 => rrr3!(|s: u32, t: u32| (t << 2).wrapping_sub(s)),
-        Opcode::OPCODE_SUBX8 => rrr3!(|s: u32, t: u32| (t << 3).wrapping_sub(s)),
+        Opcode::OPCODE_ADDX2 => rrr3!(|s: u32, t: u32| (s << 1).wrapping_add(t)),
+        Opcode::OPCODE_ADDX4 => rrr3!(|s: u32, t: u32| (s << 2).wrapping_add(t)),
+        Opcode::OPCODE_ADDX8 => rrr3!(|s: u32, t: u32| (s << 3).wrapping_add(t)),
+        Opcode::OPCODE_SUBX2 => rrr3!(|s: u32, t: u32| (s << 1).wrapping_sub(t)),
+        Opcode::OPCODE_SUBX4 => rrr3!(|s: u32, t: u32| (s << 2).wrapping_sub(t)),
+        Opcode::OPCODE_SUBX8 => rrr3!(|s: u32, t: u32| (s << 3).wrapping_sub(t)),
         Opcode::OPCODE_AND | Opcode::OPCODE_ANDB => rrr3!(|s: u32, t: u32| s & t),
         Opcode::OPCODE_OR | Opcode::OPCODE_ORB => rrr3!(|s: u32, t: u32| s | t),
         Opcode::OPCODE_XOR | Opcode::OPCODE_XORB => rrr3!(|s: u32, t: u32| s ^ t),
@@ -105,11 +105,14 @@ pub(crate) fn execute<B: Bus>(
         Opcode::OPCODE_MUL16U => rrr3!(|s: u32, t: u32| (s & 0xffff).wrapping_mul(t & 0xffff)),
         Opcode::OPCODE_QUOS => rrr3!(|s: u32, t: u32| {
             // QEMU translate_quos special case: 0x80000000 / -1 = 0x80000000.
+            // The division is SIGNED (the old u32 `s / t` returned garbage
+            // for negative operands — newlib printf's %d via div()/QUOS
+            // would print wrong values).
             if s == 0x8000_0000 && t == 0xffff_ffff {
                 0x8000_0000
             } else {
                 // Division by zero: undefined on real silicon; saturate.
-                s.checked_div(t).unwrap_or(u32::MAX)
+                ((s as i32).checked_div(t as i32)).unwrap_or(i32::MAX) as u32
             }
         }),
         Opcode::OPCODE_QUOU => rrr3!(|s: u32, t: u32| s.checked_div(t).unwrap_or(u32::MAX)),
@@ -118,7 +121,8 @@ pub(crate) fn execute<B: Bus>(
                 0
             } else {
                 // Division by zero: undefined on real silicon; return s.
-                s.checked_rem(t).unwrap_or(s)
+                // Signed remainder (see QUOS note).
+                ((s as i32).checked_rem(t as i32)).unwrap_or(s as i32) as u32
             }
         }),
         Opcode::OPCODE_REMU => rrr3!(|s: u32, t: u32| s.checked_rem(t).unwrap_or(s)),
@@ -174,18 +178,27 @@ pub(crate) fn execute<B: Bus>(
         // a 64-bit right shift of {s, t} by SAR.
         // ------------------------------------------------------------------
         Opcode::OPCODE_SLL => {
-            let sh = 32u32.wrapping_sub(cpu.sreg(SR_SAR)) & 31;
-            cpu.set_reg(o[0].value, cpu.reg(o[1].value) << sh);
+            // QEMU translate_sll: shift left by (32 - SAR) & 0x3f — the SAR
+            // holds the RIGHT-shift amount; SSL pre-computes 32 - as.  A
+            // shift of >= 32 yields 0 (TCG semantics).
+            let sh = 32u32.wrapping_sub(cpu.sreg(SR_SAR)) & 0x3f;
+            cpu.set_reg(o[0].value, ((cpu.reg(o[1].value) as u64) << sh) as u32);
             Outcome::Seq
         }
         Opcode::OPCODE_SRL => {
-            let sh = cpu.sreg(SR_SAR) & 31;
-            cpu.set_reg(o[0].value, cpu.reg(o[1].value) >> sh);
+            // QEMU translate_srl: shift right by SAR; >= 32 yields 0.
+            let sh = cpu.sreg(SR_SAR) & 0x3f;
+            cpu.set_reg(o[0].value, ((cpu.reg(o[1].value) as u64) >> sh) as u32);
             Outcome::Seq
         }
         Opcode::OPCODE_SRA => {
-            let sh = cpu.sreg(SR_SAR) & 31;
-            cpu.set_reg(o[0].value, ((cpu.reg(o[1].value) as i32) >> sh) as u32);
+            // QEMU translate_sra: arithmetic shift right by SAR; >= 32
+            // sign-fills (TCG sar semantics).
+            let sh = cpu.sreg(SR_SAR) & 0x3f;
+            cpu.set_reg(
+                o[0].value,
+                ((cpu.reg(o[1].value) as i32 as i64) >> sh) as u32,
+            );
             Outcome::Seq
         }
         Opcode::OPCODE_SRC => {
@@ -216,8 +229,10 @@ pub(crate) fn execute<B: Bus>(
             Outcome::Seq
         }
         Opcode::OPCODE_SSL => {
-            // ssl as: SAR = (32 - as) & 31 (left-shift count).
-            cpu.set_sreg(SR_SAR, 32u32.wrapping_sub(cpu.reg(o[0].value)) & 31);
+            // ssl as: SAR = 32 - (as & 31) — the SAR can legitimately hold
+            // 32 (count 0), and SLL/SRC interpret it as the right-shift
+            // complement (QEMU gen_left_shift_sar).
+            cpu.set_sreg(SR_SAR, 32u32.wrapping_sub(cpu.reg(o[0].value) & 31));
             Outcome::Seq
         }
         Opcode::OPCODE_SSAI => {
@@ -226,8 +241,9 @@ pub(crate) fn execute<B: Bus>(
             Outcome::Seq
         }
         Opcode::OPCODE_SSA8B => {
-            // ssa8b as: SAR = 32 - (as << 3) (left byte-align).
-            cpu.set_sreg(SR_SAR, 32u32.wrapping_sub(cpu.reg(o[0].value) << 3) & 31);
+            // ssa8b as: SAR = 32 - ((as << 3) & 31) (left byte-align; can
+            // hold 32 like SSL — QEMU gen_left_shift_sar).
+            cpu.set_sreg(SR_SAR, 32u32.wrapping_sub((cpu.reg(o[0].value) << 3) & 31));
             Outcome::Seq
         }
         Opcode::OPCODE_SSA8L => {
@@ -419,15 +435,19 @@ pub(crate) fn execute<B: Bus>(
         // Jumps and calls.
         // ------------------------------------------------------------------
         Opcode::OPCODE_J => Outcome::Jump(o[0].value),
-        Opcode::OPCODE_JX => Outcome::Jump(cpu.reg(o[0].value) & !3),
+        // JX target is byte-precise: NO low-2-bit masking (QEMU
+        // translate_jx = gen_jump(dc, arg[0].in)).  Real compiled code
+        // returns to odd addresses (e.g. call0 at pc ≡ 3 mod 4 → return
+        // pc+3 ≡ 2 mod 4); masking would fetch mid-instruction.
+        Opcode::OPCODE_JX => Outcome::Jump(cpu.reg(o[0].value)),
         Opcode::OPCODE_CALL0 => {
-            // call0 target: a0 = pc_next (QEMU gen_callw_slot with
-            // callinc 0).
+            // call0: a0 = pc_next; PS.CALLINC is NOT modified (QEMU
+            // translate_call0 = gen_jumpi only — gen_callw_slot is used
+            // solely by the windowed CALL4/8/12/CALLX4/8/12).  The
+            // exception vectors rely on this: the level-1 vector does
+            // `call0 _xt_user_exc`, and _xt_lowint1's `rsr.ps` must still
+            // see the interrupted task's CALLINC to save it into the frame.
             cpu.set_reg(0, cpu.pc.wrapping_add(len));
-            cpu.set_sreg(
-                SR_PS,
-                (cpu.sreg(SR_PS) & !PS_CALLINC) | (0 << PS_CALLINC_SHIFT),
-            );
             Outcome::Jump(o[0].value)
         }
         Opcode::OPCODE_CALL4 | Opcode::OPCODE_CALL8 | Opcode::OPCODE_CALL12 => {
@@ -445,15 +465,20 @@ pub(crate) fn execute<B: Bus>(
             Outcome::Jump(o[0].value)
         }
         Opcode::OPCODE_CALLX0 => {
+            // Target is byte-precise, no low-2-bit masking (QEMU
+            // translate_callx0 = mov tmp, in; movi a0, pc_next; gen_jump).
+            // PS.CALLINC is NOT modified (see OPCODE_CALL0 note).
+            let target = cpu.reg(o[0].value);
             cpu.set_reg(0, cpu.pc.wrapping_add(len));
-            cpu.set_sreg(
-                SR_PS,
-                (cpu.sreg(SR_PS) & !PS_CALLINC) | (0 << PS_CALLINC_SHIFT),
-            );
-            Outcome::Jump(cpu.reg(o[0].value) & !3)
+            Outcome::Jump(target)
         }
         Opcode::OPCODE_CALLX4 | Opcode::OPCODE_CALLX8 | Opcode::OPCODE_CALLX12 => {
             let callinc = o[1].value / 4;
+            // The target register `as` shares its physical slot with the
+            // return address (phys[wb*4 + callinc*4]): read it BEFORE the
+            // write, or the jump goes to the return address (QEMU
+            // gen_callw_slot materializes arg[0].in first).
+            let target = cpu.reg(o[0].value);
             // QEMU gen_callw_slot: return addr = pc_next = pc + actual length.
             cpu.set_reg(
                 callinc * 4,
@@ -463,7 +488,7 @@ pub(crate) fn execute<B: Bus>(
                 SR_PS,
                 (cpu.sreg(SR_PS) & !PS_CALLINC) | (callinc << PS_CALLINC_SHIFT),
             );
-            Outcome::Jump(cpu.reg(o[0].value) & !3)
+            Outcome::Jump(target)
         }
 
         // ------------------------------------------------------------------
@@ -535,8 +560,11 @@ pub(crate) fn execute<B: Bus>(
             Outcome::Jump((cpu.pc & 0xc000_0000) | (a0 & 0x3fff_ffff))
         }
         Opcode::OPCODE_RET | Opcode::OPCODE_RET_N => {
-            // ret: jump to a0, low 2 bits cleared (QEMU translate_ret).
-            Outcome::Jump(cpu.reg(0) & !3)
+            // ret: jump to a0, byte-precise — NO low-2-bit masking (QEMU
+            // translate_ret = gen_jump(dc, cpu_R[0])).  Real firmware
+            // returns from call0 at pc ≡ 3 (mod 4) to a0 = pc+3 ≡ 2
+            // (mod 4); masking would execute garbage mid-instruction.
+            Outcome::Jump(cpu.reg(0))
         }
         Opcode::OPCODE_MOVSP => {
             // movsp t, s: t = s, with ALLOCA check: the three windows below

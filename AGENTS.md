@@ -107,6 +107,89 @@ Core design:
 
 ## Status log (append, newest last)
 
+- 2026-08-20: Second real Arduino-CLI firmware boots: **esp32s3_periph**
+  (GPIO blink + digitalRead, analogRead with injected voltage, millis,
+  and a FreeRTOS core-1 worker task). Run: `ADC_INJECT_MV=825 cargo run
+  --release -p esp32s3-emu --example run_flash -- tools/sketches/esp32s3_periph/esp32s3_periph.merged.bin`
+  → `Hello from ESP32-S3!`, `chip model=ESP32-S3 rev=0 cores=2 freq=40`,
+  `boot OK`, `[core1] worker tick N (core=1, millis=...)`, `[main] loop N
+  gpio2=0/1 adc4=866 millis=...` (866 = exactly 825 mV / 3900 mV (11 dB
+  atten full scale) * 4095 — the ADC oneshot path + injection is
+  numerically correct). Sketch built with arduino-cli 1.5.1 / esp32 core
+  3.3.10, merged with esptool (bootloader@0, partitions@0x8000,
+  boot_app0@0xe000, app@0x10000).
+  - **GPIO register layout corrected to the TRUE S3 layout**
+    (soc/esp32s3/register/soc/gpio_struct.h — the old 0x54-based layout
+    was classic ESP32): pin[54] @ 0x74, func_in_sel_cfg[256] @ 0x154,
+    func_out_sel_cfg[54] @ 0x554, clock_gate @ 0x62C, date @ 0x700;
+    REG_COUNT 0x280 → 0x704. The periph sketch's pinMode(2) writes
+    FUNC_OUT_SEL for pin 2 at 0x55C — the 0x280 window panicked the
+    dispatch (the hello sketch never touched FUNC_OUT_SEL, which is why
+    the old layout survived the boot). ledc/spi/i2c machine tests now
+    write FUNC_OUT_SEL at the real 0x554 base (s32i imm8 caps at 255 →
+    li the base in a spare register).
+  - GPIO_IN pad loopback: output-enabled pins read back their driven
+    value (digitalRead of an OUTPUT pin returns GPIO_OUT like real
+    silicon); non-enabled pins keep the strap/input state (boot ROM
+    strap check unaffected).
+  - run_flash gained `ADC_INJECT_MV=<mv>` (injects on ADC1_CH3/GPIO4,
+    the periph sketch's analogRead pin).
+  - Cosmetic inaccuracies noted: `freq=40` (efuse/clk calibration not
+    modeled — ESP.getCpuFreqMHz reads 40 MHz) and the doubled
+    core-dump UART echo (dual-console artifact).
+  - 30/30 emu, 89 total tests green; fmt/clippy clean.
+  - Next: more Arduino sketches (UART RX echo, I2C/SPI with the
+    existing models) or the browser frontend (P6).
+
+- 2026-08-20: **FIRMWARE BOOTS TO COMPLETION** — the Arduino hello sketch
+  prints `Hello from ESP32-S3!` + `boot OK` (real ESP-IDF/FreeRTOS SMP app
+  through 16M steps). All tests green (30/30 emu + core/soc/wasm-bridge =
+  79 total), clippy-clean libs, wasm32 clean.
+  - **ROOT CAUSE of the long boot stall: u64 source bitmap overflow in
+    `Soc::int_pending`**. `src |= 1 << (79 + cpu)` on a u64 masks the shift
+    count to 63 (release build) → the cross-core source (FROM_CPU_INTR0/1 =
+    79/80, esp-idf crosscore_int.c) landed on bit 15 → unmapped line 6 →
+    the yield interrupt never fired → `ulTaskGenericNotifyTake`'s
+    `esp_crosscore_int_send_yield` (self-yield) never switched the ipc tasks
+    out → the main task never ran (TCB existed, stack = untouched sentinels).
+    FreeRTOS SMP depends on the crosscore interrupt for every yield.
+    `Intc::pending_lines` + the soc bitmap are now **u128** (sources 79/80
+    and 94/95 sit beyond u64; the S3's source numbers reach 95).
+  - The mechanism: `esp_crosscore_int_send` (0x40375EF8) writes
+    SYSTEM.CPU_INT_FROM_CPU_0/1 (0x600C0030/34); the ISR
+    `esp_crosscore_isr` (0x40375E9C) clears it (write 0) then
+    `_frxt_setup_switch`. `esp_crosscore_int_init` (0x42007794) allocates
+    source 79 (core0) / 80 (core1); the matrix maps core0 src79 → line 3
+    (level 1). Verified: crosscore ISR entries 4, send calls 11, boot
+    proceeds.
+  - Second stall fix: gpio.rs `REG_COUNT` 0x180→0x280 — the app's GPIO init
+    reads FUNC_IN_SEL entries (0x100..0x27F, 96 signals); the 0x180 array
+    panicked at offset 0x184 (signal input 33).
+  - ets_printf path forensics: the stub's 0x400005D0 slot is past
+    `GLUE_END = 0x570` and is NOT spliced — the image keeps the REAL ROM's
+    `__call_*` wrapper table (`l32r a9, [lit]; jx a9`, 12-byte entries:
+    wrapper + literal). The app's ets_printf call → wrapper → the real
+    ets_printf at 0x4004423C (vsnprintf + putc1 + uart_tx_one_char) — the
+    real code WORKS in the emulator. The mailbox (HOST_PRINTF_BODY 0x520 +
+    take_uart_tx drain) is dead weight (kept for now).
+  - `machine::load_rom_data` now writes `_putc1` (0x3FCEF754) =
+    uart_tx_one_char (0x40000648) — the state the real bootloader leaves
+    behind. Without it the real ets_printf early-returns and bare-metal ROM
+    tests print nothing (the full app works anyway because the app itself
+    calls ets_install_uart_printf). The ets_printf_mailbox test was
+    rewritten to drive the REAL wrapper path (callx8 with fmt/args →
+    formatted bytes via the USB-Serial-JTAG FIFO, merged into take_uart_tx).
+  - Gotchas: `1u64 << 79` is an overflow (shift ≥ 64 is UB in release /
+    panic in debug) — the clippy/const-fold of `1u64 << 79` in the probe
+    caught it; probe pcs-watch AFTER step misses vector entries (branches
+    at the vector are never seen); the real ROM's ets_printf no-ops with
+    putc1 = 0 (BSS, set by the app's own install).
+  - Committed with: scratch examples deleted (probe_assert/dbg_printf/
+    dbg_rom/dump_qsort), tools/tmp logs + Arduino build output + stale
+    sketch bins dropped (sketches dir keeps .ino + merged.bin + .elf).
+    run_flash.rs keeps its diagnostic probes (still useful for P5).
+  - Next: P5 golden traces vs QEMU.
+
 - 2026-08-15: P4 dual-core lands — **P4 complete**: 25/25 emu, 17/17 core,
   32/32 soc tests green (75 total incl. wasm-bridge).
   - `xtensa-core` cpu.rs: `Cpu` gains `core_id`; `Cpu::new(id)` seeds
@@ -495,4 +578,52 @@ Core design:
     sext14 + pc+4 — bytes, no <<2); rom_puts beqz skips s32i+addi+j+ret
     = 12 bytes.
 - 2026-08-13: Environment verified. Research done (no Xtensa Rust crate;
-  QEMU = only reference). AGENTS.md created. Workspace scaffold next.
+  QEMU = only reference). AGENTS.md created. Workspace scaffold next.- 2026-08-18: qsort milestone + firmware boot debugging (stale-bin + S32C1I forensics).
+  - asm.rs callx4 encoding bug FIXED: b0 low nibble is op0=[3:0] and MUST be
+    0..7 or insn_len returns 2 (0xDD decoded as inst16b → mis-fetch). callx4 t
+    = (t<<8)|(3<<6)|(1<<4) (b0 = 0xD0; fields m=[7:6], n=[5:4], t=[7:4]).
+  - rom_stub.rs `pad_to` is now pub; machine_tests.rs + dump_qsort.rs pad the
+    comparator to CODE+0x80 (the old CODE+0x4B pointer aimed at zeroed IROM).
+  - qsort body rewritten (slot 0x40001488 → QSORT_BODY 0x40001300): entry bgeu
+    removed; multiply loop `movi(9,1); and(8,14,9)` (the old and(8,14,1) masked
+    with a1=SP); sign-extract `movi(9,31); ssr; srl` (emu SSR sets SAR=as);
+    byte-swap loop added; sw_done uses TWO sub(10,10,4) (swap advances both
+    pointers by size). Final layout/targets: m_loop 0x131B, m_done 0x1336,
+    inner 0x133C, sw_loop 0x1387, sw_body 0x138D, sw_done 0x13A5, next_i
+    0x13B1, done 0x13BD. Sorts [9,7,5,6,8,4], caller halts at step 1035;
+    `cargo test -p esp32s3-emu rom_qsort` green; all workspace tests green.
+  - FIRMWARE now passes the heap_caps_init qsort assert. The run was using a
+    STALE merged bin (entry 0x403C88B8, 3 segments); the fresh one is
+    build/esp32.esp32.esp32s3/esp32s3_hello.ino.merged.bin (entry 0x40375AAC,
+    6 segments, matches the ELF: .iram0.text 0x40374404, .dram0.data
+    0x3FC92F00 len 0x3884, .dram0.bss 0x3FC96788). Copied fresh bin to
+    tools/sketches/esp32s3_hello/esp32s3_hello.merged.bin.
+  - S32C1I forensics on esp_cpu_compare_and_set (0x40377AD8): the internal-RAM
+    path at 0x40377B24 is `wsr.scompare1 a3; s32c1i a4, a2, 0; sub a3, a3, a4;
+    nsau a2, a3` — SCOMPARE1 = the compare arg (0xB33FFFFF) BEFORE the s32c1i.
+    The emulator was CORRECT: SCOMPARE1=0xB33FFFFF, mem matched, the store
+    overwrote the mux with the core id 0 (lock acquired) — the apparent "mux
+    clobber" is real hardware semantics. The objdump disasm at 0x40377b22 and
+    0x4037ade0 was misaligned: objdump -d prints the LE WORD, so the byte
+    string is reversed vs memory order ("00e242" = bytes 42 e2 00).
+  - The FreeRTOS "SPIN" at 0x4037ade5 is NOT a stuck loop: it is
+    regi2c_ctrl_write_reg_mask (0x40377F2C) repeatedly entering/exiting
+    xPortEnterCriticalTimeout (0x4037AD18) critical sections — the app makes
+    progress (~200 steps between visits). SPIN prints: lock=0x3FC93070 (mux,
+    .dram0.data init 0xB33FFFFF), mem=0 (core 0 owns it), ra=0x80377F3B,
+    a3=0xffffffff (timeout arg), a9=0x60000 (= nesting+1, nesting read 0x5FFFF).
+  - OPEN ISSUES: (1) NEST trace: a8=0x3FC972CC after `addx4 a8, a8, a9`
+    (0x4037AD51) where the l32r literal = 0x3FC972D4 (port_uxCriticalNesting)
+    — off by -8; a9=0x60000 with `bnei a9, 1` implies the nesting was 0x5FFFF,
+    and `bne a8, a14` at 0x4037ADE2 (a14=0xF) should assert — check
+    addx4/rsr.prid/extui semantics. (2) OOB panic soc.rs:676: psram backing
+    array indexed with 0x201FDE58 (len 8192) — an MMU psram page 0x201F —
+    needs a page bound check or MMU-entry decode fix in the cache translate.
+  - GOTCHAS: objdump -d hex is the LE word (bytes reversed vs memory order);
+    insn_len = 3 if b0&0xf <= 7 else 2; s32c1i fields: t=[7:4] (data),
+    s=[11:8] (base), r=[15:12] (selector 14), imm8=[23:16], decode guard
+    op0==2 && r==14; esptool image_info on a merged bin reports the
+    BOOTLOADER at offset 0, not the app (parse the app at 0x10000 manually).
+  - run_flash.rs has temporary debug watches (MUX-CLOBBER/SCOMP-WRITE/S32C1I/
+    NEST/LIT/APP-FIRST prints) — strip before commit; scratch examples
+    probe_assert.rs/dbg_printf.rs/dbg_rom.rs/dump_qsort.rs to delete.

@@ -45,6 +45,21 @@ impl Intc {
         }
     }
 
+    /// Source id mapped to `line` on `cpu`, or 0xFFFF if unmapped (debug).
+    pub fn source_for_line(&self, cpu: usize, line: usize) -> u32 {
+        for (src, &l) in self.irq_map[cpu].iter().enumerate() {
+            if l as usize == line {
+                return src as u32;
+            }
+        }
+        0xFFFF
+    }
+
+    /// Direct irq_map access for diagnostics (run_flash probes).
+    pub fn map_entry(&self, cpu: usize, src: usize) -> u32 {
+        self.irq_map[cpu][src] as u32
+    }
+
     fn entry(&self, offset: u32) -> Option<(usize, usize)> {
         let idx = (offset / 4) as usize;
         if idx >= INT_MATRIX_INPUTS * INT_MATRIX_CPUS {
@@ -58,7 +73,11 @@ impl Intc {
     /// esp32s3_intc.c irq_map: each source asserts the line stored in
     /// INT_MATRIX(cpu, source); 32 lines, all values 0..=31 are legal
     /// lines, 6 is merely the reset value).
-    pub fn pending_lines(&self, cpu: usize, sources: u64) -> u32 {
+    ///
+    /// The bitmap is u128: the S3's source numbers reach 95
+    /// (INTERNAL_GPIO_N), beyond u64's 64 bits — the cross-core
+    /// FROM_CPU_INTR0/1 sources (79/80) live in the high half.
+    pub fn pending_lines(&self, cpu: usize, sources: u128) -> u32 {
         let mut lines = 0u32;
         let mut s = sources;
         while s != 0 {

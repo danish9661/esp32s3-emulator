@@ -10,7 +10,6 @@ pub mod generated;
 
 pub use bus::Bus;
 pub use cpu::{Cpu, StepResult};
-
 #[cfg(test)]
 mod tests {
     use crate::generated::{decode_inst, *};
@@ -26,12 +25,15 @@ mod tests {
         assert_eq!(enc(insn), Some(Opcode::OPCODE_L32R));
         let o = opnds(Opcode::OPCODE_L32R, insn, 0x4000_0100);
         assert_eq!((o[0].value, o[0].is_reg), (3, true));
-        // ISA RM L32R: sext16(imm16) << 2 + ((pc+3) & ~3). (QEMU's C emits
-        // the tensilica idiom `((0xffff<<16)|imm16)<<2`, which equals sext
-        // only when bit 15 of imm16 is set; forward l32r would be wrong.)
+        // L32R pc-relative offset: (((0xffff)<<16)|imm16)<<2 — the top 16
+        // ones force a negative offset for every imm16 (QEMU operand
+        // uimm16x4), so L32R only references backward.  sext16(imm16)<<2
+        // would be wrong for fields with bit 15 clear (forward target).
         assert_eq!(
             o[1].value,
-            0x48d0u32.wrapping_add((0x4000_0100u32 + 3) & !3)
+            (0xffff_0000u32 | 0x1234)
+                .wrapping_shl(2)
+                .wrapping_add((0x4000_0100u32 + 3) & !3)
         );
     }
 
@@ -301,6 +303,7 @@ mod cpu_tests {
 
         let mut bus = RamBus::load(&prog);
         let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_0000; // programs live at 0x40000000
         run(&mut cpu, &mut bus, end);
 
         assert_eq!(cpu.reg(2), 6, "add.n result");
@@ -376,6 +379,91 @@ mod cpu_tests {
     }
 
     #[test]
+    fn call0_preserves_callinc() {
+        // QEMU translate_call0/translate_callx0 do NOT write PS.CALLINC
+        // (only the windowed CALL4/8/12 + CALLX4/8/12 deposit it via
+        // gen_callw_slot).  The ESP-IDF level-1 vector does `call0
+        // _xt_user_exc` and _xt_lowint1 saves `rsr.ps` into the task
+        // frame — if call0 cleared CALLINC, an interrupt taken right
+        // after a task dispatch would resume the task with CALLINC=0
+        // and its `entry` would fail to rotate (a2 = 0 -> callx8 0).
+        // Regression for the ipc0 crash in esp32s3_hello.
+        let mut prog = Vec::new();
+        let mut a = 0x4000_1000u32;
+        // Layout constraints (real silicon, QEMU): CALL/CALL4 targets
+        // resolve to (pc&~3)+4+off<<2 (always 4-aligned), and RET masks
+        // a0&~3, so calls must sit at pc ≡ 1 (mod 4) so pc+3 ≡ 0 (mod 4).
+        // The store base must be a4-free AND a5-free: call4 rotates the
+        // window, so the callee's a1 lands in phys[5] (caller's a5) and
+        // a4 holds the call4 return slot — only a0..a3 survive a call4.
+        put(&mut prog, &mut a, 0x0006_A022); // movi a2, 6
+        put(&mut prog, &mut a, 0x0011_2200); // slli a2, a2, 16    ; a2 = 0x60000 (WOE|CALLINC=2)
+        put(&mut prog, &mut a, 0x0013_E620); // wsr.ps a2          ; WSR = op2=1 (0x13E)
+        put(&mut prog, &mut a, 0x0000_A032); // movi a3, 0         ; store base (preserved)
+        put(&mut prog, &mut a, 0x0000_20F0); // nop
+        put(&mut prog, &mut a, 0x0000_20F0); // nop
+        put(&mut prog, &mut a, 0x0003_E620); // rsr.ps a2          ; RSR = op2=0 (0x03E)
+        let call0_pc = a;
+        put(&mut prog, &mut a, 0x0000_0005); // call0 (off patched); pc ≡ 1 mod 4
+        put(&mut prog, &mut a, 0x0010_6322); // s32i a2, a3, 0x40  ; mem[0x40] = ps after call0
+        put(&mut prog, &mut a, 0x0000_0041); // l32r a4, f1 (imm16 patched)
+        put(&mut prog, &mut a, 0x0000_20F0); // nop
+        put(&mut prog, &mut a, 0x0003_E620); // rsr.ps a2
+        put(&mut prog, &mut a, 0x0000_20F0); // nop
+        put(&mut prog, &mut a, 0x0000_20F0); // nop
+        put(&mut prog, &mut a, 0x0000_20F0); // nop
+        let callx0_pc = a;
+        put(&mut prog, &mut a, 0x0000_04C0); // callx0 a4          ; pc ≡ 1 mod 4
+        put(&mut prog, &mut a, 0x0011_6322); // s32i a2, a3, 0x44  ; mem[0x44] = ps after callx0
+        put(&mut prog, &mut a, 0x0060_A012); // movi a1, 0x60      ; sp for the call4 chain
+        put(&mut prog, &mut a, 0x0000_20F0); // nop
+        put(&mut prog, &mut a, 0x0003_E620); // rsr.ps a2
+        put(&mut prog, &mut a, 0x0000_20F0); // nop
+        put(&mut prog, &mut a, 0x0000_20F0); // nop
+        put(&mut prog, &mut a, 0x0000_20F0); // nop
+        let call4_pc = a;
+        put(&mut prog, &mut a, 0x0000_0015); // call4 (off patched); pc ≡ 1 mod 4
+        put(&mut prog, &mut a, 0x0003_E620); // rsr.ps a2
+        put(&mut prog, &mut a, 0x0012_6322); // s32i a2, a3, 0x48  ; mem[0x48] = ps after call4
+        put(&mut prog, &mut a, 0x0000_20F0); // nop
+        let j_end_pc = a;
+        put(&mut prog, &mut a, 0x0000_0006); // j end (off patched)
+        let f2 = a;
+        put(&mut prog, &mut a, 0x0000_4136); // f2: entry a1, 0x20  ; rotate by CALLINC=1
+        put(&mut prog, &mut a, 0x0000_0090); //     retw             ; 4-aligned target
+        put(&mut prog, &mut a, 0x0000_20F0); // nop
+        put(&mut prog, &mut a, 0x0000_20F0); // nop
+        let f1 = a;
+        put(&mut prog, &mut a, 0x0000_0080); // f1: ret            ; 4-aligned target
+        let end = a;
+        // l32r literal BEFORE the code (l32r target = ((0xFFFF0000|imm16)
+        // << 2) + base is always a backward reference — QEMU uimm16x4).
+        prog.push((0x4000_0FFC, f1)); // 4 bytes, 4-aligned
+
+        // Patch call targets (call offset = (target - 4 - (pc & ~3)) >> 2).
+        let c0 = f1.wrapping_sub(4).wrapping_sub(call0_pc & !3) >> 2;
+        prog[(call0_pc - 0x4000_1000) as usize / 3].1 = 0x05 | (c0 << 6);
+        let c4 = f2.wrapping_sub(4).wrapping_sub(call4_pc & !3) >> 2;
+        prog[(call4_pc - 0x4000_1000) as usize / 3].1 = 0x15 | (c4 << 6);
+        // j end from 0x51: off = end - pc - 4.
+        prog[(j_end_pc - 0x4000_1000) as usize / 3].1 =
+            0x06 | (end.wrapping_sub(4).wrapping_sub(j_end_pc) << 6);
+        // l32r a4 at 0x1b: base = (0x4000101b + 3) & ~3 = 0x4000101c.
+        let imm16 = (0x4000_0FFCu32.wrapping_sub(0x4000_101c) >> 2) & 0xFFFF;
+        prog[9].1 = (imm16 << 8) | 0x41; // l32r: imm16 in bits [23:8]
+
+        let mut bus = RamBus::load(&prog);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_1000;
+        run(&mut cpu, &mut bus, end);
+
+        assert_eq!(bus.read32(0x40), 0x60000, "call0 leaves CALLINC alone");
+        assert_eq!(bus.read32(0x44), 0x60000, "callx0 leaves CALLINC alone");
+        assert_eq!(bus.read32(0x48), 0x50000, "call4 writes CALLINC=1");
+        assert_eq!(cpu.sreg(SR_PS), 0x50000, "PS after call4");
+    }
+
+    #[test]
     fn exception_vectors_and_rfe() {
         // ill -> kernel vector (VECBASE + 0x300); handler rewrites EPC1
         // and returns with rfe.
@@ -396,6 +484,7 @@ mod cpu_tests {
 
         let mut bus = RamBus::load(&prog);
         let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_0000; // programs live at 0x40000000
         assert!(matches!(cpu.step(&mut bus), StepResult::Ok));
         assert_eq!(cpu.pc, ill_pc, "reached ill");
         assert!(matches!(
@@ -442,6 +531,7 @@ mod cpu_tests {
 
         let mut bus = RamBus::load(&prog);
         let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_0000; // programs live at 0x40000000
         run(&mut cpu, &mut bus, end);
 
         assert_eq!(cpu.reg(4), 0xff, "l8ui");
@@ -482,6 +572,7 @@ mod cpu_tests {
 
         let mut bus = IntBus::load(&prog, 1 << 22);
         let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_0000; // programs live at 0x40000000
         for _ in 0..6 {
             cpu.step(&mut bus); // 5 builders + wsr (take at end)
         }
@@ -533,6 +624,7 @@ mod cpu_tests {
 
         let mut bus = IntBus::load(&prog, 1 << 19);
         let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_0000; // programs live at 0x40000000
         for _ in 0..3 {
             cpu.step(&mut bus);
         }
@@ -568,6 +660,7 @@ mod cpu_tests {
         put(&mut prog, &mut h, 0x0000_3410); // rfi 4
         let mut bus = IntBus::load(&prog, 1 << 19);
         let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_0000; // programs live at 0x40000000
         cpu.set_sreg(SR_INTENABLE, (1 << 19) | (1 << 15) | (1 << 24));
         cpu.set_sreg(SR_PS, 2); // INTLEVEL 2
         cpu.step(&mut bus);
@@ -621,6 +714,7 @@ mod cpu_tests {
         put(&mut prog, &mut a, 0x0000_20F0); // nop                ; interrupted target
         let mut bus = IntBus::load(&prog, 1 << 0);
         let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_0000; // programs live at 0x40000000
         cpu.step(&mut bus); // movi
         cpu.step(&mut bus); // wsr intenable -> level 1 pending
         assert_eq!(cpu.pc, 0x4000_0300, "kernel vector");
@@ -645,6 +739,7 @@ mod cpu_tests {
         let end = a;
         let mut bus = RamBus::load(&prog);
         let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_0000; // programs live at 0x40000000
         run(&mut cpu, &mut bus, end);
         assert_eq!(cpu.reg(3), 0x800, "rsr.interrupt reflects wsr.intset");
         assert_eq!(cpu.reg(4), 0, "intclear visible to rsr.interrupt");
@@ -654,8 +749,9 @@ mod cpu_tests {
 
     #[test]
     fn prid_reads_core_id() {
-        // PRID (SR 235) is the per-core read-only core number; each Cpu has
-        // its own value (QEMU xtensa_cpu_reset sets sregs[PRID] = core_id).
+        // PRID (SR 235) carries the per-core strapping; the ESP32-S3 ROM
+        // compares against 0xCDCD (core 0) / 0xABAB (core 1) and the app
+        // derives the core index as (PRID >> 13) & 1.
         // rsr a2, PRID = 0x0003_EB20 (t=2); rsr a3, PRID = 0x0003_EB30.
         let mut prog = Vec::new();
         let mut a = 0x4000_1000u32;
@@ -667,14 +763,16 @@ mod cpu_tests {
         let mut cpu0 = Cpu::new(0);
         cpu0.pc = 0x4000_1000;
         run(&mut cpu0, &mut bus, end);
-        assert_eq!(cpu0.reg(2), 0, "core 0 PRID");
-        assert_eq!(cpu0.reg(3), 0, "core 0 PRID");
+        assert_eq!(cpu0.reg(2), 0xCDCD, "core 0 PRID");
+        assert_eq!(cpu0.reg(3), 0xCDCD, "core 0 PRID");
+        assert_eq!((cpu0.reg(2) >> 13) & 1, 0, "core 0 index bit");
 
         let mut bus = RamBus::load(&prog);
         let mut cpu1 = Cpu::new(1);
         cpu1.pc = 0x4000_1000;
         run(&mut cpu1, &mut bus, end);
-        assert_eq!(cpu1.reg(2), 1, "core 1 PRID");
-        assert_eq!(cpu1.reg(3), 1, "core 1 PRID");
+        assert_eq!(cpu1.reg(2), 0xABAB, "core 1 PRID");
+        assert_eq!(cpu1.reg(3), 0xABAB, "core 1 PRID");
+        assert_eq!((cpu1.reg(2) >> 13) & 1, 1, "core 1 index bit");
     }
 }

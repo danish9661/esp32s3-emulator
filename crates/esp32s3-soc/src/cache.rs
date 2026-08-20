@@ -121,10 +121,15 @@ impl Cache {
         match off {
             0x000 | 0x004 => self.dcache_enable,
             0x060 | 0x064 => self.icache_enable,
-            // SYNC_CTRL (DCACHE 0x028 / ICACHE 0x088) and PRELOAD_CTRL
-            // (DCACHE 0x040 / ICACHE 0x094): INVALIDATE/PRELOAD_ENA bit 0,
-            // DONE bit 1.
-            0x028 | 0x088 | 0x040 | 0x094 => self.check_and_reset_ena(idx, 0x1, 0x2),
+            // SYNC_CTRL (DCACHE 0x028 / ICACHE 0x088): INVALIDATE_ENA bit 0.
+            // DONE bit differs: DCACHE = bit 3, ICACHE = bit 1 (esp-idf
+            // extmem_reg.h EXTMEM_DCACHE_SYNC_DONE bitpos 3 vs
+            // EXTMEM_ICACHE_SYNC_DONE bitpos 1 — the ROM's cache-sync
+            // routine at 0x4004E550 polls `bnone a9, 0x8` on 0x600C4028).
+            // PRELOAD_CTRL (DCACHE 0x040 / ICACHE 0x094): ENA bit 0, DONE
+            // bit 1 (both).
+            0x028 => self.check_and_reset_ena(idx, 0x1, 0x8),
+            0x088 | 0x040 | 0x094 => self.check_and_reset_ena(idx, 0x1, 0x2),
             // AUTOLOAD_CTRL (DCACHE 0x04C / ICACHE 0x0A0): AUTOLOAD_ENA
             // bit 2, AUTOLOAD_DONE bit 3.
             0x04C | 0x0A0 => self.check_and_reset_ena(idx, 0x4, 0x8),
