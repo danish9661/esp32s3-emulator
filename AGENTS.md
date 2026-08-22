@@ -83,7 +83,7 @@ Core design:
       peripheral state such as `gpio_output()` and device registers),
       exception correctness and interrupt timing verified through real
        FreeRTOS/Arduino behavior. NEXT: keep implementing missing peripherals
-       (RMT ✓, PCNT ✓, TWAI/CAN, MCPWM, Touch, …) and validate each with a
+       (RMT ✓, PCNT ✓, TWAI/CAN ✓, MCPWM, Touch, …) and validate each with a
        sketch. NOTE: the esp-idf RMT *driver* uses GDMA (unmodeled) — RMT was
        validated via direct register pokes; modeling GDMA would also enable the
        driver path.
@@ -794,3 +794,58 @@ Core design:
     (ack_en-free, FIFO-drain model). 89 workspace tests green, clippy
     `--target wasm32-unknown-unknown` clean. NOT committed (awaiting
     user go-ahead).
+ - 2026-08-22: **GDMA (P5 — new peripheral via arduino-cli validation)**.
+   `esp32s3-soc/src/gdma.rs` models the General DMA controller: register
+   block @ 0x6004_2000, 5 channel pairs (`gdma_dev_t` array, `in`+`out`
+   blocks 0x60 each, channel stride 0xC0, `out` block at `ch*0xC0+0x60` per
+   `gdma_struct.h`). Only the TX (`out`) path is functional: writing
+   `out.link.start` (bit 1) walks the descriptor chain from `out.link.addr`
+   (20 LSBs of a DRAM descriptor — full addr = `0x3FC0_0000 | (addr & ~0x3)`,
+   the low 2 bits are the start/stop control bits and are stripped, since a
+   descriptor is 4-byte aligned) and copies `dw0[23:12]` = `length` bytes
+   from each descriptor's `buf` (full 32-bit DRAM addr) into the connected
+   peripheral's RAM. `gdma_descriptor_t = {dw0,buf,next,rsvd}`; `dw0[11:0]`
+   size, `dw0[23:12]` length, `dw0[30]` eof, `dw0[31]` owner. For
+   `peri_sel == 9` (RMT) the destination is `RMTMEM_BASE + ch*0x100` (each
+   RMT channel block = 0x100 bytes); RMT then transmits exactly as for
+   CPU-written items, raising its own `tx_end`. After the walk
+   `out_done`/`out_eof`/`out_total_eof` (raw bits 0/1/3) are asserted;
+   `GDMA_INTR_SOURCE = 63` is ORed into `soc.rs::int_pending`, `int_clr`
+   (reg 0x14) clears raw bits. TX copy is word-wise (`read32`/`write32`)
+   because RMTMEM `write32` stores the full word (a byte-wise copy would
+   clobber neighbors). Wired into `soc.rs` (mmio arm `GDMA_BASE`, inline
+   descriptor walk since the closure capturing `&mut self` conflicted with
+   the per-descriptor reads, `signal_level`/`int_pending`). Unit tests
+   (`tests/gdma.rs`, 6): link-addr control-bit stripping, peri_sel low-6-bit
+   mask, start-write returns the channel, tx_done assert+clear handshake,
+   descriptor field decode. Validated end-to-end with
+   `tools/sketches/esp32s3_gdma` (direct GDMA register programming: volatile
+   `g_desc`/`g_items` → fill RMTMEM via channel 0 → `tx_start` → poll
+   `tx_end`) → `GDMA RMT TX done`. Note: the esp-idf v5.3 **legacy**
+   `rmt_write_items` writes RMTMEM directly (no GDMA); only the **new**
+    `rmt_transmit` driver uses GDMA — so the next stretch is to validate the
+    new RMT driver path. 119 workspace tests green (+6 GDMA), clippy/
+    wasm32 clean. Committed as 15ea7b3.
+ - 2026-08-22: **TWAI / CAN (P5 — new peripheral via arduino-cli validation)**.
+   `esp32s3-soc/src/twai.rs` models the ESP32-S3 TWAI (CAN 2.0B) controller:
+   register block @ 0x6000_C000 (PeliCAN-style, `soc/twai_struct.h`), registers
+   8-bit but mapped to the LSB of every 32-bit word. Implements mode/command/
+   status/interrupt(IR)/interrupt-enable(IER), bus timing, error counters, a
+   4-byte acceptance filter (ACR/AMR, only writable in reset mode), and the
+   13-byte shared TX/RX frame buffer. Registers `0x40..0x70` are dual-purpose:
+   in **reset mode** they hold ACR[4] (0x40)/AMR[4] (0x50); in **operational
+   mode** they are the TX (write)/RX (read) buffer. Writing `command.tr` (or
+   `srr`) completes TX synchronously; in self-test mode (`mode.stm`) or on a
+   self-reception request the frame loops back into the RX buffer (subject to
+   the acceptance filter) — this is exactly how `TWAI_MODE_NO_ACK` / the
+   `self_reception` flag exercise the receive path with no real bus. IR read
+   clears all interrupts except RI (cleared by RX-buffer release, `rrb`);
+   `twai.int_pending` = raw & IER. Source = `ETS_TWAI_INTR_SOURCE = 37`, wired
+   into `soc.rs::int_pending` + the mmio arm `TWAI_BASE`. Real bus
+   arbitration/ACK/error-frame timing is not modeled. Unit tests
+   (`tests/twai.rs`, 5): reset-mode default, ACR/AMR config vs op-mode buffer
+   aliasing, self-test loopback round-trip, TI/RI assert + RRB clear, accept-all
+   filter. Validated end-to-end with `tools/sketches/esp32s3_twai` (direct
+   register pokes: reset → accept-all filter → STM → load frame → `tr` → poll
+   `rbs` → compare) → `TWAI LOOPBACK PASS` / `TWAI RRB OK`. 124 workspace tests
+   green (+5 TWAI), clippy/wasm32 clean.

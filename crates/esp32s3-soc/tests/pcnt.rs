@@ -48,13 +48,7 @@ fn counts_falling_edges_on_ch0() {
     p.write32(0x08, 0xFFFF_0000); // l_lim = -1 (0xFFFF), so it can go negative
     p.write32(0x60, 0);
     let sig = Cell::new(0u32);
-    let input = |s: u32| -> u32 {
-        if s == SIG_CH0 {
-            sig.get()
-        } else {
-            1
-        }
-    };
+    let input = |s: u32| -> u32 { if s == SIG_CH0 { sig.get() } else { 1 } };
     p.tick(&input);
     for _ in 0..5 {
         sig.set(1);
@@ -76,13 +70,7 @@ fn threshold_interrupt_fires_and_clears() {
     p.write32(0x48, 1); // INT_ENA unit0
     p.write32(0x60, 0);
     let sig = Cell::new(0u32);
-    let input = |s: u32| -> u32 {
-        if s == SIG_CH0 {
-            sig.get()
-        } else {
-            1
-        }
-    };
+    let input = |s: u32| -> u32 { if s == SIG_CH0 { sig.get() } else { 1 } };
     p.tick(&input);
     for _ in 0..5 {
         sig.set(1);
@@ -90,7 +78,11 @@ fn threshold_interrupt_fires_and_clears() {
         sig.set(0);
         p.tick(&input);
     }
-    assert_ne!(p.int_st(), 0, "reaching h_lim=5 should assert the interrupt");
+    assert_ne!(
+        p.int_st(),
+        0,
+        "reaching h_lim=5 should assert the interrupt"
+    );
     p.write32(0x4C, 1); // INT_CLR unit0
     assert_eq!(p.int_st(), 0, "int_clr must clear the threshold interrupt");
 }

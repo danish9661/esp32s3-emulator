@@ -144,9 +144,19 @@ impl Pcnt {
                 let positive = cur == 1;
                 // Channel mode fields within CONF0.
                 let (pos_mode, neg_mode, hctrl, lctrl) = if c == 0 {
-                    ((conf0 >> 18) & 3, (conf0 >> 16) & 3, (conf0 >> 20) & 3, (conf0 >> 22) & 3)
+                    (
+                        (conf0 >> 18) & 3,
+                        (conf0 >> 16) & 3,
+                        (conf0 >> 20) & 3,
+                        (conf0 >> 22) & 3,
+                    )
                 } else {
-                    ((conf0 >> 26) & 3, (conf0 >> 24) & 3, (conf0 >> 28) & 3, (conf0 >> 30) & 3)
+                    (
+                        (conf0 >> 26) & 3,
+                        (conf0 >> 24) & 3,
+                        (conf0 >> 28) & 3,
+                        (conf0 >> 30) & 3,
+                    )
                 };
                 let base = if positive { pos_mode } else { neg_mode };
                 let ctrl_cur = input(Self::sig_ctrl(u, c)) & 1;
@@ -155,7 +165,13 @@ impl Pcnt {
                 match ctrl_mode {
                     1 => {
                         // Invert: increment <-> decrement.
-                        action = if base == 1 { 2 } else if base == 2 { 1 } else { base };
+                        action = if base == 1 {
+                            2
+                        } else if base == 2 {
+                            1
+                        } else {
+                            base
+                        };
                     }
                     2 | 3 => action = 0, // inhibit
                     _ => {}

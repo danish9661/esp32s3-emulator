@@ -17,18 +17,20 @@ use xtensa_core::Bus;
 
 use crate::adc::Adc;
 use crate::cache::{Cache, CacheTarget};
+use crate::gdma::{GDMA_BASE, Gdma};
 use crate::gpio::Gpio;
 use crate::i2c::I2c;
 use crate::intc::Intc;
 use crate::ledc::Lcdc;
 use crate::memmap::*;
 use crate::memspi::Memspi;
+use crate::pcnt::{PCNT_BASE, Pcnt};
+use crate::rmt::{RMT_BASE, Rmt};
 use crate::rtc::Rtc;
-use crate::rmt::{Rmt, RMT_BASE};
-use crate::pcnt::{Pcnt, PCNT_BASE};
 use crate::spi::Spi;
 use crate::systimer::Systimer;
 use crate::timg::{INT_T0, INT_T1, INT_WDT, Timg};
+use crate::twai::{TWAI_BASE, Twai};
 use crate::uart::Uart;
 
 macro_rules! in_range {
@@ -123,8 +125,10 @@ pub struct Soc {
     pub memspi: [Memspi; 2],
     i2c: [I2c; 2],
     rmt: Rmt,
+    twai: Twai,
     adc: Adc,
     pcnt: Pcnt,
+    gdma: Gdma,
     cache: Cache,
     timg: [Timg; 2],
     systimer: Systimer,
@@ -180,8 +184,10 @@ impl Soc {
             memspi: [Memspi::new(), Memspi::new()],
             i2c: [I2c::new(0), I2c::new(1)],
             rmt: Rmt::new(),
+            twai: Twai::new(),
             adc: Adc::new(),
             pcnt: Pcnt::new(),
+            gdma: Gdma::default(),
             cache: Cache::new(),
             timg: [Timg::new(), Timg::new()],
             systimer: Systimer::new(),
@@ -572,6 +578,64 @@ impl Soc {
                     self.pcnt.read32(off)
                 }
             }
+            GDMA_BASE => {
+                if is_write {
+                    // A write that starts an OUT channel transfer triggers the
+                    // descriptor-walk copy into the connected peripheral's RAM.
+                    if let Some(ch) = self.gdma.write32(off, value) {
+                        let link_addr = self.gdma.out_link_addr(ch);
+                        let peri = self.gdma.out_peri_sel(ch);
+                        // Walk the descriptor chain. Descriptor addresses are
+                        // in DRAM; the link register holds the 20 LSBs
+                        // (GDMA_DESC_BASE), buffer/next are full 32-bit
+                        // addresses. Copy `length` bytes from each buffer into
+                        // the destination peripheral's RAM (RMTMEM for RMT).
+                        let mut desc = link_addr;
+                        loop {
+                            let dw0 = self.read32(desc);
+                            let buf = self.read32(desc + 4);
+                            let next = self.read32(desc + 8);
+                            let len = (dw0 >> 12) & 0xFFF;
+                            let eof = (dw0 >> 30) & 1;
+                            let owner = (dw0 >> 31) & 1;
+                            if owner == 0 {
+                                break;
+                            }
+                            if peri == crate::gdma::GDMA_RMT_PERIPH {
+                                let dst = crate::rmt::RMTMEM_BASE + (ch as u32) * 0x100;
+                                // Copy in 32-bit words. RMT items are
+                                // word-aligned and the item buffer length is a
+                                // multiple of 4; a byte-wise copy would clobber
+                                // whole words because RMTMEM writes via
+                                // write32 store the full word (see Rmt::write32).
+                                let mut k = 0u32;
+                                while k + 4 <= len {
+                                    let w = self.read32(buf + k);
+                                    self.write32(dst + k, w);
+                                    k += 4;
+                                }
+                                self.gdma.set_out_eof_des_addr(ch, desc);
+                            }
+                            if next == 0 || eof == 1 {
+                                break;
+                            }
+                            desc = next;
+                        }
+                        self.gdma.raise_out_done(ch);
+                    }
+                    0
+                } else {
+                    self.gdma.read32(off)
+                }
+            }
+            TWAI_BASE => {
+                if is_write {
+                    self.twai.write32(off, value);
+                    0
+                } else {
+                    self.twai.read32(off)
+                }
+            }
             // Page 0x6000_8000 holds RTC_CNTL (0x000), RTC_IO (0x400),
             // SENS (0x800, the SAR ADC RTC oneshot controller) and
             // RTC_MEM (0xC00); RTC_CNTL's slow-clock timer is modeled
@@ -767,6 +831,16 @@ impl Bus for Soc {
         // PCNT threshold events (units 0..3) = source 41 (ETS_PCNT_INTR_SOURCE).
         if self.pcnt.int_st() != 0 {
             src |= 1 << crate::pcnt::PCNT_INTR_SOURCE;
+        }
+        // GDMA (shared interrupt, sources = OUT/IN channel done/eof). The
+        // firmware GDMA ISR (esp-idf gdma_hal) reads each channel's int_st and
+        // dispatches to the registered tx/rx-event callback.
+        if self.gdma.int_pending() {
+            src |= 1 << crate::gdma::GDMA_INTR_SOURCE;
+        }
+        // TWAI (CAN) controller = source 37 (ETS_TWAI_INTR_SOURCE).
+        if self.twai.int_pending() {
+            src |= 1 << crate::twai::TWAI_INTR_SOURCE;
         }
         // Cross-core interrupts: SYSTEM.CPU_INT_FROM_CPU_0/1 (0x600C0030/34)
         // assert the FROM_CPU_INTR0/1 sources = 79/80 (esp32s3 interrupts.h

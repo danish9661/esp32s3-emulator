@@ -11,19 +11,21 @@ extern crate alloc;
 
 pub mod adc;
 pub mod cache;
+pub mod gdma;
 pub mod gpio;
 pub mod i2c;
 pub mod intc;
 pub mod ledc;
 pub mod memmap;
 pub mod memspi;
-pub mod rtc;
-pub mod rmt;
 pub mod pcnt;
+pub mod rmt;
+pub mod rtc;
 pub mod soc;
 pub mod spi;
 pub mod systimer;
 pub mod timg;
+pub mod twai;
 pub mod uart;
 
 pub use soc::Soc;

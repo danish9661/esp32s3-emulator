@@ -4,4 +4,5 @@
 web/pkg/
 web/hello.bin
 web/firmware/*.bin
+*.merged.bin
 # sample firmware used for local browser testing (copy your own merged.bin)
