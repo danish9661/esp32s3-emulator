@@ -627,3 +627,55 @@ Core design:
   - run_flash.rs has temporary debug watches (MUX-CLOBBER/SCOMP-WRITE/S32C1I/
     NEST/LIT/APP-FIRST prints) — strip before commit; scratch examples
     probe_assert.rs/dbg_printf.rs/dbg_rom.rs/dump_qsort.rs to delete.
+
+- 2026-08-22: **P4 validation via real Arduino-CLI sketches** — added SPI +
+  I2C validation sketches and fixed two emulator gaps they exposed.
+  - Built 5 sketches with arduino-cli 1.5.1 / esp32 core 3.3.10 + esptool
+    merge: `tools/sketches/{esp32s3_hello,esp32s3_periph,esp32s3_uart_echo,
+    esp32s3_spi,esp32s3_i2c}/`. All 5 boot to completion (exit=0) under
+    `target/release/examples/run_flash`. Run: `cargo build --release
+    --example run_flash -p esp32s3-emu` then
+    `target/release/examples/run_flash <sketch>.ino.merged.bin`.
+  - **SPI fix (real gap)**: GPSPI2 `i2c_spi_master.cpp` waits on
+    `SPI_STrans`/`cmd->cmd_state` which reads `SPI_INT_RAW.trans_done`
+    (bit 0). Our SPI never self-cleared `CMD_UPDATE` (0x60000000) on write,
+    so the busy-wait `while (cmd->cmd_state & SPI_CMD_USR)` never exited →
+    hang. Fixed `spi.rs` write32: writing `CMD_UPDATE` clears it (one-shot
+    like `CMD_USR`); `CMD_USR` still triggers the transfer via
+    `maybe_trigger`. SPI sketch now prints `SPI transfer(0x55)=0x00`
+    (MISO zeros, no device) and exits 0.
+  - **I2C fix (real gap)**: the FSM hung on the SECOND transaction — the
+    Arduino Wire driver reuses the same 8 COMD slots and relies on the
+    controller auto-clearing every `COMD_DONE` on `trans_start` (TRM
+    I2C_COMD0..7 done bit is rw0c, cleared by HW on start). `i2c.rs`
+    `trans_start` now clears all 8 `COMD_DONE` bits; the FSM chains to the
+    next queued command after each completes. I2C sketch now reaches
+    `I2C SCAN done` and prints (see known limitation below).
+  - **Interrupt wiring**: `soc.rs::int_pending` now ORs UART0/1/2 (src
+    27/28/29), I2C_EXT0/1 (src 42/43), SPI2/SPI3 (src 44/45) into the
+    per-CPU pending bitmap; `Intc::pending_lines` maps them to lines. The
+    matrix dump shows I2C0 (src42) routed to **core1 line 2** (ISR runs on
+    core 1; the core-0 task waits on the cross-core event) — source NOT
+    mapped to core 0.
+  - **I2C NACK model**: added `INT_NACK` (I2C_INT_RAW bit 10) assertion on
+    the WRITE ACK-high phase (no device present → SDA released → NACK, which
+    `i2c_ll.h` `i2c_hal_master_handle_tx_event` reports via `int_status`
+    = INT_ST, NACK priority > TRANS_DONE). `SR_RESP_REC` (bit 0) set to 1
+    (NACK) unconditionally on the ACK cycle.
+  - **KNOWN LIMITATION (not fixed this session)**: the I2C scan prints
+    `found=56` (expected 0 with no bus devices). Debug counters showed
+    `int_raw_reads=0` (driver reads INT_ST, not RAW), `tx_data_writes=112`
+    (one push per scan address, no re-push on the ~449 `trans_start` retry
+    calls), `trans_done_sets` at the END command for every transaction, and
+    `nack_sets=0` because the scan's WRITE comd has `ack_en=0` (so
+    `nack_int_raw` is never raised). The deterministic 56/56 split is
+    address-correlated and the firmware's actual NACK-decision path
+    (which status register it reads) was not identified — requires
+    disassembly/tracing of the Arduino Wire `endTransmission` + the
+    `i2c_ll` ISR to resolve. Deferred to P5/P6 (golden-trace + peripheral
+    accuracy). All other behavior (boot, SPI, UART, periph) is correct.
+  - Debug instrumentation (i2c.rs counters, soc.rs `pub i2c`, run_flash.rs
+    TEMP eprintln) added then fully removed; i2c.rs is back to clean
+    (ack_en-free, FIFO-drain model). 89 workspace tests green, clippy
+    `--target wasm32-unknown-unknown` clean. NOT committed (awaiting
+    user go-ahead).

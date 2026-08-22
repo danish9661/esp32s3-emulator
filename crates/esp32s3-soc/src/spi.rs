@@ -16,10 +16,12 @@
 //! The module clock gate (CLK_GATE.clk_en) must be set for the clock to
 //! run, exactly like real hardware (IDF spi_ll_enable_clock).
 //!
-//! Not modeled: DMA, slave mode, quad/octal, segments, interrupts, the
-//! CMD.update latch (values are used as written — functionally equivalent
-//! once firmware follows the IDF update sequence).  MISO input has no
-//! device attached, so RX phases read back zeros.
+//! Interrupts: transaction completion latches INT_RAW.trans_done (bit 0,
+//! TRM SPI_SLV_INT_RAW); INT_STATUS = INT_RAW & INT_ENA. The matrix + CPU
+//! delivery is wired in soc.rs int_pending.  Not modeled: DMA slave mode,
+//! quad/octal, segments, the CMD.update latch (values are used as written
+//! — functionally equivalent once firmware follows the IDF update sequence).
+//! MISO input has no device attached, so RX phases read back zeros.
 
 // Register offsets (TRM GPSPI chapter).
 pub const SPI_CMD: u32 = 0x00;
@@ -35,7 +37,8 @@ pub const SPI_DATA_BUF: u32 = 0x98;
 pub const SPI_SLAVE: u32 = 0xE0;
 pub const SPI_CLK_GATE: u32 = 0xE8;
 
-// CMD bits (TRM SPI_CMD).
+// CMD bits (TRM SPI_CMD, per esp32s3 spi_struct.h: update=bit23, usr=bit24).
+const CMD_UPDATE: u32 = 1 << 23;
 const CMD_USR: u32 = 1 << 24;
 // CLOCK bits (TRM SPI_CLOCK).
 const CLOCK_EQU_SYSCLK: u32 = 1 << 31;
@@ -64,6 +67,12 @@ const MISC_CS1_DIS: u32 = 1 << 1;
 const CTRL_D_POL: u32 = 1 << 20;
 // CLK_GATE bits (TRM SPI_CLK_GATE).
 const CLK_GATE_CLK_EN: u32 = 1 << 0;
+// Interrupt registers (TRM SPI_SLV_INT_*): trans_done = bit 0.
+pub const SPI_INT_ENA: u32 = 0x34;
+pub const SPI_INT_CLR: u32 = 0x38;
+pub const SPI_INT_RAW: u32 = 0x3C;
+pub const SPI_INT_ST: u32 = 0x40;
+const INT_TRANS_DONE: u32 = 1 << 0;
 
 const REG_COUNT: usize = 0xF4 / 4;
 const DATA_WORDS: usize = 16;
@@ -138,13 +147,15 @@ impl Spi {
     }
 
     /// Finish the transaction: sample MISO (no device -> zeros) into the
-    /// data buffer and clear CMD.usr (self-clearing, TRM SPI_CMD.usr).
+    /// data buffer, latch trans_done, and clear CMD.usr (self-clearing,
+    /// TRM SPI_CMD.usr).
     fn complete(&mut self) {
         if self.txn.as_ref().filter(|t| t.have_miso).is_some() {
             let zeros = [0u32; DATA_WORDS];
             self.regs[SPI_DATA_BUF as usize / 4..SPI_DATA_BUF as usize / 4 + DATA_WORDS]
                 .copy_from_slice(&zeros);
         }
+        self.regs[(SPI_INT_RAW / 4) as usize] |= INT_TRANS_DONE;
         self.regs[(SPI_CMD / 4) as usize] &= !CMD_USR;
         self.txn = None;
     }
@@ -336,18 +347,46 @@ impl Spi {
         }
     }
 
+    /// Interrupt status: INT_RAW & INT_ENA (TRM SPI_SLV_INT_STATUS). The
+    /// driver ISR reads this to identify the cause before clearing INT_CLR.
+    pub fn int_st(&self) -> u32 {
+        let raw = self.regs[(SPI_INT_RAW / 4) as usize];
+        let ena = self.regs[(SPI_INT_ENA / 4) as usize];
+        raw & ena
+    }
+
     pub fn read32(&mut self, offset: u32) -> u32 {
         if offset >= (REG_COUNT * 4) as u32 {
             return 0;
         }
-        self.regs[(offset / 4) as usize]
+        match offset {
+            SPI_INT_RAW => self.regs[(SPI_INT_RAW / 4) as usize],
+            SPI_INT_ENA => self.regs[(SPI_INT_ENA / 4) as usize],
+            SPI_INT_ST => self.int_st(),
+            SPI_INT_CLR => 0,
+            _ => self.regs[(offset / 4) as usize],
+        }
     }
 
     pub fn write32(&mut self, offset: u32, value: u32) {
         if offset.is_multiple_of(4) && offset < (REG_COUNT * 4) as u32 {
-            self.regs[(offset / 4) as usize] = value;
-            if offset == SPI_CMD {
-                self.maybe_trigger();
+            match offset {
+                SPI_INT_CLR => {
+                    // Clearing the status clears the matching RAW bits.
+                    self.regs[(SPI_INT_RAW / 4) as usize] &= !value;
+                }
+                _ => {
+                    self.regs[(offset / 4) as usize] = value;
+                    if offset == SPI_CMD {
+                        // UPDATE (bit 23) is self-clearing: it latches the APB
+                        // register image into the SPI module clock domain, then
+                        // the hardware clears it. The driver busy-waits on it.
+                        if value & CMD_UPDATE != 0 {
+                            self.regs[(SPI_CMD / 4) as usize] &= !CMD_UPDATE;
+                        }
+                        self.maybe_trigger();
+                    }
+                }
             }
         }
     }

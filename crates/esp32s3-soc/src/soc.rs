@@ -126,11 +126,6 @@ pub struct Soc {
     systimer: Systimer,
     rtc: Rtc,
     intc: Intc,
-    /// Ring of last matrix writes (off,value pairs) for boot forensics.
-    /// Debug counters for interrupt-delivery diagnosis (run_flash probes).
-    pub cc_asserted_count: u64,
-    pub matrix_log: [u32; 1024],
-    pub matrix_log_len: usize,
     /// SENS2 PLL-lock status (TRM SENS2 SAR_PLL_FORCE_CTRL @ 0x6000E040):
     /// rtc_clk powers the CPU PLL, then polls bit 24 (PLL_LOCK) until the
     /// ~200 us lock time elapses; the register is read-only on silicon for
@@ -186,9 +181,6 @@ impl Soc {
             systimer: Systimer::new(),
             rtc: Rtc::new(),
             intc: Intc::new(),
-            matrix_log: [0; 1024],
-            matrix_log_len: 0,
-            cc_asserted_count: 0,
             pll: PllLock::default(),
             appcpu_ctrl_a: 0,
             cpu_int_from_cpu: [0, 0],
@@ -604,11 +596,6 @@ impl Soc {
             }
             INT_MATRIX_BASE => {
                 if is_write {
-                    if self.matrix_log_len < self.matrix_log.len() {
-                        self.matrix_log[self.matrix_log_len] = off;
-                        self.matrix_log[self.matrix_log_len + 1] = value;
-                        self.matrix_log_len += 2;
-                    }
                     self.intc.write32(off, value);
                     0
                 } else {
@@ -714,6 +701,21 @@ impl Bus for Soc {
                 src |= 1 << (57 + n);
             }
         }
+        // I2C master (I2CEXT0/1) = sources 42/43, SPI2/SPI3 = 44/45
+        // (esp32s3 interrupts.h ETS_I2C_EXT*_INTR_SOURCE /
+        // ETS_SPI*_DMA_INTR_SOURCE). The driver ISR waits on a semaphore
+        // for trans_complete / trans_done, so the done bit must reach the
+        // CPU or the Arduino Wire/SPI library blocks forever.
+        for (i, ic) in self.i2c.iter().enumerate() {
+            if ic.int_st() != 0 {
+                src |= 1 << (42 + i);
+            }
+        }
+        for (i, s) in self.spi.iter().enumerate() {
+            if s.int_st() != 0 {
+                src |= 1 << (44 + i);
+            }
+        }
         // Cross-core interrupts: SYSTEM.CPU_INT_FROM_CPU_0/1 (0x600C0030/34)
         // assert the FROM_CPU_INTR0/1 sources = 79/80 (esp32s3 interrupts.h
         // ETS_FROM_CPU_INTR0/1; the esp-idf crosscore_int.c allocates
@@ -724,7 +726,6 @@ impl Bus for Soc {
         // NOTE: the bitmap must be u128 — source 79/80 exceed u64's range.
         if self.cpu_int_from_cpu[cpu] & 1 != 0 {
             src |= 1 << (79 + cpu);
-            self.cc_asserted_count += 1;
         }
         self.intc.pending_lines(cpu, src)
     }

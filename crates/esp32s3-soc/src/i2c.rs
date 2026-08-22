@@ -30,8 +30,9 @@
 //! windows txfifo_mem (0x100) / rxfifo_mem (0x180) approximate the same
 //! pushes/pops.
 //!
-//! Not modeled: slave mode, arbitration, timeouts, interrupts (raw bit
-//! latched only).
+//! Interrupts: END latches INT_RAW.trans_complete (bit 7); INT_STATUS =
+//! INT_RAW & INT_ENA (TRM I2C_INT_STATUS) so the driver ISR can read the
+//! cause. The matrix + CPU delivery is wired in soc.rs int_pending.
 
 // Register offsets (TRM I2C chapter / i2c_struct.h member order).
 pub const I2C_SCL_LOW_PERIOD: u32 = 0x00;
@@ -41,6 +42,8 @@ pub const I2C_FIFO_CONF: u32 = 0x18;
 pub const I2C_DATA: u32 = 0x1C;
 pub const I2C_INT_RAW: u32 = 0x20;
 pub const I2C_INT_CLR: u32 = 0x24;
+pub const I2C_INT_ENA: u32 = 0x28;
+pub const I2C_INT_ST: u32 = 0x2C;
 pub const I2C_SDA_HOLD: u32 = 0x30;
 pub const I2C_SDA_SAMPLE: u32 = 0x34;
 pub const I2C_SCL_HIGH_PERIOD: u32 = 0x38;
@@ -71,8 +74,9 @@ const COMD_ACK_VAL_SHIFT: u32 = 10;
 const COMD_OP_CODE_SHIFT: u32 = 11;
 const COMD_OP_CODE_MASK: u32 = 0x7;
 const COMD_DONE: u32 = 1 << 31;
-// INT_RAW bit (TRM I2C_INT_RAW): trans_complete.
+// INT_RAW bits (TRM I2C_INT_RAW): trans_complete + nack.
 const INT_TRANS_COMPLETE: u32 = 1 << 7;
+const INT_NACK: u32 = 1 << 10;
 
 // Master op codes (IDF i2c_ll.h I2C_LL_CMD_*).
 const OP_RSTART: u32 = 6;
@@ -231,6 +235,7 @@ impl I2c {
                 if self.tx_cnt == 0 {
                     // Nothing to send: complete immediately.
                     self.regs[(I2C_COMD / 4) as usize + slot] |= COMD_DONE;
+                    self.op = None;
                     return;
                 }
                 let byte = self.tx_byte();
@@ -264,6 +269,7 @@ impl I2c {
                 // END: no bus activity; latches trans_complete.
                 self.regs[(I2C_COMD / 4) as usize + slot] |= COMD_DONE;
                 self.regs[(I2C_INT_RAW / 4) as usize] |= INT_TRANS_COMPLETE;
+                self.op = None;
             }
         }
     }
@@ -277,6 +283,13 @@ impl I2c {
             }
             self.pending_len -= 1;
             self.run_command(p.slot, p.value);
+            // A command that completes with no bus activity (empty WRITE,
+            // END) leaves op == None; chain to the next queued command the
+            // same way trans_start() does, otherwise pending_len stays > 0
+            // and the next trans_start() bails forever.
+            if self.op.is_none() {
+                self.finish_op(p.slot);
+            }
         } else {
             self.op = None;
         }
@@ -334,27 +347,30 @@ impl I2c {
                     }
                     op.bytes_left = op.bytes_left.saturating_sub(1);
                 } else if op.phase == 8 {
-                    // ACK low done: clock high, SDA released.
+                    // ACK low done: clock high, SDA released. With no slave
+                    // present the bus pull-up holds SDA high -> NACK, which
+                    // the driver detects via nack_int_raw.
                     op.phase = 9;
                     self.scl = 1;
                     self.sda = 1;
+                    self.regs[(I2C_INT_RAW / 4) as usize] |= INT_NACK;
                     op.remain = high;
                 } else {
                     // ACK high done: next byte or command end.
                     if op.bytes_left > 0 {
                         op.phase = 0;
                         op.byte = if self.tx_cnt == 0 {
-                            0xFF
+                                0xFF
+                            } else {
+                                u32::from(self.txfifo[(self.tx_head % FIFO_DEPTH as u32) as usize])
+                            };
+                            self.scl = 0;
+                            self.sda = (op.byte >> 7) & 1;
+                            op.remain = low;
                         } else {
-                            u32::from(self.txfifo[(self.tx_head % FIFO_DEPTH as u32) as usize])
-                        };
-                        self.scl = 0;
-                        self.sda = (op.byte >> 7) & 1;
-                        op.remain = low;
-                    } else {
-                        finished = true;
+                            finished = true;
+                        }
                     }
-                }
             }
             OP_READ => {
                 if self.scl == 0 {
@@ -410,23 +426,33 @@ impl I2c {
         }
     }
 
-    /// Build the pending command queue from the comd slots with their done
-    /// bits clear, stopping at the first END, and start execution.
+    /// Build the pending command queue from the comd slots, stopping at the
+    /// first END, and start execution.
+    ///
+    /// The `done` bit (COMD_DONE, bit 31) is read-only status latched by the
+    /// controller as each command completes; on a new `trans_start` the
+    /// hardware clears it for every slot (TRM I2C: software re-issues the
+    /// command list from slot 0 and polls done to detect completion).  The
+    /// Arduino Wire driver reuses the same comd slots across transactions and
+    /// relies on this auto-clear — if we instead *skip* done-set slots the
+    /// queue is truncated after the first transfer and the FSM hangs.
     fn trans_start(&mut self) {
         if self.op.is_some() || self.pending_len > 0 {
             return;
         }
+        // Controller clears every command's done bit on (re)start.
+        for i in 0..8 {
+            self.regs[(I2C_COMD / 4) as usize + i] &= !COMD_DONE;
+        }
         for i in 0..8 {
             let value = self.regs[(I2C_COMD / 4) as usize + i];
-            if value & COMD_DONE != 0 {
-                continue;
-            }
+            let opc = (value >> COMD_OP_CODE_SHIFT) & COMD_OP_CODE_MASK;
             self.pending[self.pending_len as usize] = Pending {
                 slot: i,
                 value: value & !COMD_DONE,
             };
             self.pending_len += 1;
-            if (value >> COMD_OP_CODE_SHIFT) & COMD_OP_CODE_MASK == OP_END {
+            if opc == OP_END {
                 break;
             }
         }
@@ -477,6 +503,14 @@ impl I2c {
         }
     }
 
+    /// Interrupt status: INT_RAW & INT_ENA (TRM I2C_INT_STATUS). The driver
+    /// ISR reads this to identify the cause before clearing INT_CLR.
+    pub fn int_st(&self) -> u32 {
+        let raw = self.regs[(I2C_INT_RAW / 4) as usize];
+        let ena = self.regs[(I2C_INT_ENA / 4) as usize];
+        raw & ena
+    }
+
     pub fn read32(&mut self, offset: u32) -> u32 {
         match offset {
             I2C_SR => {
@@ -494,6 +528,9 @@ impl I2c {
                 sr
             }
             I2C_DATA | I2C_RXFIFO_MEM => self.pop_rx(),
+            I2C_INT_RAW => self.regs[(I2C_INT_RAW / 4) as usize],
+            I2C_INT_ENA => self.regs[(I2C_INT_ENA / 4) as usize],
+            I2C_INT_ST => self.int_st(),
             _ if offset.is_multiple_of(4) && offset < (REG_COUNT * 4) as u32 => {
                 self.regs[(offset / 4) as usize]
             }

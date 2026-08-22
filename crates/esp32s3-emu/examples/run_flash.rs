@@ -174,9 +174,6 @@ fn main() {
                 m.cpu[1].sreg(xtensa_core::cpu::SR_INTSET),
                 pc
             );
-            for w in m.soc.matrix_log[..m.soc.matrix_log_len].chunks(2) {
-                println!("INTC-WRITE off={:#x} value={:#x}", w[0], w[1]);
-            }
             core1_vec_shown = 1;
         }
         if m.cpu[1].pc == 0x4037_4340 && core1_vec_shown == 0 {
@@ -1939,10 +1936,9 @@ fn main() {
         m.cpu[1].dbg_irq_skipped_level0
     );
     println!(
-        "== int_pending(0)={:#x} int_pending(1)={:#x} cc_asserted_count={}",
+        "== int_pending(0)={:#x} int_pending(1)={:#x}",
         m.soc.int_pending(0),
-        m.soc.int_pending(1),
-        m.soc.cc_asserted_count
+        m.soc.int_pending(1)
     );
     println!(
         "== map_entry core0[79]={} core1[80]={} via_mmio={}",
