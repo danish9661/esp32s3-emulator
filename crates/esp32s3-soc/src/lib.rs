@@ -18,6 +18,8 @@ pub mod ledc;
 pub mod memmap;
 pub mod memspi;
 pub mod rtc;
+pub mod rmt;
+pub mod pcnt;
 pub mod soc;
 pub mod spi;
 pub mod systimer;

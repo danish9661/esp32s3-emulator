@@ -23,8 +23,8 @@ driven, etc.) without any server-side emulation.
 | wasm32-unknown-unknown target | installed | OK |
 | wasm-pack | 0.14.0 | OK |
 | node | 22.22.2 | OK |
-| qemu-system-xtensa | — | MISSING → install espressif prebuilt later (golden validation) |
-| ESP-IDF | — | MISSING → needed later to build real firmware |
+| qemu-system-xtensa | — | MISSING → reference-ONLY (GPL source for register layout/behavior); NOT used for validation (see Validation strategy) |
+| ESP-IDF | — | MISSING → arduino-cli used instead to build real firmware |
 | esptool.py | ~/.local/bin | OK (merge_bin for flash images) |
 
 ## Useful tools & references (researched 2026-08-13)
@@ -56,7 +56,7 @@ esp32-s3-emu/            (workspace root = /home/danish1075/Documents/esp32 s3 e
 │   ├── esp32s3-emu/     Machine glue: Bus impl, boot (ROM stubs), firmware loader
 │   └── wasm-bridge/     wasm-bindgen exports: Emulator struct for JS
 ├── web/                 frontend (static HTML/JS + wasm-pack build output)
-└── tools/               QEMU golden-trace scripts, test firmware build scripts
+└── tools/               arduino-cli firmware build scripts + sketches, test helpers
 ```
 
 Core design:
@@ -69,18 +69,25 @@ Core design:
 
 ## Roadmap (status updated as we go)
 
-- [ ] **P0 — Skeleton**: workspace + crates compile, wasm-pack builds, browser
-      loads module. (in progress)
-- [ ] **P1 — Core CPU**: decode + ALU + load/store + branches + CALL0/J loops;
+- [x] **P0 — Skeleton**: workspace + crates compile, wasm-pack builds, browser
+      loads module.
+- [x] **P1 — Core CPU**: decode + ALU + load/store + branches + CALL0/J loops;
       runs hand-assembled bare-metal test programs.
-- [ ] **P2 — SoC basics**: memory map, UART0 (console out), GPIO, timers,
+- [x] **P2 — SoC basics**: memory map, UART0 (console out), GPIO, timers,
       interrupt controller; trivial IDF firmware prints via UART.
-- [ ] **P3 — Boot path**: flash image loading, ROM stubs (printf/UART/delay),
+- [x] **P3 — Boot path**: flash image loading, ROM stubs (printf/UART/delay),
       second-stage bootloader, partition table → real IDF app boots.
 - [x] **P4 — Peripherals**: SPI/I2C/PWM/ADC, dual-core, PSRAM.
-- [ ] **P5 — Hardening**: golden-trace validation vs QEMU (PC/register diffs),
-      exception correctness, interrupt timing.
-- [ ] **P6 — Frontend polish**: serial console UI, GPIO/LED visualization,
+- [ ] **P5 — Hardening**: real-firmware validation via arduino-cli (compile
+      sketches, run via `run_flash` + node bridge, assert serial output +
+      peripheral state such as `gpio_output()` and device registers),
+      exception correctness and interrupt timing verified through real
+       FreeRTOS/Arduino behavior. NEXT: keep implementing missing peripherals
+       (RMT ✓, PCNT ✓, TWAI/CAN, MCPWM, Touch, …) and validate each with a
+       sketch. NOTE: the esp-idf RMT *driver* uses GDMA (unmodeled) — RMT was
+       validated via direct register pokes; modeling GDMA would also enable the
+       driver path.
+- [x] **P6 — Frontend polish**: serial console UI, GPIO/LED visualization,
       example firmware gallery.
 - [ ] WiFi/BLE: OUT OF SCOPE for now (months of work; not required for the
       core milestone).
@@ -90,9 +97,18 @@ Core design:
 1. **Unit tests** in each crate (instruction-level, known-answer tests).
 2. **Hand-written assembly tests** — assemble with xtensa-esp32s3 toolchain,
    run in our emulator, assert register/memory results.
-3. **Golden traces vs QEMU**: run same firmware in QEMU with
-   `-d in_asm,cpu` / gdb, record PC+reg trace, diff against ours.
-4. **Real firmware**: ESP-IDF hello_world over UART as the first real target.
+3. **Real firmware via arduino-cli** (PRIMARY): compile real Arduino/ESP-IDF
+   sketches with `arduino-cli` (esp32 core), merge with `esptool.py`, run the
+   `.merged.bin` through `crates/esp32s3-emu/examples/run_flash` (or the node
+   bridge built from `wasm-bridge`), and assert BOTH the serial output AND the
+   emulator's internal state (e.g. `gpio_output()`, device registers, counter
+   values). Each newly implemented peripheral gets at least one such sketch
+   that exercises it and is checked for correct behavior. This is the main
+   correctness gate now — it exercises the full real toolchain + FreeRTOS +
+   peripheral drivers end-to-end.
+4. **QEMU is reference-only** (GPL source for register layout / behavior), NOT
+   used for golden-trace diffing. It may be consulted when implementing a
+   peripheral, but validation is via real arduino-cli firmware (above).
 
 ## Conventions
 
@@ -106,7 +122,28 @@ Core design:
 - Commit-ready, formatted with `cargo fmt`, clippy-clean.
 
 ## Status log (append, newest last)
-- 2026-08-22: **Browser firmware gallery (P6 polish)**. `web/` now
+ - 2026-08-22: **PCNT pulse-counter (P5 — new peripheral via arduino-cli
+   validation)** + **interrupt-source fixes**. PCNT (`esp32s3-soc/src/pcnt.rs`,
+   4 units × 2 channels, one shared counter/unit): register block @ 0x6008_6000
+   (CONF0/CONF1/CONF2 per unit @ 0x0C stride, CNT @ 0x30, INT_* @ 0x40..0x4C,
+   STATUS @ 0x50, CTRL @ 0x60 per `pcnt_struct.h`), edge counting with
+   pos/neg mode + control-signal gating (hctrl/lctrl KEEP/INVERT/INHIBIT),
+   threshold interrupts, CTRL reset/pause. Wired into `soc.rs` (mmio arm,
+   `tick` sampling unit/channel signal levels through the **GPIO-matrix input
+   routing** — `gpio.rs` gained `in_sel()` / `pin_level()` resolving
+   FUNC_IN_SEL_CFG to a GPIO's level). PCNT source = 41. Unit tests
+   (`tests/pcnt.rs`, 3) assert rising/falling-edge counts and threshold
+   assert+clear. Validated end-to-end with `tools/sketches/esp32s3_pcnt` (raw
+   register driver: routes GPIO4 → PCNT unit0 ch0 via FUNC_IN_SEL, toggles 100
+   edges) → `PCNT count=100` / `PCNT PASS` under `run_flash`.
+   **BUG FIX**: the interrupt-source numbers in `soc.rs::int_pending` were wrong
+   (latent — those sketches polled): RMT was 9 → **40**, SPI2/SPI3 were 44/45 →
+   **21/22** (verified against `esp32s3 interrupts.h`; I2C 42/43, TIMG 50-55,
+   UART 27-29, SYSTIMER 57-59, cross-core 79/80 were already correct). Also
+   dropped the dead `RMTMEM_BASE` mmio arm (RMTMEM shares RMT's 4KB page, so it
+   was never matched — RMTMEM access routes through the RMT_BASE arm). 113
+   workspace tests green, clippy/wasm32 clean.
+ - 2026-08-22: **Browser firmware gallery (P6 polish)**. `web/` now
   bundles 5 example sketches (`web/firmware/*.merged.bin` + `manifest.json`,
   gitignored — copy arduino-cli builds or reuse) and a `Examples` dropdown
   that fetches + loads the selected firmware; auto-load still pulls
@@ -118,6 +155,25 @@ Core design:
   on main.js and JSON-valid manifest. Frontend is pure HTML/JS/CSS (no Rust
   change); emulator logic unchanged from the GPIO-fix commit. `.gitignore`
   updated (`web/firmware/*.bin`).
+- 2026-08-22: **RMT TX peripheral (P5 — new peripheral via arduino-cli
+  validation)**. `esp32s3-soc/src/rmt.rs` implements the RMT transmitter:
+  register block @ 0x6001_6000 + item RAM @ 0x6001_6800 (RMTMEM_BASE shares
+  the RMT_BASE 4KB page so the mmio dispatch routes both via `RMT_BASE` and
+  `in_mem_range(off 0x800..0x1000)` → `mem[(off-0x800)/4]`), 4 TX channels,
+  each 64×`rmt_item32_t` (duration0[14:0]/level0[15]/duration1[14:0]/level1[31]),
+  signal indices RMT_TX_SIGNAL_BASE=81..84 (TRM gpio_sig_map), source 9 →
+  tx_end interrupt. FSM advances `TICKS_PER_STEP=32` ticks/step, drives
+  `signal_level`, raises `INT_RAW` ch0 bit on completion; `INT_CLR` clears.
+  Wired into `soc.rs` (mmio arm, `signal_level`, `int_pending` source 9,
+  `tick`). Unit tests (tests/rmt.rs, 3) assert the waveform levels,
+  tx_end assert + clear, and out-of-range signal 0. Validated end-to-end
+  with a real arduino-cli sketch `tools/sketches/esp32s3_rmt` that pokes the
+  RMT registers directly (NOT the esp-idf `rmt_write_items` driver, which on
+  S3 routes through **GDMA — UNMODELED** → would hang waiting for a DMA
+  tx_end) and polls `INT_RAW`; runs under `run_flash` → prints `RMT TX done`.
+  113 workspace tests green, clippy/wasm32 clean. NEXT peripheral candidates:
+  TWAI/CAN, PCNT, MCPWM, Touch; and/or model GDMA so the esp-idf RMT driver
+  path works too.
 - 2026-08-22: **GPIO LED-grid fix (real gap, validated by Arduino sketch)**.
   `gpio_output()` was returning `0x0` for the periph sketch's `digitalWrite`
   blink, so the browser 40-pin LED grid never lit. Root cause localized with

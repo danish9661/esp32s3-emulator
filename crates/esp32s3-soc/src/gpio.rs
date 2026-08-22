@@ -126,6 +126,31 @@ impl Gpio {
     pub fn pin_count(&self) -> usize {
         PIN_COUNT
     }
+
+    /// Resolve a GPIO-matrix INPUT signal index (`sig`) to the GPIO pin it
+    /// sources from, per `FUNC_IN_SEL_CFG[sig]` (bits [5:0] = gpio, bit 6 =
+    /// invert). Returns `None` if `sig` is out of range. The firmware calls
+    /// `gpio_matrix_in(pin, sig, inv)` which writes exactly this register; it
+    /// lets a peripheral (PCNT, UART RX, I2C SDA/SCL, …) read a GPIO's level.
+    pub fn in_sel(&self, sig: u32) -> Option<(u32, bool)> {
+        if (sig as usize) >= 256 {
+            return None;
+        }
+        let reg = self.regs[(GPIO_FUNC_IN_SEL_0 / 4) as usize + sig as usize];
+        let pin = reg & 0x3F;
+        let inv = (reg >> 6) & 1 != 0;
+        Some((pin, inv))
+    }
+
+    /// Current logical level (0/1) of GPIO `pin`: the driven output if the pin
+    /// is output-enabled, else its input/strap state (GPIO_IN loopback).
+    pub fn pin_level(&self, pin: u32) -> u32 {
+        let inp = self.regs[(GPIO_IN / 4) as usize] as u64;
+        let out = self.regs[(GPIO_OUT / 4) as usize] as u64;
+        let en = self.regs[(GPIO_ENABLE / 4) as usize] as u64;
+        let v = (inp & !en) | (out & en);
+        ((v >> pin) & 1) as u32
+    }
 }
 
 impl Default for Gpio {

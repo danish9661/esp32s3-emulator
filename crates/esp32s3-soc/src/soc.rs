@@ -24,6 +24,8 @@ use crate::ledc::Lcdc;
 use crate::memmap::*;
 use crate::memspi::Memspi;
 use crate::rtc::Rtc;
+use crate::rmt::{Rmt, RMT_BASE};
+use crate::pcnt::{Pcnt, PCNT_BASE};
 use crate::spi::Spi;
 use crate::systimer::Systimer;
 use crate::timg::{INT_T0, INT_T1, INT_WDT, Timg};
@@ -120,7 +122,9 @@ pub struct Soc {
     /// the `flash` backing (see `crate::memspi`).
     pub memspi: [Memspi; 2],
     i2c: [I2c; 2],
+    rmt: Rmt,
     adc: Adc,
+    pcnt: Pcnt,
     cache: Cache,
     timg: [Timg; 2],
     systimer: Systimer,
@@ -175,7 +179,9 @@ impl Soc {
             spi: [Spi::new(0), Spi::new(1)],
             memspi: [Memspi::new(), Memspi::new()],
             i2c: [I2c::new(0), I2c::new(1)],
+            rmt: Rmt::new(),
             adc: Adc::new(),
+            pcnt: Pcnt::new(),
             cache: Cache::new(),
             timg: [Timg::new(), Timg::new()],
             systimer: Systimer::new(),
@@ -355,6 +361,17 @@ impl Soc {
             self.i2c[0].tick(1);
             self.i2c[1].tick(1);
             self.adc.tick(1);
+            self.rmt.tick();
+            // PCNT samples its unit/channel signal inputs via the GPIO-matrix
+            // input routing (FUNC_IN_SEL_CFG); resolve each signal index to the
+            // GPIO pin's current level.
+            let pcnt_input = |sig: u32| -> u32 {
+                match self.gpio.in_sel(sig) {
+                    Some((pin, inv)) => self.gpio.pin_level(pin) ^ (inv as u32),
+                    None => 0,
+                }
+            };
+            self.pcnt.tick(&pcnt_input);
         }
         self.rtc.tick(cycles);
         self.pll.tick(cycles);
@@ -444,6 +461,8 @@ impl Soc {
     fn signal_level(&self, sig: u32) -> u32 {
         if (73..=80).contains(&sig) {
             self.ledc.signal_level(sig)
+        } else if (81..=84).contains(&sig) {
+            self.rmt.signal_level(sig)
         } else {
             self.spi[0].signal_level(sig)
                 | self.spi[1].signal_level(sig)
@@ -535,6 +554,22 @@ impl Soc {
                     0
                 } else {
                     self.i2c[n].read32(off)
+                }
+            }
+            RMT_BASE => {
+                if is_write {
+                    self.rmt.write32(off, value);
+                    0
+                } else {
+                    self.rmt.read32(off)
+                }
+            }
+            PCNT_BASE => {
+                if is_write {
+                    self.pcnt.write32(off, value);
+                    0
+                } else {
+                    self.pcnt.read32(off)
                 }
             }
             // Page 0x6000_8000 holds RTC_CNTL (0x000), RTC_IO (0x400),
@@ -707,11 +742,11 @@ impl Bus for Soc {
                 src |= 1 << (57 + n);
             }
         }
-        // I2C master (I2CEXT0/1) = sources 42/43, SPI2/SPI3 = 44/45
+        // I2C master (I2CEXT0/1) = sources 42/43, GPSPI2/GPSPI3 = 21/22
         // (esp32s3 interrupts.h ETS_I2C_EXT*_INTR_SOURCE /
-        // ETS_SPI*_DMA_INTR_SOURCE). The driver ISR waits on a semaphore
-        // for trans_complete / trans_done, so the done bit must reach the
-        // CPU or the Arduino Wire/SPI library blocks forever.
+        // ETS_SPI2/3_INTR_SOURCE). The driver ISR waits on a semaphore for
+        // trans_complete / trans_done, so the done bit must reach the CPU or
+        // the Arduino Wire/SPI library blocks forever.
         for (i, ic) in self.i2c.iter().enumerate() {
             if ic.int_st() != 0 {
                 src |= 1 << (42 + i);
@@ -719,8 +754,19 @@ impl Bus for Soc {
         }
         for (i, s) in self.spi.iter().enumerate() {
             if s.int_st() != 0 {
-                src |= 1 << (44 + i);
+                src |= 1 << (21 + i);
             }
+        }
+        // RMT TX (channels 0..3) = source 40 (ETS_RMT_INTR_SOURCE).  The
+        // Arduino/esp-idf RMT driver waits on the tx_end interrupt (or a
+        // semaphore given from its ISR), so the done bit must reach the CPU
+        // or rmt_write_items blocks forever.
+        if self.rmt.int_st() != 0 {
+            src |= 1 << crate::rmt::RMT_INTR_SOURCE;
+        }
+        // PCNT threshold events (units 0..3) = source 41 (ETS_PCNT_INTR_SOURCE).
+        if self.pcnt.int_st() != 0 {
+            src |= 1 << crate::pcnt::PCNT_INTR_SOURCE;
         }
         // Cross-core interrupts: SYSTEM.CPU_INT_FROM_CPU_0/1 (0x600C0030/34)
         // assert the FROM_CPU_INTR0/1 sources = 79/80 (esp32s3 interrupts.h
