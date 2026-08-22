@@ -32,8 +32,27 @@ fn main() {
     let mut app_dumped = false;
     let mut mux_watch = 0u32;
     let mut last_scomp = 0u32;
+    // UART1 RX injection (echo-sketch support): UART_INJECT=<text> is
+    // pushed into UART1 RX as soon as the console shows the RXREADY marker.
+    let uart1_inject: Option<Vec<u8>> = env::var("UART_INJECT").ok().map(|s| s.into_bytes());
+    let mut uart1_injected = false;
+    let mut main_trace: Vec<(usize, u32, u32)> = Vec::new();
+    let mut flag_was_set = false;
+    let mut flag_follow: Option<usize> = None;
+    let mut wdt_ret_seen = false;
+    let mut abort_seen = false;
+    let mut app_main_seen = false;
+    let mut looptask_seen = false;
+    let mut setup_seen = false;
+    let mut delay200_seen = false;
+    let mut println1_seen = false;
+    let mut println_follow: Option<usize> = None;
+    let mut last_pc1 = 0u32;
+    let mut loop_seen = false;
+    let mut uart_isr_count = 0usize;
+    let mut app_main_seen_step = usize::MAX;
 
-    const STEPS: usize = 16_000_000;
+    const STEPS: usize = 48_000_000;
     let mut trace: Vec<u32> = Vec::with_capacity(4096);
     let mut trace_i = 0usize;
     let mut uart_buf: Vec<u8> = Vec::new();
@@ -363,6 +382,255 @@ fn main() {
                 ps_log.remove(0);
             }
             last_ps = ps;
+        }
+        // main_task spin on s_other_cpu_startup_done (0x3fc96ffc): dump the
+        // idle-callback table + flag so a stuck startup handshake is visible.
+        if pc == 0x4202_125d && i % 100_000 == 0 {
+            let flag = m.soc.read32(0x3fc9_6ffc);
+            let idle: Vec<u32> = (0..16)
+                .map(|k| m.soc.read32(0x3fc9_6df4 + 4 * k))
+                .collect();
+            println!(
+                "MAINSPIN@{i} flag={flag:#x} idle={idle:?} pc1={:#x}",
+                m.cpu[1].pc
+            );
+        }
+        // Trace main_task's body (0x4202123c..0x420212aa): every visit.
+        let in_main = (0x4202_123c..0x4202_12aa).contains(&pc)
+            || (0x4202_123c..0x4202_12aa).contains(&m.cpu[1].pc);
+        if in_main && (i < 3_000_000 || i % 200_000 == 0) && main_trace.len() < 3000 {
+            main_trace.push((i, pc, m.cpu[1].pc));
+        }
+        // The startup handshake flag 0->1 transition: dump context, then
+        // follow core0's PCs for the next 200 steps to see where main_task
+        // goes after the spin.
+        let flag = m.soc.read32(0x3fc9_6ffc) & 1;
+        if flag == 1 && !flag_was_set && i > 2_000_000 {
+            flag_was_set = true;
+            println!(
+                "FLAGSET@{i} pc0={pc:#x} sp0={:#x} a0={:#x} a2={:#x} ps0={:#x} pc1={:#x}",
+                m.cpu[0].reg(1),
+                m.cpu[0].reg(0),
+                m.cpu[0].reg(2),
+                m.cpu[0].ps(),
+                m.cpu[1].pc
+            );
+            flag_follow = Some(i + 5000);
+        }
+        if let Some(until) = flag_follow {
+            if i <= until {
+                println!("  FLW@{i} pc0={pc:#x} pc1={:#x}", m.cpu[1].pc);
+            } else {
+                flag_follow = None;
+            }
+        }
+        // main_task lifecycle: esp_task_wdt_init return, abort path, app_main.
+        if pc == 0x4202_1289 && !wdt_ret_seen {
+            wdt_ret_seen = true;
+            println!("WDTINIT_RET@{i} a10={:#x}", m.cpu[0].reg(10));
+        }
+        if (0x4202_128b..=0x4202_129b).contains(&pc) && !abort_seen {
+            abort_seen = true;
+            println!("MAIN_ABORT@{i} pc0={pc:#x}");
+        }
+        if pc == 0x4200_3abc && !app_main_seen {
+            app_main_seen = true;
+            app_main_seen_step = i;
+            println!("APP_MAIN@{i}");
+        }
+        if (pc == 0x4200_3a74 || m.cpu[1].pc == 0x4200_3a74) && !looptask_seen {
+            looptask_seen = true;
+            println!("LOOPTASK@{i} pc0={pc:#x} pc1={:#x}", m.cpu[1].pc);
+        }
+        // setup() = 0x42001a38 (sketch setup, prints Hello + echo marker).
+        let in_setup = (0x4200_1a38..0x4200_1c00).contains(&pc)
+            || (0x4200_1a38..0x4200_1c00).contains(&m.cpu[1].pc);
+        if in_setup && !setup_seen {
+            setup_seen = true;
+            println!("SETUP_ENTER@{i} pc0={pc:#x} pc1={:#x}", m.cpu[1].pc);
+        }
+        // setup progression on either core: every 5000 steps inside setup().
+        if in_setup && i % 5_000 == 0 {
+            println!(
+                "SETUP@{i} pc1={:#x} a0={:#x} a1={:#x} a2={:#x}",
+                m.cpu[1].pc,
+                m.cpu[1].reg(0),
+                m.cpu[1].reg(1),
+                m.cpu[1].reg(2)
+            );
+        }
+        if (pc == 0x4200_1a76 || m.cpu[1].pc == 0x4200_1a76) && !delay200_seen {
+            delay200_seen = true;
+            println!("SETUP_DELAY200@{i}");
+        }
+        if (pc == 0x4200_1a81 || m.cpu[1].pc == 0x4200_1a81) && !println1_seen {
+            println1_seen = true;
+            println!("SETUP_PRINTLN1@{i}");
+            println!(
+                "PRINTLN_CTX uart_obj={:#x} uart_obj1={:#x}",
+                m.soc.read32(0x3fc9_743c),
+                m.soc.read32(0x3fc9_7440)
+            );
+            println_follow = Some(i + 40000);
+        }
+        if let Some(until) = println_follow {
+            if i <= until && m.cpu[1].pc != last_pc1 {
+                last_pc1 = m.cpu[1].pc;
+                if i % 997 == 0 || until - i < 400 {
+                    println!(
+                        "PLW@{i} pc1={:#x} a0={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+                        m.cpu[1].pc,
+                        m.cpu[1].reg(0),
+                        m.cpu[1].reg(2),
+                        m.cpu[1].reg(3),
+                        m.cpu[1].reg(4),
+                        m.cpu[1].reg(5)
+                    );
+                }
+            }
+            if i >= until {
+                println_follow = None;
+            }
+        }
+        if (pc == 0x4200_1a90 || m.cpu[1].pc == 0x4200_1a90) && !loop_seen {
+            loop_seen = true;
+            println!("LOOP_ENTER@{i}");
+        }
+        // uartBegin's uart_driver_install return check (0x420036cb): dump
+        // uart number (a2) + install result (a10).
+        if pc == 0x4200_36cb || m.cpu[1].pc == 0x4200_36cb {
+            println!(
+                "UART_INSTALL_RET@{i} uart={:#x} res={:#x} obj0={:#x} obj1={:#x}",
+                m.cpu[0].reg(2),
+                m.cpu[0].reg(10),
+                m.soc.read32(0x3fc9_743c),
+                m.soc.read32(0x3fc9_7440)
+            );
+        }
+        // Who frees the uart0 object? uart_free_driver_obj (0x42009be8) /
+        // uart_driver_delete (0x4200bae8).
+        for (addr, name) in [
+            (0x4200_9be8u32, "UART_FREE_OBJ"),
+            (0x4200_bae8u32, "UART_DRIVER_DELETE"),
+            (0x4200_1f0cu32, "HW_SERIAL_END"),
+        ] {
+            if pc == addr || m.cpu[1].pc == addr {
+                let (ra, sp_) = if m.cpu[1].pc == addr {
+                    (m.cpu[1].reg(0), m.cpu[1].reg(1))
+                } else {
+                    (m.cpu[0].reg(0), m.cpu[0].reg(1))
+                };
+                println!(
+                    "{name}@{i} ra={ra:#x} sp={sp_:x} obj0={:#x} obj1={:#x} pc0={pc:#x} pc1={:#x}",
+                    m.soc.read32(0x3fc9_743c),
+                    m.soc.read32(0x3fc9_7440),
+                    m.cpu[1].pc
+                );
+            }
+        }
+        // uart_intr_config: every ENA-OR (0x4200b444) with the OR'd mask
+        // (a10 at the l32i 0x4200b435) and uart num (a2).
+        if pc == 0x4200_b435 || m.cpu[1].pc == 0x4200_b435 {
+            let c = if m.cpu[1].pc == 0x4200_b435 { 1 } else { 0 };
+            println!(
+                "UINTCFG_MASK@{i} uart={:#x} mask={:#x}",
+                m.cpu[c].reg(2),
+                m.cpu[c].reg(10)
+            );
+        }
+        if pc == 0x4200_b444 || m.cpu[1].pc == 0x4200_b444 {
+            let c = if m.cpu[1].pc == 0x4200_b444 { 1 } else { 0 };
+            println!(
+                "UINTCFG_ENA@{i} uart={:#x} ena={:#x}",
+                m.cpu[c].reg(2),
+                m.cpu[c].reg(8)
+            );
+        }
+        // uart_disable_intr_mask HW-ENA store (0x4200ada4): dump mask (a3).
+        if pc == 0x4200_ada4 || m.cpu[1].pc == 0x4200_ada4 {
+            let c = if m.cpu[1].pc == 0x4200_ada4 { 1 } else { 0 };
+            println!(
+                "UARTDIS_MASK@{i} uart={:#x} ena={:#x}",
+                m.cpu[c].reg(2),
+                m.cpu[c].reg(3)
+            );
+        }
+        // uartSetPins entry (0x42002d34). Under the deferred window-rotation
+        // model the callee window is still the caller's at this pc, and a
+        // call8 delivers args in the caller's a8..a13 -> here reg(8..13).
+        // The function reads its params from callee a2..a6 = caller a10..a14,
+        // so reg(10..14) = (uart_num, rxPin, txPin, ctsPin, rtsPin).
+        if pc == 0x4200_2d34 || m.cpu[1].pc == 0x4200_2d34 {
+            let c = if m.cpu[1].pc == 0x4200_2d34 { 1 } else { 0 };
+            let pins_base = 0x3fc9_68e8u32;
+            let mut dump = String::new();
+            for p in [0u32, 17, 18, 43, 44] {
+                let b = pins_base + p * 16;
+                let t = m.soc.read32(b);
+                let n = m.soc.read32(b + 4);
+                let o = m.soc.read32(b + 8);
+                dump.push_str(&format!("[pin{p} ty={t} num={n} own={o:#x}]"));
+            }
+            println!(
+                "SETPINS@{i} args a10={} a11={} a12={} a13={} a14={} ra={:#x} u0rx={} u0tx={} u1rx={} u1tx={} {dump}",
+                m.cpu[c].reg(10) as i8,
+                m.cpu[c].reg(11) as i8,
+                m.cpu[c].reg(12) as i8,
+                m.cpu[c].reg(13) as i8,
+                m.cpu[c].reg(14) as i8,
+                m.cpu[c].reg(0),
+                m.soc.read8(0x3fc9_2f0c) as i8,
+                m.soc.read8(0x3fc9_2f0d) as i8,
+                m.soc.read8(0x3fc9_2f30) as i8,
+                m.soc.read8(0x3fc9_2f31) as i8
+            );
+        }
+        // uartSetPins termination call site (0x4200310b): a10 = uart to end.
+        if pc == 0x4200_310b || m.cpu[1].pc == 0x4200_310b {
+            let c = if m.cpu[1].pc == 0x4200_310b { 1 } else { 0 };
+            let pins_base = 0x3fc9_68e8u32;
+            let mut dump = String::new();
+            for p in [17u32, 18, 43, 44] {
+                let b = pins_base + p * 16;
+                let t = m.soc.read32(b);
+                let n = m.soc.read32(b + 4);
+                let o = m.soc.read32(b + 8);
+                let ch = m.soc.read8(b + 12);
+                dump.push_str(&format!("[pin{p} ty={t:#x} num={n:#x} own={o:#x} ch={ch}]"));
+            }
+            println!(
+                "SETPINS_END@{i} uart={} ra={:#x} {dump}",
+                m.cpu[c].reg(10) as i8,
+                m.cpu[c].reg(0)
+            );
+        }
+        // UART0 TX ISR (0x42009e88 uart_rx_intr_handler_default) + int regs.
+        let uisr = pc == 0x4200_9e88 || m.cpu[1].pc == 0x4200_9e88;
+        if uisr {
+            uart_isr_count += 1;
+        }
+        if i % 500_000 == 0 && i > 2_000_000 && uart_isr_count < 3 {
+            println!(
+                "UISR@{i} count={uart_isr_count} raw0={:#x} ena0={:#x} st0={:#x} obj0={:#x}",
+                m.soc.read32(0x6000_0004),
+                m.soc.read32(0x6000_000c),
+                m.soc.read32(0x6000_0008),
+                m.soc.read32(0x3fc9_743c)
+            );
+        }
+        // Where is app_main stuck? setCpuFrequencyMhz (0x42004218) / initArduino (0x42002584).
+        let in_setfreq = (0x4200_4218..0x4200_4490).contains(&pc);
+        let in_initard = (0x4200_2584..0x4200_2a00).contains(&pc);
+        if (in_setfreq || in_initard) && i > app_main_seen_step && i % 100_000 == 0 {
+            println!(
+                "APPSTUCK@{i} pc0={pc:#x} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} ps0={:#x}",
+                m.cpu[0].reg(0),
+                m.cpu[0].reg(1),
+                m.cpu[0].reg(2),
+                m.cpu[0].reg(3),
+                m.cpu[0].reg(4),
+                m.cpu[0].ps()
+            );
         }
         if (0x4038_2cac..=0x4038_2d4e).contains(&pc) && ctx_passes < 2 {
             let wb = m.cpu[0].windowbase();
@@ -1263,6 +1531,23 @@ fn main() {
             );
         }
         let tx = m.take_uart_tx(0);
+        let tx1 = m.take_uart_tx(1);
+        if !tx1.is_empty() {
+            uart_buf.extend_from_slice(&tx1);
+        }
+        // UART1 RX injection: once the app prints the ready marker, push
+        // the host payload into UART1 RX (the echo sketch reads it back).
+        if !uart1_injected {
+            if let Some(bytes) = &uart1_inject {
+                if uart_buf.windows(b"RXREADY".len()).any(|w| w == b"RXREADY") {
+                    for &b in bytes {
+                        m.soc.uart_inject_rx(1, b);
+                    }
+                    println!("[host] injected {:?} into UART1 RX", String::from_utf8_lossy(bytes));
+                    uart1_injected = true;
+                }
+            }
+        }
         if i % 500_000 == 0 && sample_shown < 40 {
             sample_shown += 1;
             println!(
@@ -1494,6 +1779,22 @@ fn main() {
         "\n== end: core0 pc {:#010x}, core1 pc {:#010x}, {} steps ==",
         m.cpu[0].pc, m.cpu[1].pc, STEPS
     );
+    {
+        let flag = m.soc.read32(0x3fc9_6ffc);
+        let idle: Vec<u32> = (0..16)
+            .map(|k| m.soc.read32(0x3fc9_6df4 + 4 * k))
+            .collect();
+        println!("== startup handshake: flag={flag:#x} idle_cb={idle:?}");
+        if !main_trace.is_empty() {
+            println!("== main_task trace ({}):", main_trace.len());
+            let step = (main_trace.len() / 40).max(1);
+            for (k, (i, pc0, pc1)) in main_trace.iter().enumerate() {
+                if k % step == 0 || k == main_trace.len() - 1 {
+                    println!("  [{k}] @{i} pc0={pc0:#x} pc1={pc1:#x}");
+                }
+            }
+        }
+    }
     for c in 0..2 {
         let cpu = &m.cpu[c];
         println!(

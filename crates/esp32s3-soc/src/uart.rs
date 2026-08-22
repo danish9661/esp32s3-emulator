@@ -66,6 +66,13 @@ impl Uart {
         let mut regs = [0u32; REG_COUNT];
         // ST_UTX_OUT = idle high (UART_STATUS[9:8]); TXFIFO_CNT = 0.
         regs[(UART_STATUS / 4) as usize] = STATUS_ST_UTX_OUT;
+        // TXFIFO_EMPTY/TX_DONE are LEVEL-style latches on real silicon: the
+        // FIFO is empty and the transmitter idle from reset, so both RAW
+        // bits read 1 until the first byte is written (TRM UART_INT_RAW).
+        // IDF's uart driver relies on this: uart_enable_tx_intr() enables
+        // TXFIFO_EMPTY and the ISR fires immediately to drain the driver's
+        // TX ringbuffer (uart_tx_all -> xRingbufferSend -> enable -> ISR).
+        regs[(UART_INT_RAW / 4) as usize] = INT_TXFIFO_EMPTY | INT_TX_DONE;
         Self {
             regs,
             tx_out: Vec::new(),
