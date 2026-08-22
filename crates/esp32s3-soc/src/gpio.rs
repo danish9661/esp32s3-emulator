@@ -50,6 +50,15 @@ pub struct Gpio {
 impl Gpio {
     pub fn new() -> Self {
         let mut regs = [0u32; REG_COUNT];
+        // TRM GPIO_FUNC_OUT_SEL_CFG: reset default 0x80 selects the GPIO
+        // output function (vs a peripheral signal). Our window initializes
+        // to 0, which would make every pin follow signal 0 instead of
+        // GPIO_OUT — so output-enabled pins would never reflect their
+        // driven level (breaks GPIO LED visualization and digitalRead of an
+        // OUTPUT pin). Seed the default.
+        for i in 0..PIN_COUNT {
+            regs[(GPIO_FUNC_OUT_SEL_0 / 4) as usize + i] = 0x80;
+        }
         regs[(GPIO_STRAP / 4) as usize] = STRAP_FLASH_BOOT;
         regs[(GPIO_IN / 4) as usize] = STRAP_FLASH_BOOT;
         Self { regs }
@@ -97,10 +106,13 @@ impl Gpio {
     }
 
     /// GPIO matrix output signal selected for pin `i` (FUNC_OUT_SEL [7:0];
-    /// 128 = the pin follows GPIO_OUT instead of a peripheral signal).
+    /// 128 = the pin follows GPIO_OUT instead of a peripheral signal). Bit 7
+    /// is the GPIO-drive sentinel, so the low byte is returned intact — a
+    /// `& 0x7F` mask would strip the 0x80 sentinel and force every pin onto
+    /// signal 0.
     pub fn out_sel(&self, i: usize) -> u32 {
         let reg = self.regs[(GPIO_FUNC_OUT_SEL_0 / 4) as usize + i];
-        reg & 0x7F
+        reg & 0xFF
     }
 
     /// Snapshot of the output-pin state (host LED visualization later).

@@ -3,4 +3,5 @@
 *.pyc
 web/pkg/
 web/hello.bin
+web/firmware/*.bin
 # sample firmware used for local browser testing (copy your own merged.bin)

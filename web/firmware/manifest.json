@@ -1,0 +1,7 @@
+[
+  { "name": "hello — Hello from ESP32-S3", "file": "esp32s3_hello.merged.bin" },
+  { "name": "periph — GPIO blink + sensors", "file": "esp32s3_periph.merged.bin" },
+  { "name": "uart_echo — UART loopback", "file": "esp32s3_uart_echo.merged.bin" },
+  { "name": "spi — SPI master transfer", "file": "esp32s3_spi.merged.bin" },
+  { "name": "i2c — I2C bus scan", "file": "esp32s3_i2c.merged.bin" }
+]

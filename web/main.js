@@ -4,6 +4,7 @@ const NUM_PINS = 40; // visualize GPIO 0..39
 
 const els = {
   firmware: document.getElementById('firmware'),
+  gallery: document.getElementById('gallery'),
   run: document.getElementById('run'),
   stop: document.getElementById('stop'),
   reset: document.getElementById('reset'),
@@ -88,6 +89,38 @@ els.firmware.addEventListener('change', async (e) => {
   loadFlash(new Uint8Array(buf));
 });
 
+async function loadFromUrl(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`fetch ${url} -> ${res.status}`);
+  const buf = await res.arrayBuffer();
+  loadFlash(new Uint8Array(buf));
+}
+
+// Populate the example-firmware gallery from a manifest (graceful if absent).
+try {
+  const res = await fetch('./firmware/manifest.json');
+  if (res.ok) {
+    const list = await res.json();
+    for (const item of list) {
+      const opt = document.createElement('option');
+      opt.value = `./firmware/${item.file}`;
+      opt.textContent = item.name;
+      els.gallery.appendChild(opt);
+    }
+  }
+} catch (_) { /* no manifest; gallery stays empty */ }
+
+els.gallery.addEventListener('change', async (e) => {
+  const url = e.target.value;
+  if (!url) return;
+  try {
+    setStatus(`loading ${url} …`);
+    await loadFromUrl(url);
+  } catch (err) {
+    setStatus(`failed: ${err.message}`);
+  }
+});
+
 els.run.addEventListener('click', () => {
   if (!emu) return;
   startLoop();
@@ -112,9 +145,9 @@ els.steps.addEventListener('input', () => {
 
 // Boot the WASM module, then try to auto-load a bundled demo firmware.
 await init();
-setStatus('wasm ready — load a merged.bin firmware');
+setStatus('wasm ready — pick an example or load a merged.bin');
 try {
-  const res = await fetch('./hello.bin');
+  const res = await fetch('./firmware/esp32s3_hello.merged.bin');
   if (res.ok) {
     const buf = await res.arrayBuffer();
     loadFlash(new Uint8Array(buf));

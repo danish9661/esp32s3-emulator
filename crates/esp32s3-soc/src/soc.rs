@@ -314,11 +314,17 @@ impl Soc {
                 continue;
             }
             let sel = self.gpio.out_sel(i);
-            out |= if sel == 0x80 {
+            // A pin drives its GPIO_OUT bit when FUNC_OUT_SEL selects the
+            // GPIO function. The matrix encodes this two ways: the 0x80
+            // sentinel (our documented default) and 0 (what pinMode leaves /
+            // writes for a plain digital output). Any other value is a
+            // peripheral matrix signal, whose level comes from signal_level.
+            let bit = if sel == 0x80 || sel == 0 {
                 self.gpio.out_bit(i)
             } else {
                 self.signal_level(sel)
-            } << i;
+            };
+            out |= bit << i;
         }
         out
     }

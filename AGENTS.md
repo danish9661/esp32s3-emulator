@@ -106,7 +106,35 @@ Core design:
 - Commit-ready, formatted with `cargo fmt`, clippy-clean.
 
 ## Status log (append, newest last)
-
+- 2026-08-22: **Browser firmware gallery (P6 polish)**. `web/` now
+  bundles 5 example sketches (`web/firmware/*.merged.bin` + `manifest.json`,
+  gitignored — copy arduino-cli builds or reuse) and a `Examples` dropdown
+  that fetches + loads the selected firmware; auto-load still pulls
+  `firmware/esp32s3_hello.merged.bin`. `index.html` gained the `<select>`,
+  `main.js` populates it from the manifest and adds `loadFromUrl`;
+  `web/pkg` rebuilt via `wasm-pack build crates/wasm-bridge --target web
+  --out-dir web/pkg`. Verified: `python3 -m http.server` serves
+  index.html/main.js/style.css/manifest.json + bins all 200; `node --check`
+  on main.js and JSON-valid manifest. Frontend is pure HTML/JS/CSS (no Rust
+  change); emulator logic unchanged from the GPIO-fix commit. `.gitignore`
+  updated (`web/firmware/*.bin`).
+- 2026-08-22: **GPIO LED-grid fix (real gap, validated by Arduino sketch)**.
+  `gpio_output()` was returning `0x0` for the periph sketch's `digitalWrite`
+  blink, so the browser 40-pin LED grid never lit. Root cause localized with
+  a temporary `gpio_debug` probe (later removed, fully clean): the
+  `esp32s3_periph` firmware drives `GPIO_OUT` bit 2 correctly (toggles
+  `0x0`↔`0x4`) and sets `GPIO_ENABLE` bit 2, but `FUNC_OUT_SEL[2]` was `0`
+  (not the `0x80` "GPIO drive" sentinel). Two bugs: (1) `out_sel()` masked
+  the register with `0x7F`, stripping the bit-7 sentinel so the `sel ==
+  0x80` branch in `gpio_output()` was unreachable; (2) `pinMode(OUTPUT)`
+  leaves/writes `FUNC_OUT_SEL = 0`, which also means "drive from GPIO_OUT"
+  but wasn't recognized. Fix: `out_sel` now returns the full low byte
+  (`& 0xFF`), `gpio_output()` treats `sel == 0x80 || sel == 0` as GPIO (any
+  other value is a peripheral matrix signal routed via `signal_level`), and
+  `Gpio::new()` seeds `FUNC_OUT_SEL_CFG[i] = 0x80` as the documented S3
+  reset default. Verified through the node bridge: periph sketch now yields
+  `gpio_output()` masks `0x0`↔`0x4`. 107 workspace tests green, clippy/
+  wasm32 clean.
 - 2026-08-22: **Browser bridge (P6 start) — emulator runs in the browser**.
   `wasm-bridge` (was a stub `add`) now wraps `Esp32S3` via `wasm-bindgen` and
   exposes `Emulator { new, load_flash(&[u8]), step(n), uart_read()->Vec<u8>,
@@ -115,11 +143,12 @@ Core design:
   frame), 40-pin GPIO LED grid, firmware file-input, Run/Stop/Reset + steps-
   per-frame slider; auto-loads `web/hello.bin` if present (gitignored — copy
   any arduino-cli `*.merged.bin`). Verified headlessly: built the nodejs
-  target and ran the hello sketch in node → `Hello from ESP32-S3!` / `boot OK`
-  over UART. Web target built into `web/pkg/` (gitignored, regenerated with
-  `wasm-pack build crates/wasm-bridge --target web --out-dir web/pkg`); served
-  over `python3 -m http.server` all assets return 200. `Esp32S3` re-exported at
-  `esp32s3_emu` crate root for the bridge. clippy `--target wasm32` clean.
+  target and ran the hello sketch in node → `Hello from ESP32-S3!` /
+  `boot OK` over UART. Web target built into `web/pkg/` (gitignored,
+  regenerated with `wasm-pack build crates/wasm-bridge --target web
+  --out-dir web/pkg`); served over `python3 -m http.server` all assets
+  return 200. `Esp32S3` re-exported at `esp32s3_emu` crate root for the
+  bridge. clippy `--target wasm32` clean.
 - 2026-08-22: **I2C NACK-model fix (real gap, validated by Arduino sketch)**.
   `i2c.rs` WRITE command no longer silently completes on an empty TX FIFO.
   On real HW the driver's NACK-retry re-runs the FSM still holding the byte
