@@ -614,11 +614,13 @@ fn ledc_pwm_blinks_gpio0_at_50_percent_duty() {
     use crate::asm::Asm;
     use esp32s3_soc::memmap::LEDC_BASE;
 
-    // Firmware: TIMER0 with divider 1.0 and duty_resolution field 9 (10-bit
-    // period = 1024 timer ticks, one tick per APB cycle), channel 0 duty =
-    // 0x20000 (50% of 18 bits) with duty_start | sig_out_en, then routes
-    // LEDC_CH0 (GPIO-matrix signal 96) to GPIO0 and enables the pad.  The
-    // host measures the pad: 512 cycles high / 512 cycles low.
+    // Firmware: TIMER0 at 0xA0 (S3 ledc_struct.h: timer_group after the 8
+    // channels) with clock_divider 256 (CONF [21:4]) and duty_resolution field
+    // 10 ([3:0]) — 1024-tick period, one tick per APB step — channel 0 at
+    // 0x00 with duty 0x2000 (esp-idf stores user_duty<<4, so 512<<4 = 50%),
+    // sig_out_en (conf0 bit 2) + duty_start (conf1 bit 31), then routes
+    // LEDC_CH0 (GPIO-matrix signal 73) to GPIO0 and enables the pad.  The host
+    // measures the pad: 512 steps high / 512 steps low.
     const STASH: u32 = 0x3FC8_0100;
     let mut a = Asm::new(IRAM_BASE);
     let l_ledc = a.offset();
@@ -630,12 +632,14 @@ fn ledc_pwm_blinks_gpio0_at_50_percent_duty() {
     let code_start = a.pc();
     let p = a.l32r(2); // LEDC_BASE
     a.patch_l32r(p, IRAM_BASE + l_ledc as u32);
-    a.li(3, 0x0024_0100);
-    a.s32i(3, 2, 0); // TIMER0_CONF: clock_divider 1.0, duty_resolution 9
-    a.li(3, 0x2_0000);
-    a.s32i(3, 2, 0x28); // CH0_DUTY = 50% of the 18-bit range
-    a.movi_n(3, 12);
-    a.s32i(3, 2, 0x20); // CH0_CONF0: duty_start | sig_out_en
+    a.li(3, 0x100A);
+    a.s32i(3, 2, 0xA0); // TIMER0_CONF: clock_divider 256, duty_resolution 10
+    a.li(3, 0x2000);
+    a.s32i(3, 2, 0x08); // CH0_DUTY: user 512 << 4 = 50% of 1024
+    a.movi_n(3, 4);
+    a.s32i(3, 2, 0x00); // CH0_CONF0: sig_out_en (bit 2)
+    a.li(3, 0x8000_0000u32 as i32);
+    a.s32i(3, 2, 0x0C); // CH0_CONF1: duty_start (bit 31)
     let p = a.l32r(2); // GPIO_BASE
     a.patch_l32r(p, IRAM_BASE + l_gpio as u32);
     a.movi_n(3, 1);

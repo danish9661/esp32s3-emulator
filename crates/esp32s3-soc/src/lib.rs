@@ -11,6 +11,7 @@ extern crate alloc;
 
 pub mod adc;
 pub mod cache;
+pub mod efuse;
 pub mod gdma;
 pub mod gpio;
 pub mod i2c;

@@ -16,6 +16,7 @@ use alloc::vec::Vec;
 use xtensa_core::Bus;
 
 use crate::adc::Adc;
+use crate::efuse::Efuse;
 use crate::cache::{Cache, CacheTarget};
 use crate::gdma::{GDMA_BASE, Gdma};
 use crate::gpio::Gpio;
@@ -131,6 +132,7 @@ pub struct Soc {
     adc: Adc,
     pcnt: Pcnt,
     gdma: Gdma,
+    efuse: Efuse,
     cache: Cache,
     timg: [Timg; 2],
     systimer: Systimer,
@@ -191,6 +193,7 @@ impl Soc {
             adc: Adc::new(),
             pcnt: Pcnt::new(),
             gdma: Gdma::default(),
+            efuse: Efuse::new(),
             cache: Cache::new(),
             timg: [Timg::new(), Timg::new()],
             systimer: Systimer::new(),
@@ -364,7 +367,7 @@ impl Soc {
             self.timg[0].tick(1);
             self.timg[1].tick(1);
             self.systimer.tick(1);
-            self.ledc.tick(1);
+            self.ledc.tick();
             self.spi[0].tick(1);
             self.spi[1].tick(1);
             self.i2c[0].tick(1);
@@ -771,6 +774,14 @@ impl Soc {
                     self.cache.mmu_read32(off)
                 }
             }
+            EFUSE_BASE => {
+                if is_write {
+                    self.efuse.write32(off, value);
+                    0
+                } else {
+                    self.efuse.read32(off)
+                }
+            }
             // SYSTEM peripheral (0x600C0000): only APPCPU_CTRL_A @ +0x04 is
             // modeled — the APP-CPU release register (the ROM's
             // ets_set_appcpu_boot_addr stores the core-1 entry here and the
@@ -802,8 +813,8 @@ impl Soc {
                     0
                 }
             }
-            // Everything else in the APB space: no model yet.
-            _ => 0,
+    // Everything else in the APB space: no model yet.
+    _ => 0,
         }
     }
 }

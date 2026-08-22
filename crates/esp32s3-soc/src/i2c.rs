@@ -74,7 +74,8 @@ const COMD_ACK_VAL_SHIFT: u32 = 10;
 const COMD_OP_CODE_SHIFT: u32 = 11;
 const COMD_OP_CODE_MASK: u32 = 0x7;
 const COMD_DONE: u32 = 1 << 31;
-// INT_RAW bits (TRM I2C_INT_RAW): trans_complete + nack.
+// INT_RAW bits (TRM I2C_INT_RAW): end_detect + trans_complete + nack.
+const INT_END_DETECT: u32 = 1 << 3;
 const INT_TRANS_COMPLETE: u32 = 1 << 7;
 const INT_NACK: u32 = 1 << 10;
 
@@ -289,9 +290,12 @@ impl I2c {
                 });
             }
             _ => {
-                // END: no bus activity; latches trans_complete.
+                // END: no bus activity; latches end_detect (on END command)
+                // and trans_complete (master finished STOP).  The esp-idf
+                // master ISR waits on END_DETECT (I2C_LL_INTR_END_DETECT)
+                // to signal transaction completion, so both must be raised.
                 self.regs[(I2C_COMD / 4) as usize + slot] |= COMD_DONE;
-                self.regs[(I2C_INT_RAW / 4) as usize] |= INT_TRANS_COMPLETE;
+                self.regs[(I2C_INT_RAW / 4) as usize] |= INT_END_DETECT | INT_TRANS_COMPLETE;
                 self.op = None;
             }
         }

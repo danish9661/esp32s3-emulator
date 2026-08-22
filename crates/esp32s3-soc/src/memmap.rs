@@ -138,6 +138,10 @@ pub const TIMG1_BASE: u32 = 0x6002_0000;
 /// counters, 3 alarm targets; esp_timer's clock source on the S3.
 pub const SYSTIMER_BASE: u32 = 0x6002_3000;
 
+/// eFuse controller (esp32s3 reg_base.h DR_REG_EFUSE_BASE): holds the read-data
+/// registers that mirror the eFuse array blocks (MAC, chip version, keys...).
+pub const EFUSE_BASE: u32 = 0x6000_7000;
+
 /// Interrupt matrix: maps peripheral interrupt sources to CPU interrupt lines.
 /// Register space = 512 sources × 2 CPUs × 4 bytes.
 pub const INT_MATRIX_BASE: u32 = 0x600C_2000;

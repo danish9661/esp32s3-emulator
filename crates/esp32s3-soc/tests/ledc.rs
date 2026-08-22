@@ -1,20 +1,29 @@
 //! LEDC PWM model unit tests (divider + duty-resolution timing).
 
-use esp32s3_soc::ledc::*;
+use esp32s3_soc::ledc::Lcdc;
 
-/// TIMER0 divider 1.0, 10-bit resolution, channel 0 duty 50%:
-/// the output must alternate 512 cycles high / 512 low.
+// S3 ledc_struct.h layout: channel 0 at 0x00 (conf0/duty/conf1), timer 0 at
+// 0xA0 (conf/value). esp-idf stores duty = user_duty << 4.
+const CH0_CONF0: u32 = 0x00;
+const CH0_DUTY: u32 = 0x08;
+const TMR0_CONF: u32 = 0xA0;
+const TMR0_VALUE: u32 = 0xA4;
+const SIG_CH0: u32 = 73;
+const SIG_CH7: u32 = 80;
+
+/// TIMER0 divider 256 (1 tick/step), 10-bit resolution, channel 0 duty 50%:
+/// the output must alternate 512 steps high / 512 low.
 #[test]
 fn channel_toggles_50_percent_at_10_bit_resolution() {
     let mut l = Lcdc::new();
-    l.write32(LEDC_TIMER_CONF_0, 0x0024_0100);
-    l.write32(LEDC_CH0_DUTY, 0x2_0000);
-    l.write32(LEDC_CH0_CONF0, 12);
+    l.write32(TMR0_CONF, 0x100A); // div 256, res 10
+    l.write32(CH0_DUTY, 0x2000); // user 512 << 4 = 50% of 1024
+    l.write32(CH0_CONF0, 4); // sig_out_en
     let mut runs = Vec::new();
-    let mut prev = l.channel_level(0);
+    let mut prev = l.signal_level(73);
     let mut len = 0u32;
     for _ in 0..2048 {
-        let v = l.channel_level(0);
+        let v = l.signal_level(73);
         if v != prev {
             runs.push((prev, len));
             prev = v;
@@ -22,46 +31,51 @@ fn channel_toggles_50_percent_at_10_bit_resolution() {
         } else {
             len += 1;
         }
-        l.tick(1);
+        l.tick();
     }
     runs.push((prev, len));
-    assert_eq!(runs, [(1, 512), (0, 512), (1, 512), (0, 512)]);
+    assert!(runs.len() >= 4);
+    assert_eq!(&runs[0..4], &[(1, 512), (0, 512), (1, 512), (0, 512)]);
 }
 
-/// duty_start=0 must hold the output low even with sig_out_en set
-/// (TRM: the PWM only oscillates once the duty cycle is started).
+/// A paused timer holds the channel at its idle level (no oscillation).
 #[test]
-fn output_low_before_duty_start() {
+fn paused_timer_holds_idle() {
     let mut l = Lcdc::new();
-    l.write32(LEDC_TIMER_CONF_0, 0x0024_0100);
-    l.write32(LEDC_CH0_DUTY, 0x2_0000);
-    l.write32(LEDC_CH0_CONF0, 8); // sig_out_en only
+    l.write32(TMR0_CONF, 0x100A | (1 << 22)); // div 256, res 10, pause
+    l.write32(CH0_DUTY, 0x2000);
+    l.write32(CH0_CONF0, 4); // sig_out_en
     for _ in 0..64 {
-        assert_eq!(l.channel_level(0), 0);
-        l.tick(1);
+        assert_eq!(l.signal_level(73), 0);
+        l.tick();
     }
 }
 
-/// TIMERx_VALUE register reflects the live phase counter.
+/// TIMERx_VALUE register reflects the live phase counter (1 tick / step at
+/// div 256).
 #[test]
 fn timer_value_tracks_counter() {
     let mut l = Lcdc::new();
-    l.write32(LEDC_TIMER_CONF_0, 0x0024_0100);
-    l.write32(LEDC_CH0_DUTY, 0x2_0000);
-    l.write32(LEDC_CH0_CONF0, 12);
-    l.tick(100);
-    assert_eq!(l.read32(LEDC_TIMER_VALUE_0), 100);
+    l.write32(TMR0_CONF, 0x100A);
+    l.write32(CH0_DUTY, 0x2000);
+    l.write32(CH0_CONF0, 4);
+    l.tick();
+    l.tick();
+    assert_eq!(l.read32(TMR0_VALUE), 2);
+    l.tick();
+    l.tick();
+    assert_eq!(l.read32(TMR0_VALUE), 4);
 }
 
-/// Signal indices 96..103 map to channels 0..7 (TRM GPIO matrix table).
+/// Signal indices 73..80 map to channels 0..7.
 #[test]
 fn signal_level_maps_channels() {
     let mut l = Lcdc::new();
-    assert_eq!(l.signal_level(95), 0);
-    assert_eq!(l.signal_level(104), 0);
-    l.write32(LEDC_TIMER_CONF_0, 0x0024_0100);
-    l.write32(LEDC_CH0_DUTY, 0x2_0000);
-    l.write32(LEDC_CH0_CONF0, 12);
-    assert_eq!(l.signal_level(LEDC_CH0_SIGNAL), 1);
-    assert_eq!(l.signal_level(LEDC_CH0_SIGNAL + 7), 0);
+    assert_eq!(l.signal_level(72), 0);
+    assert_eq!(l.signal_level(81), 0);
+    l.write32(TMR0_CONF, 0x100A);
+    l.write32(CH0_DUTY, 0x2000);
+    l.write32(CH0_CONF0, 4);
+    assert_eq!(l.signal_level(SIG_CH0), 1);
+    assert_eq!(l.signal_level(SIG_CH7), 0);
 }

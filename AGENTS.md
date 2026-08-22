@@ -81,12 +81,14 @@ Core design:
 - [ ] **P5 — Hardening**: real-firmware validation via arduino-cli (compile
       sketches, run via `run_flash` + node bridge, assert serial output +
       peripheral state such as `gpio_output()` and device registers),
-      exception correctness and interrupt timing verified through real
+       exception correctness and interrupt timing verified through real
        FreeRTOS/Arduino behavior. NEXT: keep implementing missing peripherals
-       (RMT ✓, PCNT ✓, TWAI/CAN ✓, MCPWM, Touch, …) and validate each with a
-       sketch. NOTE: the esp-idf RMT *driver* uses GDMA (unmodeled) — RMT was
-       validated via direct register pokes; modeling GDMA would also enable the
-       driver path.
+       (RMT ✓, PCNT ✓, TWAI/CAN ✓, MCPWM ✓, GDMA ✓, I2C-peripheral ✓, …) and
+       validate each with a sketch. Driver-path status: RMT and GDMA were
+       validated end-to-end through the esp-idf *driver* stack; I2C is validated
+       at the peripheral level via direct register pokes (the Wire-driver path
+       times out at the FreeRTOS semaphore sync — documented known limitation).
+       Touch: NOT being pursued (user directive: do NOT do Touch).
 - [x] **P6 — Frontend polish**: serial console UI, GPIO/LED visualization,
       example firmware gallery.
 - [ ] WiFi/BLE: OUT OF SCOPE for now (months of work; not required for the
@@ -122,6 +124,20 @@ Core design:
 - Commit-ready, formatted with `cargo fmt`, clippy-clean.
 
 ## Status log (append, newest last)
+  - 2026-08-22: **SPI master driver path validated via arduino-cli (P5)**.
+    The Arduino `SPI` library (`SPI.begin` / `transfer` / `transferBytes` /
+    `transfer16` / `beginTransaction`) drives GPSPI2 (FSPI) through the
+    **polling USR path** (no GDMA — `esp32-hal-spi.c` `spiTransferByte` uses
+    the peripheral registers directly, confirmed by grepping the core), which
+    our existing `spi.rs` model already supports, so no emulator changes were
+    needed. Validated with `tools/sketches/esp32s3_spi_driver` (no device on
+    the bus, so MISO reads back 0) → `SPI DRIVER transfer(0x55)=0x00`,
+    `multi rx=00 00 00 00`, `transfer16=0x0000`, `SPI DRIVER PASS` under
+    `run_flash`. The SPIN critical-section trace is the usual harmless
+    FreeRTOS spin (also seen in every other sketch), not a hang. This retires
+    the "SPI master driver" P5 candidate; remaining driver-path candidates:
+     EFUSE (factory MAC / chip id), I2C (Wire) driver, and the unmodeled Touch
+     peripheral.
   - 2026-08-22: **RMT driver path validated via arduino-cli (P5)** — the new
     esp-idf RMT driver (`rmtWrite`/`rmtWriteAsync`, Arduino 3.3.10) routes the
     item buffer through **GDMA** into RMTMEM, so it exercises the GDMA-backed
@@ -894,7 +910,88 @@ Core design:
    arbitration/ACK/error-frame timing is not modeled. Unit tests
    (`tests/twai.rs`, 5): reset-mode default, ACR/AMR config vs op-mode buffer
    aliasing, self-test loopback round-trip, TI/RI assert + RRB clear, accept-all
-   filter. Validated end-to-end with `tools/sketches/esp32s3_twai` (direct
-   register pokes: reset → accept-all filter → STM → load frame → `tr` → poll
-   `rbs` → compare) → `TWAI LOOPBACK PASS` / `TWAI RRB OK`. 124 workspace tests
-   green (+5 TWAI), clippy/wasm32 clean.
+    filter. Validated end-to-end with `tools/sketches/esp32s3_twai` (direct
+    register pokes: reset → accept-all filter → STM → load frame → `tr` → poll
+    `rbs` → compare) → `TWAI LOOPBACK PASS` / `TWAI RRB OK`. 124 workspace tests
+    green (+5 TWAI), clippy/wasm32 clean.
+ - 2026-08-22: **I2C (P5) — peripheral validated via direct register-poke
+   sketch; Wire-driver path NOT modeled (known limitation)**. `i2c.rs` fix:
+   the esp-idf master ISR waits on `I2C_LL_INTR_END_DETECT` (bit 3), not just
+   `TRANS_COMPLETE` (bit 7), so the END command now latches
+   `INT_END_DETECT | INT_TRANS_COMPLETE` together (previously only
+   TRANS_COMPLETE). Peripheral FSM + interrupt model validated with
+   `tools/sketches/esp32s3_i2c_poke` (no Wire driver): it drives I2CEXT0 via
+   comd pokes (RSTART/WRITE+STOP+END and RSTART/WRITE+READ+STOP+END), polls
+   `INT_RAW`, and under `run_flash` prints `I2C POKE write raw=0x488
+   sr=0x40001 nack=1 ok=1` / `I2C POKE read raw=0x488 sr=0x40101 rxcnt=1
+   ok=1` → `I2C POKE PASS` (0x488 = END_DETECT|TRANS_COMPLETE|NACK, confirming
+   the FSM runs to completion, NACK is latched with no device, bus returns
+   idle, and READ fills the RX FIFO). All 124+ workspace tests still green,
+   clippy/wasm32 clean. **Wire-driver limitation**: the Arduino `Wire`
+   `endTransmission` scan still times out (`other=119`) under the real
+   esp-idf i2c *driver* stack. Root-caused to the FreeRTOS/esp-idf driver
+   synchronization layer, NOT the emulator: the I2C ISR
+   (`i2c_master_isr_handler_default`) is correctly invoked (verified PC hits
+   0x40377af4), reads `INT_STATUS=0x88`, and calls
+   `xQueueGenericSendFromISR` to give the completion semaphore — yet the
+   blocking `xQueueSemaphoreTake` in `s_i2c_synchronous_transaction` still
+   times out. Every emulator-side behavior (FSM, source-42→line-6 routing,
+   CPU INTENABLE SR, ISR invocation, register offsets matching real S3
+   `i2c_struct.h`) is correct, so the gap is inside the driver's
+    semaphore/struct sync which we do not model. Deferred: I2C is validated at
+    the peripheral level; the Wire-driver path is a documented known
+    limitation (consistent with how RMT/GDMA/MCPWM/PCNT were each first proven
+    via direct pokes).
+  - 2026-08-22: **LEDC PWM driver path validated via arduino-cli (P5)**. The
+    Arduino 3.3.10 `ledc` driver (`ledcAttach(pin, freq, res)` /
+    `ledcWrite(pin, duty)`, the real esp-idf ledc stack with the HAL
+    function-pointer dispatch) drives LEDC0 through the **driver** path,
+    routes GPIO2 via the matrix (FUNC_OUT_SEL = LEDC_CH0 signal 73), and the
+    firmware samples the pin with `digitalRead` — exercising the full model
+    end-to-end. Two **real, maskering model bugs** were found and fixed:
+    (1) **LEDC register layout was completely wrong** vs S3 `ledc_struct.h`:
+    the real layout has the 8 `channel_group` entries FIRST (0x00..0x9F,
+    stride 0x14: conf0/hpoint/duty/conf1/duty_rd) and the 4 `timer_group`
+    timers at **0xA0** (conf/value). The old model had timers at 0x00 and
+    channels at 0x20 with `REG_COUNT = 0x94/4`, so the driver's timer-config
+    writes at 0xA0 **fell out of bounds and were silently dropped** — the old
+    machine test used convenient values that happened to read back correctly,
+    masking the bug (the timer never ticked, output stayed idle). `ledc.rs`
+    rewritten to the real layout; `REG_COUNT` bumped to 0x94→0xD4.
+    (2) **esp-idf duty encoding**: the driver stores `duty = user_duty << 4`
+    (4 fractional bits, `ledc_ll_set_duty`), so the comparator value is
+    `duty_reg >> 4`. Old model used a different (wrong) normalization. The
+    driver writes `TIMER_CONF` divider/resolution to bits [21:4]/[3:0]
+    (confirmed by disassembly: `T0_conf` read back as `0x2007d0a`, `CH0_conf1
+    = 0xc0100400` with `duty_start` set). Validated with
+    `tools/sketches/esp32s3_ledc` (driver API, digitalRead sampling): `LEDC
+    50% duty measured=51%`, `LEDC 25% duty measured=25%`, `LEDC 10% duty
+    measured=10%` → `LEDC PASS` under `run_flash`. `tests/ledc.rs` (4) + the
+    `ledc_pwm_blinks_gpio0_at_50_percent_duty` machine test rewritten to the
+    real layout; all workspace tests green, clippy clean. **LEDC is retired as
+    a P5 candidate.** Remaining P5 driver-path work: I2C (Wire) driver is a
+     documented known limitation (peripheral validated via direct poke); Touch
+     is excluded per user directive (do NOT do Touch).
+  - 2026-08-22: **EFUSE read (factory MAC) validated via arduino-cli (P5)**.
+    `esp32s3-soc/src/efuse.rs` models the eFuse controller at `DR_REG_EFUSE_BASE
+    = 0x60007000`: `EFUSE_CMD_REG` (0x1D4) `read_cmd` (bit 0) is a no-op on our
+    already-materialized array, `EFUSE_STATUS_REG` (0x1D0) `state` field reads
+    idle (0) so the driver's read-done poll exits immediately, and the read-data
+    registers carry a fixed factory MAC. The factory MAC (`ESP_EFUSE_MAC_FACTORY`
+    = `ESP_EFUSE_MAC`, block 1) lives at `RD_SYS_PART1_DATA0..1` (0x5C/0x60); the
+    identical SPI-boot MAC at `RD_MAC_SPI_SYS_0..1` (0x44/0x48). **CRITICAL byte
+    ordering**: the esp-idf eFuse driver assembles the MAC with block bit[0:8) →
+    MAC byte[0], and block bit[0:8) of a 32-bit word is its LSB — so each word
+    stores the MAC reversed per byte (MAC `0x112233445566` →
+    `RD_SYS_PART1_DATA0 = 0x44332211`, `DATA1 = 0x00006655`). The block↔register
+    mapping (block 1 = `RD_SYS_PART1_DATA`) was confirmed by disassembling the
+    bundled sketch's `get_efuse_factory_mac` → `esp_efuse_read_field_blob`
+    (field id 272 = `ESP_EFUSE_MAC`) and decoding the `esp_efuse_desc_t` array
+    (`{efuse_block:u8, bit_start:u8, bit_count:u16}`; 6 descriptors, block=1,
+    bit_start 40/32/24/16/8/0, count 8) plus a read-log probe of the live run.
+    Validated with `tools/sketches/esp32s3_efuse` (Arduino `ESP.getEfuseMac()`)
+    → `MAC=0000112233445566` / `EFUSE DONE` under `run_flash`. 3 unit tests in
+    `tests/efuse.rs` (MAC in SYS_PART1 + SPI_SYS mirrors, STATUS idle, read_cmd
+    no-op + RO writes dropped). 15x workspace test binaries green, clippy/
+    wasm32 clean. **EFUSE is retired as a P5 candidate.**
+
