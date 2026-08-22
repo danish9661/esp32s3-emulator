@@ -3,4 +3,13 @@ name = "wasm-bridge"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
+# The bridge is the only crate that speaks to JS, so it uses std (required
+# by wasm-bindgen) even though the core emulator crates are `#![no_std]`.
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+esp32s3-emu = { path = "../esp32s3-emu" }
+esp32s3-soc = { path = "../esp32s3-soc" }

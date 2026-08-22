@@ -384,9 +384,7 @@ fn main() {
         // idle-callback table + flag so a stuck startup handshake is visible.
         if pc == 0x4202_125d && i % 100_000 == 0 {
             let flag = m.soc.read32(0x3fc9_6ffc);
-            let idle: Vec<u32> = (0..16)
-                .map(|k| m.soc.read32(0x3fc9_6df4 + 4 * k))
-                .collect();
+            let idle: Vec<u32> = (0..16).map(|k| m.soc.read32(0x3fc9_6df4 + 4 * k)).collect();
             println!(
                 "MAINSPIN@{i} flag={flag:#x} idle={idle:?} pc1={:#x}",
                 m.cpu[1].pc
@@ -1540,7 +1538,10 @@ fn main() {
                     for &b in bytes {
                         m.soc.uart_inject_rx(1, b);
                     }
-                    println!("[host] injected {:?} into UART1 RX", String::from_utf8_lossy(bytes));
+                    println!(
+                        "[host] injected {:?} into UART1 RX",
+                        String::from_utf8_lossy(bytes)
+                    );
                     uart1_injected = true;
                 }
             }
@@ -1778,9 +1779,7 @@ fn main() {
     );
     {
         let flag = m.soc.read32(0x3fc9_6ffc);
-        let idle: Vec<u32> = (0..16)
-            .map(|k| m.soc.read32(0x3fc9_6df4 + 4 * k))
-            .collect();
+        let idle: Vec<u32> = (0..16).map(|k| m.soc.read32(0x3fc9_6df4 + 4 * k)).collect();
         println!("== startup handshake: flag={flag:#x} idle_cb={idle:?}");
         if !main_trace.is_empty() {
             println!("== main_task trace ({}):", main_trace.len());

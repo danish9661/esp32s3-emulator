@@ -1,0 +1,94 @@
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --border: #30363d;
+  --fg: #c9d1d9;
+  --accent: #2ea043;
+  --led-on: #f5c211;
+  --led-off: #21262d;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+header {
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+}
+header h1 { margin: 0; font-size: 18px; }
+header small { color: #8b949e; font-weight: normal; }
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.controls label { font-size: 13px; }
+button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+button:disabled { background: #30363d; cursor: not-allowed; opacity: 0.6; }
+button#stop { background: #b62324; }
+.steps input[type=range] { vertical-align: middle; }
+.status { margin-left: auto; font-size: 12px; color: #8b949e; }
+
+main {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: 16px;
+  padding: 16px 20px;
+}
+@media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+
+.console-wrap h2, .gpio-wrap h2 { font-size: 13px; color: #8b949e; margin: 0 0 6px; }
+.console {
+  background: #010409;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  height: 70vh;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.gpio-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, 34px);
+  gap: 6px;
+}
+.led {
+  width: 34px;
+  height: 34px;
+  border-radius: 6px;
+  background: var(--led-off);
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  color: #8b949e;
+}
+.led.on {
+  background: var(--led-on);
+  color: #000;
+  box-shadow: 0 0 8px var(--led-on);
+}

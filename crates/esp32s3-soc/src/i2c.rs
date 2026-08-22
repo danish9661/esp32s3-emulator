@@ -128,6 +128,12 @@ pub struct I2c {
     /// Current driven bus levels (idle/released = (1, 1)).
     scl: u32,
     sda: u32,
+    /// Transmission cursor: bytes already clocked out in the current
+    /// transaction. The TX FIFO is NOT drained on transmit (real HW keeps the
+    /// bytes; the driver's NACK-retry path re-runs the FSM to re-send the same
+    /// data), so `tx_head`/`tx_cnt` persist across re-runs and the retry
+    /// re-NACKs instead of succeeding on an empty FIFO.
+    tx_pos: u32,
 }
 
 impl I2c {
@@ -146,6 +152,7 @@ impl I2c {
             op: None,
             scl: 1,
             sda: 1,
+            tx_pos: 0,
         }
     }
 
@@ -183,7 +190,7 @@ impl I2c {
         if self.tx_cnt == 0 {
             return 0xFF;
         }
-        u32::from(self.txfifo[(self.tx_head % FIFO_DEPTH as u32) as usize])
+        u32::from(self.txfifo[((self.tx_head + self.tx_pos) % FIFO_DEPTH as u32) as usize])
     }
 
     fn pop_rx(&mut self) -> u32 {
@@ -233,9 +240,25 @@ impl I2c {
             }
             OP_WRITE => {
                 if self.tx_cnt == 0 {
-                    // Nothing to send: complete immediately.
-                    self.regs[(I2C_COMD / 4) as usize + slot] |= COMD_DONE;
-                    self.op = None;
+                    // The TX FIFO is empty. On real HW the driver's NACK
+                    // retry re-runs the FSM still holding the byte in the
+                    // hardware FIFO, so the byte is re-sent and re-NACKed;
+                    // our model's retry sees an empty FIFO. Either way, with
+                    // no slave present the bus stays high and the master
+                    // receives a NACK, so run the NACK phases with a dummy
+                    // byte rather than completing silently (which would let
+                    // the retry report success with no device).
+                    self.scl = 0;
+                    self.sda = 1;
+                    self.op = Some(Op {
+                        kind,
+                        slot,
+                        bytes_left: 0,
+                        byte: 0,
+                        phase: 0,
+                        remain: self.start_hold_len(),
+                        ack: 0,
+                    });
                     return;
                 }
                 let byte = self.tx_byte();
@@ -341,10 +364,7 @@ impl I2c {
                     self.sda = 1;
                     op.remain = low;
                     self.regs[(I2C_SR / 4) as usize] |= SR_RESP_REC;
-                    if self.tx_cnt > 0 {
-                        self.tx_head += 1;
-                        self.tx_cnt -= 1;
-                    }
+                    self.tx_pos += 1;
                     op.bytes_left = op.bytes_left.saturating_sub(1);
                 } else if op.phase == 8 {
                     // ACK low done: clock high, SDA released. With no slave
@@ -360,17 +380,20 @@ impl I2c {
                     if op.bytes_left > 0 {
                         op.phase = 0;
                         op.byte = if self.tx_cnt == 0 {
-                                0xFF
-                            } else {
-                                u32::from(self.txfifo[(self.tx_head % FIFO_DEPTH as u32) as usize])
-                            };
-                            self.scl = 0;
-                            self.sda = (op.byte >> 7) & 1;
-                            op.remain = low;
+                            0xFF
                         } else {
-                            finished = true;
-                        }
+                            u32::from(
+                                self.txfifo
+                                    [((self.tx_head + self.tx_pos) % FIFO_DEPTH as u32) as usize],
+                            )
+                        };
+                        self.scl = 0;
+                        self.sda = (op.byte >> 7) & 1;
+                        op.remain = low;
+                    } else {
+                        finished = true;
                     }
+                }
             }
             OP_READ => {
                 if self.scl == 0 {
@@ -440,6 +463,7 @@ impl I2c {
         if self.op.is_some() || self.pending_len > 0 {
             return;
         }
+        self.tx_pos = 0;
         // Controller clears every command's done bit on (re)start.
         for i in 0..8 {
             self.regs[(I2C_COMD / 4) as usize + i] &= !COMD_DONE;

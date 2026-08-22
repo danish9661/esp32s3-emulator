@@ -160,16 +160,35 @@ fn sclk_div_scales_period() {
     assert_eq!(edges[2] - edges[1], 6);
 }
 
-/// A WRITE with an empty TX FIFO completes immediately without bus
-/// activity and raises no interrupt.
+/// A WRITE issued with an empty TX FIFO must still drive the bus and, with
+/// no slave present, receive a NACK (TRM I2C: the master clocks out the
+/// byte and samples SDA high = NACK). The driver's NACK-retry path relies
+/// on this: if the empty-FIFO retry completed silently the firmware would
+/// report a successful transaction with no device on the bus.
 #[test]
-fn write_with_empty_fifo_completes() {
+fn write_with_empty_fifo_nacks() {
     let mut i2c = I2c::new(0);
     setup_master(&mut i2c);
     i2c.write32(I2C_COMD, (1 << 11) | 1);
     i2c.write32(I2C_CTR, (1 << 4) | (1 << 5));
-    assert_eq!(i2c.signal_level(89), 1, "no SCL activity");
+    // Advance until the command completes; record whether SCL ever toggled.
+    let mut scl_low_seen = false;
+    for _ in 0..256 {
+        if i2c.signal_level(89) == 0 {
+            scl_low_seen = true;
+        }
+        i2c.tick(1);
+        if i2c.read32(I2C_COMD) & (1 << 31) != 0 {
+            break;
+        }
+    }
+    assert!(scl_low_seen, "empty-FIFO WRITE must still drive SCL");
     assert_ne!(i2c.read32(I2C_COMD) & (1 << 31), 0, "comd done");
+    assert_ne!(
+        i2c.read32(I2C_INT_RAW) & (1 << 10),
+        0,
+        "empty-FIFO WRITE raises nack_int_raw"
+    );
 }
 
 /// FIFO reset bits clear the pointers.

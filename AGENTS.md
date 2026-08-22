@@ -107,6 +107,36 @@ Core design:
 
 ## Status log (append, newest last)
 
+- 2026-08-22: **Browser bridge (P6 start) — emulator runs in the browser**.
+  `wasm-bridge` (was a stub `add`) now wraps `Esp32S3` via `wasm-bindgen` and
+  exposes `Emulator { new, load_flash(&[u8]), step(n), uart_read()->Vec<u8>,
+  gpio_output()->u32, pc()->u32 }`. `web/` is a minimal harness:
+  `index.html` + `main.js` + `style.css` — serial console (drains UART each
+  frame), 40-pin GPIO LED grid, firmware file-input, Run/Stop/Reset + steps-
+  per-frame slider; auto-loads `web/hello.bin` if present (gitignored — copy
+  any arduino-cli `*.merged.bin`). Verified headlessly: built the nodejs
+  target and ran the hello sketch in node → `Hello from ESP32-S3!` / `boot OK`
+  over UART. Web target built into `web/pkg/` (gitignored, regenerated with
+  `wasm-pack build crates/wasm-bridge --target web --out-dir web/pkg`); served
+  over `python3 -m http.server` all assets return 200. `Esp32S3` re-exported at
+  `esp32s3_emu` crate root for the bridge. clippy `--target wasm32` clean.
+- 2026-08-22: **I2C NACK-model fix (real gap, validated by Arduino sketch)**.
+  `i2c.rs` WRITE command no longer silently completes on an empty TX FIFO.
+  On real HW the driver's NACK-retry re-runs the FSM still holding the byte
+  in the hardware FIFO and re-NACKs; our model's retry saw an empty FIFO and
+  reported success — which is why `Wire` on `esp32s3_i2c` (no devices on the
+  bus) printed `found=56` instead of `found=0`. Now an empty-FIFO WRITE runs
+  the START + 8 data pulses + ACK phases and raises `INT_NACK` (1<<10), so the
+  retry also NACKs and `endTransmission` returns 2 (ACK error) for every
+  address → `I2C SCAN done found=0`. The mandatory FIFO drain on transmit was
+  also removed (`tx_pos` cursor replaces `tx_cnt` decrement) so a re-run
+  re-sends the same byte instead of an empty FIFO. Sketches
+  `esp32s3_{hello,periph,uart_echo,spi,i2c}` all boot (exit=0); i2c unit test
+  `write_with_empty_fifo_completes` rewritten to `write_with_empty_fifo_nacks`.
+  Driven by disabling nack to prove the lever (`found=112` with nack off vs
+  `found=56` with nack on), then tracing `nack_set=112` vs `write_empty=58` to
+  localize the empty-FIFO retry. 89 workspace tests green, clippy/wasm32
+  clean.
 - 2026-08-20: Second real Arduino-CLI firmware boots: **esp32s3_periph**
   (GPIO blink + digitalRead, analogRead with injected voltage, millis,
   and a FreeRTOS core-1 worker task). Run: `ADC_INJECT_MV=825 cargo run

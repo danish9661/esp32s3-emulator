@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ESP32-S3 Emulator</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header>
+    <h1>ESP32-S3 Emulator <small>(Rust &rarr; WASM, in-browser)</small></h1>
+  </header>
+
+  <section class="controls">
+    <label class="file">
+      Firmware (merged.bin):
+      <input type="file" id="firmware" accept=".bin" />
+    </label>
+    <button id="run" disabled>Run</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="reset" disabled>Reset</button>
+    <label class="steps">
+      Steps/frame:
+      <input type="range" id="steps" min="1000" max="200000" step="1000" value="40000" />
+      <span id="stepsVal">40000</span>
+    </label>
+    <span id="status" class="status"></span>
+  </section>
+
+  <main>
+    <section class="console-wrap">
+      <h2>Serial console (UART0)</h2>
+      <pre id="console" class="console"></pre>
+    </section>
+    <section class="gpio-wrap">
+      <h2>GPIO outputs</h2>
+      <div id="gpio" class="gpio-grid"></div>
+    </section>
+  </main>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
