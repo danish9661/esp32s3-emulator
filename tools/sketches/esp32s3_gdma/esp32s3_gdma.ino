@@ -63,7 +63,7 @@ void setup() {
   // Program descriptor address (20 LSBs) then start the transfer.
   uint32_t desc_lsb = ((uint32_t)&g_desc) & 0x000FFFFFu;
   *((volatile uint32_t*)G_OUT_LINK) = desc_lsb;
-  *((volatile uint32_t*)G_OUT_LINK) = desc_lsb | (1u << 1);  // start = bit1
+  *((volatile uint32_t*)G_OUT_LINK) = desc_lsb | (1u << 21);  // start = bit21
 
   // Poll GDMA out_done (raw int bit 0). Copy is performed synchronously by the
   // emulator, so this is observed immediately after the start write.

@@ -7,7 +7,9 @@
 //! (`soc/gdma_struct.h`).
 //!
 //! Only the TX (`out`) path is functionally modeled. When software writes
-//! `out.link.start` (bit 1 of the link register at out-offset 0x20), GDMA
+//! `out.link.start` (bit 21 of the link register at out-offset 0x20 — the
+//! `addr` field is bits [19:0], then `stop`=20, `start`=21, `restart`=22,
+//! `park`=23, per `gdma_struct.h`), GDMA
 //! walks the descriptor chain starting at `out.link.addr` (the 20 LSBs of a
 //! DRAM descriptor address — full address = `0x3FC0_0000 | addr`, since all
 //! DMA descriptors live in DRAM at 0x3FC8_0000..0x3FD0_0000). Each descriptor
@@ -179,7 +181,7 @@ impl Gdma {
                 0x14 => self.out_int_raw[ch] &= !value, // int_clr clears raw bits
                 0x20 => {
                     self.out_link[ch] = value;
-                    if value & (1 << 1) != 0 {
+                    if value & (1 << 21) != 0 {
                         return Some(ch);
                     }
                 }
@@ -198,7 +200,7 @@ impl Gdma {
                     // RX start would begin a peripheral->memory transfer; not
                     // modeled (no GDMA RX consumer yet), but clear the park
                     // bit to mimic the FSM leaving idle.
-                    if value & (1 << 1) != 0 {
+                    if value & (1 << 21) != 0 {
                         self.out_state[ch] &= !(1 << 1);
                     }
                 }

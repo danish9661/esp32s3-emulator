@@ -16,12 +16,13 @@ const C2_LINK: u32 = 2 * 0xC0 + 0x60 + 0x20;
 
 #[test]
 fn link_addr_strips_start_stop_control_bits() {
-    // Firmware writes `(&desc & 0xFFFFF)` then ORs `start` (bit 1). The address
-    // field's low 2 bits are control bits and must be stripped so the
-    // reconstructed descriptor address matches the real DRAM address.
+    // Firmware writes `(&desc & 0xFFFFF)` then ORs `start` (bit 21; the `addr`
+    // field is bits [19:0], then `stop`=20, `start`=21, per gdma_struct.h).
+    // The address field's low 2 bits are control bits and must be stripped so
+    // the reconstructed descriptor address matches the real DRAM address.
     let mut g = Gdma::default();
-    // descriptor at 0x3FC9_6788, start bit 1 set -> link value 0x9678A.
-    g.write32(C0_LINK, 0x9678A);
+    // descriptor at 0x3FC9_6788, start bit 21 set -> link value 0x2096788.
+    g.write32(C0_LINK, 0x2096788);
     assert_eq!(g.out_link_addr(0), 0x3FC9_6788);
 }
 
@@ -45,8 +46,8 @@ fn peri_sel_returns_low_six_bits() {
 #[test]
 fn write_start_returns_channel_and_sets_link() {
     let mut g = Gdma::default();
-    // Start bit set on channel 2's out link.
-    let ch = g.write32(C2_LINK, 0x1000_02);
+    // Start bit (bit 21) set on channel 2's out link.
+    let ch = g.write32(C2_LINK, 0x200002);
     assert_eq!(ch, Some(2));
     // A plain (no start) peri_sel write returns None.
     let none = g.write32(C0_PERI, 9);

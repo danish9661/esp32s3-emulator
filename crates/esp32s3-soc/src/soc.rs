@@ -22,6 +22,7 @@ use crate::gpio::Gpio;
 use crate::i2c::I2c;
 use crate::intc::Intc;
 use crate::ledc::Lcdc;
+use crate::mcpwm::{MCPWM_BASE, Mcpwm};
 use crate::memmap::*;
 use crate::memspi::Memspi;
 use crate::pcnt::{PCNT_BASE, Pcnt};
@@ -119,6 +120,7 @@ pub struct Soc {
     uarts: [Uart; 3],
     gpio: Gpio,
     ledc: Lcdc,
+    mcpwm: Mcpwm,
     spi: [Spi; 2],
     /// SPI1 (0x60002000) + SPIMEM0 (0x60003000) flash controllers, sharing
     /// the `flash` backing (see `crate::memspi`).
@@ -180,6 +182,7 @@ impl Soc {
             usb_serial_tx: Vec::new(),
             gpio: Gpio::new(),
             ledc: Lcdc::new(),
+            mcpwm: Mcpwm::new(),
             spi: [Spi::new(0), Spi::new(1)],
             memspi: [Memspi::new(), Memspi::new()],
             i2c: [I2c::new(0), I2c::new(1)],
@@ -368,6 +371,7 @@ impl Soc {
             self.i2c[1].tick(1);
             self.adc.tick(1);
             self.rmt.tick();
+            self.mcpwm.tick();
             // PCNT samples its unit/channel signal inputs via the GPIO-matrix
             // input routing (FUNC_IN_SEL_CFG); resolve each signal index to the
             // GPIO pin's current level.
@@ -460,6 +464,33 @@ impl Soc {
         }
     }
 
+    /// GPIO_IN readback with output loopback resolved to the actual driven
+    /// level. For a pin whose FUNC_OUT_SEL selects a peripheral matrix signal
+    /// (e.g. MCPWM 160..165) the loopback level is that peripheral's output,
+    /// not GPIO_OUT — matching real silicon where a peripheral-driven pad is
+    /// readable via digitalRead (TRM GPIO matrix). Pins driving GPIO_OUT
+    /// (FUNC_OUT_SEL 0x80 or 0) loop back the GPIO_OUT bit.
+    pub fn gpio_in_readback(&self) -> u32 {
+        let mut v = self.gpio.raw_in();
+        for i in 0..self.gpio.pin_count() {
+            if !self.gpio.enabled(i) {
+                continue;
+            }
+            let sel = self.gpio.out_sel(i);
+            let driven = if sel == 0x80 || sel == 0 {
+                self.gpio.out_bit(i)
+            } else {
+                self.signal_level(sel)
+            };
+            if driven != 0 {
+                v |= 1 << i;
+            } else {
+                v &= !(1 << i);
+            }
+        }
+        v
+    }
+
     /// GPIO matrix output signal level for a peripheral signal index.
     /// LEDC occupies 73..80, I2CEXT0 SCL/SDA = 89/90, I2CEXT1 = 91/92,
     /// GPSPI2 (FSPI) 101..105 + CS 110/111, GPSPI3 66..72 (S3
@@ -469,6 +500,9 @@ impl Soc {
             self.ledc.signal_level(sig)
         } else if (81..=84).contains(&sig) {
             self.rmt.signal_level(sig)
+        } else if (160..=165).contains(&sig) {
+            // MCPWM0 operator 0..2 output A/B (PWM0_OUT0A..OUT2B_IDX).
+            self.mcpwm.signal_level(sig)
         } else {
             self.spi[0].signal_level(sig)
                 | self.spi[1].signal_level(sig)
@@ -506,6 +540,10 @@ impl Soc {
                 if is_write {
                     self.gpio.write32(off, value);
                     0
+                } else if off == crate::gpio::GPIO_IN {
+                    // Resolve the output loopback to the real driven level
+                    // (peripheral signal for matrix-routed pins).
+                    self.gpio_in_readback()
                 } else {
                     self.gpio.read32(off)
                 }
@@ -634,6 +672,14 @@ impl Soc {
                     0
                 } else {
                     self.twai.read32(off)
+                }
+            }
+            MCPWM_BASE => {
+                if is_write {
+                    self.mcpwm.write32(off, value);
+                    0
+                } else {
+                    self.mcpwm.read32(off)
                 }
             }
             // Page 0x6000_8000 holds RTC_CNTL (0x000), RTC_IO (0x400),
@@ -841,6 +887,10 @@ impl Bus for Soc {
         // TWAI (CAN) controller = source 37 (ETS_TWAI_INTR_SOURCE).
         if self.twai.int_pending() {
             src |= 1 << crate::twai::TWAI_INTR_SOURCE;
+        }
+        // MCPWM0 group = source 31 (ETS_PWM0_INTR_SOURCE).
+        if self.mcpwm.int_pending() {
+            src |= 1 << crate::mcpwm::MCPWM_INTR_SOURCE;
         }
         // Cross-core interrupts: SYSTEM.CPU_INT_FROM_CPU_0/1 (0x600C0030/34)
         // assert the FROM_CPU_INTR0/1 sources = 79/80 (esp32s3 interrupts.h

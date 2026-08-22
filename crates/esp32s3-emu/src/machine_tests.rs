@@ -1421,3 +1421,43 @@ fn rom_qsort_sorts_size8_entries() {
     let vals: [i32; 12] = std::array::from_fn(|i| m.soc.read32(ARR + 4 * i as u32) as i32);
     assert_eq!(vals, [4, 40, 5, 50, 6, 60, 7, 70, 8, 80, 9, 90]);
 }
+
+#[test]
+fn rmt_signal_drives_gpio_in_loopback() {
+    use esp32s3_soc::memmap::GPIO_BASE;
+    use esp32s3_soc::rmt::{RMT_BASE, RMTMEM_BASE};
+
+    let mut m = Esp32S3::new();
+    // Route GPIO2 to RMT TX signal 81 (channel 0) and enable output.
+    m.soc.write32(GPIO_BASE + 0x554 + 2 * 4, 81); // FUNC_OUT_SEL_CFG[2]
+    m.soc.write32(GPIO_BASE + 0x20, 1 << 2); // GPIO_ENABLE_W1TS bit2
+
+    // Two RMT items: item0 = HIGH 100 / LOW 100, item1 = HIGH 50 / LOW 50.
+    // item format: duration0[14:0], level0[15], duration1[30:16], level1[31].
+    let item0: u32 = 100 | (1u32 << 15) | (100 << 16);
+    let item1: u32 = 50 | (1u32 << 15) | (50 << 16);
+    m.soc.write32(RMTMEM_BASE, item0);
+    m.soc.write32(RMTMEM_BASE + 4, item1);
+
+    // chnconf0[0] = tx_start | idle_out_en (mem_size default -> 64 items).
+    m.soc.write32(RMT_BASE + 0x20, (1 << 0) | (1 << 6));
+
+    let mut saw0 = false;
+    let mut saw1 = false;
+    for _ in 0..20000 {
+        m.step();
+        let g = m.soc.gpio_in_readback();
+        if (g >> 2) & 1 == 1 {
+            saw1 = true;
+        } else {
+            saw0 = true;
+        }
+        if saw0 && saw1 {
+            break;
+        }
+    }
+    assert!(
+        saw0 && saw1,
+        "RMT output must toggle GPIO2 via the GPIO_IN loopback (saw0={saw0} saw1={saw1})"
+    );
+}

@@ -80,6 +80,14 @@ impl Gpio {
         }
     }
 
+    /// Raw GPIO_IN register value (strap / external input state) WITHOUT the
+    /// output loopback. `Soc::gpio_in_readback` overlays the loopback using
+    /// the actual driven level (which for a peripheral-matrix-routed pin is the
+    /// peripheral signal, not GPIO_OUT).
+    pub fn raw_in(&self) -> u32 {
+        self.regs[(GPIO_IN / 4) as usize]
+    }
+
     pub fn write32(&mut self, offset: u32, value: u32) {
         match offset {
             GPIO_OUT_W1TS => self.regs[(GPIO_OUT / 4) as usize] |= value,

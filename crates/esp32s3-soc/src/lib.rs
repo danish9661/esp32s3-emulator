@@ -16,6 +16,7 @@ pub mod gpio;
 pub mod i2c;
 pub mod intc;
 pub mod ledc;
+pub mod mcpwm;
 pub mod memmap;
 pub mod memspi;
 pub mod pcnt;

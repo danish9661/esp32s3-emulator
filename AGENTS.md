@@ -122,7 +122,56 @@ Core design:
 - Commit-ready, formatted with `cargo fmt`, clippy-clean.
 
 ## Status log (append, newest last)
- - 2026-08-22: **PCNT pulse-counter (P5 — new peripheral via arduino-cli
+  - 2026-08-22: **RMT driver path validated via arduino-cli (P5)** — the new
+    esp-idf RMT driver (`rmtWrite`/`rmtWriteAsync`, Arduino 3.3.10) routes the
+    item buffer through **GDMA** into RMTMEM, so it exercises the GDMA-backed
+    path. Two emulator bugs were fixed to make it work:
+    (1) **GDMA `out.link.start` bit**: `gdma.rs` checked bit **1**, but
+    `gdma_struct.h` places `start` at **bit 21** (`addr`[19:0], `stop`=20,
+    `start`=21, `restart`=22, `park`=23). The direct-poke GDMA sketch happened
+    to write bit 1 (matching the old model) so it passed anyway — the real
+    driver writes bit 21 and hung. Fixed to bit 21; `tests/gdma.rs` + the
+    `esp32s3_gdma` sketch updated to bit 21, both still green.
+    (2) **RMT continuous/loop mode**: the driver's `rmtWriteLooping` uses
+    `tx_loop_cnt_en` (bit 14) with `tx_loop_cnt`==0 for infinite looping (not
+    `tx_conti_mode` bit 15). `rmt.rs` `begin_tx` now loops when either is set.
+    Validated with `tools/sketches/esp32s3_rmt_driver` (Arduino `rmtWrite`,
+    64-item buffer @ 1 MHz): the blocking call returns true and the item buffer
+    is copied into RMTMEM (`RMT DRIVER GDMA copied item=7fffffff` / `RMT DRIVER
+    PASS`) — the previously-hanging GDMA path now completes. NOTE: the live pin
+    waveform can't be sampled from firmware (the RMT FSM advances every step, so
+    a transmission finishes *inside* the driver's `rmt_transmit()` call); the
+    live RMT→GPIO toggling via the GPIO_IN loopback is instead covered by the
+    Rust machine test `rmt_signal_drives_gpio_in_loopback` (added to
+    `esp32s3-emu/src/machine_tests.rs`). 136 workspace tests green, clippy/
+    wasm32 clean.
+  - 2026-08-22: **MCPWM group-0 (P5 — new peripheral via arduino-cli
+    validation)** + **GPIO_IN peripheral-loopback fix**. `mcpwm.rs` models
+    ESP32-S3 MCPWM0: register block @ `0x6001_E000` (`DR_REG_PWM0_BASE` —
+    **NOT 0x6000_B000**, which is HINF; TRM typo / misread), 3 timers (up /
+    down / up-down count, prescale divider, 16-bit period) + 3 operators each
+    with 2 comparators (A/B) and 2 generators (A/B). On the timer events TEZ
+    (count==0), TEA (==cmprA), TEB (==cmprB) the generator action table
+    (`generator0/1`, 2-bit selectors per event: 0=keep,1=high,2=low,3=toggle)
+    updates the output; the level is exposed to the GPIO matrix via the PWM0
+    OUT0A..OUT2B signals (160..165, `gpio_sig_map.h`). `int_pending` = source
+    **31** (`ETS_PWM0_INTR_SOURCE`, `interrupts.h` — PWM1=32, LEDC=33, TWAI=35;
+    note the existing RMT=40/PCNT=41/I2C=42/43 wiring is verified-correct against
+    the same header, while `TWAI=37` in `twai.rs` does NOT match the header's
+    35 and should be re-checked). Wired into `soc.rs` (mmio arm `MCPWM_BASE`,
+    `signal_level`, `tick`, `int_pending`). 6 unit tests (`tests/mcpwm.rs`)
+    assert 50%/25% up-mode duty, operator A/B signal mapping, live
+    `timer_status`, stop/hold, and prescale. Validated end-to-end with
+    `tools/sketches/esp32s3_mcpwm` (direct register pokes: route PWM0_OUT0A→
+    GPIO2, timer0 up-mode period=100, generator0 utez=set/utea=clear, sample
+    the pad via `digitalRead`) → `MCPWM duty1=44% duty2=21% MCPWM PASS` under
+    `run_flash`. **GPIO_IN loopback fix**: a peripheral-matrix-routed pin (e.g.
+    MCPWM 160..165) is now readable via `digitalRead` like real silicon — `soc.rs`
+    gained `gpio_in_readback`, which overlays `GPIO_IN` with the *driven* level
+    (peripheral signal via `signal_level` when `FUNC_OUT_SEL` is neither 0x80 nor
+    0), intercepted at the `GPIO_IN` mmio read; `gpio.rs` gained `raw_in()`. 130
+    workspace tests green (+6 MCPWM), clippy/wasm32 clean.
+  - 2026-08-22: **PCNT pulse-counter (P5 — new peripheral via arduino-cli
    validation)** + **interrupt-source fixes**. PCNT (`esp32s3-soc/src/pcnt.rs`,
    4 units × 2 channels, one shared counter/unit): register block @ 0x6008_6000
    (CONF0/CONF1/CONF2 per unit @ 0x0C stride, CNT @ 0x30, INT_* @ 0x40..0x4C,
@@ -169,11 +218,11 @@ Core design:
   tx_end assert + clear, and out-of-range signal 0. Validated end-to-end
   with a real arduino-cli sketch `tools/sketches/esp32s3_rmt` that pokes the
   RMT registers directly (NOT the esp-idf `rmt_write_items` driver, which on
-  S3 routes through **GDMA — UNMODELED** → would hang waiting for a DMA
-  tx_end) and polls `INT_RAW`; runs under `run_flash` → prints `RMT TX done`.
-  113 workspace tests green, clippy/wasm32 clean. NEXT peripheral candidates:
-  TWAI/CAN, PCNT, MCPWM, Touch; and/or model GDMA so the esp-idf RMT driver
-  path works too.
+   S3 routes through **GDMA** (now MODELED); the esp-idf RMT *driver* path is
+   validated separately via `tools/sketches/esp32s3_rmt_driver`. Runs under
+   `run_flash` → prints `RMT TX done`. 113 workspace tests green, clippy/wasm32
+   clean. Peripheral candidates: Touch; and/or more peripherals' esp-idf driver
+   paths (e.g. SPI master driver, I2C driver) via arduino-cli sketches.
 - 2026-08-22: **GPIO LED-grid fix (real gap, validated by Arduino sketch)**.
   `gpio_output()` was returning `0x0` for the periph sketch's `digitalWrite`
   blink, so the browser 40-pin LED grid never lit. Root cause localized with

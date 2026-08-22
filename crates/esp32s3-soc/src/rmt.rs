@@ -37,6 +37,12 @@ const CHN_TX_LIM: usize = 0xA0 / 4; // 40
 const TX_START: u32 = 1 << 0;
 const IDLE_OUT_LV: u32 = 1 << 5;
 const IDLE_OUT_EN: u32 = 1 << 6;
+// tx_conti_mode (bit 15): continuous transmission — reload item 0 on end
+// instead of raising tx_end.  The IDF `rmt_transmit` loop_count path uses
+// tx_loop_cnt_en (bit 14) + tx_loop_cnt (bits [23:16]) == 0 for infinite
+// looping; both mechanisms keep the FSM re-reading RMTMEM.
+const TX_CONTI_MODE: u32 = 1 << 15;
+const TX_LOOP_CNT_EN: u32 = 1 << 14;
 
 // GPIO-matrix output signal indices for TX channels 0..3 (gpio_sig_map.h
 // RMT_SIG_OUT0..3 = 81..84).
@@ -54,6 +60,7 @@ const TICKS_PER_STEP: u32 = 32;
 #[derive(Default)]
 struct TxCh {
     active: bool,
+    conti: bool, // continuous (loop) mode
     item_idx: usize,
     pulse: u32, // 0 = duration0/level0, 1 = duration1/level1
     ticks_left: u32,
@@ -110,8 +117,10 @@ impl Rmt {
         .min(MEM_ITEMS);
         let num_items = num_items.max(1);
 
+        let loop_en = (conf & TX_LOOP_CNT_EN) != 0 && ((conf >> 16) & 0xFF) == 0;
         let mut t = TxCh {
             active: true,
+            conti: (conf & TX_CONTI_MODE) != 0 || loop_en,
             item_idx: 0,
             pulse: 0,
             ticks_left: 0,
@@ -137,6 +146,15 @@ impl Rmt {
                 } else {
                     self.tx[ch].item_idx += 1;
                     if self.tx[ch].item_idx >= self.tx[ch].num_items {
+                        if self.tx[ch].conti {
+                            // Continuous mode: reload item 0 and keep running.
+                            let item = self.item(ch, 0);
+                            self.tx[ch].item_idx = 0;
+                            self.tx[ch].pulse = 0;
+                            self.tx[ch].level = (item >> 15) & 1;
+                            self.tx[ch].ticks_left = item & 0x7FFF;
+                            continue;
+                        }
                         self.tx[ch].active = false;
                         self.regs[INT_RAW] |= 1 << ch;
                         self.tx[ch].level = self.idle_level(ch);
