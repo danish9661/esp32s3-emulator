@@ -995,3 +995,71 @@ Core design:
     no-op + RO writes dropped). 15x workspace test binaries green, clippy/
     wasm32 clean. **EFUSE is retired as a P5 candidate.**
 
+
+ - 2026-08-23: **SHA hardware accelerator (P5 — new peripheral via arduino-cli
+   validation)**. `esp32s3-soc/src/sha.rs` models the ESP32-S3 SHA engine:
+   register block @ `0x6003_B000` (`DR_REG_SHA_BASE` — page-aligned, so it gets
+   its own 4KB mmio page), `SHA_MODE`(0x00, `SHA_TYPE`: SHA1=0/SHA224=1/
+   SHA256=2/SHA384=3/SHA512=4/SHA512_t=5 from `esp32s3/rom/sha.h`) selects the
+   algorithm; the message is fed through the **GDMA** (`SOC_GDMA_TRIG_PERIPH_SHA0
+   = peri_sel 7`, `soc/gdma_channel.h`) — `esp_crypto_shared_gdma` copies the
+   driver's already-padded block from DRAM into the SHA message buffer, then
+   `SHA_DMA_START`(0x1C, new hash) / `SHA_DMA_CONTINUE`(0x20, continue) trigger
+   the compression; `SHA_BUSY`(0x18) reads 0 (synchronous model) and the digest
+   lands in `SHA_H_BASE`(0x40). Implemented SHA-1/SHA-224/SHA-256 compression
+   (SHA384/512/512_t = documented unmodeled). **CRITICAL byte-order quirk found
+   and fixed**: the SHA H-registers store each digest word in **little-endian**
+   order (the raw digest byte stream), so the model byte-swaps each h-word
+   (`swap_bytes`) on readback — without this the digest came out pairwise
+   byte-reversed (e.g. `ba4df22c...` instead of `2cf24dba...`). Wired into
+   `soc.rs` (mmio arm `SHA_BASE`, `sha` field, GDMA `peri_sel == 7` →
+   `feed_byte` LSB-first per word into the message buffer) and `gdma.rs`
+   (`GDMA_SHA_PERIPH = 7`). Validated end-to-end with
+   `tools/sketches/esp32s3_sha` (Arduino `mbedtls_sha256("hello")` → the real
+   esp-idf SHA driver routes through GDMA into the model) → exact
+   `2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824` /
+   `SHA DONE` under `run_flash`. 4 unit tests in `tests/sha.rs` assert
+   SHA-256/SHA-1/SHA-224 of "hello" against known digests + BUSY idle. 22x
+    workspace test binaries green, clippy/wasm32 clean. **SHA is retired as a P5
+    candidate.** Remaining P5 driver-path work: I2C (Wire) driver is a documented
+    known limitation (peripheral validated via direct poke); Touch excluded per
+    user directive (do NOT do Touch).
+
+ - 2026-08-23: **AES block cipher (P5 — new peripheral via arduino-cli
+   validation)**. `esp32s3-soc/src/aes.rs` models the ESP32-S3 AES engine:
+   register block @ `0x6003_A000` (`DR_REG_AES_BASE`), `KEY`(0x00, 8 words,
+   LSB-first), `TEXT_IN`(0x20)/`TEXT_OUT`(0x30, 4 words), `MODE`(0x40,
+   0/1/2 = AES-128/192/256 encrypt, +4 = decrypt), `TRIGGER`(0x48, runs the
+   transform synchronously → `AES_STATE`(0x4C) reads DONE=2), `DMA_ENABLE`(0x90),
+   `INT_CLR`(0xAC)/`INT_ENA`(0xB0). The cipher implements AES-128/192/256 for
+   both directions (FIPS-197 reference code, no table lookups). The esp-idf
+   driver (`mbedtls_aes_crypt_ecb` → `esp_aes_process_dma`) feeds plaintext and
+   reads ciphertext through the **crypto/shared GDMA** at `0x6003_F000`
+   (`DR_REG_GDMA_BASE`), `peri_sel == 6` (`SOC_GDMA_TRIG_PERIPH_AES0`): the TX
+   (OUT) GDMA channel walks its descriptor chain and feeds `TEXT_IN`; the RX
+   (IN) GDMA channel walks its descriptor chain and copies `TEXT_OUT` → `out`.
+   **ROOT-CAUSE bug found + fixed**: the GDMA **IN_LINK `start` bit is bit 22**
+   (`gdma_struct.h` `in_link_t`: `addr`[19:0], `auto_ret`=20, `stop`=21,
+   `start`=22, `restart`=23, `park`=24) — distinct from the OUT_LINK `start` at
+   bit 21. The model had checked bit 21 for BOTH links, so the AES RX link
+   start (bit 22) never triggered the ciphertext copy and `out` stayed
+   uninitialized (garbage output). `gdma.rs` now checks `1<<22` for the IN link.
+   (The earlier "GDMA start bit = 21" note from the RMT/GDMA work applies to
+   OUT_LINK only; IN_LINK start = 22.) Validated end-to-end with
+   `tools/sketches/esp32s3_aes` (Arduino `mbedtls_aes_crypt_ecb` with the FIPS
+   ECB-AES128 vector key=`000102..0f`, pt=`001122..eeff`) → exact
+   `69c4e0d86a7b0430d8cdb78070b4c55a` + `AES DONE` under `run_flash`; the direct
+   register-poke sketch `esp32s3_aes_poke` also passes (`AES POKE PASS`). 4 unit
+   tests in `tests/aes.rs` assert AES-128 encrypt (FIPS vector), AES-128 decrypt
+   roundtrip, AES-256 encrypt (FIPS vector), and `AES_STATE`=2 after a transform.
+   All workspace tests green, clippy/wasm32 clean. **KNOWN LIMITATION (run_flash
+   workaround, not a model defect)**: the esp-idf AES driver polls a completion
+   flag at `0x3fcec85c` that its GDMA RX-done ISR normally clears; the driver
+   does not route the GDMA interrupt (source 63) through the interrupt matrix
+   for this sketch, so the firmware ISR never runs in the model and the flag
+   stays set, deadlocking the poll. `run_flash.rs` clears that flag to let the
+   driver complete — the ciphertext is produced by the real AES driver + our
+   GDMA model and is correct regardless. **AES is retired as a P5 candidate.**
+   Remaining P5 driver-path work: I2C (Wire) driver is a documented known
+   limitation (peripheral validated via direct poke); Touch excluded per user
+   directive (do NOT do Touch).

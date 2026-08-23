@@ -48,7 +48,7 @@ fn write_start_returns_channel_and_sets_link() {
     let mut g = Gdma::default();
     // Start bit (bit 21) set on channel 2's out link.
     let ch = g.write32(C2_LINK, 0x200002);
-    assert_eq!(ch, Some(2));
+    assert_eq!(ch, Some((2, true)));
     // A plain (no start) peri_sel write returns None.
     let none = g.write32(C0_PERI, 9);
     assert_eq!(none, None);

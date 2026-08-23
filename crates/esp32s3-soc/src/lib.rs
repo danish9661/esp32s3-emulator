@@ -10,6 +10,7 @@
 extern crate alloc;
 
 pub mod adc;
+pub mod aes;
 pub mod cache;
 pub mod efuse;
 pub mod gdma;
@@ -23,6 +24,7 @@ pub mod memspi;
 pub mod pcnt;
 pub mod rmt;
 pub mod rtc;
+pub mod sha;
 pub mod soc;
 pub mod spi;
 pub mod systimer;

@@ -142,6 +142,10 @@ pub const SYSTIMER_BASE: u32 = 0x6002_3000;
 /// registers that mirror the eFuse array blocks (MAC, chip version, keys...).
 pub const EFUSE_BASE: u32 = 0x6000_7000;
 
+/// SHA acceleration peripheral (`DR_REG_SHA_BASE`, soc/reg_base.h): the
+/// message blocks are fed through the GDMA (`SOC_GDMA_TRIG_PERIPH_SHA0`).
+pub const SHA_BASE: u32 = 0x6003_B000;
+
 /// Interrupt matrix: maps peripheral interrupt sources to CPU interrupt lines.
 /// Register space = 512 sources × 2 CPUs × 4 bytes.
 pub const INT_MATRIX_BASE: u32 = 0x600C_2000;

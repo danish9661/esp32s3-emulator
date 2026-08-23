@@ -1,0 +1,386 @@
+//! ESP32-S3 AES acceleration peripheral (`DR_REG_AES_BASE = 0x6003_A000`).
+//!
+//! The esp-idf AES driver (`esp_aes_process_dma`) feeds the plaintext through
+//! the GDMA `out` channel (`SOC_GDMA_TRIG_PERIPH_AES0`, `peri_sel = 6`) into the
+//! message (TEXT_IN) registers at `AES_TEXT_IN_BASE` (offset 0x20); the engine
+//! transforms the block and the ciphertext is read back through the GDMA `in`
+//! channel from `AES_TEXT_OUT_BASE` (offset 0x30). `AES_MODE` (offset 0x40)
+//! selects algorithm + direction (`esp_aes` LL: `(decrypt?4:0) + key_bytes/8 -
+//! 2`, so 0/1/2 = AES-128/192/256 encrypt, +4 = decrypt); `AES_TRIGGER`(0x48)
+//! starts the transform and `AES_STATE`(0x4c) reads idle (0) — the computation
+//! is modeled synchronously.
+//!
+//! ECB is fully implemented (the validated path); CBC/CTR/CFB/OFB are accepted
+//! by the register model but currently behave as ECB (no IV chaining modeled).
+
+use alloc::vec;
+use alloc::vec::Vec;
+
+const S: [u8; 256] = [
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+];
+
+const SINV: [u8; 256] = [
+    0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
+    0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
+    0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
+    0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25,
+    0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92,
+    0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
+    0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06,
+    0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02, 0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b,
+    0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
+    0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85, 0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e,
+    0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89, 0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b,
+    0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
+    0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f,
+    0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d, 0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef,
+    0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
+    0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d,
+];
+
+fn xtime(a: u8) -> u8 {
+    let t = a << 1;
+    if a & 0x80 != 0 { t ^ 0x1b } else { t }
+}
+
+fn gmul(mut a: u8, mut b: u8) -> u8 {
+    let mut p = 0u8;
+    for _ in 0..8 {
+        if b & 1 != 0 {
+            p ^= a;
+        }
+        let hi = a & 0x80;
+        a <<= 1;
+        if hi != 0 {
+            a ^= 0x1b;
+        }
+        b >>= 1;
+    }
+    p
+}
+
+/// Expand the cipher key into the round-key words (returns `4 * (nr + 1)`
+/// words, nr = nk + 6).
+fn key_expansion(key: &[u8], nk: usize) -> Vec<u32> {
+    let nr = nk + 6;
+    let mut w = vec![0u32; 4 * (nr + 1)];
+    for i in 0..nk {
+        w[i] = ((key[4 * i] as u32) << 24)
+            | ((key[4 * i + 1] as u32) << 16)
+            | ((key[4 * i + 2] as u32) << 8)
+            | (key[4 * i + 3] as u32);
+    }
+    let mut rcon = 1u8;
+    for i in nk..(4 * (nr + 1)) {
+        let mut temp = w[i - 1];
+        if i % nk == 0 {
+            temp = temp.rotate_left(8); // RotWord
+            let b0 = S[((temp >> 24) & 0xFF) as usize];
+            let b1 = S[((temp >> 16) & 0xFF) as usize];
+            let b2 = S[((temp >> 8) & 0xFF) as usize];
+            let b3 = S[(temp & 0xFF) as usize];
+            temp = ((b0 as u32) << 24) | ((b1 as u32) << 16) | ((b2 as u32) << 8) | (b3 as u32);
+            temp ^= (rcon as u32) << 24;
+            rcon = xtime(rcon);
+        } else if nk > 6 && i % nk == 4 {
+            let b0 = S[((temp >> 24) & 0xFF) as usize];
+            let b1 = S[((temp >> 16) & 0xFF) as usize];
+            let b2 = S[((temp >> 8) & 0xFF) as usize];
+            let b3 = S[(temp & 0xFF) as usize];
+            temp = ((b0 as u32) << 24) | ((b1 as u32) << 16) | ((b2 as u32) << 8) | (b3 as u32);
+        }
+        w[i] = w[i - nk] ^ temp;
+    }
+    w
+}
+
+/// AES state is column-major: `state[r + 4*c]` (r = row, c = column).
+fn add_round_key(state: &mut [u8; 16], w: &[u32], round: usize) {
+    for c in 0..4 {
+        let word = w[round * 4 + c];
+        for r in 0..4 {
+            state[r + 4 * c] ^= ((word >> (24 - 8 * r)) & 0xFF) as u8;
+        }
+    }
+}
+
+fn sub_bytes(state: &mut [u8; 16]) {
+    for b in state.iter_mut() {
+        *b = S[*b as usize];
+    }
+}
+
+fn inv_sub_bytes(state: &mut [u8; 16]) {
+    for b in state.iter_mut() {
+        *b = SINV[*b as usize];
+    }
+}
+
+fn shift_rows(state: &mut [u8; 16]) {
+    let s = *state;
+    for r in 0..4 {
+        for c in 0..4 {
+            state[r + 4 * c] = s[r + 4 * ((c + r) % 4)];
+        }
+    }
+}
+
+fn inv_shift_rows(state: &mut [u8; 16]) {
+    let s = *state;
+    for r in 0..4 {
+        for c in 0..4 {
+            state[r + 4 * c] = s[r + 4 * ((c + 4 - r) % 4)];
+        }
+    }
+}
+
+fn mix_columns(state: &mut [u8; 16]) {
+    for c in 0..4 {
+        let s0 = state[4 * c];
+        let s1 = state[1 + 4 * c];
+        let s2 = state[2 + 4 * c];
+        let s3 = state[3 + 4 * c];
+        state[4 * c] = gmul(s0, 2) ^ gmul(s1, 3) ^ s2 ^ s3;
+        state[1 + 4 * c] = s0 ^ gmul(s1, 2) ^ gmul(s2, 3) ^ s3;
+        state[2 + 4 * c] = s0 ^ s1 ^ gmul(s2, 2) ^ gmul(s3, 3);
+        state[3 + 4 * c] = gmul(s0, 3) ^ s1 ^ s2 ^ gmul(s3, 2);
+    }
+}
+
+fn inv_mix_columns(state: &mut [u8; 16]) {
+    for c in 0..4 {
+        let s0 = state[4 * c];
+        let s1 = state[1 + 4 * c];
+        let s2 = state[2 + 4 * c];
+        let s3 = state[3 + 4 * c];
+        state[4 * c] = gmul(s0, 14) ^ gmul(s1, 11) ^ gmul(s2, 13) ^ gmul(s3, 9);
+        state[1 + 4 * c] = gmul(s0, 9) ^ gmul(s1, 14) ^ gmul(s2, 11) ^ gmul(s3, 13);
+        state[2 + 4 * c] = gmul(s0, 13) ^ gmul(s1, 9) ^ gmul(s2, 14) ^ gmul(s3, 11);
+        state[3 + 4 * c] = gmul(s0, 11) ^ gmul(s1, 13) ^ gmul(s2, 9) ^ gmul(s3, 14);
+    }
+}
+
+fn aes_encrypt_block(input: &[u8; 16], w: &[u32], nr: usize) -> [u8; 16] {
+    let mut state = *input;
+    add_round_key(&mut state, w, 0);
+    for rnd in 1..nr {
+        sub_bytes(&mut state);
+        shift_rows(&mut state);
+        mix_columns(&mut state);
+        add_round_key(&mut state, w, rnd);
+    }
+    sub_bytes(&mut state);
+    shift_rows(&mut state);
+    add_round_key(&mut state, w, nr);
+    state
+}
+
+fn aes_decrypt_block(input: &[u8; 16], w: &[u32], nr: usize) -> [u8; 16] {
+    let mut state = *input;
+    add_round_key(&mut state, w, nr);
+    for rnd in (1..nr).rev() {
+        inv_shift_rows(&mut state);
+        inv_sub_bytes(&mut state);
+        add_round_key(&mut state, w, rnd);
+        inv_mix_columns(&mut state);
+    }
+    inv_shift_rows(&mut state);
+    inv_sub_bytes(&mut state);
+    add_round_key(&mut state, w, 0);
+    state
+}
+
+/// AES peripheral register-block base (`DR_REG_AES_BASE`, soc/reg_base.h).
+pub const AES_BASE: u32 = 0x6003_A000;
+/// AES ciphertext output registers (source for the GDMA `in` channel).
+pub const AES_TEXT_OUT_BASE: u32 = AES_BASE + 0x30;
+
+#[derive(Default)]
+pub struct Aes {
+    key: [u8; 32],
+    mode: u32,
+    block_mode: u32,
+    text_in: [u8; 16],
+    text_out: [u8; 16],
+    in_idx: usize,
+    /// AES engine state as read from `AES_STATE` (0x4c): 0 = idle, 1 = busy,
+    /// 2 = done. The esp-idf AES driver (`aes_hal_wait_done`) spins until the
+    /// state reads DONE, so a synchronous transform must leave the state at 2.
+    aes_state: u8,
+    // AES DMA-done interrupt: INT_RAW (set when a transform completes), INT_ENA
+    // (driver-controlled). INT_ST = INT_RAW & INT_ENA. The esp-idf AES driver
+    // (`esp_aes_intr_alloc`) registers its completion ISR on the AES peripheral
+    // interrupt source (`ETS_AES_INTR_SOURCE`, source 77), NOT the GDMA
+    // interrupt — so we must raise INT_RAW when a block finishes so the driver's
+    // `op_complete_sem` is given.
+    int_raw: u32,
+    int_ena: u32,
+}
+
+/// AES interrupt register offsets (`soc/hwcrypto_reg.h`).
+const AES_INT_RAW_REG: u32 = 0xA4;
+const AES_INT_ST_REG: u32 = 0xA8;
+const AES_INT_CLR_REG: u32 = 0xAC;
+const AES_INT_ENA_REG: u32 = 0xB0;
+/// Bit raised in INT_RAW when a DMA (GDMA) transform completes.
+const AES_DMA_DONE_INT: u32 = 1 << 0;
+
+impl Aes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// AES peripheral interrupt is pending when RAW & ENA is non-zero.
+    pub fn int_pending(&self) -> bool {
+        self.int_raw & self.int_ena != 0
+    }
+
+    /// Debug: raw + enabled AES interrupt state.
+    pub fn debug_int(&self) -> (u32, u32) {
+        (self.int_raw, self.int_ena)
+    }
+
+    /// Read a single ciphertext byte from the last transform (for the GDMA
+    /// `in` channel to copy into DRAM).
+    pub fn text_out_byte(&self, i: usize) -> u8 {
+        self.text_out[i % 16]
+    }
+
+    /// Append one plaintext byte (GDMA `out` channel feed, LSB-first per word).
+    pub fn feed_text_in_byte(&mut self, b: u8) {
+        self.text_in[self.in_idx % 16] = b;
+        self.in_idx += 1;
+    }
+
+    fn nk(&self) -> usize {
+        match self.mode & 0x3 {
+            0 => 4,
+            1 => 6,
+            _ => 8,
+        }
+    }
+
+    fn decrypt(&self) -> bool {
+        self.mode & 0x4 != 0
+    }
+
+    /// Run the transform on the currently buffered plaintext block.
+    pub fn transform(&mut self) {
+        let nk = self.nk();
+        let nr = nk + 6;
+        let w = key_expansion(&self.key[..nk * 4], nk);
+        let block = self.text_in;
+        self.text_out = if self.decrypt() {
+            aes_decrypt_block(&block, &w, nr)
+        } else {
+            aes_encrypt_block(&block, &w, nr)
+        };
+        self.in_idx = 0;
+        self.aes_state = 2; // DONE: the driver's `aes_hal_wait_done` spins until this.
+        // A DMA-driven transform has completed: raise the AES DMA-done
+        // interrupt so the esp-idf AES driver's completion ISR
+        // (`esp_aes_complete_isr`, registered on the AES peripheral interrupt
+        // source 77) is invoked and gives `op_complete_sem`.
+        self.int_raw |= AES_DMA_DONE_INT;
+    }
+
+    pub fn read32(&self, off: u32) -> u32 {
+        match off {
+            0x00..=0x1C => {
+                // KEY readback (bytes stored LSB-first per 32-bit word).
+                let i = (off / 4) as usize;
+                if i < 8 {
+                    (self.key[i * 4] as u32)
+                        | ((self.key[i * 4 + 1] as u32) << 8)
+                        | ((self.key[i * 4 + 2] as u32) << 16)
+                        | ((self.key[i * 4 + 3] as u32) << 24)
+                } else {
+                    0
+                }
+            }
+            0x20..=0x2C => {
+                // TEXT_IN readback (unused by the driver).
+                let i = ((off - 0x20) / 4) as usize;
+                (self.text_in[i * 4] as u32)
+                    | ((self.text_in[i * 4 + 1] as u32) << 8)
+                    | ((self.text_in[i * 4 + 2] as u32) << 16)
+                    | ((self.text_in[i * 4 + 3] as u32) << 24)
+            }
+            0x30..=0x3C => {
+                // TEXT_OUT (ciphertext), bytes stored LSB-first per word.
+                let i = ((off - 0x30) / 4) as usize;
+                (self.text_out[i * 4] as u32)
+                    | ((self.text_out[i * 4 + 1] as u32) << 8)
+                    | ((self.text_out[i * 4 + 2] as u32) << 16)
+                    | ((self.text_out[i * 4 + 3] as u32) << 24)
+            }
+            0x40 => self.mode,
+            0x4c => (self.aes_state as u32) & 0x3, // STATE: idle/busy/done
+            0x94 => self.block_mode,
+            AES_INT_RAW_REG => self.int_raw,
+            AES_INT_ST_REG => self.int_raw & self.int_ena,
+            AES_INT_ENA_REG => self.int_ena,
+            _ => 0,
+        }
+    }
+
+    pub fn write32(&mut self, off: u32, value: u32) {
+        match off {
+            0x00..=0x1C => {
+                // KEY write (32-bit word -> 4 key bytes, LSB first).
+                let i = (off / 4) as usize;
+                if i < 8 {
+                    self.key[i * 4] = value as u8;
+                    self.key[i * 4 + 1] = (value >> 8) as u8;
+                    self.key[i * 4 + 2] = (value >> 16) as u8;
+                    self.key[i * 4 + 3] = (value >> 24) as u8;
+                }
+            }
+            0x20..=0x2C => {
+                // TEXT_IN direct write (32-bit word -> 4 bytes, LSB first).
+                let i = ((off - 0x20) / 4) as usize;
+                if i < 4 {
+                    self.text_in[i * 4] = value as u8;
+                    self.text_in[i * 4 + 1] = (value >> 8) as u8;
+                    self.text_in[i * 4 + 2] = (value >> 16) as u8;
+                    self.text_in[i * 4 + 3] = (value >> 24) as u8;
+                }
+            }
+            0x30..=0x3C => {
+                // TEXT_OUT is read-only.
+            }
+            0x40 => self.mode = value & 0x7,
+            0x48 => {
+                // AES_TRIGGER: the engine transforms synchronously, so mark
+                // busy (1) then done (2) — `aes_hal_wait_done` exits on DONE.
+                self.aes_state = 1;
+                self.transform();
+            }
+            0x4c => {}
+            0x90 => {} // AES_DMA_ENABLE: ignored (synchronous model)
+            0x94 => self.block_mode = value,
+            AES_INT_ENA_REG => self.int_ena = value,
+            AES_INT_CLR_REG => {
+                // Writing any bit clears the corresponding raw interrupt.
+                self.int_raw &= !value;
+            }
+            _ => {}
+        }
+    }
+}
