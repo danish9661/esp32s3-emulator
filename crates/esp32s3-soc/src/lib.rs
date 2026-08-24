@@ -23,6 +23,7 @@ pub mod memmap;
 pub mod memspi;
 pub mod pcnt;
 pub mod rmt;
+pub mod rsa;
 pub mod rtc;
 pub mod sha;
 pub mod soc;

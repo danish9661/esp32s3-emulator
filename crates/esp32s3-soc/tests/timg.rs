@@ -3,9 +3,15 @@
 
 #![allow(clippy::identity_op)]
 
-use esp32s3_soc::timg::{INT_T0, INT_T1, Timg};
+use esp32s3_soc::timg::{INT_T0, INT_T1, INT_WDT, Timg};
 
 const T0CONFIG: u32 = 0x00;
+const WDT_CONFIG0: u32 = 0x48;
+const WDT_CONFIG1: u32 = 0x4C;
+const WDT_CONFIG2: u32 = 0x50;
+const WDT_FEED: u32 = 0x60;
+const WDT_WPROTECT: u32 = 0x64;
+const WDT_WKEY: u32 = 0x50D8_3AA1;
 const T0LO: u32 = 0x04;
 const T0HI: u32 = 0x08;
 const T0UPDATE: u32 = 0x0C;
@@ -112,4 +118,76 @@ fn timer_load_update_semantics() {
     t.write32(0x24, 0xC000_0000); // T1CONFIG EN|INCREASE
     t.tick(3);
     assert_eq!(t.read32(0x28), 3, "T1LO counts");
+}
+
+#[test]
+fn wdt_disabled_does_not_fire() {
+    let mut t = Timg::new();
+    // Never enabled: ticking forever must not assert an interrupt or reset.
+    t.tick(100_000);
+    assert_eq!(
+        t.read32(INT_RAW) & INT_WDT,
+        0,
+        "no WDT interrupt when disabled"
+    );
+    assert!(!t.consume_reset(), "no WDT reset when disabled");
+}
+
+#[test]
+fn wdt_feed_resets_counter() {
+    let mut t = Timg::new();
+    t.write32(WDT_WPROTECT, WDT_WKEY);
+    t.write32(WDT_CONFIG1, 1 << 16); // prescale = 1
+    t.write32(WDT_CONFIG2, 10); // stage0 hold = 10
+    // enable + stage0 action = interrupt (bits [30:29] = 0b01)
+    t.write32(WDT_CONFIG0, (1 << 31) | (1 << 29));
+    t.tick(9);
+    assert_eq!(t.read32(INT_RAW) & INT_WDT, 0, "no fire before threshold");
+    t.write32(WDT_FEED, 0xABAD_1DEA); // feed -> counter reset
+    t.tick(9);
+    assert_eq!(t.read32(INT_RAW) & INT_WDT, 0, "no fire after feed");
+    t.tick(1); // reach threshold 10
+    assert_ne!(t.read32(INT_RAW) & INT_WDT, 0, "interrupt on timeout");
+    // INT_CLR clears the level interrupt.
+    t.write32(INT_CLR, INT_WDT);
+    assert_eq!(t.read32(INT_RAW) & INT_WDT, 0, "raw cleared");
+}
+
+#[test]
+fn wdt_reset_action_requests_reset() {
+    let mut t = Timg::new();
+    t.write32(WDT_WPROTECT, WDT_WKEY);
+    t.write32(WDT_CONFIG2, 5);
+    // enable + stage0 action = reset (bits [30:29] = 0b11 = 3)
+    t.write32(WDT_CONFIG0, (1 << 31) | (3 << 29));
+    t.tick(5); // reach threshold
+    assert!(t.consume_reset(), "reset requested on timeout");
+    assert!(!t.consume_reset(), "reset latched once until cleared");
+}
+
+#[test]
+fn wdt_write_protect_blocks_config() {
+    let mut t = Timg::new();
+    // Wrong key blocks config writes.
+    t.write32(WDT_WPROTECT, 0);
+    t.write32(WDT_CONFIG1, 1 << 16);
+    t.write32(WDT_CONFIG2, 5);
+    t.write32(WDT_CONFIG0, (1 << 31) | (1 << 29)); // ignored
+    t.tick(10_000);
+    assert_eq!(
+        t.read32(INT_RAW) & INT_WDT,
+        0,
+        "config ignored under write-protect"
+    );
+    assert!(!t.consume_reset());
+    // Re-enable the key, then write config -> now honored.
+    t.write32(WDT_WPROTECT, WDT_WKEY);
+    t.write32(WDT_CONFIG2, 5);
+    t.write32(WDT_CONFIG0, (1 << 31) | (1 << 29));
+    t.tick(5);
+    assert_ne!(
+        t.read32(INT_RAW) & INT_WDT,
+        0,
+        "config honored once key set"
+    );
 }

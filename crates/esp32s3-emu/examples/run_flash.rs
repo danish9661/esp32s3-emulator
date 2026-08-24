@@ -100,9 +100,45 @@ fn main() {
     let mut aes77_shown = false;
     let mut aes_entered = false;
     let mut dma_done_shown = 0u32;
+    let mut trace_count = 0u32;
+    let mut setup_in_range = 0u32;
+    let mut println_count = 0u32;
+    let mut flash_visited = 0u32;
+    let mut final_pc_seen = 0u32;
+    let mut flash_min = 0xffffffffu32;
+    let mut flash_max = 0u32;
+    let mut setup_entry_seen = 0u32;
     for i in 0..STEPS {
         m.soc.tick_timers(1);
+        // A WDT (or other peripheral) reset request is consumed here, mirroring
+        // the canonical `Esp32S3::step` path used by the wasm bridge, so the
+        // machine reboots.  (run_flash's manual loop otherwise bypasses it.)
+        if m.soc.consume_reset() {
+            m.reset();
+            continue;
+        }
         let r = m.cpu[0].step(&mut m.soc);
+        if (0x42001a7c..=0x42001c00).contains(&m.cpu[0].pc) {
+            setup_in_range += 1;
+        }
+        if m.cpu[0].pc == 0x42001a80 {
+            setup_entry_seen += 1;
+            if setup_entry_seen <= 3 {
+                println!("SETUP_ENTRY@{} pc0={:#x}", i, m.cpu[0].pc);
+            }
+        }
+        if (0x42000000..=0x420fffff).contains(&m.cpu[0].pc) {
+            flash_visited += 1;
+            if m.cpu[0].pc < flash_min {
+                flash_min = m.cpu[0].pc;
+            }
+            if m.cpu[0].pc > flash_max {
+                flash_max = m.cpu[0].pc;
+            }
+        }
+        if m.cpu[0].pc == 0x420068f2 {
+            final_pc_seen += 1;
+        }
         if m.soc.rom_boot_mode()
             && !(m.cpu[0].pc >= esp32s3_emu::rom_stub::ROM_BASE
                 && m.cpu[0].pc < esp32s3_emu::rom_stub::ROM_END)
@@ -1683,6 +1719,15 @@ fn main() {
         }
         if !tx.is_empty() {
             uart_buf.extend_from_slice(&tx);
+            if tx.contains(&0x53u8) {
+                println!(
+                    "UARTS@{} pc0={:#x} pc1={:#x} tx={:?}",
+                    i,
+                    m.cpu[0].pc,
+                    m.cpu[1].pc,
+                    String::from_utf8_lossy(&tx)
+                );
+            }
             if uart_dump_shown < 8 {
                 uart_dump_shown += 1;
                 println!("TX@{} {:?}", i, String::from_utf8_lossy(&tx));
@@ -1934,6 +1979,31 @@ fn main() {
         uart_buf.len(),
         String::from_utf8_lossy(&uart_buf)
     );
+    {
+        let z0 = m.soc.read32(0x6003_c200);
+        let z1 = m.soc.read32(0x6003_c204);
+        let z2 = m.soc.read32(0x6003_c208);
+        let z3 = m.soc.read32(0x6003_c20c);
+        println!(
+            "== RSA Z[0..3] = {:#x} {:#x} {:#x} {:#x}  (expect DE8235AA ...)",
+            z0, z1, z2, z3
+        );
+        let mxr = m.soc.read32(0x6003_c80c);
+        println!("== RSA MODEXP reg = {:#x}", mxr);
+    }
+    {
+        let mut hx = String::new();
+        for &b in &uart_buf {
+            hx.push_str(&format!("{:02x} ", b));
+        }
+        println!("== uart hex: {}", hx);
+        println!(
+            "== S count: {}, R count: {}, '3' count: {}",
+            uart_buf.iter().filter(|&&b| b == b'S').count(),
+            uart_buf.iter().filter(|&&b| b == b'R').count(),
+            uart_buf.iter().filter(|&&b| b == b'3').count()
+        );
+    }
     println!("== tasks in DRAM:");
     let names: [&[u8]; 8] = [
         b"main\0",
@@ -2129,5 +2199,20 @@ fn main() {
     rom_pcs.sort();
     for (p, i) in &rom_pcs {
         println!("  {p:#010x} @ step {i}");
+    }
+    println!(
+        "== SUMMARY setup_in_range={setup_in_range} setup_entry_seen={setup_entry_seen} println_count={println_count} flash_visited={flash_visited} flash_min={flash_min:#x} flash_max={flash_max:#x} final_pc_seen={final_pc_seen} final_pc={:#x} STEPS={}",
+        m.cpu[0].pc, STEPS
+    );
+    // Dump last 60 trace entries (ring buffer) to locate the hang loop.
+    {
+        let n = trace.len();
+        let mut out = String::new();
+        for k in 0..n.min(60) {
+            let off = (trace_i + n - n.min(60) + k) % n;
+            let p = trace[off];
+            out.push_str(&format!("{:#010x} ", p));
+        }
+        println!("TRACE-TAIL: {}", out);
     }
 }

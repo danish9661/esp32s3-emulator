@@ -57,6 +57,30 @@ pub const INT_T0: u32 = 1 << 0;
 pub const INT_T1: u32 = 1 << 1;
 pub const INT_WDT: u32 = 1 << 2;
 
+/// MWDT (Main Watchdog Timer) register block, per ESP-IDF `timer_group_struct.h`
+/// (the WDT sits at 0x48..0x64 within each TIMG, after the two hw_timer blocks).
+const WDT_CONFIG0: u32 = 0x48;
+const WDT_CONFIG1: u32 = 0x4C;
+const WDT_CONFIG2: u32 = 0x50;
+const WDT_CONFIG3: u32 = 0x54;
+const WDT_CONFIG4: u32 = 0x58;
+const WDT_CONFIG5: u32 = 0x5C;
+const WDT_FEED: u32 = 0x60;
+const WDT_WPROTECT: u32 = 0x64;
+/// Write-protect key: WDT config registers are only writable while
+/// WDT_WPROTECT == this value (TRM timg_wdtwprotect_reg_t). The reset default
+/// already equals the key, so the first config writes succeed.
+const WDT_WKEY: u32 = 0x50D8_3AA1;
+/// Feed token written to WDT_FEED to reset the watchdog counter (any value
+/// works on real silicon; we accept any write to the feed register).
+const _WDT_FEED_KEY: u32 = 0xABAD_1DEA;
+/// WDT enable bit in WDT_CONFIG0 (timg_wdtconfig0_reg_t.wdt_en).
+const WDT_EN: u32 = 1 << 31;
+/// Stage action field shifts in WDT_CONFIG0: stg0 [30:29], stg1 [28:27],
+/// stg2 [26:25], stg3 [24:23]. Action codes: 0 = disabled, 1 = interrupt,
+/// 2 = reset CPU, 3 = reset system.
+const WDT_STG_SHIFT: [u32; 4] = [29, 27, 25, 23];
+
 /// CONFIG field bits (timg_tnconfig_reg_t).
 const CFG_EN: u32 = 1 << 31;
 const CFG_INCREASE: u32 = 1 << 30;
@@ -82,6 +106,18 @@ pub struct Timg {
     cali_done: bool,
     /// XTAL-cycle countdown until the cycling timeout fires.
     cali_timeout: u64,
+    /// MWDT write-protect key currently latched in WDT_WPROTECT.
+    wdt_wkey: u32,
+    /// Watchdog counter (MWDT clock ticks since last feed / enable).
+    wdt_count: u64,
+    /// Fractional remainder of the prescaler accumulator (1/N of a tick).
+    wdt_clk_acc: u64,
+    /// True while the WDT is enabled and counting (latched on the enable edge).
+    wdt_running: bool,
+    /// Each stage's action has been taken (so it fires once until a feed).
+    wdt_stage_fired: [bool; 4],
+    /// A reset-action stage has elapsed; the machine consumes this to reboot.
+    wdt_reset: bool,
 }
 
 impl Timg {
@@ -98,6 +134,12 @@ impl Timg {
             t1: TimerState::default(),
             cali_done: false,
             cali_timeout: 0,
+            wdt_wkey: WDT_WKEY,
+            wdt_count: 0,
+            wdt_clk_acc: 0,
+            wdt_running: false,
+            wdt_stage_fired: [false; 4],
+            wdt_reset: false,
         }
     }
 
@@ -107,6 +149,62 @@ impl Timg {
             Self::tick_timer(&mut self.regs, &mut self.t0, 0);
             Self::tick_timer(&mut self.regs, &mut self.t1, 1);
             self.tick_cali();
+            self.tick_wdt();
+        }
+    }
+
+    /// Advance the Main Watchdog Timer. The MWDT clock is the APB clock divided
+    /// by WDT_CLK_PRESCALE (timg_wdtconfig1_reg_t, default 1). The WDT counts
+    /// up; on reaching each stage's cumulative hold it runs that stage's action
+    /// (interrupt / reset). Feeding (WDT_FEED write) or disabling restarts it.
+    fn tick_wdt(&mut self) {
+        let cfg0 = self.regs[(WDT_CONFIG0 / 4) as usize];
+        if cfg0 & WDT_EN == 0 {
+            // Disabled: keep the counter clear so (re-)enabling starts fresh.
+            self.wdt_count = 0;
+            self.wdt_clk_acc = 0;
+            self.wdt_stage_fired = [false; 4];
+            self.wdt_running = false;
+            return;
+        }
+        if !self.wdt_running {
+            self.wdt_count = 0;
+            self.wdt_clk_acc = 0;
+            self.wdt_stage_fired = [false; 4];
+            self.wdt_running = true;
+        }
+        let prescale = ((self.regs[(WDT_CONFIG1 / 4) as usize] >> 16) & 0xFFFF).max(1) as u64;
+        self.wdt_clk_acc += 1;
+        if self.wdt_clk_acc < prescale {
+            return;
+        }
+        self.wdt_clk_acc -= prescale;
+        self.wdt_count = self.wdt_count.wrapping_add(1);
+        // Cumulative stage thresholds (TRM: stage N fires at sum of holds[0..=N]).
+        let mut thr: u64 = 0;
+        for (i, &shift) in WDT_STG_SHIFT.iter().enumerate() {
+            let hold = self.regs[(WDT_CONFIG2 as usize / 4) + i] as u64;
+            thr = thr.wrapping_add(hold);
+            if thr == 0 {
+                continue; // no timeout at this cumulative point
+            }
+            if !self.wdt_stage_fired[i] && self.wdt_count >= thr {
+                self.wdt_stage_fired[i] = true;
+                let action = (cfg0 >> shift) & 0x3;
+                match action {
+                    0 => {} // disabled / no action
+                    1 => {
+                        // Interrupt: raise the WDT bit in INT_RAW (level, cleared
+                        // by INT_CLR like the other TIMG interrupts).
+                        self.regs[(INT_RAW / 4) as usize] |= INT_WDT;
+                    }
+                    2 | 3 => {
+                        // CPU / system reset request consumed by the machine.
+                        self.wdt_reset = true;
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -215,6 +313,23 @@ impl Timg {
                 }
             }
             INT_CLR => self.regs[(INT_RAW / 4) as usize] &= !value,
+            WDT_CONFIG0 | WDT_CONFIG1 | WDT_CONFIG2 | WDT_CONFIG3 | WDT_CONFIG4 | WDT_CONFIG5 => {
+                // Write-protected: only honored while WDT_WPROTECT holds the key
+                // (the reset default already has the key set).
+                if self.wdt_wkey == WDT_WKEY {
+                    self.regs[(offset / 4) as usize] = value;
+                }
+            }
+            WDT_WPROTECT => {
+                self.wdt_wkey = value;
+                self.regs[(WDT_WPROTECT / 4) as usize] = value;
+            }
+            WDT_FEED => {
+                // Feeding resets the counter and all latched stage actions.
+                self.wdt_count = 0;
+                self.wdt_clk_acc = 0;
+                self.wdt_stage_fired = [false; 4];
+            }
             _ => self.regs[(offset / 4) as usize] = value,
         }
     }
@@ -222,6 +337,14 @@ impl Timg {
     /// INT_ST = RAW & ENA (TRM TIMG_INT_ST).
     pub fn int_st(&self) -> u32 {
         self.regs[(INT_RAW / 4) as usize] & self.regs[(INT_ENA / 4) as usize]
+    }
+
+    /// Consume (clear) a pending WDT reset request. The machine polls this each
+    /// step and reboots when it returns true. Returns false once cleared.
+    pub fn consume_reset(&mut self) -> bool {
+        let r = self.wdt_reset;
+        self.wdt_reset = false;
+        r
     }
 }
 impl Default for Timg {

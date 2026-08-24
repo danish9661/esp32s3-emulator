@@ -22,6 +22,9 @@ pub struct Esp32S3 {
     /// the ROM gate CPU1 — no release register is modeled).
     pub cpu: [Cpu; 2],
     pub soc: Soc,
+    /// Last flash image passed to `boot_from_flash`, retained so a WDT/system
+    /// reset can re-run the boot sequence.
+    flash: Vec<u8>,
 }
 
 impl Esp32S3 {
@@ -29,6 +32,7 @@ impl Esp32S3 {
         Self {
             cpu: [Cpu::new(0), Cpu::new(1)],
             soc: Soc::new(),
+            flash: Vec::new(),
         }
     }
 
@@ -40,6 +44,12 @@ impl Esp32S3 {
     /// behavior the machine tests were written against.
     pub fn step(&mut self) -> StepResult {
         self.soc.tick_timers(1);
+        // A device (e.g. a WDT stage with a reset action) may have requested a
+        // hard reset while the timers advanced; reboot before executing more.
+        if self.soc.consume_reset() {
+            self.reset();
+            return StepResult::Ok;
+        }
         let r = self.cpu[0].step(&mut self.soc);
         if self.soc.rom_boot_mode()
             && !(self.cpu[0].pc >= rom_stub::ROM_BASE && self.cpu[0].pc < rom_stub::ROM_END)
@@ -51,6 +61,15 @@ impl Esp32S3 {
         }
         self.cpu[1].step(&mut self.soc);
         r
+    }
+
+    /// Re-run the boot sequence from the last loaded flash image.  Used when a
+    /// peripheral (WDT) triggers a system reset.
+    pub fn reset(&mut self) {
+        self.cpu = [Cpu::new(0), Cpu::new(1)];
+        self.soc = Soc::new();
+        let f = self.flash.clone();
+        self.boot_from_flash(&f);
     }
 
     /// Load a raw firmware image at `addr` (DRAM, IRAM or IROM window).
@@ -74,6 +93,7 @@ impl Esp32S3 {
     /// to the ROM reset vector. The ROM stub (rom_stub.rs) loads the app
     /// image from flash offset `APP_FLASH_OFFSET` and jumps to its entry.
     pub fn boot_from_flash(&mut self, flash: &[u8]) {
+        self.flash = flash.to_vec();
         self.soc.load_flash_image(0, flash);
         // Pre-map the app's flash-mapped segments (.flash.text/.flash.rodata)
         // in the cache MMU — the real 2nd-stage bootloader maps them instead

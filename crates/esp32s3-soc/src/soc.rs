@@ -29,6 +29,7 @@ use crate::memmap::*;
 use crate::memspi::Memspi;
 use crate::pcnt::{PCNT_BASE, Pcnt};
 use crate::rmt::{RMT_BASE, Rmt};
+use crate::rsa::Rsa;
 use crate::rtc::Rtc;
 use crate::sha::Sha;
 use crate::spi::Spi;
@@ -143,6 +144,7 @@ pub struct Soc {
     efuse: Efuse,
     sha: Sha,
     aes: Aes,
+    rsa: Rsa,
     cache: Cache,
     timg: [Timg; 2],
     systimer: Systimer,
@@ -211,6 +213,7 @@ impl Soc {
             efuse: Efuse::new(),
             sha: Sha::new(),
             aes: Aes::new(),
+            rsa: Rsa::default(),
             cache: Cache::new(),
             timg: [Timg::new(), Timg::new()],
             systimer: Systimer::new(),
@@ -916,6 +919,14 @@ impl Soc {
                     self.aes.read32(off)
                 }
             }
+            crate::rsa::RSA_BASE => {
+                if is_write {
+                    self.rsa.write32(off, value);
+                    0
+                } else {
+                    self.rsa.read32(off)
+                }
+            }
             // Crypto/shared GDMA (`DR_REG_GDMA_BASE = 0x6003F000`): dedicated DMA
             // for the crypto engines (AES, SHA). Mirrors the general GDMA arm but
             // routes to AES/SHA. AES is the default (the crypto DMA is
@@ -1073,6 +1084,12 @@ impl Default for Soc {
 }
 
 impl Soc {
+    /// True if any device requested a hard reset (e.g. a WDT stage action of
+    /// reset-CPU/system). The machine consumes this each step to reboot.
+    pub fn consume_reset(&mut self) -> bool {
+        self.timg[0].consume_reset() || self.timg[1].consume_reset()
+    }
+
     /// Debug accessor for the AES interrupt raw&enabled state (validation harness).
     pub fn aes_debug_int(&self) -> (u32, u32) {
         self.aes.debug_int()
@@ -1189,6 +1206,13 @@ impl Bus for Soc {
         // MCPWM0 group = source 31 (ETS_PWM0_INTR_SOURCE).
         if self.mcpwm.int_pending() {
             src |= 1 << crate::mcpwm::MCPWM_INTR_SOURCE;
+        }
+        // RSA accelerator = source 95 (ETS_RSA_INTR_SOURCE). The esp-idf RSA
+        // driver polls the peripheral `QUERY_INTERRUPT` register for completion,
+        // but wiring the matrix source too is harmless (covered if the driver
+        // path ever registers an ISR on this source).
+        if self.rsa.int_pending() {
+            src |= 1 << crate::rsa::RSA_INTR_SOURCE;
         }
         // Cross-core interrupts: SYSTEM.CPU_INT_FROM_CPU_0/1 (0x600C0030/34)
         // assert the FROM_CPU_INTR0/1 sources = 79/80 (esp32s3 interrupts.h

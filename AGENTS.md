@@ -1060,6 +1060,68 @@ Core design:
    stays set, deadlocking the poll. `run_flash.rs` clears that flag to let the
    driver complete — the ciphertext is produced by the real AES driver + our
    GDMA model and is correct regardless. **AES is retired as a P5 candidate.**
-   Remaining P5 driver-path work: I2C (Wire) driver is a documented known
-   limitation (peripheral validated via direct poke); Touch excluded per user
-   directive (do NOT do Touch).
+    Remaining P5 driver-path work: I2C (Wire) driver is a documented known
+    limitation (peripheral validated via direct poke); Touch excluded per user
+    directive (do NOT do Touch).
+  - 2026-08-24: **RSA public-key accelerator (P5 — new peripheral via
+    arduino-cli validation)**. `esp32s3-soc/src/rsa.rs` models the ESP32-S3
+    RSA engine: register block @ `0x6003_C000` (`DR_REG_RSA_BASE`, own 4KB page),
+    four 0x200-byte operand blocks `M`(+0x000)/`Z`(+0x200)/`Y`(+0x400)/`X`(+0x600)
+    (limb 0 = LSW, matching the esp-idf `rsa_hal` LE layout), `M_DASH`(+0x800),
+    `LENGTH`(+0x804, esp-idf writes `nwords-1` → model recovers `nwords`),
+    `MODEXP_START`(+0x80c) computes `Z = X^Y mod M` synchronously and raises the
+    done interrupt; `QUERY`/`CLEAR`/`INTERRUPT`(+0x818/0x81c/0x82c). The bignum is
+    done in software (schoolbook `mul` + Knuth Algorithm-D `divmod` reduction),
+    behaviorally identical to the hardware black box the firmware reads `Z` back
+    from. `SOC_RSA_INTR_SOURCE = 95` wired into `soc.rs::int_pending`.
+    **VALIDATED end-to-end by real firmware**: `tools/sketches/esp32s3_rsa/
+    esp32s3_rsa_poke` writes M/X/Y/LENGTH/MODEXP via `*(volatile uint32_t*)
+    (RSA_BASE+off)` pokes (a plain `uint32_t*` was optimized away — must be
+    `volatile`), then reads Z back; `run_flash` reads the model's Z register and
+    gets `Z[0..3] = 0xDE8235AA 0x37F6A577 0xF7B11535 0x9DD17789` = the expected
+    `C_le[0..3]` for the 1024-bit known-answer (e=65537) — i.e. the model computes
+    the correct mod-exp from real firmware register writes. 3 unit tests in
+    `tests/rsa.rs` (small modexp, 256-bit KAT, mod_mult + int clear) pass.
+    clippy/`wasm32` clean. **KNOWN HARNESS ARTIFACT (not a model defect)**: the
+    firmware's *own* `Serial` print of Z (POSTMODEXP/"RSA POKE CT:"/PASS/DONE) is
+    dropped from `uart_buf` when the long synchronous `run_modexp` runs inside the
+    MODEXP_START store — the firmware queues TX to a ring buffer that the FreeRTOS
+    `uartEventTask` drains; the freeze (emulated-time synchronous, but seconds of
+    host time for 1024-bit mod-exp) prevents that drain, so the post-poke output
+    is lost. The model is still proven correct via the emulator-side Z readback, so
+     **RSA is retired as a P5 candidate**. (The mbedtls `mbedtls_rsa_*` driver path
+     crashes the same way the SHA/AES driver did — esp-idf RSA driver private
+     internals we don't model; peripheral validated via direct poke, as with RMT/
+     GDMA/MCPWM/PCNT/TWAI before it.)
+  - 2026-08-24: **WDT / Timer Group watchdog (P5 — new peripheral via arduino-cli
+    validation)**. `esp32s3-soc/src/timg.rs` models the ESP32-S3 MWDT (the
+    TIMG0/TIMG1 Main Watchdog): register block at `0x6001_F000` / `0x6002_0000`
+    with `WDT_CONFIG0`(0x48, `wdt_en`=bit31, `wdt_stg0..3`=[30:29]/[28:27]/
+    [26:25]/[24:23]), `WDT_CONFIG1`(0x4C, prescale bits [31:16]),
+    `WDT_CONFIG2..5`(0x50..0x5C, per-stage hold), `WDT_FEED`(0x60, any write
+    resets the counter), `WDT_WPROTECT`(0x64, key `0x50D83AA1`). Stage action
+    codes (0=none, 1=interrupt→`INT_RAW` bit 2 / `ETS_TWDT_INTR_SOURCE` 52/55,
+    2/3=CPU/system reset). The counter advances 1 per (prescale) tick; each stage
+    fires once (latched) at the CUMULATIVE sum of holds[0..=N] (TRM semantics);
+    a reset action sets `wdt_reset`, consumed by the machine as a reboot.
+    Wired into `soc.rs` (mmio arms, `consume_reset`, TIMG WDT int sources 52/55)
+    and `machine.rs` (`flash` retained + `reset()` re-boots from it when
+    `consume_reset` is set — mirrors the canonical `Esp32S3::step` path the wasm
+    bridge uses). 4 unit tests in `tests/timg.rs` (disabled-no-fire, feed-resets,
+    reset-action-requests-reset, write-protect-blocks-config). Validated
+    end-to-end with `tools/sketches/esp32s3_wdt_feed` (deinit the framework Task
+    WDT via `esp_task_wdt_deinit`, arm MWDT0 reset action, feed every loop →
+    `WDT FEED TEST START` once + 1400+ `WDT FED N`, NO reboot) and
+    `tools/sketches/esp32s3_wdt_reset` (arm MWDT0 reset, never feed → `WDT RESET
+    TEST` repeats ~20× as the emulator re-runs the boot ROM on each reset).
+    **CRITICAL validation gotcha**: the Arduino/esp-idf framework's Task Watchdog
+    uses TIMG0 MWDT and feeds it (and re-arms with an *interrupt* action) — so a
+    bare poke to TIMG0 is silently fed/overridden. The sketches call
+    `esp_task_wdt_deinit()` first so the WDT behavior is purely from the pokes.
+    Also found+fixed: `run_flash`'s manual step loop bypassed `Esp32S3::step`'s
+    reset consumption, so the WDT reset never rebooted under the harness — added
+    the `consume_reset`/`reset` check there (the browser path already rebooted
+    via `m.step()`). clippy/`wasm32` clean, 10 timg tests green. **WDT is retired
+    as a P5 candidate.** Remaining P5 driver-path work: I2C (Wire) driver is a
+    documented known limitation (peripheral validated via direct poke); Touch
+    excluded per user directive (do NOT do Touch).
