@@ -15,6 +15,7 @@ pub mod cache;
 pub mod efuse;
 pub mod gdma;
 pub mod gpio;
+pub mod hmac;
 pub mod i2c;
 pub mod intc;
 pub mod ledc;

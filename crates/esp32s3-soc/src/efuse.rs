@@ -25,6 +25,17 @@ const EFUSE_STATUS_OFF: usize = 0x1D0 / 4;
 const EFUSE_CLK_OFF: usize = 0x1C8 / 4;
 const EFUSE_CMD_OFF: usize = 0x1D4 / 4;
 
+// HMAC/Digital-Signature key blocks KEY0..KEY5.  Each block is 8 words
+// (256 bits = 32 bytes); the 6 block bases are spaced 0x20 (32 bytes) apart.
+// The real registers are read-only (they mirror the burned eFuse array), but
+// for the emulator we make them writable so a sketch can provision a test key;
+// they default to zero (a valid all-zero HMAC key).  Key byte j (0..32) is the
+// big-endian byte of word (j/4): byte 0 = DATA0[31:24] .. byte 3 = DATA0[7:0].
+const EFUSE_KEY_BASE_OFF: usize = 0x9C / 4;
+const EFUSE_KEY_STRIDE_OFF: usize = 0x20 / 4;
+const EFUSE_KEY_WORDS: usize = 8;
+const EFUSE_KEY_COUNT: usize = 6;
+
 // Modeled factory MAC: 0x112233445566. The esp-idf eFuse driver assembles the
 // MAC with block bit[0:8) -> MAC byte[0], and bit[0:8) of a 32-bit eFuse word is
 // its LSB — so each word stores the MAC in reversed byte order. Block 1 words
@@ -68,6 +79,25 @@ impl Efuse {
         }
     }
 
+    /// Read the 32-byte HMAC/DS key from eFuse key block `id` (0..5), as a
+    /// big-endian-per-word byte stream (key byte j = DATA(j/4) byte (3 - j%4)).
+    pub fn hmac_key(&self, id: usize) -> [u8; 32] {
+        let mut key = [0u8; 32];
+        if id >= EFUSE_KEY_COUNT {
+            return key;
+        }
+        let base = EFUSE_KEY_BASE_OFF + id * EFUSE_KEY_STRIDE_OFF;
+        for i in 0..EFUSE_KEY_WORDS {
+            let word = self.regs[base + i];
+            let j = i * 4;
+            key[j] = (word >> 24) as u8;
+            key[j + 1] = (word >> 16) as u8;
+            key[j + 2] = (word >> 8) as u8;
+            key[j + 3] = word as u8;
+        }
+        key
+    }
+
     pub fn write32(&mut self, off: u32, value: u32) {
         let w = (off >> 2) as usize;
         match w {
@@ -79,6 +109,14 @@ impl Efuse {
             }
             // clk_en / power control — ignored.
             EFUSE_CLK_OFF => {}
+            // HMAC/DS key-block readout registers: read-only on silicon, but
+            // writable here so a sketch can provision a test key.  Spans KEY0..5
+            // (0x9C .. 0x9C + 6*0x20).
+            w if (EFUSE_KEY_BASE_OFF..EFUSE_KEY_BASE_OFF + EFUSE_KEY_COUNT * EFUSE_KEY_STRIDE_OFF)
+                .contains(&w) =>
+            {
+                self.regs[w] = value;
+            }
             // RD_* data registers are read-only on silicon; PGM registers are not
             // modeled. Drop all other writes so the modeled MAC is preserved.
             _ => {

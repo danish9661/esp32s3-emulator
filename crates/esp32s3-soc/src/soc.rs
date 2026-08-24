@@ -21,6 +21,7 @@ use crate::cache::{Cache, CacheTarget};
 use crate::efuse::Efuse;
 use crate::gdma::{GDMA_BASE, Gdma};
 use crate::gpio::Gpio;
+use crate::hmac::Hmac;
 use crate::i2c::I2c;
 use crate::intc::Intc;
 use crate::ledc::Lcdc;
@@ -145,6 +146,7 @@ pub struct Soc {
     sha: Sha,
     aes: Aes,
     rsa: Rsa,
+    hmac: Hmac,
     cache: Cache,
     timg: [Timg; 2],
     systimer: Systimer,
@@ -214,6 +216,7 @@ impl Soc {
             sha: Sha::new(),
             aes: Aes::new(),
             rsa: Rsa::default(),
+            hmac: Hmac::new(),
             cache: Cache::new(),
             timg: [Timg::new(), Timg::new()],
             systimer: Systimer::new(),
@@ -925,6 +928,19 @@ impl Soc {
                     0
                 } else {
                     self.rsa.read32(off)
+                }
+            }
+            crate::hmac::HMAC_BASE => {
+                if is_write {
+                    self.hmac.write32(off, value);
+                    // On SET_PARA_FINISH the engine latches the eFuse key for the
+                    // selected key_id into its working key.
+                    if off == (crate::hmac::SET_PARA_FINISH_OFF * 4) as u32 {
+                        self.hmac.fetch_key(&self.efuse);
+                    }
+                    0
+                } else {
+                    self.hmac.read32(off)
                 }
             }
             // Crypto/shared GDMA (`DR_REG_GDMA_BASE = 0x6003F000`): dedicated DMA

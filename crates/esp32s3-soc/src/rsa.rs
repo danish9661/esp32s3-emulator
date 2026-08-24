@@ -134,7 +134,8 @@ impl Rsa {
             let v_m2 = if m >= 2 { v[m - 2] as u64 } else { 0 };
             while qhat >= (1u64 << 32)
                 || (m >= 2
-                    && (qhat * v_m2) > ((rhat << 32) | rem.get(j + m - 2).copied().unwrap_or(0) as u64))
+                    && (qhat * v_m2)
+                        > ((rhat << 32) | rem.get(j + m - 2).copied().unwrap_or(0) as u64))
             {
                 qhat -= 1;
                 rhat += v[m - 1] as u64;
@@ -230,7 +231,7 @@ impl Rsa {
     }
 
     /// Run the configured modular exponentiation (`Z = X^Y mod M`).
-      fn run_modexp(&mut self) {
+    fn run_modexp(&mut self) {
         // esp-idf writes LENGTH = nwords - 1, so recover nwords.
         let n = if self.nwords == 0 {
             NW
@@ -323,35 +324,19 @@ impl Rsa {
         match off {
             0x000..=0x1FC => {
                 let i = (off / 4) as usize;
-                if i < NW {
-                    self.m[i]
-                } else {
-                    0
-                }
+                if i < NW { self.m[i] } else { 0 }
             }
             0x200..=0x3FC => {
                 let i = ((off - 0x200) / 4) as usize;
-                if i < NW {
-                    self.z[i]
-                } else {
-                    0
-                }
+                if i < NW { self.z[i] } else { 0 }
             }
             0x400..=0x5FC => {
                 let i = ((off - 0x400) / 4) as usize;
-                if i < NW {
-                    self.y[i]
-                } else {
-                    0
-                }
+                if i < NW { self.y[i] } else { 0 }
             }
             0x600..=0x7FC => {
                 let i = ((off - 0x600) / 4) as usize;
-                if i < NW {
-                    self.x[i]
-                } else {
-                    0
-                }
+                if i < NW { self.x[i] } else { 0 }
             }
             0x800 => self.m_dash,
             0x804 => self.nwords as u32,

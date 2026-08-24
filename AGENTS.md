@@ -1121,7 +1121,34 @@ Core design:
     Also found+fixed: `run_flash`'s manual step loop bypassed `Esp32S3::step`'s
     reset consumption, so the WDT reset never rebooted under the harness — added
     the `consume_reset`/`reset` check there (the browser path already rebooted
-    via `m.step()`). clippy/`wasm32` clean, 10 timg tests green. **WDT is retired
-    as a P5 candidate.** Remaining P5 driver-path work: I2C (Wire) driver is a
-    documented known limitation (peripheral validated via direct poke); Touch
-    excluded per user directive (do NOT do Touch).
+     via `m.step()`). clippy/`wasm32` clean, 10 timg tests green. **WDT is retired
+     as a P5 candidate.** Remaining P5 driver-path work: I2C (Wire) driver is a
+     documented known limitation (peripheral validated via direct poke); Touch
+     excluded per user directive (do NOT do Touch).
+  - 2026-08-24: **HMAC-SHA256 (P5 — new peripheral via arduino-cli validation)**.
+    `esp32s3-soc/src/hmac.rs` models the ESP32-S3 HMAC engine at
+    `DR_REG_HMAC_BASE = 0x6003_E000`: the block is a RAW SHA-256 engine — the
+    driver XORs the eFuse key with ipad/opad and feeds `(key^ipad) || msg ||
+    SHA-padding` as 512-bit blocks via `WDATA`(0x80, 16 words). Registers:
+    `SET_START`(0x40), `SET_PARA_PURPOSE`(0x44), `SET_PARA_KEY`(0x48),
+    `SET_PARA_FINISH`(0x4C, latches the eFuse key via `efuse.hmac_key(key_id)`),
+    `SET_MESSAGE_ONE`(0x50)/`SET_MESSAGE_ING`(0x54)/`SET_MESSAGE_END`(0x58,
+    auto-pads)/`SET_MESSAGE_PAD`(0xF0), `QUERY_BUSY`(0x6C, always idle),
+    `RDATA`(0xC0, 8 words). `compute()` does `inner = SHA256((key^ipad)||msg)`,
+    then `SHA256((key^opad)||inner)`; `ONE_BLOCK`/`PAD` are already fully
+    padded by the driver so the model does NOT re-pad (faithful to HW). SHA-256
+    core = `sha256` / `sha256_raw` / `compress` (verified vs hashlib). Wired
+    into `soc.rs` (mmio arm + `fetch_key` on `SET_PARA_FINISH` write). eFuse
+    `efuse.rs` gained 6 key blocks KEY0..5 (0x9C..0x13C, stride 0x20) +
+    `hmac_key(id)` (big-endian-per-word; default zero → valid all-zero-key
+    HMAC). 4 unit tests in `tests/hmac.rs` assert RFC known-answer vectors
+    (zero-key over "hello" / "Hi There" / "what do ya want for nothing?" /
+    a multiblock message) against `hmac.new(zero_key, msg, sha256).hexdigest()`.
+    Validated end-to-end with `tools/sketches/esp32s3_hmac` (direct register
+    pokes, eFuse key 0 = zero): `HMAC digest=<4352B26E…AFC4DA> OK` and
+    `<FB011E61…19A416> OK` matching the host vectors, `HMAC DONE` under
+    `run_flash` (both single- and multi-block paths). clippy/`wasm32` clean, 4
+    hmac tests green. **HMAC is retired as a P5 candidate.** Remaining P5
+    driver-path work: DS (digital signature); I2C (Wire) driver is a documented
+    known limitation (peripheral validated via direct poke); Touch excluded per
+    user directive (do NOT do Touch).
