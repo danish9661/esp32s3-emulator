@@ -1445,3 +1445,70 @@ Core design:
       new work required.
     - All workspace tests green; clippy clean (host + `wasm32-unknown-unknown`);
       `cargo fmt` clean.
+
+  - 2026-08-25: **P5 peripheral batch — PARLIO (LCD_CAM, functional) + 7 register-store stubs**.
+    User's list (PARLIO, PMS, World Controller, ETM, Peri-backup, PCR/clocks,
+    I2S, Assist-Debug) mapped onto the REAL ESP32-S3 blocks (confirmed via
+    esp-idf `reg_base.h`): PARLIO = **LCD_CAM** (`DR_REG_LCD_CAM_BASE =
+    0x6004_1000`); PMS = **SENSITIVE** (`0x600C_1000`); World Controller =
+    **WCL** (`0x600D_0000`); PCR/clocks = **SYSCON** (`0x6002_6000`);
+    Peri-backup = `0x6002_A000`; I2S0 = `0x6000_F000`, I2S1 = `0x6002_D000`;
+    Assist-Debug = `0x600C_E000`. **ETM was DROPPED** — web research confirmed
+    ETM is NOT present on ESP32-S3 (only ESP32-C6/H2 and later), so there is
+    nothing to model for it.
+    - **Stubs (register-store, depth = "functional where it matters" applied to
+      the rest)**: new `esp32s3-soc/src/regstore.rs` — a no_std `RegStore`
+      (fixed `[u32; 0x1000/4]` array, `new(size)`, `read32`/`write32` by
+      `offset & 0xFFF`). Wired into `soc.rs` as fields `sensitive`, `wcl`,
+      `peri_backup`, `syscon`, `i2s:[RegStore;2]`, `assist_debug` and a free
+      `store_dispatch(is_write, off, value, &mut store)` mmio arm helper; the
+      8 bases added to `memmap.rs` as `I2S0_BASE`/`I2S1_BASE`/`SYSCON_BASE`/
+      `PERI_BACKUP_BASE`/`LCD_CAM_BASE`/`SENSITIVE_BASE`/`ASSIST_DEBUG_BASE`/
+      `WCL_BASE`. Accesses round-trip (config-register pokes never panic).
+      `tests/p5_stub_peripherals_round_trip` (machine test) + the arduino-cli
+      poke sketch `tools/sketches/esp32s3_p5_stubs` (all 8 POKE PASS under
+      `run_flash`) validate boot-neutrality.
+    - **LCD_CAM functional (`esp32s3-soc/src/lcd_cam.rs`)**: TX/RX FIFO pair +
+      transfer-start / transfer-done interrupt path. `LCD_DATA` (0x40) pushes
+      the TX FIFO; `LCD_FIFO_STATUS` (0x44, field `[10:0]` TX count) reports it;
+      `LCD_USER` (0x14) `LCD_START` (bit 27) drains the FIFO and raises
+      `LCD_TRANS_DONE` (bit 1 of the `LC_DMA_INT_ENA/RAW/ST/CLR` block at
+      0x64/0x68/0x6C/0x70); the interrupt clears via `LC_DMA_INT_CLR`. CAM path
+      mirrors with `CAM_DATA`/`CAM_FIFO_STATUS`/`CAM_START` but has no data
+      source (RX FIFO stays empty). 2 unit tests (`tests/` inside lcd_cam.rs) +
+      machine test `lcd_cam_fifo_and_transfer_done` + arduino-cli poke sketch
+      `tools/sketches/esp32s3_lcd_cam` (`LCD CAM POKE PASS` under `run_flash`).
+      **KNOWN LIMITATION**: the parallel data is NOT shifted onto the LCD_CAM
+      GPIO-matrix output signals (`LCD_DATAx`/`LCD_WR`/`LCD_RS`/...) during a
+      transfer — no external device and the 8080/6800/RGB FSM is not modeled;
+      the FIFO data path + transfer-done interrupt are functional.
+    - All workspace tests green; clippy clean (host + `wasm32-unknown-unknown`);
+      `cargo fmt` clean.
+
+  - 2026-08-25: **I2S audio + LCD_CAM GPIO-matrix output (P5)**.
+    I2S (`I2S0` 0x6000_F000, `I2S1` 0x6002_D000) is now a **functional model**
+    (`esp32s3-soc/src/i2s.rs`, replacing the RegStore stub): TX/RX FIFO
+    (FIFO reg 0x80, depth 16) + `TX_START` (bit 2 of `TX_CONF` 0x24) begins a
+    bit-clocked serial transmission that drives the I2S GPIO-matrix output
+    signals — `I2SxO_BCK` (sig 22/28), `I2SxO_WS` (sig 24/29), `I2SxO_SD`
+    (sig 25/30) — one serial bit per emulator step (MSB/LSB-first per
+    `tx_bit_order`). When the TX FIFO empties, `tx_done` (bit 1 of the INT
+    block at 0x0C/0x10/0x14/0x18) is raised. Register layout per esp-idf
+    `i2s_struct.h`. 3 unit tests + machine test `i2s_tx_drives_gpio_matrix_
+    signals` (routes I2S0 SD/BCK to GPIO pins via FUNC_OUT_SEL and confirms
+    `gpio_output()` reflects the serial bit + `tx_done`) + arduino-cli poke
+    sketch `esp32s3_i2s` (`I2S POKE PASS` under `run_flash`).
+    **LCD_CAM now drives its parallel output onto the GPIO matrix during a
+    transfer** (`lcd_cam.rs` `tick` + `signal_level`): each TX FIFO word is
+    presented on `LCD_DATA_OUT0..15` (sig 133..148) for one `LCD_PCLK` (sig
+    154) cycle, asserting `LCD_CS` (sig 132, active low) and `LCD_DC` (sig
+    153, from `LCD_USER` bit 26) for the duration; the camera (RX) path has no
+    data source. Machine test `lcd_cam_parallel_drives_gpio_matrix_signals`
+    routes DATA0/CS to pins and confirms `gpio_output()`. Signal indices from
+    esp-idf `gpio_sig_map.h` (LCD_CAM 132..154, I2S0 22..27, I2S1 28..32).
+    **KNOWN LIMITATIONS**: I2S RX has no data source (RX FIFO empty, no
+    `rx_done`); I2S master/slave clock-gen, TDM, PDM and the esp-idf DMA path
+    are not modeled (fixed 1-bit-per-step shift rate). LCD_CAM's 8080/6800/RGB
+    FSM and the LCD_WR/LCD_RS signal wiring beyond DC/PCLK/CS are not modeled.
+    All workspace tests green; clippy clean (host + `wasm32`); `cargo fmt`
+    clean.

@@ -25,13 +25,16 @@ use crate::gdma::{GDMA_BASE, Gdma};
 use crate::gpio::Gpio;
 use crate::hmac::Hmac;
 use crate::i2c::I2c;
+use crate::i2s::I2s;
 use crate::intc::Intc;
+use crate::lcd_cam::LcdCam;
 use crate::ledc::Lcdc;
 use crate::lp_uart::LpUart;
 use crate::mcpwm::{MCPWM_BASE, Mcpwm};
 use crate::memmap::*;
 use crate::memspi::Memspi;
 use crate::pcnt::{PCNT_BASE, Pcnt};
+use crate::regstore::RegStore;
 use crate::rmt::{RMT_BASE, Rmt};
 use crate::rng::Rng;
 use crate::rsa::Rsa;
@@ -174,6 +177,30 @@ pub struct Soc {
     /// that bit, so writes to it only matter for arming the lock timer.
     pll: PllLock,
 
+    // ── P5 register-store peripherals (configure-and-forget, no observable
+    //    side-effects modeled — see regstore.rs). Bases from esp-idf
+    //    components/soc/esp32s3/register/soc/reg_base.h.
+    /// SENSITIVE (= Mem-Protection/PMS, DR_REG_SENSITIVE_BASE 0x600C1000).
+    sensitive: RegStore,
+    /// WCL (= World Controller / TEE, DR_REG_WCL_BASE 0x600D0000).
+    wcl: RegStore,
+    /// PERI_BACKUP (retention registers, DR_REG_PERI_BACKUP_BASE 0x6002A000).
+    peri_backup: RegStore,
+    /// SYSCON (= peripheral clock/reset control, "PCR" on S3, 0x60026000).
+    syscon: RegStore,
+    /// ASSIST_DEBUG (watchpoint/breakpoint unit, DR_REG_ASSIST_DEBUG_BASE
+    /// 0x600CE000).
+    assist_debug: RegStore,
+    /// I2S audio controllers (I2S0 @ 0x6000F000, I2S1 @ 0x6002D000).
+    /// Functional model: TX/RX FIFO + serial shift-out onto GPIO-matrix
+    /// signals (BCK/WS/SD).
+    i2s: [I2s; 2],
+
+    /// LCD_CAM (= parallel I/O / PARLIO, DR_REG_LCD_CAM_BASE 0x60041000).
+    /// Functional model: FIFO data path + transfer-done interrupt, with the
+    /// parallel data/clock signals driven onto the GPIO matrix.
+    lcd_cam: LcdCam,
+
     /// SYSTEM.APPCPU_CTRL_A (0x600C0004): the APP-CPU release register.
     /// `ets_set_appcpu_boot_addr` (ROM 0x40043664) stores the core-1 entry
     /// address here; the core-1 reset path (real ROM fastboot / our
@@ -247,6 +274,13 @@ impl Soc {
             sdm: Sdm::new(),
             intc: Intc::new(),
             pll: PllLock::default(),
+            sensitive: RegStore::new(0x1000),
+            wcl: RegStore::new(0x1000),
+            peri_backup: RegStore::new(0x1000),
+            syscon: RegStore::new(0x1000),
+            i2s: [I2s::new(0), I2s::new(1)],
+            assist_debug: RegStore::new(0x1000),
+            lcd_cam: LcdCam::new(),
             appcpu_ctrl_a: 0,
             cpu_int_from_cpu: [0, 0],
             rom_boot_mode: false,
@@ -423,6 +457,9 @@ impl Soc {
             self.rmt.tick();
             self.mcpwm.tick();
             self.sdm.tick();
+            self.lcd_cam.tick();
+            self.i2s[0].tick();
+            self.i2s[1].tick();
             // PCNT samples its unit/channel signal inputs via the GPIO-matrix
             // input routing (FUNC_IN_SEL_CFG); resolve each signal index to the
             // GPIO pin's current level.
@@ -557,6 +594,15 @@ impl Soc {
         } else if (93..=100).contains(&sig) {
             // Sigma-Delta channels 0..7 (GPIO_SD0..7_OUT_IDX).
             self.sdm.signal_level(sig)
+        } else if (132..=154).contains(&sig) {
+            // LCD_CAM parallel data / clock / control signals.
+            self.lcd_cam.signal_level(sig)
+        } else if (22..=27).contains(&sig) {
+            // I2S0 output signals (BCK/MCLK/WS/SD + RX BCK/WS).
+            self.i2s[0].signal_level(sig)
+        } else if (28..=32).contains(&sig) {
+            // I2S1 output signals (BCK/WS/SD + RX BCK/WS).
+            self.i2s[1].signal_level(sig)
         } else {
             self.spi[0].signal_level(sig)
                 | self.spi[1].signal_level(sig)
@@ -1191,6 +1237,37 @@ impl Soc {
                     0
                 }
             }
+            // ── P5 register-store peripherals (see regstore.rs). Each is a
+            //    dedicated 4 KB APB page; pokes are retained and read back.
+            0x6000_F000 => {
+                if is_write {
+                    self.i2s[0].write32(off, value);
+                    0
+                } else {
+                    self.i2s[0].read32(off)
+                }
+            }
+            0x6002_D000 => {
+                if is_write {
+                    self.i2s[1].write32(off, value);
+                    0
+                } else {
+                    self.i2s[1].read32(off)
+                }
+            }
+            0x6002_6000 => store_dispatch(is_write, off, value, &mut self.syscon),
+            0x6002_A000 => store_dispatch(is_write, off, value, &mut self.peri_backup),
+            0x6004_1000 => {
+                if is_write {
+                    self.lcd_cam.write32(off, value);
+                    0
+                } else {
+                    self.lcd_cam.read32(off)
+                }
+            }
+            0x600C_1000 => store_dispatch(is_write, off, value, &mut self.sensitive),
+            0x600C_E000 => store_dispatch(is_write, off, value, &mut self.assist_debug),
+            0x600D_0000 => store_dispatch(is_write, off, value, &mut self.wcl),
             // Everything else in the APB space: no model yet.
             _ => 0,
         }
@@ -1200,6 +1277,17 @@ impl Soc {
 impl Default for Soc {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Route a single 32-bit MMIO access to a `RegStore` (register-store stub).
+/// Returns the read value (or 0 for writes), per the bus contract.
+fn store_dispatch(is_write: bool, off: u32, value: u32, store: &mut RegStore) -> u32 {
+    if is_write {
+        store.write32(off, value);
+        0
+    } else {
+        store.read32(off)
     }
 }
 

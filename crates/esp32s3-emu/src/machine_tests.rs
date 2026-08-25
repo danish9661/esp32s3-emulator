@@ -6,7 +6,10 @@
 //! `insn()`; a fixed 4-byte-per-word layout misaligns after the first 3-byte
 //! instruction (verified failure mode 2026-08-15).
 
-use esp32s3_soc::memmap::{GPIO_BASE, IRAM_BASE, TIMG0_BASE, UART0_BASE};
+use esp32s3_soc::memmap::{
+    ASSIST_DEBUG_BASE, GPIO_BASE, I2S0_BASE, I2S1_BASE, IRAM_BASE, LCD_CAM_BASE, PERI_BACKUP_BASE,
+    SENSITIVE_BASE, SYSCON_BASE, TIMG0_BASE, UART0_BASE, WCL_BASE,
+};
 
 use xtensa_core::Bus;
 
@@ -1740,5 +1743,139 @@ fn rtc_slp_wakeup_cause_register_is_rtc() {
     assert_eq!(
         m.soc.read32(RTC_CNTL_BASE + SLP_WAKEUP_CAUSE_OFF),
         0xABCD_1234
+    );
+}
+
+/// P5 register-store peripherals (SENSITIVE/PMS, WCL/World-Ctrl, PERI_BACKUP,
+/// SYSCON/PCR-clocks, I2S0/1, ASSIST_DEBUG): firmware pokes them during
+/// boot/init. Each is a `RegStore` that retains writes and reads them back, so
+/// accesses never panic and round-trip. (LCD_CAM is modeled functionally in
+/// `lcd_cam.rs` and covered by `lcd_cam_fifo_and_transfer_done`.)
+#[test]
+fn p5_stub_peripherals_round_trip() {
+    let addrs = [
+        (SENSITIVE_BASE, "SENSITIVE"),
+        (WCL_BASE, "WCL"),
+        (PERI_BACKUP_BASE, "PERI_BACKUP"),
+        (SYSCON_BASE, "SYSCON"),
+        (I2S0_BASE, "I2S0"),
+        (I2S1_BASE, "I2S1"),
+        (ASSIST_DEBUG_BASE, "ASSIST_DEBUG"),
+        (LCD_CAM_BASE, "LCD_CAM"),
+    ];
+    let mut m = Esp32S3::new();
+    for (base, name) in addrs.iter() {
+        // Use 0x20 (a plain config register on every modeled block) so the
+        // round-trip holds even for peripherals whose 0x10 is a computed
+        // read-only register (e.g. I2S INT_ST).
+        let w = 0x1234_5678u32;
+        m.soc.write32(*base + 0x20, w);
+        let r = m.soc.read32(*base + 0x20);
+        assert_eq!(r, w, "{} register round-trip failed", name);
+        // A second, distinct offset also round-trips.
+        m.soc.write32(*base + 0x24, 0xDEAD_BEEF);
+        assert_eq!(m.soc.read32(*base + 0x24), 0xDEAD_BEEF, "{} off 0x24", name);
+    }
+}
+
+/// LCD_CAM (= PARLIO) functional model: TX FIFO + transfer-start / done.
+/// Words pushed to `LCD_DATA` (0x40) fill the TX FIFO; `LCD_FIFO_STATUS`
+/// (0x44) reports the count. Setting `LCD_START` (bit 27 of `LCD_USER` 0x14)
+/// drains the FIFO and raises `LCD_TRANS_DONE` (bit 1 of the LC_DMA_INT_*
+/// block). The interrupt clears via `LC_DMA_INT_CLR`.
+#[test]
+fn lcd_cam_fifo_and_transfer_done() {
+    use esp32s3_soc::lcd_cam::LCD_CAM_BASE;
+    let lcd_user = LCD_CAM_BASE + 0x14;
+    let lcd_data = LCD_CAM_BASE + 0x40;
+    let lcd_fifo_status = LCD_CAM_BASE + 0x44;
+    let lc_int_ena = LCD_CAM_BASE + 0x64;
+    let lc_int_raw = LCD_CAM_BASE + 0x68;
+    let lc_int_st = LCD_CAM_BASE + 0x6C;
+    let lc_int_clr = LCD_CAM_BASE + 0x70;
+
+    let mut m = Esp32S3::new();
+    // Enable + clear the TRANS_DONE interrupt, then fill the TX FIFO.
+    m.soc.write32(lc_int_ena, 1 << 1);
+    m.soc.write32(lc_int_clr, 0xF);
+    m.soc.write32(lcd_data, 0x1111_1111);
+    m.soc.write32(lcd_data, 0x2222_2222);
+    m.soc.write32(lcd_data, 0x3333_3333);
+    assert_eq!(m.soc.read32(lcd_fifo_status) & 0x7FF, 3, "TX FIFO count");
+    // Start a transfer; the FIFO drains one word per PCLK cycle (~2 ticks).
+    let user = m.soc.read32(lcd_user);
+    m.soc.write32(lcd_user, user | (1 << 27));
+    assert_eq!(
+        m.soc.read32(lcd_fifo_status) & 0x7FF,
+        3,
+        "TX still queued pre-tick"
+    );
+    m.soc.tick_timers(40);
+    assert_eq!(m.soc.read32(lcd_fifo_status) & 0x7FF, 0, "TX drained");
+    assert_eq!(m.soc.read32(lc_int_raw) & (1 << 1), 1 << 1, "RAW done set");
+    assert_eq!(m.soc.read32(lc_int_st) & (1 << 1), 1 << 1, "ST done set");
+    // Clear and confirm.
+    m.soc.write32(lc_int_clr, 1 << 1);
+    assert_eq!(m.soc.read32(lc_int_raw) & (1 << 1), 0, "RAW cleared");
+}
+
+/// I2S TX serial output is observable on GPIO pins routed to the I2S0 SD/BCK
+/// matrix signals. Pushing 0x8000 (MSB-first) and starting a transfer must
+/// drive SD high on the first bit, and the transfer must raise `tx_done`.
+#[test]
+fn i2s_tx_drives_gpio_matrix_signals() {
+    use esp32s3_soc::i2s::I2S0_BASE;
+    let i2s_fifo = I2S0_BASE + 0x80;
+    let i2s_tx_conf = I2S0_BASE + 0x24;
+    let i2s_int_raw = I2S0_BASE + 0x0C;
+    let sd_pin = 5u32; // route I2S0 SD (sig 25) here
+    let bck_pin = 6u32; // route I2S0 BCK (sig 22) here
+    let mut m = Esp32S3::new();
+    m.soc.write32(GPIO_BASE + 0x554 + 4 * sd_pin, 25);
+    m.soc.write32(GPIO_BASE + 0x554 + 4 * bck_pin, 22);
+    m.soc
+        .write32(GPIO_BASE + 0x24, (1u32 << sd_pin) | (1u32 << bck_pin));
+    m.soc.write32(i2s_fifo, 0x8000);
+    m.soc.write32(i2s_tx_conf, 1 << 2); // TX_START
+    m.soc.tick_timers(1);
+    let out = m.soc.gpio_output();
+    assert_eq!(
+        (out >> sd_pin) & 1,
+        1,
+        "I2S0 SD high (MSB first) after 1 tick"
+    );
+    assert_eq!((out >> bck_pin) & 1, 1, "I2S0 BCK high after 1 tick");
+    m.soc.tick_timers(40);
+    assert_eq!(
+        m.soc.read32(i2s_int_raw) & (1 << 1),
+        1 << 1,
+        "I2S tx_done fired"
+    );
+}
+
+/// LCD_CAM parallel output is observable on GPIO pins routed to the LCD
+/// data/CS matrix signals. A transfer presenting 0x00000001 must drive
+/// DATA0 high and CS (active-low) low.
+#[test]
+fn lcd_cam_parallel_drives_gpio_matrix_signals() {
+    use esp32s3_soc::lcd_cam::LCD_CAM_BASE;
+    let lcd_user = LCD_CAM_BASE + 0x14;
+    let lcd_data = LCD_CAM_BASE + 0x40;
+    let data_pin = 7u32; // route LCD_DATA_OUT0 (sig 133)
+    let cs_pin = 8u32; // route LCD_CS (sig 132)
+    let mut m = Esp32S3::new();
+    m.soc.write32(GPIO_BASE + 0x554 + 4 * data_pin, 133);
+    m.soc.write32(GPIO_BASE + 0x554 + 4 * cs_pin, 132);
+    m.soc
+        .write32(GPIO_BASE + 0x24, (1u32 << data_pin) | (1u32 << cs_pin));
+    m.soc.write32(lcd_data, 0x0000_0001);
+    m.soc.write32(lcd_user, 1 << 27); // LCD_START
+    m.soc.tick_timers(1);
+    let out = m.soc.gpio_output();
+    assert_eq!((out >> data_pin) & 1, 1, "LCD DATA0 high during transfer");
+    assert_eq!(
+        (out >> cs_pin) & 1,
+        0,
+        "LCD CS active (low) during transfer"
     );
 }

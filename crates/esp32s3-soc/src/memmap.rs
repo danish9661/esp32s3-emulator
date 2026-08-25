@@ -159,6 +159,19 @@ pub const INT_MATRIX_SIZE: u32 = (INT_MATRIX_INPUTS * INT_MATRIX_CPUS * 4) as u3
 /// (base + 0x04, the APP-CPU release register) is modeled by the SoC.
 pub const SYSTEM_BASE: u32 = 0x600C_0000;
 
+/// P5 register-store peripheral bases (esp-idf components/soc/esp32s3/
+/// register/soc/reg_base.h). These are configure-and-forget blocks; the
+/// emulator retains pokes in a `RegStore` (see regstore.rs) so firmware
+/// touching them during boot/init never panics.
+pub const I2S0_BASE: u32 = 0x6000_F000;
+pub const I2S1_BASE: u32 = 0x6002_D000;
+pub const SYSCON_BASE: u32 = 0x6002_6000;
+pub const PERI_BACKUP_BASE: u32 = 0x6002_A000;
+pub const LCD_CAM_BASE: u32 = 0x6004_1000;
+pub const SENSITIVE_BASE: u32 = 0x600C_1000;
+pub const ASSIST_DEBUG_BASE: u32 = 0x600C_E000;
+pub const WCL_BASE: u32 = 0x600D_0000;
+
 /// Cache / MMU controller registers (EXTMEM, esp32s3_reg.h): dcache/icache
 /// enable, sync/preload/autoload/freeze handshakes, cache state.
 pub const EXTMEM_BASE: u32 = 0x600C_4000;
