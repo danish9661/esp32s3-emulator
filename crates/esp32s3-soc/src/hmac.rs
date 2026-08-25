@@ -107,7 +107,7 @@ fn compress(h: &mut [u32; 8], chunk: &[u8]) {
 }
 
 /// SHA-256 over `msg` (applies standard padding).
-fn sha256(msg: &[u8]) -> [u8; 32] {
+pub(crate) fn sha256(msg: &[u8]) -> [u8; 32] {
     let mut h: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,
@@ -129,8 +129,31 @@ fn sha256(msg: &[u8]) -> [u8; 32] {
     out
 }
 
+/// HMAC-SHA256(key, msg) — used by the DS peripheral to derive the AES key
+/// from the eFuse HMAC key (HMAC-SHA256(efuse_key, 0xFF*32), downstream mode).
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        k[..32].copy_from_slice(&sha256(key));
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let mut inner = ipad.to_vec();
+    inner.extend_from_slice(msg);
+    let inner_d = sha256(&inner);
+    let mut outer = opad.to_vec();
+    outer.extend_from_slice(&inner_d);
+    sha256(&outer)
+}
+
 /// SHA-256 over `data` which is already a multiple of 64 bytes (no padding).
-fn sha256_raw(data: &[u8]) -> [u8; 32] {
+pub fn sha256_raw(data: &[u8]) -> [u8; 32] {
     let mut h: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,

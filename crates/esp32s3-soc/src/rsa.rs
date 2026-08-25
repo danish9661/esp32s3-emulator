@@ -203,7 +203,7 @@ impl Rsa {
     }
 
     /// `base^exp mod modulus` (all little-endian limb slices).
-    fn modexp(base: &[u32], exp: &[u32], modulus: &[u32]) -> Vec<u32> {
+    pub(crate) fn modexp(base: &[u32], exp: &[u32], modulus: &[u32]) -> Vec<u32> {
         let modulus = trim(modulus);
         if modulus.is_empty() {
             return Vec::new();

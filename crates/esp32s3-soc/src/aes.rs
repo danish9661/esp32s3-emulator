@@ -206,6 +206,26 @@ fn aes_decrypt_block(input: &[u8; 16], w: &[u32], nr: usize) -> [u8; 16] {
     state
 }
 
+/// AES-256-CBC decrypt (PKCS#7-free: `data` length must be a multiple of 16).
+/// Reused by the DS peripheral to decrypt the protected RSA key parameters.
+pub(crate) fn aes256_cbc_decrypt(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> Vec<u8> {
+    let w = key_expansion(key, 8);
+    let mut out = Vec::with_capacity(data.len());
+    let mut prev = *iv;
+    for chunk in data.chunks_exact(16) {
+        let mut block = [0u8; 16];
+        block.copy_from_slice(chunk);
+        let dec = aes_decrypt_block(&block, &w, 14);
+        let mut pt = [0u8; 16];
+        for i in 0..16 {
+            pt[i] = dec[i] ^ prev[i];
+        }
+        out.extend_from_slice(&pt);
+        prev = block;
+    }
+    out
+}
+
 /// AES peripheral register-block base (`DR_REG_AES_BASE`, soc/reg_base.h).
 pub const AES_BASE: u32 = 0x6003_A000;
 /// AES ciphertext output registers (source for the GDMA `in` channel).

@@ -539,6 +539,11 @@ impl I2c {
         raw & ena
     }
 
+    /// Raw interrupt bits (INT_RAW) regardless of enable.
+    pub fn int_raw(&self) -> u32 {
+        self.regs[(I2C_INT_RAW / 4) as usize]
+    }
+
     pub fn read32(&mut self, offset: u32) -> u32 {
         match offset {
             I2C_SR => {

@@ -112,7 +112,8 @@ impl Efuse {
             // HMAC/DS key-block readout registers: read-only on silicon, but
             // writable here so a sketch can provision a test key.  Spans KEY0..5
             // (0x9C .. 0x9C + 6*0x20).
-            w if (EFUSE_KEY_BASE_OFF..EFUSE_KEY_BASE_OFF + EFUSE_KEY_COUNT * EFUSE_KEY_STRIDE_OFF)
+            w if (EFUSE_KEY_BASE_OFF
+                ..EFUSE_KEY_BASE_OFF + EFUSE_KEY_COUNT * EFUSE_KEY_STRIDE_OFF)
                 .contains(&w) =>
             {
                 self.regs[w] = value;

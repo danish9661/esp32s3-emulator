@@ -82,8 +82,6 @@ fn main() {
     let mut uart2_count = 0u64;
     let mut tick_count = 0u64;
     let mut cc_isr_count = 0u64;
-    let mut cc_send_count = 0u64;
-    let mut l1_vec_count = 0u64;
     let mut uart3_shown = 0u32;
     let mut uart1_shown = 0u32;
     let mut uart2_shown = 0u32;
@@ -1045,14 +1043,8 @@ fn main() {
         if pc == 0x4037_b3e0 {
             tick_count += 1;
         }
-        if pc == 0x4037_5e9c {
+        if pc == 0x4037_5ea8 {
             cc_isr_count += 1;
-        }
-        if pc == 0x4037_5ef8 {
-            cc_send_count += 1;
-        }
-        if pc == 0x4000_0300 {
-            l1_vec_count += 1;
         }
         if pc == 0x4004_9096 {
             uart2_count += 1;
@@ -2119,7 +2111,6 @@ fn main() {
     );
     println!("== usb write-site hits: {uart2_count}");
     println!("== systick isr entries: {tick_count}");
-    println!("== level1 vector entries (both cores): {l1_vec_count}");
     println!(
         "== irq taken core0={} core1={} (skipped-no-intenable core0={} core1={})",
         m.cpu[0].dbg_irq_taken,
@@ -2153,7 +2144,7 @@ fn main() {
         m.soc.read32(0x600C_0030),
         m.soc.read32(0x600C_0034)
     );
-    println!("== crosscore isr entries: {cc_isr_count} (send calls: {cc_send_count})");
+    println!("== crosscore isr entries: {cc_isr_count}");
     println!(
         "== cpu_int_from_cpu regs: core0={:#x} core1={:#x}",
         m.soc.read32(0x600C_0030),

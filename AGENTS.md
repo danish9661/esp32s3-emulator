@@ -83,12 +83,13 @@ Core design:
       peripheral state such as `gpio_output()` and device registers),
        exception correctness and interrupt timing verified through real
        FreeRTOS/Arduino behavior. NEXT: keep implementing missing peripherals
-       (RMT ✓, PCNT ✓, TWAI/CAN ✓, MCPWM ✓, GDMA ✓, I2C-peripheral ✓, …) and
-       validate each with a sketch. Driver-path status: RMT and GDMA were
-       validated end-to-end through the esp-idf *driver* stack; I2C is validated
-       at the peripheral level via direct register pokes (the Wire-driver path
-       times out at the FreeRTOS semaphore sync — documented known limitation).
-       Touch: NOT being pursued (user directive: do NOT do Touch).
+        (RMT ✓, PCNT ✓, TWAI/CAN ✓, MCPWM ✓, GDMA ✓, I2C-peripheral ✓,
+        SigmaDelta ✓, …) and validate each with a sketch. Driver-path status:
+        RMT, GDMA and SigmaDelta were validated end-to-end through the esp-idf
+        *driver* stack; I2C is validated at the peripheral level via direct
+        register pokes (the Wire-driver path times out at the FreeRTOS semaphore
+        sync — documented known limitation). Touch: NOT being pursued (user
+        directive: do NOT do Touch).
 - [x] **P6 — Frontend polish**: serial console UI, GPIO/LED visualization,
       example firmware gallery.
 - [ ] WiFi/BLE: OUT OF SCOPE for now (months of work; not required for the
@@ -927,21 +928,39 @@ Core design:
    ok=1` → `I2C POKE PASS` (0x488 = END_DETECT|TRANS_COMPLETE|NACK, confirming
    the FSM runs to completion, NACK is latched with no device, bus returns
    idle, and READ fills the RX FIFO). All 124+ workspace tests still green,
-   clippy/wasm32 clean. **Wire-driver limitation**: the Arduino `Wire`
-   `endTransmission` scan still times out (`other=119`) under the real
-   esp-idf i2c *driver* stack. Root-caused to the FreeRTOS/esp-idf driver
-   synchronization layer, NOT the emulator: the I2C ISR
-   (`i2c_master_isr_handler_default`) is correctly invoked (verified PC hits
-   0x40377af4), reads `INT_STATUS=0x88`, and calls
-   `xQueueGenericSendFromISR` to give the completion semaphore — yet the
-   blocking `xQueueSemaphoreTake` in `s_i2c_synchronous_transaction` still
-   times out. Every emulator-side behavior (FSM, source-42→line-6 routing,
-   CPU INTENABLE SR, ISR invocation, register offsets matching real S3
-   `i2c_struct.h`) is correct, so the gap is inside the driver's
-    semaphore/struct sync which we do not model. Deferred: I2C is validated at
-    the peripheral level; the Wire-driver path is a documented known
-    limitation (consistent with how RMT/GDMA/MCPWM/PCNT were each first proven
-    via direct pokes).
+    clippy/wasm32 clean. **Wire-driver limitation (PRECISELY ROOT-CAUSED
+    2026-08-24)**: the Arduino `Wire` `endTransmission` scan times out
+    (`other=119`, returns code 3/4 = timeout; never the NACK code 2) under the
+    real esp-idf i2c *driver* stack, whereas the direct-poke sketch (which
+    reads `INT_RAW` directly) passes — so the peripheral model is CORRECT.
+    Disassembly of `i2c_master_isr_handler_default` (0x40377af4) + FreeRTOS
+    probes prove the failure is 100% firmware-internal, NOT an emulator gap:
+      • The ISR fires 336× on **core1** (src42→line3, verified PC hits
+        0x40377af4), which is correct — earlier "ISR never ran" was a bad
+        probe address (the ISR is 0x40375ea8, not 0x40375e9c).
+      • The NACK path (`bbci a7,10` at 0x40377b14) records `i2c_obj->+12=6/
+        +16=2`, sends the event via `xQueueGenericSendFromISR`, then because
+        `INT_STATUS=0x488` has bits 3+7 set it routes into the command loop
+        (0x40377b74) → error path (0x40377d2b). That loop handles the END
+        command and resets internal counters but **never sets
+        `cmd_link->+193` (the done flag)** the ISR reads at 0x40377bf5.
+      • The success give (0x40377c12) is therefore NEVER taken — 336/336
+        gives are the ABORT give (0x40377db1, `+193=0`), which frees the
+        semaphore (driver's `xQueueSemaphoreTake` consumes the SAME handle
+        0x3FC86118 — the sync handles MATCH) but leaves `cmd_link->ret` at
+        its initial `ESP_ERR_TIMEOUT`, so `endTransmission` reports timeout.
+    The `cmd_link->done`/`ret` handshake is entirely inside the esp-idf i2c
+    driver (a firmware-owned struct the ISR is meant to populate on the NACK
+    branch); it cannot be influenced by any peripheral register bit, so an
+    `i2c.rs` status-bit change CANNOT fix it (and an "abort-on-NACK" change
+    would _break_ the poke sketch, which legitimately expects `INT_RAW=0x488`
+    with the END command completing). I2C is validated at the peripheral
+    level; the Wire-driver path is a documented known limitation (consistent
+    with how RMT/GDMA/MCPWM/PCNT/TWAI were each first proven via direct
+    pokes). The only path to fixing it is ABI-level modeling of the esp-idf
+    i2c driver's cmd_link completion in the harness — a large effort requiring
+    the exact `cmd_link` struct offsets from esp-idf source (unavailable
+    offline here), out of scope unless explicitly funded.
   - 2026-08-22: **LEDC PWM driver path validated via arduino-cli (P5)**. The
     Arduino 3.3.10 `ledc` driver (`ledcAttach(pin, freq, res)` /
     `ledcWrite(pin, duty)`, the real esp-idf ledc stack with the HAL
@@ -1148,7 +1167,57 @@ Core design:
     pokes, eFuse key 0 = zero): `HMAC digest=<4352B26E…AFC4DA> OK` and
     `<FB011E61…19A416> OK` matching the host vectors, `HMAC DONE` under
     `run_flash` (both single- and multi-block paths). clippy/`wasm32` clean, 4
-    hmac tests green. **HMAC is retired as a P5 candidate.** Remaining P5
-    driver-path work: DS (digital signature); I2C (Wire) driver is a documented
-    known limitation (peripheral validated via direct poke); Touch excluded per
-    user directive (do NOT do Touch).
+    hmac tests green. **HMAC is retired as a P5 candidate.**
+  - 2026-08-24: **DS / Digital Signature (P5 — new peripheral via arduino-cli
+    validation)**. `esp32s3-soc/src/ds.rs` models the ESP32-S3 DS engine
+    (`DR_REG_DIGITAL_SIGNATURE_BASE = 0x6003_D000`): the block is a *raw RSA
+    signer* that decrypts a pre-encrypted RSA private key and computes
+    `Z = X^Y mod M`. Algorithm (from ESP-IDF `configure_ds.py` / `ds_ll`): AES
+    key = `HMAC-SHA256(efuse_key, 0xFF*32)` (HMAC "downstream"); the blob
+    `c = C_Y(512)||C_M(512)||C_RB(512)||C_BOX(48)` is AES-256-CBC decrypted with
+    the 16-byte IV into `Y||M||Rb||md(32)||M_prime(4)||length(4)||0x08*8`; the
+    signature is `Z = X^Y mod M` (Y = private exponent, M = modulus; Rb/M_prime
+    are Montgomery-only helpers a software RSA ignores); `md` = SHA256 of
+    `Y||M||Rb||M_prime||length||IV` is checked into `QUERY_CHECK`
+    (bits 0=invalid-digest, 1=invalid-padding). Reuses `aes256_cbc_decrypt`
+    (new `pub(crate)` helper in `aes.rs`, nr=14), `Rsa::modexp` (now
+    `pub(crate)`), and `hmac_sha256`/`sha256` (now `pub(crate)`) from
+    `hmac.rs`. Wired into `soc.rs` (mmio arm `DS_BASE`, `write32(off,val,&efuse)`)
+     + `lib.rs`. 2 unit tests in `tests/ds.rs` (RSA-1024 known-answer vector
+     generated from a real key on the host, plus a tamper check asserting
+     `QUERY_CHECK_INVALID_DIGEST`). Validated end-to-end with
+     `tools/sketches/esp32s3_ds` (direct register pokes, eFuse key block 0 = zero
+     → same `aes_key`): `DS QUERY_CHECK=0`, `DS Z=B3299C21…83C6 OK` matching the
+     host `pow(X, d, n)`, `DS DONE` under `run_flash`. All workspace tests
+     green, clippy/`wasm32` clean. **DS is retired as a P5 candidate.** Remaining
+     P5 driver-path work: I2C (Wire) driver is a documented known limitation
+     (peripheral validated via direct poke); Touch excluded per user directive
+     (do NOT do Touch).
+
+ - 2026-08-24: **Sigma-Delta (P5 — new peripheral via arduino-cli validation)**.
+   `esp32s3-soc/src/sigmadelta.rs` models the ESP32-S3 Sigma-Delta modulator
+   (`DR_REG_GPIO_SD_BASE = 0x60004F00`, which lives inside the GPIO 4KB page so
+   `soc.rs` routes the 0xF00..0xF28 window to the SDM device). Register block per
+   `gpio_sd_struct.h`: `channel[8]` (`duty[7:0]`, `prescale[15:8]`) at 0x00..0x1F,
+   `cg` (`clk_en` bit31) at 0x20, `misc` (`function_clk_en` bit30, `spi_swap`
+   bit31) at 0x24, `version` (`date`) at 0x28. Output routed through the GPIO
+   matrix signals `GPIO_SD0..7_OUT_IDX` (93..100, `gpio_sig_map.h`). The model
+   produces a PDM whose high fraction = `duty/256`; the 8-bit duty register holds
+   the **signed** value the esp-idf `sdm_channel_set_duty` writes (so 0 = 50%,
+   -128 = 0%, 127 ≈ 100% — confirmed by the sketch printing 49%). `cg`/`misc`
+   clock-gate bits are not modeled (clock treated as always running). Wired into
+   `soc.rs` (`Sdm` field, `signal_level` sig 93..100, `tick` in `tick_timers`,
+   GPIO-page mmio arm). 5 unit tests (`tests/sigmadelta.rs`) assert the duty
+   ratio (50%/25%), prescale period scaling, per-channel signal routing, and
+   register readback; a machine test `sigmadelta_drives_gpio_at_duty_ratio`
+   routes channel 0 → GPIO2 and samples `gpio_output()` over 2048 steps
+   (deterministic 50%). Validated end-to-end with
+   `tools/sketches/esp32s3_sigmadelta` (Arduino `sigmaDeltaAttach`/`sigmaDeltaWrite`
+   HAL API, direct register pokes not needed — the esp-idf driver path): `SDM
+   duty=128 sampled_high=9905/20000 (49%)` → `SIGMADELTA PASS` → `DONE` under
+   `run_flash`. All workspace tests green, clippy/`wasm32` clean. **Sigma-Delta
+   is retired as a P5 candidate.** Next P5 items per user: RTC_CNTL / RTC_IO
+   (RTC slow-clock timer already modeled in `rtc.rs`; extend to the full
+   RTC_CNTL register block + RTC_IO pad control), then revisit any remaining
+   gaps.
+

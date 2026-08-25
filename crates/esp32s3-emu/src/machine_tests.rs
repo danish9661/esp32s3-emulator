@@ -1465,3 +1465,68 @@ fn rmt_signal_drives_gpio_in_loopback() {
         "RMT output must toggle GPIO2 via the GPIO_IN loopback (saw0={saw0} saw1={saw1})"
     );
 }
+
+#[test]
+fn sigmadelta_drives_gpio_at_duty_ratio() {
+    use crate::asm::Asm;
+    use esp32s3_soc::memmap::{GPIO_BASE, IRAM_BASE};
+    use esp32s3_soc::sigmadelta::GPIO_SD_BASE;
+
+    // Firmware: route SDM channel 0 (GPIO-matrix signal 93) -> GPIO2 via
+    // FUNC_OUT_SEL, enable GPIO2, and configure SDM channel 0 to duty=128
+    // (50%) prescale=0. Then spin. The host samples gpio_output() bit 2 and
+    // verifies the Sigma-Delta PDM averages to ~50% high.
+    const STASH: u32 = 0x3FC8_0100;
+    let mut a = Asm::new(IRAM_BASE);
+    let l_gpio = a.offset();
+    a.lit(0);
+    let l_sdm = a.offset();
+    a.lit(0);
+    let l_stash = a.offset();
+    a.lit(0);
+    let code_start = a.pc();
+    let p = a.l32r(2); // GPIO_BASE
+    a.patch_l32r(p, IRAM_BASE + l_gpio as u32);
+    let p = a.l32r(3); // GPIO_SD_BASE
+    a.patch_l32r(p, IRAM_BASE + l_sdm as u32);
+    a.movi_n(4, 1 << 2);
+    a.s32i(4, 2, 0x20); // GPIO_ENABLE: bit 2
+    a.li(6, (GPIO_BASE + 0x554) as i32); // FUNC_OUT_SEL base
+    a.li(4, 93); // GPIO_SD0_OUT_IDX
+    a.s32i(4, 6, 8); // GPIO2 FUNC_OUT_SEL = 93
+    a.li(4, 0); // signed duty 0 = 50% (esp-idf writes signed duty to reg)
+    a.s32i(4, 3, 0x00); // GPIO_SD channel 0
+    a.li(4, 0xCAFE);
+    let p = a.l32r(5); // STASH
+    a.patch_l32r(p, IRAM_BASE + l_stash as u32);
+    a.s32i(4, 5, 0);
+    let done = a.pc();
+    a.j(done);
+    a.bytes_mut()[l_gpio..l_gpio + 4].copy_from_slice(&GPIO_BASE.to_le_bytes());
+    a.bytes_mut()[l_sdm..l_sdm + 4].copy_from_slice(&GPIO_SD_BASE.to_le_bytes());
+    a.bytes_mut()[l_stash..l_stash + 4].copy_from_slice(&STASH.to_le_bytes());
+
+    let mut m = Esp32S3::new();
+    m.load_image(IRAM_BASE, a.bytes());
+    m.cpu[0].pc = code_start;
+    for _ in 0..500 {
+        if m.soc.read32(STASH) == 0xCAFE {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.soc.read32(STASH), 0xCAFE, "firmware configured SDM");
+    let pin = |m: &Esp32S3| (m.gpio_output() & (1 << 2)) != 0;
+    // 2048 steps = 8 full 256-tick PDM periods; duty 128/256 -> ~1024 high.
+    let mut high = 0u32;
+    for _ in 0..2048 {
+        if pin(&m) {
+            high += 1;
+        }
+        m.step();
+    }
+    assert!(
+        (1000..=1048).contains(&high),
+        "SDM 50% duty ~1024 high over 2048 steps, got {high}"
+    );
+}

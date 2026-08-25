@@ -18,6 +18,7 @@ use xtensa_core::Bus;
 use crate::adc::Adc;
 use crate::aes::Aes;
 use crate::cache::{Cache, CacheTarget};
+use crate::ds::Ds;
 use crate::efuse::Efuse;
 use crate::gdma::{GDMA_BASE, Gdma};
 use crate::gpio::Gpio;
@@ -33,6 +34,7 @@ use crate::rmt::{RMT_BASE, Rmt};
 use crate::rsa::Rsa;
 use crate::rtc::Rtc;
 use crate::sha::Sha;
+use crate::sigmadelta::Sdm;
 use crate::spi::Spi;
 use crate::systimer::Systimer;
 use crate::timg::{INT_T0, INT_T1, INT_WDT, Timg};
@@ -147,10 +149,12 @@ pub struct Soc {
     aes: Aes,
     rsa: Rsa,
     hmac: Hmac,
+    ds: Ds,
     cache: Cache,
     timg: [Timg; 2],
     systimer: Systimer,
     rtc: Rtc,
+    sdm: Sdm,
     intc: Intc,
     /// SENS2 PLL-lock status (TRM SENS2 SAR_PLL_FORCE_CTRL @ 0x6000E040):
     /// rtc_clk powers the CPU PLL, then polls bit 24 (PLL_LOCK) until the
@@ -217,10 +221,12 @@ impl Soc {
             aes: Aes::new(),
             rsa: Rsa::default(),
             hmac: Hmac::new(),
+            ds: Ds::new(),
             cache: Cache::new(),
             timg: [Timg::new(), Timg::new()],
             systimer: Systimer::new(),
             rtc: Rtc::new(),
+            sdm: Sdm::new(),
             intc: Intc::new(),
             pll: PllLock::default(),
             appcpu_ctrl_a: 0,
@@ -398,6 +404,7 @@ impl Soc {
             self.adc.tick(1);
             self.rmt.tick();
             self.mcpwm.tick();
+            self.sdm.tick();
             // PCNT samples its unit/channel signal inputs via the GPIO-matrix
             // input routing (FUNC_IN_SEL_CFG); resolve each signal index to the
             // GPIO pin's current level.
@@ -529,6 +536,9 @@ impl Soc {
         } else if (160..=165).contains(&sig) {
             // MCPWM0 operator 0..2 output A/B (PWM0_OUT0A..OUT2B_IDX).
             self.mcpwm.signal_level(sig)
+        } else if (93..=100).contains(&sig) {
+            // Sigma-Delta channels 0..7 (GPIO_SD0..7_OUT_IDX).
+            self.sdm.signal_level(sig)
         } else {
             self.spi[0].signal_level(sig)
                 | self.spi[1].signal_level(sig)
@@ -563,7 +573,22 @@ impl Soc {
                 }
             }
             GPIO_BASE => {
-                if is_write {
+                // Page 0x6000_4000 also holds the Sigma-Delta block at
+                // 0x6000_4F00 (DR_REG_GPIO_SD_BASE). Route its window to the
+                // SDM device; everything else is plain GPIO. The reserved gap
+                // above the SDM window reads as 0 (no registers mapped).
+                if off >= 0xF00 {
+                    if (0xF00..=0xF28).contains(&off) {
+                        if is_write {
+                            self.sdm.write32(off - 0xF00, value);
+                            0
+                        } else {
+                            self.sdm.read32(off - 0xF00)
+                        }
+                    } else {
+                        0
+                    }
+                } else if is_write {
                     self.gpio.write32(off, value);
                     0
                 } else if off == crate::gpio::GPIO_IN {
@@ -943,6 +968,14 @@ impl Soc {
                     self.hmac.read32(off)
                 }
             }
+            crate::ds::DS_BASE => {
+                if is_write {
+                    self.ds.write32(off, value, &self.efuse);
+                    0
+                } else {
+                    self.ds.read32(off)
+                }
+            }
             // Crypto/shared GDMA (`DR_REG_GDMA_BASE = 0x6003F000`): dedicated DMA
             // for the crypto engines (AES, SHA). Mirrors the general GDMA arm but
             // routes to AES/SHA. AES is the default (the crypto DMA is
@@ -1114,6 +1147,16 @@ impl Soc {
     /// Debug accessor for the GDMA interrupt-pending state (validation harness).
     pub fn gdma_int_pending(&self) -> bool {
         self.gdma.int_pending()
+    }
+
+    /// Debug accessor for the I2C interrupt status (INT_RAW & INT_ENA).
+    pub fn i2c_int_st(&self, n: usize) -> u32 {
+        self.i2c[n].int_st()
+    }
+
+    /// Debug accessor for the I2C raw interrupt bits (INT_RAW).
+    pub fn i2c_int_raw(&self, n: usize) -> u32 {
+        self.i2c[n].int_raw()
     }
 
     /// Debug: per-channel GDMA interrupt/peri state (validation harness).
