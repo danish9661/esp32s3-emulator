@@ -6,6 +6,7 @@
 //! `insn()`; a fixed 4-byte-per-word layout misaligns after the first 3-byte
 //! instruction (verified failure mode 2026-08-15).
 
+use esp32s3_soc::gdma::{GDMA_BASE, GDMA_I2S0_PERIPH};
 use esp32s3_soc::memmap::{
     ASSIST_DEBUG_BASE, GPIO_BASE, I2S0_BASE, I2S1_BASE, IRAM_BASE, LCD_CAM_BASE, PERI_BACKUP_BASE,
     SENSITIVE_BASE, SYSCON_BASE, TIMG0_BASE, UART0_BASE, WCL_BASE,
@@ -1877,5 +1878,47 @@ fn lcd_cam_parallel_drives_gpio_matrix_signals() {
         (out >> cs_pin) & 1,
         0,
         "LCD CS active (low) during transfer"
+    );
+}
+
+/// The esp-idf GDMA path for I2S: an `out` channel with `peri_sel == 3`
+/// (I2S0) copies its descriptor's words into the I2S0 TX FIFO. Starting a
+/// loopback TX then shifts those words into the I2S0 RX FIFO, which a
+/// subsequent `read32(FIFO)` must return in order.
+#[test]
+fn i2s_gdma_out_feeds_tx_fifo() {
+    let i2s_fifo = I2S0_BASE + 0x80;
+    let i2s_tx_conf = I2S0_BASE + 0x24;
+    let i2s_int_raw = I2S0_BASE + 0x0C;
+    let desc = 0x3FC8_1000;
+    let buf = 0x3FC8_2000;
+    let mut m = Esp32S3::new();
+    // Descriptor: owner=1, eof=1, length=8 bytes (2 words).
+    m.soc
+        .write32(desc, (1u32 << 31) | (1u32 << 30) | (8u32 << 12));
+    m.soc.write32(desc + 4, buf); // buffer pointer
+    m.soc.write32(desc + 8, 0); // next = end
+    m.soc.write32(buf, 0x1122_3344);
+    m.soc.write32(buf + 4, 0x5566_7788);
+    // Wire GDMA channel 0 OUT to I2S0 and start the link. The OUT_LINK start
+    // register is at channel-offset 0x80 (OUT block base 0x60 + 0x20).
+    m.soc.write32(GDMA_BASE + 0xA8, GDMA_I2S0_PERIPH); // out_peri_sel[0]
+    m.soc
+        .write32(GDMA_BASE + 0x80, (desc & 0x000F_FFFF) | (1 << 21)); // out_link start
+    // Start I2S0 TX with loopback so the FIFO words arrive at RX.
+    m.soc.write32(i2s_tx_conf, (1 << 27) | (1 << 2)); // SIG_LOOPBACK | TX_START
+    m.soc.tick_timers(200);
+    assert_eq!(
+        m.soc.read32(i2s_int_raw) & (1 << 1),
+        1 << 1,
+        "I2S tx_done fired"
+    );
+    let rx0 = m.soc.read32(i2s_fifo);
+    let rx1 = m.soc.read32(i2s_fifo);
+    assert!(
+        rx0 == 0x1122_3344 && rx1 == 0x5566_7788,
+        "RX words mismatch: rx0={:#x} rx1={:#x}",
+        rx0,
+        rx1
     );
 }

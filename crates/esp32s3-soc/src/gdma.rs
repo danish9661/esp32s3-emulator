@@ -61,6 +61,13 @@ pub const GDMA_SHA_PERIPH: u32 = 7;
 /// `SOC_GDMA_TRIG_PERIPH_AES0`).
 pub const GDMA_AES_PERIPH: u32 = 6;
 
+/// I2S0 / I2S1 peripheral ids for `peri_sel` (`soc/gdma_channel.h`
+/// `SOC_GDMA_TRIG_PERIPH_I2S0` = 3, `SOC_GDMA_TRIG_PERIPH_I2S1` = 4). The GDMA
+/// `out` channel copies descriptor words into the I2S TX FIFO register; the
+/// `in` channel copies words out of the I2S RX FIFO register.
+pub const GDMA_I2S0_PERIPH: u32 = 3;
+pub const GDMA_I2S1_PERIPH: u32 = 4;
+
 pub struct Gdma {
     /// When true, `int_pending` reports any RAW interrupt (ignoring the
     /// per-channel enable). The crypto/shared GDMA (`0x6003F000`) is used by

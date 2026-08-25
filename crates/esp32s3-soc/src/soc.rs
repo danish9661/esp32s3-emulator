@@ -757,7 +757,7 @@ impl Soc {
                         // Walk the descriptor chain. Descriptor addresses are
                         // in DRAM; the link register holds the 20 LSBs
                         // (GDMA_DESC_BASE), buffer/next are full 32-bit
-                        // addresses. Copy `length` bytes between each buffer and
+                        // addresses. Copy `length` bytes between each frame and
                         // the connected peripheral.
                         let mut desc = link_addr;
                         loop {
@@ -857,6 +857,31 @@ impl Soc {
                                             break;
                                         }
                                     }
+                                } else if peri == crate::gdma::GDMA_I2S0_PERIPH {
+                                    // I2S0 TX: copy the descriptor's words into the
+                                    // I2S0 TX FIFO register (each 32-bit write is
+                                    // one FIFO push).
+                                    let mut k = 0u32;
+                                    while k + 4 <= len {
+                                        let w = self.read32(buf + k);
+                                        self.write32(
+                                            crate::memmap::I2S0_BASE + crate::i2s::FIFO,
+                                            w,
+                                        );
+                                        k += 4;
+                                    }
+                                    self.gdma.set_out_eof_des_addr(ch, desc);
+                                } else if peri == crate::gdma::GDMA_I2S1_PERIPH {
+                                    let mut k = 0u32;
+                                    while k + 4 <= len {
+                                        let w = self.read32(buf + k);
+                                        self.write32(
+                                            crate::memmap::I2S1_BASE + crate::i2s::FIFO,
+                                            w,
+                                        );
+                                        k += 4;
+                                    }
+                                    self.gdma.set_out_eof_des_addr(ch, desc);
                                 }
                             } else {
                                 // IN (RX) channel: copy from the peripheral's data
@@ -875,6 +900,24 @@ impl Soc {
                                     // driver's completion ISR fires regardless of
                                     // whether the RX link was started before or
                                     // after the TX link.
+                                    self.gdma.raise_in_done(ch);
+                                } else if peri == crate::gdma::GDMA_I2S0_PERIPH
+                                    || peri == crate::gdma::GDMA_I2S1_PERIPH
+                                {
+                                    // I2S RX: copy words out of the I2S RX FIFO
+                                    // register into the descriptor's DRAM buffer
+                                    // (each read pops one FIFO word).
+                                    let fifo = if peri == crate::gdma::GDMA_I2S0_PERIPH {
+                                        crate::memmap::I2S0_BASE + crate::i2s::FIFO
+                                    } else {
+                                        crate::memmap::I2S1_BASE + crate::i2s::FIFO
+                                    };
+                                    let mut k = 0u32;
+                                    while k + 4 <= len {
+                                        let w = self.read32(fifo);
+                                        self.write32(buf + k, w);
+                                        k += 4;
+                                    }
                                     self.gdma.raise_in_done(ch);
                                 }
                             }

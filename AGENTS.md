@@ -1506,9 +1506,79 @@ Core design:
     data source. Machine test `lcd_cam_parallel_drives_gpio_matrix_signals`
     routes DATA0/CS to pins and confirms `gpio_output()`. Signal indices from
     esp-idf `gpio_sig_map.h` (LCD_CAM 132..154, I2S0 22..27, I2S1 28..32).
-    **KNOWN LIMITATIONS**: I2S RX has no data source (RX FIFO empty, no
-    `rx_done`); I2S master/slave clock-gen, TDM, PDM and the esp-idf DMA path
-    are not modeled (fixed 1-bit-per-step shift rate). LCD_CAM's 8080/6800/RGB
-    FSM and the LCD_WR/LCD_RS signal wiring beyond DC/PCLK/CS are not modeled.
-    All workspace tests green; clippy clean (host + `wasm32`); `cargo fmt`
-    clean.
+     I2S RX now has a data source too: `I2s::inject_rx(word)` pushes into an
+     injected-RX FIFO (read back via `read32(FIFO)`), and `sig_loopback` (bit
+     27 of `TX_CONF`) feeds each transmitted word back into the RX FIFO and
+     raises `rx_done` (bit 0 of the INT block) when the loopback TX completes —
+     so the RX path (FIFO + `rx_done`) is fully exercisable without an external
+     codec. Bit fields corrected against `i2s_struct.h`: `tx_bit_order` is
+     **bit 18 of `TX_CONF`** (was wrongly read as bit 17 of `TX_CONF1`),
+     `rx_bit_order` = bit 18 of `RX_CONF`, `tx_bits_mod`/`rx_bits_mod` =
+     `CONF1` bits 13-17 (+1, 16 if 0). `INT_RAW/ST/ENA/CLR` at 0x0C/0x10/
+     0x14/0x18 (bits 0=rx_done,1=tx_done,2=rx_hung,3=tx_hung). 7 unit tests
+     (`tests` in i2s.rs: TX shift-out + `tx_done`, msb/lsb-first, injected RX
+     + `rx_done`, loopback TX→RX, loopback-after-prior-TX, config round-trip)
+     + machine test + arduino-cli poke sketch `esp32s3_i2s` (`I2S POKE PASS`
+     under `run_flash`, now also asserts `rx_done` + loopback `rx_word`).
+     **LCD_CAM now drives its parallel output onto the GPIO matrix during a
+     transfer** (`lcd_cam.rs` `tick` + `signal_level`): each TX FIFO word is
+     presented on `LCD_DATA_OUT0..15` (sig 133..148) for one `LCD_PCLK` (sig
+     154) cycle, asserting `LCD_CS` (sig 132, active low) and `LCD_DC` (sig
+     153, from `LCD_USER` bit 26) for the duration; the camera (RX) path has no
+     data source. Machine test `lcd_cam_parallel_drives_gpio_matrix_signals`
+     routes DATA0/CS to pins and confirms `gpio_output()`. Signal indices from
+     esp-idf `gpio_sig_map.h` (LCD_CAM 132..154, I2S0 22..27, I2S1 28..32).
+      **KNOWN LIMITATIONS**: I2S master/slave clock-gen, TDM, PDM and the
+      esp-idf DMA path are not modeled (fixed 1-bit-per-step shift rate);
+      LCD_CAM's 8080/6800/RGB FSM and the LCD_WR/LCD_RS signal wiring beyond
+      DC/PCLK/CS are not modeled. All workspace tests green; clippy clean (host
+      + `wasm32`); `cargo fmt` clean.
+
+  - 2026-08-26: **I2S RX limitation fixed (P5)**. The previously-documented
+    "I2S RX has no data source" gap is closed. `esp32s3-soc/src/i2s.rs` gained
+    `inject_rx(word)` (pushes into an injected-RX FIFO, read back via
+    `read32(FIFO)`) and `sig_loopback` (bit 27 of `TX_CONF`): when set, each
+    transmitted word is copied into the RX FIFO and `rx_done` (INT bit 0) is
+    raised on TX completion — exercising the full RX data path with no external
+    codec. Also corrected the bit-field offsets against `i2s_struct.h`:
+    `tx_bit_order` is **bit 18 of `TX_CONF`** (the old model read bit 17 of
+    `TX_CONF1` and produced a reversed/incorrect serial stream), `rx_bit_order`
+    = bit 18 of `RX_CONF`, `tx_bits_mod`/`rx_bits_mod` = `CONF1` bits 13-17
+    (+1, 16 if 0); `INT_RAW/ST/ENA/CLR` at 0x0C/0x10/0x14/0x18 (bits
+    0=rx_done,1=tx_done,2=rx_hung,3=tx_hung). 7 unit tests in `i2s.rs` (added
+    `injected_rx_fills_fifo_and_asserts_rx_done`, `loopback_tx_feeds_rx`,
+    `loopback_after_prior_tx`, `lsb_first_matches_word`) + the existing TX
+    machine test + the arduino-cli poke sketch `esp32s3_i2s` extended to assert
+    `rx_done` and the loopback `rx_word` (now prints `I2S POKE PASS` with
+    `rx_word=CAFE`). All workspace tests green, clippy/`wasm32` clean, `cargo
+    fmt` clean. **I2S is retired as a P5 candidate** (the only remaining I2S
+    gaps are master/slave clock-gen, TDM, PDM and the esp-idf DMA path — noted
+    as out-of-scope limitations).
+
+  - 2026-08-26: **I2S master/slave clock-gen, TDM, PDM, and esp-idf GDMA path
+    all modeled (P5 — remaining I2S gaps closed)**. `esp32s3-soc/src/i2s.rs`
+    now models: (1) **clock generation** — `tx_clkm_div_num`/`rx_clkm_div_num`
+    (`TX/RX_CLKM_DIV_CONF` 0x3C/0x38) set the BCK half-cycle period in emulator
+    steps; master mode drives BCK/WS/SD internally, `tx_slave_mod`/`rx_slave_mod`
+    (`RX/TX_CONF` bit 3) select slave mode (external clock not simulated);
+    (2) **TDM** — `tx_tdm_en` (`TX_CONF` bit 19) + `tx_tdm_tot_chan_num`
+    (`TX_TDM_CTRL` 0x54, bits 16-19, 0-based so slots = tot+1) produce a
+    multi-slot frame (each slot shifts one FIFO word, WS toggles per slot);
+    when TDM is off, `tx_chan_mod` (`TX_CONF` bits 24-26) selects 1/2/4 slots;
+    (3) **PDM** — `tx_pdm_en` (`TX_CONF` bit 20) re-encodes each transmitted
+    word as a first-order sigma-delta PDM bitstream on SD (unsigned sample,
+    half-scale comparator). The **GDMA path** is wired in `soc.rs`:
+    `peri_sel == 3/4` (I2S0/I2S1) copies descriptor words into the TX FIFO
+    register (OUT channel) and copies the RX FIFO register into the descriptor
+    buffer (IN channel); GDMA constants `GDMA_I2S0_PERIPH=3`/`GDMA_I2S1_PERIPH=4`
+    added in `gdma.rs` (from `gdma_channel.h` — matches the real S3 layout where
+    the OUT_LINK `start` bit is **bit 21 at channel-offset 0x80**, IN_LINK
+    `start` bit 22 at 0x20; the earlier 0x60 I used was `out_conf0`, not the
+    link register). 11 unit tests in `i2s.rs` (`clock_divisor_slows_bck`,
+    `master_slave_mode_gates_clock`, `tdm_multi_slot_shifts_multiple_words`,
+    `pdm_encodes_extremes`, …) + machine test `i2s_gdma_out_feeds_tx_fifo` (GDMA
+    OUT → I2S0 TX → loopback RX returns the descriptor words) + the arduino-cli
+    poke sketch `esp32s3_i2s` extended with TDM/PDM/clock/GMDA parts → all 6
+    parts print `I2S POKE PASS` (`tdm0/1`, `pdm_rx`, `clk_div=4`, `dma0/1`) under
+    `run_flash`. All workspace tests green, clippy/host + `wasm32` clean. **I2S
+    is fully retired as a P5 candidate** (no remaining documented limitations).
