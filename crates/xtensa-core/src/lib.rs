@@ -412,7 +412,7 @@ mod cpu_tests {
         put(&mut prog, &mut a, 0x0000_20F0); // nop
         put(&mut prog, &mut a, 0x0000_20F0); // nop
         put(&mut prog, &mut a, 0x0000_20F0); // nop
-        let callx0_pc = a;
+        let _callx0_pc = a;
         put(&mut prog, &mut a, 0x0000_04C0); // callx0 a4          ; pc ≡ 1 mod 4
         put(&mut prog, &mut a, 0x0011_6322); // s32i a2, a3, 0x44  ; mem[0x44] = ps after callx0
         put(&mut prog, &mut a, 0x0060_A012); // movi a1, 0x60      ; sp for the call4 chain

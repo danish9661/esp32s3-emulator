@@ -152,11 +152,16 @@ impl Esp32S3 {
     pub fn boot_from_flash(&mut self, flash: &[u8]) {
         self.flash = flash.to_vec();
         self.soc.load_flash_image(0, flash);
+        // Pick the app slot: OTA images select ota_0/ota_1 via the otadata
+        // partition; non-OTA images fall back to the factory slot at
+        // APP_FLASH_OFFSET (0x10000).
+        let app_off =
+            crate::partition::select_ota_boot_offset(flash).unwrap_or(rom_stub::APP_FLASH_OFFSET);
         // Pre-map the app's flash-mapped segments (.flash.text/.flash.rodata)
         // in the cache MMU — the real 2nd-stage bootloader maps them instead
         // of copying (the ROM stub's copy loop cannot write the read-only
         // windows).
-        self.soc.map_app_flash_segments(rom_stub::APP_FLASH_OFFSET);
+        self.soc.map_app_flash_segments(app_off);
         // The stub's own flash reads must NOT go through that MMU (it reads
         // the image the way the real ROM reads flash — via SPI, MMU-free).
         self.soc.set_rom_boot_mode(true);

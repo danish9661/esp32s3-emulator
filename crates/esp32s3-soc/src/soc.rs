@@ -27,6 +27,7 @@ use crate::hmac::Hmac;
 use crate::i2c::I2c;
 use crate::intc::Intc;
 use crate::ledc::Lcdc;
+use crate::lp_uart::LpUart;
 use crate::mcpwm::{MCPWM_BASE, Mcpwm};
 use crate::memmap::*;
 use crate::memspi::Memspi;
@@ -35,6 +36,7 @@ use crate::rmt::{RMT_BASE, Rmt};
 use crate::rng::Rng;
 use crate::rsa::Rsa;
 use crate::rtc::Rtc;
+use crate::rtc_i2c::RtcI2c;
 use crate::rtc_io::RtcIo;
 use crate::sdmmc::Sdmmc;
 use crate::sha::Sha;
@@ -132,6 +134,7 @@ pub struct Soc {
     gpio: Gpio,
     ledc: Lcdc,
     mcpwm: Mcpwm,
+    lp_uart: LpUart,
     spi: [Spi; 2],
     /// SPI1 (0x60002000) + SPIMEM0 (0x60003000) flash controllers, sharing
     /// the `flash` backing (see `crate::memspi`).
@@ -159,6 +162,7 @@ pub struct Soc {
     timg: [Timg; 2],
     systimer: Systimer,
     rtc: Rtc,
+    rtc_i2c: RtcI2c,
     rtc_io: RtcIo,
     rng: Rng,
     sdmmc: Sdmmc,
@@ -211,6 +215,7 @@ impl Soc {
             gpio: Gpio::new(),
             ledc: Lcdc::new(),
             mcpwm: Mcpwm::new(),
+            lp_uart: LpUart::new(),
             spi: [Spi::new(0), Spi::new(1)],
             memspi: [Memspi::new(), Memspi::new()],
             i2c: [I2c::new(0), I2c::new(1)],
@@ -235,6 +240,7 @@ impl Soc {
             timg: [Timg::new(), Timg::new()],
             systimer: Systimer::new(),
             rtc: Rtc::new(),
+            rtc_i2c: RtcI2c::new(),
             rtc_io: RtcIo::new(),
             rng: Rng::new(),
             sdmmc: Sdmmc::new(),
@@ -635,12 +641,24 @@ impl Soc {
                 }
             }
             SPI2_BASE | SPI3_BASE => {
-                let n = if dev == SPI2_BASE { 0 } else { 1 };
-                if is_write {
-                    self.spi[n].write32(off, value);
-                    0
+                // LP_UART (0x6002_5400) shares the GPSPI3 4KB page but sits at
+                // offset 0x400, past SPI3's register block (< 0x400).
+                if dev == SPI3_BASE && off >= 0x400 {
+                    let lp_off = off - 0x400;
+                    if is_write {
+                        self.lp_uart.write32(lp_off, value);
+                        0
+                    } else {
+                        self.lp_uart.read32(lp_off)
+                    }
                 } else {
-                    self.spi[n].read32(off)
+                    let n = if dev == SPI2_BASE { 0 } else { 1 };
+                    if is_write {
+                        self.spi[n].write32(off, value);
+                        0
+                    } else {
+                        self.spi[n].read32(off)
+                    }
                 }
             }
             // SPI1 (SPIMEM1) + SPI0 (SPIMEM0): flash controller registers;
@@ -848,9 +866,10 @@ impl Soc {
             }
             // Page 0x6000_8000 holds RTC_CNTL (0x000), RTC_IO (0x400),
             // SENS (0x800, the SAR ADC RTC oneshot controller) and
-            // RTC_MEM (0xC00); RTC_CNTL's slow-clock timer is modeled
-            // (rtc_time_get drives boot timeout loops); RTC_IO is modeled
-            // as a register store (see rtc_io.rs); RTC_MEM is not.
+            // RTC_I2C (0xC00); RTC_CNTL's slow-clock timer is modeled
+            // (rtc_time_get drives boot timeout loops); RTC_IO and RTC_I2C
+            // are modeled as register stores (see rtc_io.rs / rtc_i2c.rs);
+            // RTC_MEM is not.
             0x6000_8000 => {
                 if in_range!(off, 0x800, 0x400) {
                     if is_write {
@@ -858,6 +877,14 @@ impl Soc {
                         0
                     } else {
                         self.adc.sens_read32(off - 0x800)
+                    }
+                } else if in_range!(off, 0xC00, 0x100) {
+                    // RTC_I2C (LP/I2C) block at offset 0xC00 of this page.
+                    if is_write {
+                        self.rtc_i2c.write32(off, value);
+                        0
+                    } else {
+                        self.rtc_i2c.read32(off)
                     }
                 } else if off < 0x400 {
                     // RTC_CNTL page (0x000..0x400).  The ULP-RISC-V control

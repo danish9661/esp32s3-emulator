@@ -269,6 +269,66 @@ fn boot_path_loads_app_from_flash() {
     assert_eq!(parse_partition_table(&flash).unwrap().len(), 1);
 }
 
+#[test]
+fn ota_boot_selects_active_slot() {
+    use crate::asm::Asm;
+    use crate::partition::select_ota_boot_offset;
+    use esp32s3_soc::memmap::IRAM_BASE;
+
+    // OTA app (slot 1) located at 0x200000, distinct from the factory slot.
+    // `li` is an ALU sequence (no literal pool), so entry = IRAM_BASE (first
+    // instruction), unlike the boot_path test which pads a literal pool.
+    const APP_ENTRY: u32 = IRAM_BASE;
+    const STASH: u32 = 0x3FC8_0400;
+    let mut a = Asm::new(IRAM_BASE);
+    a.li(4, 0x1234);
+    a.li(5, STASH as i32);
+    a.s32i(4, 5, 0);
+    let here = a.pc();
+    a.j(here);
+    let app = a.bytes().to_vec();
+
+    let img = esp_app_image(IRAM_BASE, APP_ENTRY, &app);
+    let mut flash = std::vec![0xFFu8; 0x300_000];
+    // Partition table at 0x8000: ota_1 + otadata.
+    flash[0x8000] = 0x50;
+    flash[0x8001] = 0xAA;
+    // entry 0: ota_1 (app, subtype 0x11) @ 0x200000
+    flash[0x8002] = 0x00;
+    flash[0x8003] = 0x11;
+    flash[0x8004..0x8008].copy_from_slice(&0x200000u32.to_le_bytes());
+    flash[0x8008..0x800C].copy_from_slice(&0x100000u32.to_le_bytes());
+    flash[0x8010..0x8020].copy_from_slice(b"ota_1\0\0\0\0\0\0\0\0\0\0\0");
+    // entry 1: otadata (data, subtype 0x39) @ 0xe000
+    flash[0x8020] = 0x50;
+    flash[0x8021] = 0xAA;
+    flash[0x8022] = 0x01;
+    flash[0x8023] = 0x39;
+    flash[0x8024..0x8028].copy_from_slice(&0xe000u32.to_le_bytes());
+    flash[0x8028..0x802C].copy_from_slice(&0x2000u32.to_le_bytes());
+    flash[0x8030..0x8040].fill(0);
+    flash[0x8030..0x8040].copy_from_slice(b"otadata\0\0\0\0\0\0\0\0\0");
+    flash[0x8040] = 0xEB;
+    flash[0x8041] = 0xEB;
+    // otadata: slot0 invalid, slot1 valid (seq 1).
+    flash[0xe000..0xe004].copy_from_slice(&0u32.to_le_bytes());
+    flash[0xe020..0xe024].copy_from_slice(&0x8000_0001u32.to_le_bytes());
+
+    assert_eq!(select_ota_boot_offset(&flash), Some(0x200000));
+    flash[0x200000 as usize..0x200000 as usize + img.len()].copy_from_slice(&img);
+
+    let mut m = Esp32S3::new();
+    m.boot_from_flash(&flash);
+    for _ in 0..2000 {
+        if m.cpu[0].pc == here {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.cpu[0].pc, here, "OTA app reached its self-loop");
+    assert_eq!(m.soc.read32(STASH), 0x1234, "OTA slot-1 app executed");
+}
+
 /// ESP-IDF-style app image with multiple segments: 24-byte header (byte 1 =
 /// segment count) followed by `(load_addr, data)` segments read back-to-back
 /// (the ROM stub does not pad/checksum segments).
@@ -1604,6 +1664,34 @@ fn sdmmc_registers_round_trip() {
     assert_eq!(m.soc.read32(SDMMC_BASE + 0x00), 0x000F_0001);
     assert_eq!(m.soc.read32(SDMMC_BASE + 0x2C), 0x8020_0000);
     assert_eq!(m.soc.read32(SDMMC_BASE + 0x30), 0xCAFE_BEEF);
+}
+
+#[test]
+fn rtc_i2c_registers_round_trip() {
+    use esp32s3_soc::rtc_i2c::RTC_I2C_BASE;
+
+    let mut m = Esp32S3::new();
+    // RTC_I2C (LP/I2C) block at 0x6000_8C00.
+    m.soc.write32(RTC_I2C_BASE + 0x00, 0x0000_0032); // I2C_SCL_LOW
+    m.soc.write32(RTC_I2C_BASE + 0x04, 0x0000_0064); // I2C_SCL_HIGH
+    m.soc.write32(RTC_I2C_BASE + 0x0C, 0x00FF_00AA); // I2C_CTRL
+    assert_eq!(m.soc.read32(RTC_I2C_BASE + 0x00), 0x0000_0032);
+    assert_eq!(m.soc.read32(RTC_I2C_BASE + 0x04), 0x0000_0064);
+    assert_eq!(m.soc.read32(RTC_I2C_BASE + 0x0C), 0x00FF_00AA);
+}
+
+#[test]
+fn lp_uart_registers_round_trip() {
+    use esp32s3_soc::lp_uart::LP_UART_BASE;
+
+    let mut m = Esp32S3::new();
+    // LP_UART block at 0x6002_5400 (shares the GPSPI3 page).
+    m.soc.write32(LP_UART_BASE + 0x00, 0x0000_00AB); // FIFO
+    m.soc.write32(LP_UART_BASE + 0x14, 0x00AA_00BB); // CLKDIV
+    m.soc.write32(LP_UART_BASE + 0x20, 0x1234_5678); // CONF0
+    assert_eq!(m.soc.read32(LP_UART_BASE + 0x00), 0x0000_00AB);
+    assert_eq!(m.soc.read32(LP_UART_BASE + 0x14), 0x00AA_00BB);
+    assert_eq!(m.soc.read32(LP_UART_BASE + 0x20), 0x1234_5678);
 }
 
 /// Poke the legacy deep-sleep path directly (mirrors the `esp32s3_deepsleep_poke`

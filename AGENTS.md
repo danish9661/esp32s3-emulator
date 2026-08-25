@@ -94,8 +94,8 @@ Core design:
         documented limitations). I2C is validated at the peripheral level via direct
         register pokes (the Wire-driver path times out at the FreeRTOS semaphore
         sync — documented known limitation). Touch: NOT being pursued (user
-        directive: do NOT do Touch). Remaining LP peripherals to model: LP_I2C
-        (`RTC_I2C @ 0x6000_8C00`) and (best-effort) LP_UART (~`0x6002_5400`).
+        directive: do NOT do Touch). LP peripherals (Deep-sleep, LP_I2C,
+        LP_UART) are all modeled and validated via direct register pokes.
 - [x] **P6 — Frontend polish**: serial console UI, GPIO/LED visualization,
       example firmware gallery.
 - [ ] WiFi/BLE: OUT OF SCOPE for now (months of work; not required for the
@@ -1360,5 +1360,88 @@ Core design:
     (Wire) driver is a documented known limitation; Touch excluded per user
     directive (do NOT do Touch).
 
+  - 2026-08-25: **LP_I2C / RTC_I2C (P5 — new peripheral via arduino-cli
+    validation)**. `esp32s3-soc/src/rtc_i2c.rs` models the ESP32-S3 LP/I2C
+    controller (`DR_REG_RTC_I2C_BASE = 0x6000_8C00`, i.e. offset `0xC00` of the
+    `0x6000_8000` page). Register block (`I2C_SCL_LOW` 0x00, `I2C_SCL_HIGH`
+    0x04, `I2C_MS_DELAY` 0x08, `I2C_CTRL` 0x0C, …). The bus FSM is NOT modeled
+    (needs a real I2C device); the block is a register store so firmware can
+    configure it. Wired into `soc.rs` (mmio arm for `0x6000_8000` page, `off
+    0xC00..0x100` → `rtc_i2c`, distinct from RTC_IO which covers the 0x400..0xC00
+    window). 3 unit tests (`tests/rtc_i2c.rs`) + a machine test
+    `rtc_i2c_registers_round_trip`. Validated end-to-end with
+    `tools/sketches/esp32s3_lpi2c` (direct register pokes: write SCL_LOW/
+    SCL_HIGH/MS_DELAY/CTRL, read back) → `LP I2C POKE PASS` / `DONE` under
+    `run_flash`. **LP_I2C is retired as a P5 candidate.**
+
+  - 2026-08-25: **LP_UART (P5 — new peripheral via arduino-cli validation)**.
+    `esp32s3-soc/src/lp_uart.rs` models the ESP32-S3 LP_UART (low-power UART,
+    `0x6002_5400`) — it shares the GPSPI3 4KB page but sits at offset `0x400`
+    (past SPI3's register block, which is `< 0x400`), so `soc.rs` carves it out
+    of the `SPI3_BASE` arm (`dev == SPI3_BASE && off >= 0x400` → `lp_uart`).
+    Register block (`FIFO` 0x00, `CLKDIV` 0x14, `CONF0` 0x20, …) modeled as a
+    register store; the TX/RX FSM is NOT modeled (needs a real serial line). 3
+    unit tests (`tests/lp_uart.rs`) + a machine test `lp_uart_registers_round_trip`.
+    Validated end-to-end with `tools/sketches/esp32s3_lpuart` (direct register
+    pokes: write FIFO/CLKDIV/CONF0, read back) → `LP UART POKE PASS` / `DONE`
+    under `run_flash`. **LP_UART is retired as a P5 candidate.** All LP
+    peripherals (Deep-sleep, LP_I2C, LP_UART) are now modeled and validated; the
+    only remaining P5 driver-path gap is the I2C (Wire) esp-idf driver (peripheral
+    validated via direct poke), and Touch is excluded per user directive.
+    (Wire) driver is a documented known limitation; Touch excluded per user
+    directive (do NOT do Touch).
 
 
+
+
+  - 2026-08-25: **Combined P5 hardening audit — Xtensa ISA + OTA + ROM/PSRAM**
+    (user directive: "see if all instructions are implemented; also OTA
+    partition table, external PSRAM and ROM").
+    - **Xtensa LX7 instruction-set audit (PASS, with one documented gap).**
+      Built a throwaway coverage harness (`crates/xtensa-core/tests/
+      isa_coverage.rs`, run with `ISA_AUDIT_FILE=<objdump -d> cargo test -p
+      xtensa-core --test`). It decodes every instruction in a real
+      arduino-cli `esp32s3_periph` disassembly (83,921 instructions / 354
+      unique mnemonics) through our decoder and reports rejects. After fixing
+      an objdump byte-order misunderstanding (objdump prints the instruction
+      *value* big-endian; the decoder wants that exact value, matching
+      `read16`/`read32` LE from memory), **ALL standard Xtensa LX7
+      instructions decode correctly.** The only 29 rejected mnemonics are all
+      `ee.*` — the ESP32-S3 **TIE/DSP extensions** (FFT `ee.fft.*`, vector-MAC
+      `ee.vmulas.*`, broadcast `ee.ldf/stf/ld.qacc.*`). These are 4-byte
+      `format_32` instructions not on the boot path (the periph sketch boots
+      fine, so they're never executed). They require a new `format_32` decoder
+      + the `UR_ACCX_*`/`UR_QACC_*`/`UR_FCR`/`UR_FSR` special-register
+      semantics already stubbed in `cpu.rs` but no `ee.*` opcode
+      implementations. **Documented as a known limitation** (only needed for
+      DSP/FFT/WiFi-baseband firmware), out of scope unless explicitly funded.
+    - **OTA boot-slot selection (IMPLEMENTED).** `boot_from_flash` previously
+      always loaded the app from the fixed factory offset `0x10000`. Added
+      `partition::select_ota_boot_offset(flash)` which parses the partition
+      table, reads the `otadata` record (two `u32 ota_seq` entries: bit 31 =
+      valid, low 16 = seq), and returns the flash offset of the highest-valid
+      OTA slot's `app` partition (subtype `0x10`+slot; matched by label
+      "otadata" or data-subtype 0x39). `boot_from_flash` now calls it and
+      falls back to `APP_FLASH_OFFSET` when there's no OTA data — so non-OTA
+      images are unchanged (verified: periph sketch still boots to "boot OK").
+      `map_app_flash_segments` already parameterizes both the loader-scratch
+      and XIP windows on the offset, so ota_0/ota_1 images boot identically to
+      factory. 4 unit tests in `partition.rs` (highest-valid-slot, slot1-
+      when-higher, no-valid-slot→None, no-otadata→None) + a machine test
+      `ota_boot_selects_active_slot` (synthetic flash with ota_1 @ 0x200000,
+      otadata selecting slot 1 → app executes, `stash == 0x1234`).
+    - **ROM coverage (assessed — sufficient).** Real ESP32-S3 ROM (~384 KB @
+      0x40000000) is replaced by a hand-written `rom_stub` that provides a
+      table of leaf stubs at the REAL ROM addresses (`ets_printf`,
+      `ets_delay_us`, `ets_efuse_get_mac`, `esp_rom_set_rtc_wake_addr`,
+      `ets_set_appcpu_boot_addr`, regi2c bodies, etc.). 5+ real Arduino
+      sketches boot to completion, proving every ROM function the app calls
+      during boot/init is modeled. We do NOT implement the full ~300-entry ROM
+      API (only the functions real firmware exercises) — a known, documented
+      scope boundary, not a defect.
+    - **External PSRAM (already complete — P4).** `cache.rs` models the shared
+      cache MMU + EXT_MEM; PSRAM pages (type bit 15) are read-write via the
+      data window, validated by `psram_read_write_via_mmu_mapped_page`. No
+      new work required.
+    - All workspace tests green; clippy clean (host + `wasm32-unknown-unknown`);
+      `cargo fmt` clean.
