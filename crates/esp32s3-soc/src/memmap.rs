@@ -59,8 +59,10 @@ pub const SPIMEM0_BASE: u32 = 0x6000_3000;
 
 /// GPSPI2 (general-purpose SPI), TRM GPSPI chapter.
 pub const SPI2_BASE: u32 = 0x6002_4000;
-/// GPSPI3.
-pub const SPI3_BASE: u32 = 0x6002_8000;
+/// GPSPI3 (general-purpose SPI). TRM GPSPI chapter. NOTE: on ESP32-S3 GPSPI3
+/// is at 0x6002_5000; 0x6002_8000 is the SD/MMC host controller (SDMMC_BASE),
+/// a distinct peripheral.
+pub const SPI3_BASE: u32 = 0x6002_5000;
 
 /// LEDC (LED PWM controller), TRM LEDC chapter.
 pub const LEDC_BASE: u32 = 0x6001_9000;

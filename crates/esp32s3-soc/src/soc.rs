@@ -31,8 +31,11 @@ use crate::memmap::*;
 use crate::memspi::Memspi;
 use crate::pcnt::{PCNT_BASE, Pcnt};
 use crate::rmt::{RMT_BASE, Rmt};
+use crate::rng::Rng;
 use crate::rsa::Rsa;
 use crate::rtc::Rtc;
+use crate::rtc_io::RtcIo;
+use crate::sdmmc::Sdmmc;
 use crate::sha::Sha;
 use crate::sigmadelta::Sdm;
 use crate::spi::Spi;
@@ -40,6 +43,7 @@ use crate::systimer::Systimer;
 use crate::timg::{INT_T0, INT_T1, INT_WDT, Timg};
 use crate::twai::{TWAI_BASE, Twai};
 use crate::uart::Uart;
+use crate::ulp::Ulp;
 
 macro_rules! in_range {
     ($addr:expr, $base:expr, $size:expr) => {
@@ -154,6 +158,10 @@ pub struct Soc {
     timg: [Timg; 2],
     systimer: Systimer,
     rtc: Rtc,
+    rtc_io: RtcIo,
+    rng: Rng,
+    ulp: Ulp,
+    sdmmc: Sdmmc,
     sdm: Sdm,
     intc: Intc,
     /// SENS2 PLL-lock status (TRM SENS2 SAR_PLL_FORCE_CTRL @ 0x6000E040):
@@ -226,6 +234,10 @@ impl Soc {
             timg: [Timg::new(), Timg::new()],
             systimer: Systimer::new(),
             rtc: Rtc::new(),
+            rtc_io: RtcIo::new(),
+            rng: Rng::new(),
+            ulp: Ulp::new(),
+            sdmmc: Sdmmc::new(),
             sdm: Sdm::new(),
             intc: Intc::new(),
             pll: PllLock::default(),
@@ -837,7 +849,8 @@ impl Soc {
             // Page 0x6000_8000 holds RTC_CNTL (0x000), RTC_IO (0x400),
             // SENS (0x800, the SAR ADC RTC oneshot controller) and
             // RTC_MEM (0xC00); RTC_CNTL's slow-clock timer is modeled
-            // (rtc_time_get drives boot timeout loops), RTC_IO/MEM are not.
+            // (rtc_time_get drives boot timeout loops); RTC_IO is modeled
+            // as a register store (see rtc_io.rs); RTC_MEM is not.
             0x6000_8000 => {
                 if in_range!(off, 0x800, 0x400) {
                     if is_write {
@@ -845,6 +858,14 @@ impl Soc {
                         0
                     } else {
                         self.adc.sens_read32(off - 0x800)
+                    }
+                 } else if in_range!(off, crate::ulp::ULP_OFF_START, crate::ulp::ULP_OFF_END - crate::ulp::ULP_OFF_START) {
+                    // ULP-RISC-V control/status block (off 0x100..0x200).
+                    if is_write {
+                        self.ulp.write32(addr, value);
+                        0
+                    } else {
+                        self.ulp.read32(addr)
                     }
                 } else if off < 0x400 {
                     if is_write {
@@ -854,7 +875,12 @@ impl Soc {
                         self.rtc.read32(off)
                     }
                 } else {
-                    0
+                    if is_write {
+                        self.rtc_io.write32(off, value);
+                        0
+                    } else {
+                        self.rtc_io.read32(off)
+                    }
                 }
             }
             APB_SARADC_BASE => {
@@ -974,6 +1000,22 @@ impl Soc {
                     0
                 } else {
                     self.ds.read32(off)
+                }
+            }
+            crate::sdmmc::SDMMC_BASE => {
+                if is_write {
+                    self.sdmmc.write32(off, value);
+                    0
+                } else {
+                    self.sdmmc.read32(off)
+                }
+            }
+            crate::rng::RNG_BASE => {
+                if is_write {
+                    self.rng.write32(off, value);
+                    0
+                } else {
+                    self.rng.read32(off)
                 }
             }
             // Crypto/shared GDMA (`DR_REG_GDMA_BASE = 0x6003F000`): dedicated DMA

@@ -84,9 +84,13 @@ Core design:
        exception correctness and interrupt timing verified through real
        FreeRTOS/Arduino behavior. NEXT: keep implementing missing peripherals
         (RMT ✓, PCNT ✓, TWAI/CAN ✓, MCPWM ✓, GDMA ✓, I2C-peripheral ✓,
-        SigmaDelta ✓, …) and validate each with a sketch. Driver-path status:
-        RMT, GDMA and SigmaDelta were validated end-to-end through the esp-idf
-        *driver* stack; I2C is validated at the peripheral level via direct
+        SigmaDelta ✓, RTCIO ✓, RNG ✓, SYSTIMER ✓, ULP ✓, SDMMC ✓, …) and
+        validate each with a sketch. Driver-path status: RNG (`esp_random`),
+        SYSTIMER (millis/micros + raw UNIT snapshot), RMT, GDMA and SigmaDelta
+        were validated end-to-end through the esp-idf stack; RTC_IO, ULP and
+        SDMMC were validated via direct register pokes (ULP program execution
+        and the SDMMC card-command FSM are NOT modeled — documented
+        limitations). I2C is validated at the peripheral level via direct
         register pokes (the Wire-driver path times out at the FreeRTOS semaphore
         sync — documented known limitation). Touch: NOT being pursued (user
         directive: do NOT do Touch).
@@ -1220,4 +1224,71 @@ Core design:
    (RTC slow-clock timer already modeled in `rtc.rs`; extend to the full
    RTC_CNTL register block + RTC_IO pad control), then revisit any remaining
    gaps.
+
+ - 2026-08-24: **RTC_IO (P5 — new peripheral via arduino-cli validation)**.
+   `esp32s3-soc/src/rtc_io.rs` models the ESP32-S3 RTC_IO block
+   (`DR_REG_RTCIO_BASE = 0x60008400`, the `0x60008000` page + 0x400; the page
+   used to return 0 for the whole 0x400..0x800 window, so a register store
+   with software-default 0 is boot-neutral). Per `soc/rtc_io_struct.h` the
+   block covers `out`/`out_w1ts`/`out_w1tc`, `enable`/`enable_w1ts`/
+   `enable_w1tc`, `status`/`status_w1ts`/`status_w1tc`, `in_val`, and the
+   per-pad config registers; the model stores writes and additionally honors
+   the write-1-to-set/clear semantics of `*_w1ts`/`*_w1tc` on `out`/`enable`/
+   `status` like real silicon (reads of `*_w1ts`/`*_w1tc` return 0). Wired into
+   `soc.rs` (mmio arm in the `0x60008000` page, `off >= 0x400` → `rtc_io`). 6
+   unit tests (`tests/rtc_io.rs`) + a machine test `rtc_io_registers_round_trip_
+   and_w1ts_w1tc` assert the round-trip and w1ts/w1tc behavior. Validated
+   end-to-end with `tools/sketches/esp32s3_rtcio` (direct register pokes via
+   `*(volatile uint32_t*)(0x60008400 + off)`): `RTCIO PASS` → `DONE` under
+    `run_flash`. All workspace tests green, clippy/`wasm32` clean. **RTC_IO is
+    retired as a P5 candidate.** RTC_CNTL's slow-clock timer was already modeled
+    in `rtc.rs` (P4); the rest of RTC_CNTL remains a register store of 0 (no
+    boot-critical gaps found). Remaining P5 work: revisit any remaining gaps
+    (e.g. more peripheral esp-idf driver paths); I2C (Wire) driver and Touch are
+    documented exclusions.
+
+ - 2026-08-24: **RNG / SYSTIMER / ULP / SDMMC (P5 — new peripherals via
+   arduino-cli validation)**.
+   - **RNG** (`esp32s3-soc/src/rng.rs`): ESP32-S3 hardware RNG at
+     `DR_REG_RNG_BASE = 0x6003_5000`; the data register is `WDEV_RND_REG =
+     0x6003_507C` (esp-idf `esp_random()` reads it). Model is a seeded LCG
+     (Numerical-Recipes constants) so consecutive reads differ yet the sequence
+     is reproducible for tests. 3 unit tests (`tests/rng.rs`) + a machine test
+     `rng_data_register_returns_varying_values`. Validated end-to-end with
+     `tools/sketches/esp32s3_rng` (Arduino `esp_random()` twice differ, plus raw
+     `*(volatile uint32_t*)0x6003507C` poke): `RNG PASS` → `DONE`.
+   - **SYSTIMER** (already modeled in `esp32s3-soc/src/systimer.rs`, P4): added
+     an arduino-cli validation sketch `tools/sketches/esp32s3_systimer` that
+     asserts `millis()`/`micros()` advance across a `delay()` and that the raw
+     UNIT0 counter advances across the `UNIT0_OP` snapshot handshake:
+     `SYSTIMER PASS` → `DONE`. (The unit-counter model + OP snapshot was already
+     what made `delay()`/`millis()` work during boot.) Retired as a P5 candidate.
+   - **ULP** (`esp32s3-soc/src/ulp.rs`): ESP32-S3 ULP-RISC-V control/status block
+     at `DR_REG_ULP_RISCV_BASE = 0x6000_8100` — offset `0x100` of the
+     `0x6000_8000` page (carved out of the RTC_CNTL dispatch, which still owns
+     `0x000..0x100` and `0x200..0x400`; verified the hello sketch still boots).
+     Modeled as a register store over `0x100..0x200`; **ULP program execution
+     (a second RISC-V core) is NOT modeled** — only the register interface, so
+     firmware can configure/start/poll status. 3 unit tests (`tests/ulp.rs`) + a
+     machine test `ulp_registers_round_trip`. Validated with
+     `tools/sketches/esp32s3_ulp` (direct register pokes): `ULP PASS` → `DONE`.
+     Retired as a P5 candidate (execution documented as out of scope).
+   - **SDMMC** (`esp32s3-soc/src/sdmmc.rs`): ESP32-S3 SD/MMC host (Synopsys
+     DesignWare MMC) at `DR_REG_SDMMC_BASE = 0x6002_8000`. Discovered the
+     existing `memmap.rs` had `SPI3_BASE = 0x6002_8000` (WRONG — collided with
+     SDMMC); corrected it to the real `0x6002_5000` (the local esp32s3-libs
+     headers confirm `SPI2=0x60024000, SPI3=0x60025000, SDMMC=0x60028000`),
+     freeing `0x6002_8000` for the SDMMC arm. Modeled as a register store over
+     the full controller window (`CTRL`/`CMD`/`RESP0..3`/`STATUS`/...); **the
+     card-command FSM / DMA is NOT modeled** (needs a real SD card). 3 unit tests
+     (`tests/sdmmc.rs`) + a machine test `sdmmc_registers_round_trip`. Validated
+     with `tools/sketches/esp32s3_sdmmc` (direct register pokes):
+     `SDMMC PASS` → `DONE`. Retired as a P5 candidate (card execution
+     documented as out of scope).
+   - All four: 4 new peripheral modules, 12 unit tests + 4 machine tests, all
+     workspace tests green, clippy/`wasm32` clean. **RNG, SYSTIMER, ULP, SDMMC
+     are all retired as P5 candidates.** Remaining P5 driver-path work: I2C
+     (Wire) driver is a documented known limitation (peripheral validated via
+     direct poke); Touch excluded per user directive (do NOT do Touch).
+
 

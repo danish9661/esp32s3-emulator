@@ -1530,3 +1530,78 @@ fn sigmadelta_drives_gpio_at_duty_ratio() {
         "SDM 50% duty ~1024 high over 2048 steps, got {high}"
     );
 }
+
+#[test]
+fn rtc_io_registers_round_trip_and_w1ts_w1tc() {
+    use esp32s3_soc::rtc_io::RTC_IO_BASE;
+
+    let mut m = Esp32S3::new();
+
+    // `out` register round-trips.
+    m.soc.write32(RTC_IO_BASE + 0x00, 0x55);
+    assert_eq!(m.soc.read32(RTC_IO_BASE + 0x00), 0x55);
+
+    // `out_w1ts` sets bits, `out_w1tc` clears bits (real silicon semantics).
+    m.soc.write32(RTC_IO_BASE + 0x04, 0xAA);
+    assert_eq!(m.soc.read32(RTC_IO_BASE + 0x00), 0xFF);
+    m.soc.write32(RTC_IO_BASE + 0x08, 0x0F);
+    assert_eq!(m.soc.read32(RTC_IO_BASE + 0x00), 0xF0);
+
+    // `enable` w1ts/w1tc.
+    m.soc.write32(RTC_IO_BASE + 0x0C, 0x1);
+    m.soc.write32(RTC_IO_BASE + 0x10, 0x4);
+    assert_eq!(m.soc.read32(RTC_IO_BASE + 0x0C), 0x5);
+    m.soc.write32(RTC_IO_BASE + 0x14, 0x5);
+    assert_eq!(m.soc.read32(RTC_IO_BASE + 0x0C), 0x0);
+
+    // Reading a `*_w1ts` register returns 0.
+    m.soc.write32(RTC_IO_BASE + 0x04, 0xFF);
+    assert_eq!(m.soc.read32(RTC_IO_BASE + 0x04), 0);
+
+    // A plain pad-config register stores the written value.
+    m.soc.write32(RTC_IO_BASE + 0x5BC, 0x1234_5678);
+    assert_eq!(m.soc.read32(RTC_IO_BASE + 0x5BC), 0x1234_5678);
+}
+
+#[test]
+fn rng_data_register_returns_varying_values() {
+    use esp32s3_soc::rng::RNG_BASE;
+
+    let mut m = Esp32S3::new();
+    let a = m.soc.read32(RNG_BASE + 0x7C); // WDEV_RND_REG
+    let b = m.soc.read32(RNG_BASE + 0x7C);
+    let c = m.soc.read32(RNG_BASE + 0x7C);
+    assert_ne!(a, b, "consecutive RNG reads must differ");
+    assert_ne!(b, c, "consecutive RNG reads must differ");
+
+    // Non-data registers store writes.
+    m.soc.write32(RNG_BASE + 0x10, 0xCAFE);
+    assert_eq!(m.soc.read32(RNG_BASE + 0x10), 0xCAFE);
+}
+
+#[test]
+fn ulp_registers_round_trip() {
+    use esp32s3_soc::ulp::ULP_BASE;
+
+    let mut m = Esp32S3::new();
+    // ULP-RISC-V block is at page 0x6000_8000 + 0x100.
+    m.soc.write32(ULP_BASE + 0x00, 0xDEAD_BEEF); // core
+    m.soc.write32(ULP_BASE + 0x04, 0x1234_5678); // ocp
+    m.soc.write32(ULP_BASE + 0x0C, 0xAB); // general reg 0
+    assert_eq!(m.soc.read32(ULP_BASE + 0x00), 0xDEAD_BEEF);
+    assert_eq!(m.soc.read32(ULP_BASE + 0x04), 0x1234_5678);
+    assert_eq!(m.soc.read32(ULP_BASE + 0x0C), 0xAB);
+}
+
+#[test]
+fn sdmmc_registers_round_trip() {
+    use esp32s3_soc::sdmmc::SDMMC_BASE;
+
+    let mut m = Esp32S3::new();
+    m.soc.write32(SDMMC_BASE + 0x00, 0x000F_0001); // CTRL
+    m.soc.write32(SDMMC_BASE + 0x2C, 0x8020_0000); // CMD
+    m.soc.write32(SDMMC_BASE + 0x30, 0xCAFE_BEEF); // RESP0
+    assert_eq!(m.soc.read32(SDMMC_BASE + 0x00), 0x000F_0001);
+    assert_eq!(m.soc.read32(SDMMC_BASE + 0x2C), 0x8020_0000);
+    assert_eq!(m.soc.read32(SDMMC_BASE + 0x30), 0xCAFE_BEEF);
+}

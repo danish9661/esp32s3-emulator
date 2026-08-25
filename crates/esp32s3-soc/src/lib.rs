@@ -25,8 +25,11 @@ pub mod memmap;
 pub mod memspi;
 pub mod pcnt;
 pub mod rmt;
+pub mod rng;
 pub mod rsa;
 pub mod rtc;
+pub mod rtc_io;
+pub mod sdmmc;
 pub mod sha;
 pub mod sigmadelta;
 pub mod soc;
@@ -35,5 +38,6 @@ pub mod systimer;
 pub mod timg;
 pub mod twai;
 pub mod uart;
+pub mod ulp;
 
 pub use soc::Soc;

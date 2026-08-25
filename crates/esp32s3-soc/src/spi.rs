@@ -1,7 +1,8 @@
 //! ESP32-S3 GPSPI2/GPSPI3 (general-purpose SPI) master model.
 //!
 //! Register layout per the S3 TRM GPSPI chapter / spi_struct.h (GPSPI2 at
-//! 0x6002_4000, GPSPI3 at 0x6002_8000, 0x1000 apart).
+//! 0x6002_4000, GPSPI3 at 0x6002_5000; 0x6002_8000 is the SD/MMC host, a
+//! separate peripheral — see sdmmc.rs).
 //!
 //! Modeled: CPU-controlled master USR transactions (no DMA).  Writing
 //! CMD.usr (bit 24) starts a transfer whose phases are enabled by USER:
