@@ -25,6 +25,11 @@ pub struct Esp32S3 {
     /// Last flash image passed to `boot_from_flash`, retained so a WDT/system
     /// reset can re-run the boot sequence.
     flash: Vec<u8>,
+    /// True while the machine is fast-forwarding a deep-sleep period (CPU
+    /// halted, no instructions executed).
+    asleep: bool,
+    /// Remaining steps to fast-forward while `asleep`.
+    sleep_remaining: u64,
 }
 
 impl Esp32S3 {
@@ -33,6 +38,8 @@ impl Esp32S3 {
             cpu: [Cpu::new(0), Cpu::new(1)],
             soc: Soc::new(),
             flash: Vec::new(),
+            asleep: false,
+            sleep_remaining: 0,
         }
     }
 
@@ -48,6 +55,22 @@ impl Esp32S3 {
         // hard reset while the timers advanced; reboot before executing more.
         if self.soc.consume_reset() {
             self.reset();
+            return StepResult::Ok;
+        }
+        // Deep-sleep fast-forward: while asleep the CPU is halted.  Count down
+        // the captured sleep period then wake (reboot with the timer cause).
+        if self.asleep {
+            if self.sleep_remaining == 0 {
+                self.wake();
+            } else {
+                self.sleep_remaining -= 1;
+            }
+            return StepResult::Ok;
+        }
+        // Firmware requested a deep-sleep this step: enter it and skip the CPU.
+        if let Some(ticks) = self.soc.consume_sleep_request() {
+            self.asleep = true;
+            self.sleep_remaining = ticks.max(1);
             return StepResult::Ok;
         }
         let r = self.cpu[0].step(&mut self.soc);
@@ -68,8 +91,42 @@ impl Esp32S3 {
     pub fn reset(&mut self) {
         self.cpu = [Cpu::new(0), Cpu::new(1)];
         self.soc = Soc::new();
+        self.asleep = false;
+        self.sleep_remaining = 0;
         let f = self.flash.clone();
         self.boot_from_flash(&f);
+    }
+
+    /// True while the machine is fast-forwarding a deep-sleep period.
+    pub fn is_asleep(&self) -> bool {
+        self.asleep
+    }
+
+    /// Enter deep-sleep for `ticks` (slow-clock) steps; the CPU halts until
+    /// the period elapses, then the machine reboots with the wakeup cause set.
+    pub fn begin_sleep(&mut self, ticks: u64) {
+        self.asleep = true;
+        self.sleep_remaining = ticks.max(1);
+    }
+
+    /// Advance one step of a deep-sleep fast-forward; wakes when the period
+    /// elapses.  Mirrors `Esp32S3::step` for host runners that drive the cores
+    /// manually (e.g. `run_flash`).
+    pub fn tick_sleep_one(&mut self) {
+        if self.sleep_remaining == 0 {
+            self.wake();
+        } else {
+            self.sleep_remaining -= 1;
+        }
+    }
+
+    /// Reboot after a deep-sleep period, recording a timer wakeup cause so
+    /// `esp_sleep_get_wakeup_cause()` returns `ESP_SLEEP_WAKEUP_TIMER`.
+    fn wake(&mut self) {
+        self.reset();
+        self.soc.set_sleep_wakeup_cause(1 << 3); // RTC_TIMER_TRIG_EN
+        self.asleep = false;
+        self.sleep_remaining = 0;
     }
 
     /// Load a raw firmware image at `addr` (DRAM, IRAM or IROM window).

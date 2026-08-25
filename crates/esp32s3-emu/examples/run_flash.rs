@@ -115,6 +115,16 @@ fn main() {
             m.reset();
             continue;
         }
+        // Deep-sleep fast-forward (mirror of Esp32S3::step): skip the CPU while
+        // asleep, and enter sleep when firmware writes RTC_CNTL_SLEEP_EN.
+        if m.is_asleep() {
+            m.tick_sleep_one();
+            continue;
+        }
+        if let Some(ticks) = m.soc.consume_sleep_request() {
+            m.begin_sleep(ticks);
+            continue;
+        }
         let r = m.cpu[0].step(&mut m.soc);
         if (0x42001a7c..=0x42001c00).contains(&m.cpu[0].pc) {
             setup_in_range += 1;

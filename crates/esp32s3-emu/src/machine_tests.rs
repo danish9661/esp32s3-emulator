@@ -1605,3 +1605,52 @@ fn sdmmc_registers_round_trip() {
     assert_eq!(m.soc.read32(SDMMC_BASE + 0x2C), 0x8020_0000);
     assert_eq!(m.soc.read32(SDMMC_BASE + 0x30), 0xCAFE_BEEF);
 }
+
+/// Poke the legacy deep-sleep path directly (mirrors the `esp32s3_deepsleep_poke`
+/// arduino-cli sketch): program a sleep period, write `RTC_CNTL_SLEEP_EN`, then
+/// step until the machine fast-forwards and reboots with the timer wakeup cause.
+#[test]
+fn deep_sleep_poke_wakes_with_timer_cause() {
+    use esp32s3_soc::rtc::{
+        RTC_CNTL_BASE, SLEEP_EN_BIT, SLP_TIMER0_OFF, SLP_TIMER1_OFF, SLP_WAKEUP_CAUSE_OFF,
+        STATE0_OFF,
+    };
+    const SLP_TIMER0: u32 = RTC_CNTL_BASE + SLP_TIMER0_OFF;
+    const SLP_TIMER1: u32 = RTC_CNTL_BASE + SLP_TIMER1_OFF;
+    const STATE0: u32 = RTC_CNTL_BASE + STATE0_OFF;
+    const WAKEUP_CAUSE: u32 = RTC_CNTL_BASE + SLP_WAKEUP_CAUSE_OFF;
+
+    let mut m = Esp32S3::new();
+    m.soc.write32(SLP_TIMER0, 0x0000_1234);
+    m.soc.write32(SLP_TIMER1, 0x0000_0000);
+    // Trigger power-down (bit 31 of STATE0).  This requests deep-sleep.
+    let prev = m.soc.read32(STATE0);
+    m.soc.write32(STATE0, prev | SLEEP_EN_BIT);
+
+    // Step until the wakeup-cause register reports a timer wakeup, or we give up.
+    let timer_cause = 1 << 3; // RTC_TIMER_TRIG_EN
+    let mut woke = false;
+    for _ in 0..200_000 {
+        m.step();
+        if m.soc.read32(WAKEUP_CAUSE) & timer_cause != 0 {
+            woke = true;
+            break;
+        }
+    }
+    assert!(woke, "machine did not wake from deep-sleep");
+    assert_eq!(m.soc.read32(WAKEUP_CAUSE) & timer_cause, timer_cause);
+}
+
+/// `RTC_CNTL_SLP_WAKEUP_CAUSE` (0x130, inside the ULP sub-region) must be served
+/// by RTC_CNTL, not the ULP block, so the wakeup cause survives a deep-sleep.
+#[test]
+fn rtc_slp_wakeup_cause_register_is_rtc() {
+    use esp32s3_soc::rtc::{RTC_CNTL_BASE, SLP_WAKEUP_CAUSE_OFF};
+    let mut m = Esp32S3::new();
+    m.soc
+        .write32(RTC_CNTL_BASE + SLP_WAKEUP_CAUSE_OFF, 0xABCD_1234);
+    assert_eq!(
+        m.soc.read32(RTC_CNTL_BASE + SLP_WAKEUP_CAUSE_OFF),
+        0xABCD_1234
+    );
+}

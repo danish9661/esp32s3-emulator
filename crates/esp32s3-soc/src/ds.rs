@@ -24,9 +24,9 @@
 use alloc::vec::Vec;
 
 use crate::aes::aes256_cbc_decrypt;
+use crate::bignum::*;
 use crate::efuse::Efuse;
 use crate::hmac::{hmac_sha256, sha256};
-use crate::rsa::Rsa;
 
 #[allow(clippy::identity_op)]
 pub const DS_BASE: u32 = 0x6003_D000;
@@ -153,7 +153,7 @@ impl Ds {
         let y = bytes_to_limbs_le(&plain[0..nbytes]);
         let m = bytes_to_limbs_le(&plain[C_Y_LEN..C_Y_LEN + nbytes]);
         let x = bytes_to_limbs_le(&self.x[0..nbytes]);
-        let z = Rsa::modexp(&x, &y, &m);
+        let z = modexp(&x, &y, &m);
         let zbytes = limbs_to_bytes_le(&z);
         self.z = [0u8; Z_LEN];
         let n = zbytes.len().min(Z_LEN);

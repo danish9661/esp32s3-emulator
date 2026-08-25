@@ -19,6 +19,7 @@ use crate::adc::Adc;
 use crate::aes::Aes;
 use crate::cache::{Cache, CacheTarget};
 use crate::ds::Ds;
+use crate::ecdsa::Ecdsa;
 use crate::efuse::Efuse;
 use crate::gdma::{GDMA_BASE, Gdma};
 use crate::gpio::Gpio;
@@ -43,7 +44,6 @@ use crate::systimer::Systimer;
 use crate::timg::{INT_T0, INT_T1, INT_WDT, Timg};
 use crate::twai::{TWAI_BASE, Twai};
 use crate::uart::Uart;
-use crate::ulp::Ulp;
 
 macro_rules! in_range {
     ($addr:expr, $base:expr, $size:expr) => {
@@ -152,6 +152,7 @@ pub struct Soc {
     sha: Sha,
     aes: Aes,
     rsa: Rsa,
+    ecdsa: Ecdsa,
     hmac: Hmac,
     ds: Ds,
     cache: Cache,
@@ -160,7 +161,6 @@ pub struct Soc {
     rtc: Rtc,
     rtc_io: RtcIo,
     rng: Rng,
-    ulp: Ulp,
     sdmmc: Sdmmc,
     sdm: Sdm,
     intc: Intc,
@@ -228,6 +228,7 @@ impl Soc {
             sha: Sha::new(),
             aes: Aes::new(),
             rsa: Rsa::default(),
+            ecdsa: Ecdsa::new(),
             hmac: Hmac::new(),
             ds: Ds::new(),
             cache: Cache::new(),
@@ -236,7 +237,6 @@ impl Soc {
             rtc: Rtc::new(),
             rtc_io: RtcIo::new(),
             rng: Rng::new(),
-            ulp: Ulp::new(),
             sdmmc: Sdmmc::new(),
             sdm: Sdm::new(),
             intc: Intc::new(),
@@ -859,15 +859,9 @@ impl Soc {
                     } else {
                         self.adc.sens_read32(off - 0x800)
                     }
-                 } else if in_range!(off, crate::ulp::ULP_OFF_START, crate::ulp::ULP_OFF_END - crate::ulp::ULP_OFF_START) {
-                    // ULP-RISC-V control/status block (off 0x100..0x200).
-                    if is_write {
-                        self.ulp.write32(addr, value);
-                        0
-                    } else {
-                        self.ulp.read32(addr)
-                    }
                 } else if off < 0x400 {
+                    // RTC_CNTL page (0x000..0x400).  The ULP-RISC-V control
+                    // block (0x100..0x200) is handled inside `Rtc`.
                     if is_write {
                         self.rtc.write32(off, value);
                         0
@@ -979,6 +973,14 @@ impl Soc {
                     0
                 } else {
                     self.rsa.read32(off)
+                }
+            }
+            crate::ecdsa::ECDSA_BASE => {
+                if is_write {
+                    self.ecdsa.write32(off, value);
+                    0
+                } else {
+                    self.ecdsa.read32(off)
                 }
             }
             crate::hmac::HMAC_BASE => {
@@ -1181,6 +1183,24 @@ impl Soc {
         self.timg[0].consume_reset() || self.timg[1].consume_reset()
     }
 
+    /// True if firmware requested a deep-sleep (wrote `RTC_CNTL_SLEEP_EN`).
+    /// Returns the captured sleep duration (slow-clock ticks) and clears the
+    /// flag. The machine consumes this each step to fast-forward the sleep.
+    pub fn consume_sleep_request(&mut self) -> Option<u64> {
+        self.rtc.consume_sleep_request()
+    }
+
+    /// Debug accessor: has the firmware requested a deep-sleep (pending consume)?
+    pub fn rtc_sleep_req(&self) -> bool {
+        self.rtc.sleep_req()
+    }
+
+    /// Record the wakeup-cause bits read by `esp_sleep_get_wakeup_cause`
+    /// after a deep-sleep reboot (machine writes this on wake).
+    pub fn set_sleep_wakeup_cause(&mut self, bits: u32) {
+        self.rtc.set_wakeup_cause(bits);
+    }
+
     /// Debug accessor for the AES interrupt raw&enabled state (validation harness).
     pub fn aes_debug_int(&self) -> (u32, u32) {
         self.aes.debug_int()
@@ -1314,6 +1334,13 @@ impl Bus for Soc {
         // path ever registers an ISR on this source).
         if self.rsa.int_pending() {
             src |= 1 << crate::rsa::RSA_INTR_SOURCE;
+        }
+        // ECDSA accelerator = source 97 (ETS_ECDSA_INTR_SOURCE). The esp-idf
+        // ECDSA driver polls `QUERY_INTERRUPT`/`INT_RAW` for completion, but
+        // wiring the matrix source is harmless (covered if it ever registers an
+        // ISR on this source).
+        if self.ecdsa.int_pending() {
+            src |= 1 << crate::ecdsa::ECDSA_INTR_SOURCE;
         }
         // Cross-core interrupts: SYSTEM.CPU_INT_FROM_CPU_0/1 (0x600C0030/34)
         // assert the FROM_CPU_INTR0/1 sources = 79/80 (esp32s3 interrupts.h

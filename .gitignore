@@ -6,3 +6,6 @@ web/hello.bin
 web/firmware/*.bin
 *.merged.bin
 # sample firmware used for local browser testing (copy your own merged.bin)
+
+# arduino-cli in-tree build output
+tools/sketches/*/build/

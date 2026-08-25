@@ -87,13 +87,15 @@ Core design:
         SigmaDelta ✓, RTCIO ✓, RNG ✓, SYSTIMER ✓, ULP ✓, SDMMC ✓, …) and
         validate each with a sketch. Driver-path status: RNG (`esp_random`),
         SYSTIMER (millis/micros + raw UNIT snapshot), RMT, GDMA and SigmaDelta
-        were validated end-to-end through the esp-idf stack; RTC_IO, ULP and
-        SDMMC were validated via direct register pokes (ULP program execution
-        and the SDMMC card-command FSM are NOT modeled — documented
-        limitations). I2C is validated at the peripheral level via direct
+        were validated end-to-end through the esp-idf stack; RTC_IO, ULP,
+        SDMMC and Deep-sleep were validated via direct register pokes (ULP
+        program execution and the SDMMC card-command FSM are NOT modeled; the
+        esp-idf `esp_deep_sleep_start` driver hangs in sleep *preparation* — both
+        documented limitations). I2C is validated at the peripheral level via direct
         register pokes (the Wire-driver path times out at the FreeRTOS semaphore
         sync — documented known limitation). Touch: NOT being pursued (user
-        directive: do NOT do Touch).
+        directive: do NOT do Touch). Remaining LP peripherals to model: LP_I2C
+        (`RTC_I2C @ 0x6000_8C00`) and (best-effort) LP_UART (~`0x6002_5400`).
 - [x] **P6 — Frontend polish**: serial console UI, GPIO/LED visualization,
       example firmware gallery.
 - [ ] WiFi/BLE: OUT OF SCOPE for now (months of work; not required for the
@@ -1285,10 +1287,78 @@ Core design:
      with `tools/sketches/esp32s3_sdmmc` (direct register pokes):
      `SDMMC PASS` → `DONE`. Retired as a P5 candidate (card execution
      documented as out of scope).
-   - All four: 4 new peripheral modules, 12 unit tests + 4 machine tests, all
+    - All four: 4 new peripheral modules, 12 unit tests + 4 machine tests, all
      workspace tests green, clippy/`wasm32` clean. **RNG, SYSTIMER, ULP, SDMMC
      are all retired as P5 candidates.** Remaining P5 driver-path work: I2C
      (Wire) driver is a documented known limitation (peripheral validated via
      direct poke); Touch excluded per user directive (do NOT do Touch).
+
+ - 2026-08-24: **ECDSA (P-256) accelerator (P5 — new peripheral via arduino-cli
+   validation)**. `esp32s3-soc/src/ecdsa.rs` models the ESP32-S3 ECDSA engine
+   (`DR_REG_ECDSA_BASE = 0x6008_E000`, own 4KB mmio page): CONF(0x00:
+   `work_mode`[1:0], `ecc_curve`[2]=0 P-256 / 1 P-192, `software_set_k`[3],
+   `software_set_z`[4]), START(0x04), INT_RAW/ENA/ST/CLR(0x08..0x14),
+   RESULT(0x18, bit0 done), 12×8-word PARAM RAM @ 0x80 (QX=5, QY=6, D=7,
+   K=8, Z=9, R=10, S=11, N=12). Sign: feed D/K/Z (software_set_k/z), poll
+   RESULT, read R/S. Verify: feed QX/QY/R/S/Z + N, poll RESULT. P-256 uses
+   NIST curve P-256 (a=-3, b=5AC635D8…), P-192 uses SEC2 correct constants
+   (a=-3, b=6454214…; the old `ecdsa_struct.h` P-192 b was bogus and fixed).
+   Shared bignum (`bignum.rs`): `from_be_bytes`/`to_be_bytes`/`trim`/`cmp`/
+   `add`/`sub`/`mul`/`modinv`/`modexp`/`divmod`/`modmul` (schoolbook, reused by
+   RSA/DS). `ec_add` reduces the lambda²-mod-p and y3 result; `verify` compares
+   `trim(v)==trim(r)`. Wired into `soc.rs` (mmio arm `ECDSA_BASE`, `int_pending`
+   source 97 = `ETS_ECDSA_INTR_SOURCE`). 3 unit tests (`tests/ecdsa.rs`) assert
+   P-256 sign against an independent Python KAT (d=`000102…1f`, z=`a5`*32,
+   k=`51`*32 → R=`9a65173d…`, S=`373eb412…`), P-256 sign-then-verify round-trip,
+   and P-192 sign-then-verify round-trip; all green after fixing `ec_add` carry
+   reduction + the P-192 constants. **CRITICAL model limb-encoding note**: the
+   param RAM uses LSW-first word order with **big-endian within each 32-bit
+   word** (a consequence of `from_be_bytes` packing each 4-byte chunk as BE u32)
+   — this is NOT the little-endian-within-word layout real ESP32-S3 hardware
+   uses, so a real esp-idf ECDSA *driver* sketch would misread the operands;
+   validation here is via **direct register pokes** (the harness writes BE-
+   packed words), consistent with how RMT/GDMA/MCPWM/PCNT/TWAI were first proven.
+   Validated end-to-end with `tools/sketches/esp32s3_ecdsa` (direct pokes:
+   sign → `R`/`S` match the KAT, `r_ok=1`/`s_ok=1`; verify round-trip
+   RESULT=1; a bit-flipped S fails verify RESULT=0) → `ECDSA POKE PASS` /
+   `ECDSA DONE` under `run_flash`. bignum.rs `add`/`sub` also rewritten to
+   iterator form and `from_be_bytes` uses `div_ceil` so the whole soc crate is
+    clippy-clean (host + `wasm32`). **ECDSA is retired as a P5 candidate.**
+    Remaining P5 driver-path work: I2C (Wire) driver is a documented known
+    limitation (peripheral validated via direct poke); Touch excluded per user
+    directive (do NOT do Touch).
+
+  - 2026-08-25: **Deep-sleep power-down (P5 — new peripheral path via arduino-cli
+    validation)**. The LP-subsystem deep-sleep is driven through the legacy
+    (S3) `RTC_CNTL` path: firmware sets `RTC_CNTL_SLP_TIMER0/1_REG` (@ +0x4/+0x8)
+    then `RTC_CNTL_SLEEP_EN` (bit 31 of `RTC_CNTL_STATE0_REG` @ +0x18); on wake
+    the wakeup-cause register `RTC_CNTL_SLP_WAKEUP_CAUSE_REG` (@ +0x130, field
+    `RTC_CNTL_WAKEUP_CAUSE`) carries `RTC_TIMER_TRIG_EN` (bit 3). The emulator
+    detects the SLEEP_EN write (`rtc.rs` `STATE0_OFF` bit 31), captures the
+    programmed period, and (in `machine.rs`) fast-forwards the sleep as a fixed
+    step budget then reboots — `wake()` does `reset()` and sets the timer
+    wakeup cause on the fresh SoC. **CRITICAL bug found + fixed**: the ULP-RISC-V
+    block had been carved out of the RTC_CNTL page at offset `0x100..0x200`, which
+    *stole* `RTC_CNTL_SLP_WAKEUP_CAUSE` (0x130) — so the firmware's wakeup-cause
+    read landed in the ULP device and returned 0 forever. `Rtc` now owns the full
+    `0x000..0x400` RTC_CNTL page with a generic register store and delegates only
+    the true ULP sub-range (`0x100..0x200`, still backed by `ulp.rs`) — and the
+    wakeup-cause register is special-cased before that delegation. Verified vs the
+    real header `rtc_cntl_reg.h` (`SLP_WAKEUP_CAUSE_REG = RTCCNTL_BASE + 0x130`).
+    Validated end-to-end with `tools/sketches/esp32s3_deepsleep_poke` (direct
+    register pokes: read 0x130, if timer bit clear program SLP_TIMER + write
+    STATE0 SLEEP_EN, else print WOKE/PASS): `DEEPSLEEP START` → (emulator
+    fast-forward + reboot) → `DEEPSLEEP WOKE` / `DEEPSLEEP PASS` under
+    `run_flash`. 2 machine tests added (`deep_sleep_poke_wakes_with_timer_cause`,
+    `rtc_slp_wakeup_cause_register_is_rtc`). **NOTE**: the esp-idf *driver*
+    `esp_deep_sleep_start` path is NOT modeled — the firmware hangs in sleep
+    *preparation* (core 0 stuck polling an unmodeled peripheral before it ever
+    reaches `rtc_sleep_start` / the SLEEP_EN write), so validation uses the direct
+    poke sketch, consistent with RMT/I2C/TWAI/etc. Deep-sleep is retired as a P5
+    candidate (register/driver-path gap documented). Remaining P5 work: LP_I2C
+    (`RTC_I2C @ 0x6000_8C00`) and LP_UART (best-effort, ~`0x6002_5400`); I2C
+    (Wire) driver is a documented known limitation; Touch excluded per user
+    directive (do NOT do Touch).
+
 
 

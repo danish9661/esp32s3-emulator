@@ -11,8 +11,10 @@ extern crate alloc;
 
 pub mod adc;
 pub mod aes;
+pub mod bignum;
 pub mod cache;
 pub mod ds;
+pub mod ecdsa;
 pub mod efuse;
 pub mod gdma;
 pub mod gpio;
