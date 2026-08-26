@@ -59,6 +59,23 @@ macro_rules! in_range {
 // SRAM window size used in range checks (kept in sync with DRAM_SIZE).
 const SRAM_BASE_RANGE: u32 = DRAM_SIZE;
 
+// Xtensa "I/O block" aliases (xtensa/config/system.h: XSHAL_IOBLOCK_CACHED/
+// BYPASS). On ESP32-S3 these are cached/uncached VADDR windows over the SAME
+// physical DRAM as DRAM_BASE. The esp-idf runtime stores struct pointers in
+// this alias space (e.g. 0x70004), so the emulator must mirror them to DRAM.
+const CACHED_IOBLOCK_BASE: u32 = 0x7000_0000;
+const BYPASS_IOBLOCK_BASE: u32 = 0x9000_0000;
+#[inline]
+fn ioblock_remap(addr: u32) -> u32 {
+    if in_range!(addr, CACHED_IOBLOCK_BASE, SRAM_BASE_RANGE) {
+        DRAM_BASE + (addr - CACHED_IOBLOCK_BASE)
+    } else if in_range!(addr, BYPASS_IOBLOCK_BASE, SRAM_BASE_RANGE) {
+        DRAM_BASE + (addr - BYPASS_IOBLOCK_BASE)
+    } else {
+        addr
+    }
+}
+
 // esp_image_header_t magic byte (esp_image_format.h: ESP_IMAGE_HEADER_MAGIC).
 const ESP_IMAGE_MAGIC: u8 = 0xE9;
 
@@ -1515,6 +1532,7 @@ impl Bus for Soc {
     }
 
     fn read8(&mut self, addr: u32) -> u32 {
+        let addr = ioblock_remap(addr);
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE)
             || in_range!(addr, IRAM_BASE, IRAM_WINDOW_SIZE)
         {
@@ -1553,6 +1571,7 @@ impl Bus for Soc {
     }
 
     fn read32(&mut self, addr: u32) -> u32 {
+        let addr = ioblock_remap(addr);
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE)
             || in_range!(addr, IRAM_BASE, IRAM_WINDOW_SIZE)
         {
@@ -1613,6 +1632,7 @@ impl Bus for Soc {
     }
 
     fn write8(&mut self, addr: u32, val: u32) {
+        let addr = ioblock_remap(addr);
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE)
             || in_range!(addr, IRAM_BASE, IRAM_WINDOW_SIZE)
         {
@@ -1657,6 +1677,7 @@ impl Bus for Soc {
     }
 
     fn write32(&mut self, addr: u32, val: u32) {
+        let addr = ioblock_remap(addr);
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE)
             || in_range!(addr, IRAM_BASE, IRAM_WINDOW_SIZE)
         {

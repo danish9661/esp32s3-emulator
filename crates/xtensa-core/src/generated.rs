@@ -775,6 +775,8 @@ pub enum Opcode {
     OPCODE_WUR_UA_STATE_2 = 750,
     OPCODE_RUR_UA_STATE_3 = 751,
     OPCODE_WUR_UA_STATE_3 = 752,
+    // Catch-all for unimplemented TIE/DSP (`ee.*`) coprocessor instructions.
+    OPCODE_EE_UNIMPLEMENTED = 753,
 }
 
 impl Opcode {
@@ -1533,6 +1535,7 @@ impl Opcode {
             Opcode::OPCODE_WUR_UA_STATE_2 => "wur_ua_state_2",
             Opcode::OPCODE_RUR_UA_STATE_3 => "rur_ua_state_3",
             Opcode::OPCODE_WUR_UA_STATE_3 => "wur_ua_state_3",
+            Opcode::OPCODE_EE_UNIMPLEMENTED => "ee_unimplemented",
         }
     }
 }
@@ -5723,7 +5726,13 @@ pub fn decode_inst(insn: u32) -> Option<Opcode> {
     if fld_inst::op0(insn) == 7 && (fld_inst::r(insn) == 14 || fld_inst::r(insn) == 15) {
         return Some(Opcode::OPCODE_BBSI);
     }
-    return None;
+    // Any instruction that reaches here undecoded is, in practice, an
+    // unimplemented TIE/DSP (`ee.*`) coprocessor instruction (the ISA
+    // coverage audit confirms only `ee.*` mnemonics are undecoded by real
+    // ESP32-S3 firmware). Route it to a dedicated unimplemented opcode so the
+    // core halts cleanly instead of raising a spurious illegal-instruction
+    // exception.
+    Some(Opcode::OPCODE_EE_UNIMPLEMENTED)
 }
 
 /// Decode an instruction in the 'inst16a' slot. Returns None on undefined.
@@ -8662,6 +8671,8 @@ pub fn opnds(opc: Opcode, insn: u32, pc: u32) -> [Opnd; MAX_OPERANDS] {
         Opcode::OPCODE_WUR_UA_STATE_3 => {
             o[0] = Opnd::reg(fld_inst::t(insn));
         }
+        // Unimplemented TIE/DSP (`ee.*`) instruction: no operands modeled.
+        Opcode::OPCODE_EE_UNIMPLEMENTED => {}
     }
     o
 }

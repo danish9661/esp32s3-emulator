@@ -99,6 +99,19 @@ mod tests {
         let o = opnds(Opcode::OPCODE_ADDI, insn, 0);
         assert_eq!((o[0].value, o[1].value, o[2].value), (3, 4, 0xfffffffe));
     }
+
+    #[test]
+    fn ee_dsp_decodes_as_unimplemented() {
+        // A known `ee.*` opcode (ee.stf.64.xp: fld_inst_19_16==7,
+        // fld_inst_3_0==0) decodes to its named opcode and is unimplemented at
+        // runtime (exec's `_ => Outcome::Unimplemented` arm). The decoder's
+        // final catch-all routes every undecoded TIE/DSP instruction to
+        // OPCODE_EE_UNIMPLEMENTED instead of returning None (which would raise
+        // a spurious illegal-instruction exception on real S3 silicon, where
+        // the DSP ISA is implemented).
+        let o = enc(0x0007_0000);
+        assert!(matches!(o, Some(Opcode::OPCODE_EE_STF_64_XP)), "got {:?}", o);
+    }
 }
 
 #[cfg(test)]
@@ -774,5 +787,18 @@ mod cpu_tests {
         assert_eq!(cpu1.reg(2), 0xABAB, "core 1 PRID");
         assert_eq!(cpu1.reg(3), 0xABAB, "core 1 PRID");
         assert_eq!((cpu1.reg(2) >> 13) & 1, 1, "core 1 index bit");
+    }
+
+    #[test]
+    fn ee_dsp_instruction_is_unimplemented() {
+        // An unimplemented TIE/DSP (`ee.*`) instruction must halt the core with
+        // StepResult::Unimplemented rather than mis-executing or raising a
+        // spurious illegal-instruction exception.
+        let prog = [(0x4000_1000u32, 0x0007_0000u32)]; // ee.ldf.64.xp
+        let mut bus = RamBus::load(&prog);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_1000;
+        let r = cpu.step(&mut bus);
+        assert_eq!(r, StepResult::Unimplemented("opcode"));
     }
 }
