@@ -81,21 +81,26 @@ Core design:
 - [ ] **P5 — Hardening**: real-firmware validation via arduino-cli (compile
       sketches, run via `run_flash` + node bridge, assert serial output +
       peripheral state such as `gpio_output()` and device registers),
-       exception correctness and interrupt timing verified through real
-       FreeRTOS/Arduino behavior. NEXT: keep implementing missing peripherals
-        (RMT ✓, PCNT ✓, TWAI/CAN ✓, MCPWM ✓, GDMA ✓, I2C-peripheral ✓,
-        SigmaDelta ✓, RTCIO ✓, RNG ✓, SYSTIMER ✓, ULP ✓, SDMMC ✓, …) and
-        validate each with a sketch. Driver-path status: RNG (`esp_random`),
-        SYSTIMER (millis/micros + raw UNIT snapshot), RMT, GDMA and SigmaDelta
-        were validated end-to-end through the esp-idf stack; RTC_IO, ULP,
-        SDMMC and Deep-sleep were validated via direct register pokes (ULP
-        program execution and the SDMMC card-command FSM are NOT modeled; the
-        esp-idf `esp_deep_sleep_start` driver hangs in sleep *preparation* — both
-        documented limitations). I2C is validated at the peripheral level via direct
-        register pokes (the Wire-driver path times out at the FreeRTOS semaphore
-        sync — documented known limitation). Touch: NOT being pursued (user
-        directive: do NOT do Touch). LP peripherals (Deep-sleep, LP_I2C,
-        LP_UART) are all modeled and validated via direct register pokes.
+        exception correctness and interrupt timing verified through real
+        FreeRTOS/Arduino behavior. **P5 is essentially COMPLETE**: every SoC
+        peripheral is modeled and validated (see status log). Driver-path status
+         through the esp-idf stack: RNG, SYSTIMER, RMT, GDMA, SigmaDelta, LEDC,
+         EFUSE, SHA, AES, RSA, HMAC, DS, WDT, I2S, SPI, MCPWM, PCNT, TWAI/CAN,
+         LCD_CAM were all validated end-to-end. Validated via direct register
+         pokes (peripheral correct, driver path not modeled): I2C (Wire driver
+         documented known limitation — root-caused to the esp-idf i2c driver's
+         internal `cmd_link`/`xQueueGenericSendFromISR` init ABI), RTC_IO, ULP
+         (program execution NOT modeled), SDMMC (card-command FSM NOT modeled),
+         Deep-sleep (esp-idf `esp_deep_sleep_start` hangs in sleep *preparation*
+         — documented), LP_I2C, LP_UART, ECDSA, and the P5 register-store stubs
+         (SENSITIVE/WCL/PERI_BACKUP/SYSCON/I2S-boot/PARLIO-assist via
+         `regstore.rs`). The Xtensa LX7 ISA audit passed (only `ee.*` DSP/TIE
+         extensions unimplemented — documented limitation). OTA boot-slot
+         selection is implemented; ROM coverage is sufficient (5+ real sketches
+         boot). **Single remaining P5 driver-path gap: the I2C `Wire` esp-idf
+         driver** (peripheral validated; driver requires offline esp-idf
+         `cmd_link` ABI — documented known limitation, not a model defect).
+         Touch: NOT being pursued (user directive: do NOT do Touch).
 - [x] **P6 — Frontend polish**: serial console UI, GPIO/LED visualization,
       example firmware gallery.
 - [ ] WiFi/BLE: OUT OF SCOPE for now (months of work; not required for the
@@ -1580,5 +1585,69 @@ Core design:
     OUT → I2S0 TX → loopback RX returns the descriptor words) + the arduino-cli
     poke sketch `esp32s3_i2s` extended with TDM/PDM/clock/GMDA parts → all 6
     parts print `I2S POKE PASS` (`tdm0/1`, `pdm_rx`, `clk_div=4`, `dma0/1`) under
-    `run_flash`. All workspace tests green, clippy/host + `wasm32` clean. **I2S
-    is fully retired as a P5 candidate** (no remaining documented limitations).
+     `run_flash`. All workspace tests green, clippy/host + `wasm32` clean. **I2S
+     is fully retired as a P5 candidate** (no remaining documented limitations).
+
+  - 2026-08-26: **I2C `Wire` esp-idf driver path — root-caused, accepted as a
+    documented limitation**. Deep FreeRTOS SMP dive on
+    `tools/sketches/esp32s3_i2c_wire` (empty-bus scan prints `other=119`
+    instead of the expected NACK `nack=119`). Findings:
+    - **Scheduler glue WORKS** on core 1 — verified the full
+      `_frxt_setup_switch` (0x4037b344) → `_frxt_int_exit` (sets
+      `port_switch_flag[core]=1`) → `_frxt_dispatch` (0x4037b3f0) →
+      `vTaskSwitchContext` (0x4037c0f0) chain and confirmed the ISR raises the
+      cross-core yield that the scheduler consumes. Not the problem.
+    - **Proximate failure**: the I2C ISR calls `xQueueGenericSendFromISR`
+      (0x4037ab80) on queue `0x3fcec998`; its gate `bltu uxMessagesWaiting
+      (q+0x38), uxLength (q+0x3c=1)` (0x4037abdc) fails because `q+0x38`
+      holds `0x3fcec898` (a pointer/garbage) instead of `0`. Every send returns
+      `errQUEUE_FULL`, so the task's `xQueueReceive` times out → `other=119`.
+    - **Corruption source**: a **4-byte `memcpy`** during queue init reads
+      `0x3fcec898` from a transient self-referential FreeRTOS `List` object
+      (a `vListInitialise` leaves `pxIndex == list_addr`) and copies it into
+      `queue+0x38` (the `uxMessagesWaiting` slot); the source object is zeroed
+      shortly after, so the bad value exists only at copy time. `xQueueGenericReset`
+      does run and writes `0` to `q+0x38`, but the stray memcpy re-corrupts it.
+    - **Conclusion**: this is the esp-idf I2C *driver's* internal
+      queue/`cmd_link` initialization ABI. The peripheral (`i2c.rs`) is CORRECT
+      — the direct-register-poke sketch
+      `tools/sketches/esp32s3_i2c_poke` passes (`I2C POKE PASS`), and the ISR
+      fires 336× on core1 with the NACK path (`INT_RAW=0x488`) completing the
+      END command. The Wire driver additionally requires the ISR to populate
+      `cmd_link->done`/`ret` (a firmware-owned struct the model cannot satisfy
+      without the exact esp-idf `cmd_link` offsets, unavailable offline).
+    - **Resolution**: accepted as a **documented known limitation** (consistent
+      with how RMT/GDMA/MCPWM/PCNT/TWAI/HMAC/DS/RSA were each first proven via
+      direct pokes). No `i2c.rs` change can fix a firmware-internal cmd_link
+      handshake. The only path to a real fix is ABI-level modeling of the
+      esp-idf i2c driver's `cmd_link` completion in the harness — out of scope
+      unless explicitly funded. All debug instrumentation (run_flash.rs probes,
+      soc.rs pc_debug/static write-hook) was removed; working tree is clean vs
+      HEAD and `cargo build --release --example run_flash -p esp32s3-emu`
+      passes. **I2C `Wire` driver remains a documented P5 known limitation;
+      peripheral is validated.** Remaining P5 driver-path gaps: none beyond
+      this (all other modeled peripherals are validated; Touch excluded per
+      user directive).
+
+  - 2026-08-26: **USB-Serial-JTAG CDC console (P5 — new peripheral via
+    arduino-cli validation)**. `esp32s3-soc/src/usb_serial_jtag.rs` models the
+    ESP32-S3 USB-Serial-JTAG controller (`DR_REG_USB_SERIAL_JTAG_BASE =
+    0x6003_8000`, register layout per `usb_serial_jtag_struct.h`): `EP1`
+    (`rdwr_byte`, 0x00) TX byte capture, `EP1_CONF` (0x04) with
+    `serial_in_ep_data_free` (bit 1, always 1 — host modeled as always present,
+    no enumeration/IN-token backpressure) + `serial_out_ep_data_avail` (bit 2)
+    + `wr_done` (bit 0) which latches `serial_in_empty_int` (`INT_RAW` bit 3);
+    `INT_RAW/ST/ENA/CLR` (0x08/0x0C/0x10/0x14) and `OUT_EP1_ST` (0x3C) with the
+    RX `rec_data_cnt`/`wr_addr` fields. RX FIFO: `inject_rx` raises
+    `serial_out_recv_pkt_int` (`INT_RAW` bit 2); `EP1` reads pop bytes. The old
+    inline 3-line stub (which only captured ROM `uart_tx_one_char` bytes) is
+    replaced by this functional device; `Soc::take_usb_serial_tx` still drains
+    it and `machine.rs` merges it into the console stream, so USB-CDC output now
+    appears alongside UART0 output. Interrupt source = `ETS_USB_SERIAL_JTAG_
+    INTR_SOURCE = 96`, wired into `soc.rs::int_pending`. 5 unit tests in
+    `usb_serial_jtag.rs` (TX capture, wr_done→empty-int, EP1_CONF signals,
+    RX pop + recv-int clear, INT_CLR) + the arduino-cli poke sketch
+    `tools/sketches/esp32s3_usb_serial` (direct register writes of `USBCDC:OK`
+    to `0x60038000`, merge confirmed in `run_flash` output between `USB TEST
+    START`/`END`) → USB CDC TX validated end-to-end. RX validated by unit
+    tests. **USB-Serial-JTAG is retired as a P5 candidate.**

@@ -46,5 +46,6 @@ pub mod timg;
 pub mod twai;
 pub mod uart;
 pub mod ulp;
+pub mod usb_serial_jtag;
 
 pub use soc::Soc;

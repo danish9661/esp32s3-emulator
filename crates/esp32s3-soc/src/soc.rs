@@ -49,6 +49,7 @@ use crate::systimer::Systimer;
 use crate::timg::{INT_T0, INT_T1, INT_WDT, Timg};
 use crate::twai::{TWAI_BASE, Twai};
 use crate::uart::Uart;
+use crate::usb_serial_jtag::{UsbSerialJtag, USB_SERIAL_JTAG_INTR_SOURCE};
 
 macro_rules! in_range {
     ($addr:expr, $base:expr, $size:expr) => {
@@ -145,11 +146,11 @@ pub struct Soc {
     psram: Box<[u8; PSRAM_SIZE as usize]>,
     rtc_slow: Box<[u8; RTC_SLOW_SIZE as usize]>,
     rtc_fast: Box<[u8; RTC_FAST_SIZE as usize]>,
-    /// USB-Serial-JTAG TX capture: the boot ROM's console (uart_tx_one_char
-    /// @ 0x40048C30) writes chars to the USB_SERIAL_JTAG FIFO (0x60038000),
-    /// NOT UART0 — the S3's ROM messages come out of the USB-CDC port on
-    /// real hardware.  `Esp32S3::take_uart_tx(0)` drains this too.
-    usb_serial_tx: Vec<u8>,
+    /// USB-Serial-JTAG (CDC-ACM console) controller. The boot ROM's console
+    /// (uart_tx_one_char @ 0x40048C30) writes chars to the USB_SERIAL_JTAG FIFO
+    /// (0x60038000), NOT UART0 — the S3's ROM messages come out of the USB-CDC
+    /// port on real hardware. `Esp32S3::take_usb_serial_tx` drains this too.
+    usb: UsbSerialJtag,
     uarts: [Uart; 3],
     gpio: Gpio,
     ledc: Lcdc,
@@ -255,7 +256,7 @@ impl Soc {
             rtc_slow: Box::new([0; RTC_SLOW_SIZE as usize]),
             rtc_fast: Box::new([0; RTC_FAST_SIZE as usize]),
             uarts: [Uart::new(), Uart::new(), Uart::new()],
-            usb_serial_tx: Vec::new(),
+            usb: UsbSerialJtag::new(),
             gpio: Gpio::new(),
             ledc: Lcdc::new(),
             mcpwm: Mcpwm::new(),
@@ -385,7 +386,7 @@ impl Soc {
     /// Bytes emitted by UART `n` since the last call (host console output).
     /// Number of bytes queued in the USB-Serial-JTAG TX capture (debug probe).
     pub fn usb_tx_len(&self) -> usize {
-        self.usb_serial_tx.len()
+        self.usb.tx_len()
     }
 
     /// Number of bytes queued in UART `n`'s TX capture (debug probe).
@@ -402,10 +403,15 @@ impl Soc {
         self.uarts[n].inject_rx(byte);
     }
 
+    /// Push one received byte into the USB-Serial-JTAG RX FIFO (host console input).
+    pub fn usb_inject_rx(&mut self, byte: u8) {
+        self.usb.inject_rx(byte);
+    }
+
     /// Bytes written to the USB-Serial-JTAG TX FIFO (ROM console) since the
     /// last call.
     pub fn take_usb_serial_tx(&mut self) -> Vec<u8> {
-        core::mem::take(&mut self.usb_serial_tx)
+        self.usb.take_tx()
     }
 
     /// Append host-generated console bytes to UART `n`'s TX stream (the
@@ -681,18 +687,12 @@ impl Soc {
                 }
             }
             USB_SERIAL_JTAG_BASE => {
-                // TX FIFO @ +0: byte write = console char (ROM uart_tx_one_char);
-                // the ROM's status poll reads +4 bit 1 = "writable" (always set —
-                // no FIFO backpressure modeled); reads of +0 return 0 (RX empty).
+                // USB-Serial-JTAG CDC console (functional model).
                 if is_write {
-                    if off == 0 {
-                        self.usb_serial_tx.push((value & 0xFF) as u8);
-                    }
+                    self.usb.write32(off, value);
                     0
-                } else if off == 4 {
-                    2
                 } else {
-                    0
+                    self.usb.read32(off)
                 }
             }
             LEDC_BASE => {
@@ -1516,6 +1516,11 @@ impl Bus for Soc {
         // ISR on this source).
         if self.ecdsa.int_pending() {
             src |= 1 << crate::ecdsa::ECDSA_INTR_SOURCE;
+        }
+        // USB-Serial-JTAG (CDC-ACM console) = source 96
+        // (ETS_USB_SERIAL_JTAG_INTR_SOURCE).
+        if self.usb.int_pending() {
+            src |= 1 << USB_SERIAL_JTAG_INTR_SOURCE;
         }
         // Cross-core interrupts: SYSTEM.CPU_INT_FROM_CPU_0/1 (0x600C0030/34)
         // assert the FROM_CPU_INTR0/1 sources = 79/80 (esp32s3 interrupts.h
