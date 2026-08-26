@@ -1703,3 +1703,45 @@ Core design:
     follow-up. **ULP-RISC-V core execution is validated and retired as a P5
     candidate** (alongside the documented I2C `Wire` driver limitation; Touch
     excluded per user directive).
+
+  - 2026-08-27: **ULP-RISC-V C (compressed) extension + WDT/dual-core machine tests (P5)**.
+    - **C-extension (rv32imc) decoder** (`esp32s3-soc/src/ulp.rs`): the ULP
+      rv32im core now also decodes the RISC-V **C (compressed, 16-bit)**
+      extension — `C.ADDI4SPN`, `C.LW`/`C.SW`, `C.ADDI`/`C.ADDI16SP`, `C.LI`,
+      `C.LUI`, `C.SRLI`/`C.SRAI`/`C.ANDI`/`C.MV`/`C.ADD`/`C.JR`/`C.JALR`,
+      `C.J`/`C.BEQZ`/`C.BNEZ`, `C.EBREAK`, `C.SLLI`, `C.LWSP`/`C.SWSP`. The
+      GAS (esp-rv32 toolchain) **non-canonical** compressed encodings were
+      root-caused: C.SRAI/C.SRLI use `rs2f = bits[6:2]` (shamt≥8) vs
+      `bits[4:0]` (shamt<8) as a discriminator; C.MV/C.JR have `rs2<8`
+      (`bits[6:5]==0`) while C.SRAI has them set. A hand-assembled rv32imc
+      program (`mul`/`addi`/`slli`/`sw`/compressed `c.addi`/`c.slli`/`c.j`) is
+      now a passing machine test (`ulp_runs_compressed_rv32imc_program`),
+      asserting the computed `mem[90] == 5`. Validated the same program on a
+      real ESP32-S3 via `riscv32-esp-elf-as`/`ld`/`objdump` (signature
+      `2a00006f 00b00513 ... c000 0505 8d05 0440 fd65` matches the assembler
+      output exactly). Committed as `b7d4575`.
+    - **WDT edge-case machine tests** (`crates/esp32s3-emu/src/machine_tests.rs`):
+      `wdt_interrupt_fires_instead_of_reset` (routes TG0_WDT src 52 → line 15,
+      INT_ENA bit 2, CONFIG0=`0xA0000000` EN|stg0=interrupt, handler clears
+      INT_CLR bit 2 + rfi 3 → CTR==1, NO reboot), `wdt_reset_reboots_machine`
+      (app prints 'R' to UART0, arms MWDT0 stage-0 reset with hold0=4, loops;
+      the timeout triggers `Esp32S3::step`'s `consume_reset()` → `reset()` which
+      re-runs `boot_from_flash` from `self.flash` → ≥2 'R's captured across the
+      reboot — proves the WDT-reset-as-reboot path), and
+      `cross_core_interrupt_yields_to_other_core` (core 0 releases core 1 via
+      `APPCPU_CTRL_A`@`0x600C0004`, routes SYSTEM.CPU_INT_FROM_CPU_1 (src 80,
+      matrix off `4*(512+80)=0x940`) → core1 line 15; core 1 ISR clears the
+      cross-core reg + rfi 3 → STASH==0xCAFE, CTR==1, `cpu[1].pc==done1`).
+      All 3 pass; full `--workspace` test suite green (54 esp32s3-emu tests).
+    - **Clippy hygiene**: fixed 11 minor clippy warnings I'd introduced in the
+      C-extension decode (`bit(X) << 0` no-op shifts → `bit(X)`; redundant
+      `(u32 << n) as u32` casts → `(u32 << n)`). `cargo clippy --workspace`
+      (libs) is now clean; `wasm32-unknown-unknown` build clean; ULP tests
+      green. The only remaining `cargo test` (lib-tests) warnings are
+      **pre-existing** in `memspi.rs:924` (`let mut f` unused) — unrelated to
+      this work, left untouched.
+    - Remaining P5 work: I2C (Wire) esp-idf driver is a documented known
+      limitation (peripheral validated via direct poke); Touch excluded per
+      user directive. All other modeled peripherals (incl. ULP rv32imc, WDT,
+      dual-core cross-core IRQs) are validated.
+

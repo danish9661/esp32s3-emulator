@@ -13,10 +13,10 @@
 //! `debug` halted flag). Stores to the ULP `reg` slots land in the shared `regs`
 //! array so the main CPU can poll them.
 //!
-//! **Known limitation:** the compressed (C) extension and RV32F/D are not
-//! modeled, and the ULP can only reach `RTC_SLOW_MEM` + the ULP `reg` slots
-//! (other RTC peripheral accesses are ignored). Validation is via the
-//! `esp32s3_ulp` direct-poke sketch (hand-assembled rv32im program).
+//! **Known limitation:** RV32F/D are not modeled, and the ULP can only reach
+//! `RTC_SLOW_MEM` + the ULP `reg` slots (other RTC peripheral accesses are
+//! ignored). The compressed (C) extension IS modeled. Validation is via the
+//! `esp32s3_ulp` direct-poke sketch (hand-assembled rv32im/rv32imc program).
 
 use crate::memmap::RTC_SLOW_BASE;
 use crate::memmap::RTC_SLOW_SIZE;
@@ -109,8 +109,14 @@ impl Ulp {
             self.regs[self.idx(ULP_BASE + DEBUG_OFF)] |= 1;
             return;
         }
-        let insn = read32(rtc_slow, pc - RTC_SLOW_BASE);
-        let next = self.exec(insn, rtc_slow);
+        let lo = read16(rtc_slow, pc - RTC_SLOW_BASE);
+        let next = if (lo & 0x3) == 0x3 {
+            // 32-bit instruction: read the high half too.
+            let hi = read16(rtc_slow, pc - RTC_SLOW_BASE + 2);
+            self.exec((lo as u32) | ((hi as u32) << 16), rtc_slow)
+        } else {
+            self.exec16(lo, rtc_slow)
+        };
         if self.halted {
             self.regs[self.idx(ULP_BASE + DEBUG_OFF)] |= 1;
             return;
@@ -281,6 +287,282 @@ impl Ulp {
         next_pc
     }
 
+    /// Execute one 16-bit (compressed) instruction. Returns the next PC.
+    fn exec16(&mut self, insn: u16, mem: &mut [u8]) -> u32 {
+        let insn = insn as u32;
+        let pc = self.pc;
+        let mut next = pc.wrapping_add(2);
+        let quad = insn & 0x3;
+        let funct3 = (insn >> 13) & 0x7;
+        let bit = |b: u32| (insn >> b) & 1;
+
+        // 32-bit instructions never reach here (step reads 16 bits first).
+        if quad == 0x3 {
+            self.halted = true;
+            return pc;
+        }
+
+        match quad {
+            0 => match funct3 {
+                0 => {
+                    // C.ADDI4SPN: rd'=x8..x15 = x2 + (nzimm[9:2] << 2).
+                    let nzimm = (bit(6)
+                        | (bit(5) << 1)
+                        | (bit(11) << 2)
+                        | (bit(12) << 3)
+                        | (bit(7) << 4)
+                        | (bit(8) << 5)
+                        | (bit(9) << 6)
+                        | (bit(10) << 7))
+                        & 0x3FF;
+                    let rd = 8 + ((insn >> 10) & 0x7) as usize;
+                    if nzimm != 0 {
+                        self.x[rd] = self.x[2].wrapping_add(nzimm << 2);
+                    }
+                }
+                2 => {
+                    // C.LW: rd'=x8..x15 = mem[x1' + (uimm[6:2] << 2)].
+                    let rd = 8 + ((insn >> 2) & 0x7) as usize;
+                    let rs1 = 8 + ((insn >> 7) & 0x7) as usize;
+                    let uimm = (bit(5) << 4)
+                        | (bit(12) << 3)
+                        | (bit(11) << 2)
+                        | (bit(10) << 1)
+                        | bit(6);
+                    let addr = self.x[rs1].wrapping_add(uimm << 2);
+                    self.x[rd] = self.load(mem, addr, 2);
+                }
+                6 => {
+                    // C.SW: mem[x1' + (uimm[6:2] << 2)] = rs2'.
+                    let rs2 = 8 + ((insn >> 2) & 0x7) as usize;
+                    let rs1 = 8 + ((insn >> 7) & 0x7) as usize;
+                    let uimm = (bit(5) << 4)
+                        | (bit(12) << 3)
+                        | (bit(11) << 2)
+                        | (bit(10) << 1)
+                        | bit(6);
+                    let addr = self.x[rs1].wrapping_add(uimm << 2);
+                    self.store(mem, addr, self.x[rs2], 2);
+                }
+                _ => {
+                    self.halted = true;
+                    return pc;
+                }
+            },
+            1 => match funct3 {
+                0 => {
+                    // C.ADDI: rd = rd + sext6(imm).
+                    let rd = ((insn >> 7) & 0x1F) as usize;
+                    let imm = sext((bit(12) << 5) | ((insn >> 2) & 0x1F), 6);
+                    self.x[rd] = self.x[rd].wrapping_add(imm);
+                }
+                1 => {
+                    // C.JAL: ra = pc+2; jump.
+                    self.x[1] = pc.wrapping_add(2);
+                    next = pc.wrapping_add(c_j_imm(insn));
+                }
+                2 => {
+                    // C.LI: rd = sext6(imm).
+                    let rd = ((insn >> 7) & 0x1F) as usize;
+                    let imm = sext((bit(12) << 5) | ((insn >> 2) & 0x1F), 6);
+                    self.x[rd] = imm;
+                }
+                3 => {
+                    // C.LUI (rd != 0,2) / C.ADDI16SP (rd == 2).
+                    let rd = ((insn >> 7) & 0x1F) as usize;
+                    if rd == 2 {
+                        let nzimm = ((bit(12) << 5)
+                            | (bit(4) << 4)
+                            | (bit(3) << 3)
+                            | (bit(5) << 2)
+                            | (bit(2) << 1)
+                            | bit(6))
+                            & 0x3F;
+                        let imm = sext(nzimm, 6) << 4;
+                        self.x[2] = self.x[2].wrapping_add(imm);
+                    } else if rd != 0 {
+                        let imm = sext((bit(12) << 5) | ((insn >> 2) & 0x1F), 6);
+                        self.x[rd] = imm << 12;
+                    }
+                }
+                4 => {
+                    // C.MISC-ALU (quad1, funct3=4). GAS (esp-rv32 toolchain) layout:
+                    // bit12 is 0 for shifts/andi/alu; bit12=1 is reserved for
+                    // C.ADD/C.MV/C.JR/C.JALR/C.EBREAK. funct2 = bits[11:10].
+                    //   funct2=0 -> C.SRLI (bit12=0) / C.EBREAK (bit12=1, fields=0)
+                    //   funct2=1 -> C.SRAI/C.MV/C.JR (bit12=0) or C.ADD/C.JALR (bit12=1)
+                    //              C.MV/C.JR always have bits[6:5]==0 (rs2<8); C.SRAI
+                    //              uses bits[6:2] as a 5-bit shamt, so bits[6:5]!=0.
+                    //   funct2=2 -> C.ANDI
+                    //   funct2=3 -> alu group SUB/XOR/OR/AND via bits[6:5]
+                    let funct2 = (insn >> 10) & 0x3;
+                    match funct2 {
+                        0 => {
+                            if bit(12) == 0 {
+                                let rd = 8 + ((insn >> 7) & 0x7) as usize;
+                                self.x[rd] >>= (insn >> 2) & 0x1F;
+                            } else {
+                                // C.EBREAK (rd/rs2 fields = 0)
+                                self.halted = true;
+                                return pc;
+                            }
+                        }
+                        1 => {
+                            let rs2f = (insn >> 2) & 0x7;
+                            let rd = 8 + ((insn >> 7) & 0x7) as usize;
+                            let b65 = (insn >> 5) & 0x3; // bits[6:5]
+                            if bit(12) == 0 {
+                                if rs2f == 0 {
+                                    if b65 == 0 {
+                                        // C.JR
+                                        next = self.x[rd];
+                                    } else {
+                                        // C.SRAI: shamt in bits[6:2] (shamt >= 8).
+                                        let sh = (insn >> 2) & 0x1F;
+                                        self.x[rd] = ((self.x[rd] as i32) >> sh) as u32;
+                                    }
+                                } else if b65 == 0 {
+                                    // C.SRAI: shamt in bits[6:2] (shamt < 8).
+                                    let sh = (insn >> 2) & 0x1F;
+                                    self.x[rd] = ((self.x[rd] as i32) >> sh) as u32;
+                                } else {
+                                    // C.MV: rd = rs2.
+                                    self.x[rd] = self.x[8 + rs2f as usize];
+                                }
+                            } else if rs2f == 0 {
+                                // C.JALR (or EBREAK if rd==0)
+                                if rd == 0 {
+                                    self.halted = true;
+                                    return pc;
+                                }
+                                self.x[1] = pc.wrapping_add(2);
+                                next = self.x[rd];
+                            } else {
+                                // C.ADD
+                                self.x[rd] = self.x[rd].wrapping_add(self.x[8 + rs2f as usize]);
+                            }
+                        }
+                        2 => {
+                            // C.ANDI (bit12 is 0 in GAS; imm is 6-bit signed)
+                            let rd = 8 + ((insn >> 7) & 0x7) as usize;
+                            let imm = sext((insn >> 2) & 0x1F, 6);
+                            self.x[rd] &= imm;
+                        }
+                        3 => {
+                            // alu group: SUB/XOR/OR/AND via bits[6:5]
+                            let op = (insn >> 5) & 0x3;
+                            let rd = 8 + ((insn >> 7) & 0x7) as usize;
+                            let rs2 = 8 + ((insn >> 2) & 0x7) as usize;
+                            match op {
+                                0 => self.x[rd] = self.x[rd].wrapping_sub(self.x[rs2]),
+                                1 => self.x[rd] ^= self.x[rs2],
+                                2 => self.x[rd] |= self.x[rs2],
+                                3 => self.x[rd] &= self.x[rs2],
+                                _ => unreachable!(),
+                            }
+                        }
+                        _ => {
+                            self.halted = true;
+                            return pc;
+                        }
+                    }
+                }
+                5 => {
+                    // C.J
+                    next = pc.wrapping_add(c_j_imm(insn));
+                }
+                6 => {
+                    // C.BEQZ
+                    let rs1 = 8 + ((insn >> 7) & 0x7) as usize;
+                    if self.x[rs1] == 0 {
+                        next = pc.wrapping_add(c_b_imm(insn));
+                    }
+                }
+                7 => {
+                    // C.BNEZ
+                    let rs1 = 8 + ((insn >> 7) & 0x7) as usize;
+                    if self.x[rs1] != 0 {
+                        next = pc.wrapping_add(c_b_imm(insn));
+                    }
+                }
+                _ => {
+                    self.halted = true;
+                    return pc;
+                }
+            },
+            2 => match funct3 {
+                0 => {
+                    // C.SLLI: rd <<= shamt (5-bit).
+                    let rd = ((insn >> 7) & 0x1F) as usize;
+                    let sh = (insn >> 2) & 0x1F;
+                    self.x[rd] <<= sh;
+                }
+                2 => {
+                    // C.LWSP: rd = mem[x2 + (uimm[7:2] << 2)].
+                    let rd = ((insn >> 7) & 0x1F) as usize;
+                    if rd != 0 {
+                        let uimm = (bit(3) << 5)
+                            | (bit(2) << 4)
+                            | (bit(12) << 3)
+                            | (bit(6) << 2)
+                            | (bit(5) << 1)
+                            | bit(4);
+                        let addr = self.x[2].wrapping_add(uimm << 2);
+                        self.x[rd] = self.load(mem, addr, 2);
+                    }
+                }
+                4 => {
+                    // C.JR / C.MV / C.JALR / C.ADD / C.EBREAK.
+                    let rd = ((insn >> 7) & 0x1F) as usize;
+                    let rs2 = ((insn >> 2) & 0x1F) as usize;
+                    if bit(12) == 0 {
+                        if rs2 == 0 {
+                            // C.JR
+                            next = self.x[rd] & !1;
+                        } else {
+                            // C.MV: rd = rs2
+                            self.x[rd] = self.x[rs2];
+                        }
+                    } else if rs2 == 0 {
+                        if rd == 0 {
+                            // C.EBREAK
+                            self.halted = true;
+                            return pc;
+                        } else {
+                            // C.JALR: ra = pc+2; jump.
+                            self.x[1] = pc.wrapping_add(2);
+                            next = self.x[rd] & !1;
+                        }
+                    } else {
+                        // C.ADD
+                        self.x[rd] = self.x[rd].wrapping_add(self.x[rs2]);
+                    }
+                }
+                6 => {
+                    // C.SWSP: mem[x2 + (uimm[7:2] << 2)] = rs2.
+                    let rs2 = ((insn >> 2) & 0x1F) as usize;
+                    let uimm = (bit(8) << 5)
+                        | (bit(7) << 4)
+                        | (bit(12) << 3)
+                        | (bit(11) << 2)
+                        | (bit(10) << 1)
+                        | bit(9);
+                    let addr = self.x[2].wrapping_add(uimm << 2);
+                    self.store(mem, addr, self.x[rs2], 2);
+                }
+                _ => {
+                    self.halted = true;
+                    return pc;
+                }
+            },
+            _ => {
+                self.halted = true;
+                return pc;
+            }
+        }
+        next
+    }
+
     /// Load from ULP-visible memory: the `reg` slots (ULP_BASE+0x0C..) or
     /// `RTC_SLOW_MEM`. Other addresses read as 0.
     fn load(&self, mem: &[u8], addr: u32, funct3: u32) -> u32 {
@@ -327,9 +609,45 @@ fn read32(mem: &[u8], off: u32) -> u32 {
     u32::from_le_bytes([mem[o], mem[o + 1], mem[o + 2], mem[o + 3]])
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn read16(mem: &[u8], off: u32) -> u16 {
+    let o = off as usize;
+    u16::from_le_bytes([mem[o], mem[o + 1]])
+}
+
+/// Sign-extend `v` (a value with `n` meaningful low bits) to a 32-bit word.
+fn sext(v: u32, n: u32) -> u32 {
+    let s = 32 - n;
+    (((v as i32) << s) >> s) as u32
+}
+
+/// Decode the 12-bit (signed, ×2) offset of a C.J / C.JAL instruction.
+fn c_j_imm(insn: u32) -> u32 {
+    let b = |x: u32| (insn >> x) & 1;
+    let imm = (b(3) << 1)
+        | (b(4) << 2)
+        | (b(5) << 3)
+        | (b(11) << 4)
+        | (b(2) << 5)
+        | (b(7) << 6)
+        | (b(6) << 7)
+        | (b(9) << 8)
+        | (b(10) << 9)
+        | (b(8) << 10)
+        | (b(12) << 11);
+    sext(imm, 12)
+}
+
+/// Decode the 9-bit (signed, ×2) offset of a C.BEQZ / C.BNEZ instruction.
+fn c_b_imm(insn: u32) -> u32 {
+    let b = |x: u32| (insn >> x) & 1;
+    let imm =
+        (b(3) << 1) | (b(4) << 2) | (b(10) << 3) | (b(11) << 4) | (b(2) << 5) | (b(5) << 6) | (b(6) << 7) | (b(12) << 8);
+    sext(imm, 9)
+}
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
 
     /// Hand-assembled rv32im program: store 0x12345678 to ULP reg slot 0, then
     /// `ebreak`. Words (LE): lui/addi to build the reg-slot address, lui/addi
@@ -385,6 +703,49 @@ mod tests {
         let mut ulp = Ulp::new();
         ulp.write32(ULP_BASE + 0x50, 0xCAFE_BEEF);
         assert_eq!(ulp.read32(ULP_BASE + 0x50), 0xCAFE_BEEF);
+    }
+
+    /// Hand-assembled rv32imc program (built with riscv32-esp-elf-as, -march=rv32imc)
+    /// that exercises the compressed (C) extension: C.ADDI4SPN, C.LWSP/C.SWSP,
+    /// C.LI, C.ADDI, C.ADD, C.SUB, C.SLLI, C.SRAI, C.ANDI, C.XOR/C.OR/C.AND via
+    /// C.MV+C.<op>, C.LW/C.SW, C.BEQZ, C.J, C.MV and C.EBREAK. It computes a set
+    /// of results into `RTC_SLOW_MEM` (base 0x5000_0000 + 0x80 data region).
+    const C_PROG: &[u8] = &[
+        0x37, 0x01, 0x00, 0x50, 0x00, 0x01, 0xa2, 0xc8, 0xc6, 0x44, 0xa6, 0xdc, 0x29, 0x45, 0xd1, 0x45,
+        0x2e, 0x95, 0x2a, 0x86, 0x0d, 0x8e, 0x0a, 0x05, 0x09, 0x85, 0x9d, 0x89, 0xb2, 0x86, 0xad, 0x8e,
+        0x32, 0x87, 0x4d, 0x8f, 0xb2, 0x87, 0xed, 0x8f, 0x08, 0xc0, 0x54, 0xc0, 0x18, 0xc4, 0x5c, 0xc4,
+        0x10, 0xcc, 0x91, 0x47, 0x81, 0x48, 0x85, 0x08, 0x99, 0xc3, 0xfd, 0x17, 0xed, 0xbf, 0x23, 0x28,
+        0x14, 0x01, 0x04, 0x40, 0x44, 0xc8, 0x02, 0x90,
+    ];
+
+    fn rd(mem: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes([mem[off], mem[off + 1], mem[off + 2], mem[off + 3]])
+    }
+
+    #[test]
+    fn ulp_runs_compressed_rv32imc_program() {
+        let mut ulp = Ulp::new();
+        let mut mem = [0u8; RTC_SLOW_SIZE as usize];
+        mem[..C_PROG.len()].copy_from_slice(C_PROG);
+        ulp.write32(ULP_BASE, 1);
+        for _ in 0..200 {
+            if !ulp.is_running() {
+                break;
+            }
+            ulp.step(&mut mem[..]);
+        }
+        assert!(!ulp.is_running(), "ULP did not halt");
+        // SP-relative (C.LWSP/C.SWSP): x8 = base+0x80 stored at both 0x50 and 0x78.
+        assert_eq!(rd(&mem, 0x50), 0x5000_0080);
+        assert_eq!(rd(&mem, 0x78), 0x5000_0080);
+        // Arithmetic results in the 0x80 data region.
+        assert_eq!(rd(&mem, 0x80), 30); // x10 = (10+20) <<2 >>2
+        assert_eq!(rd(&mem, 0x84), 14); // x13 = (10 ^ 4)
+        assert_eq!(rd(&mem, 0x88), 14); // x14 = (10 | 4)
+        assert_eq!(rd(&mem, 0x8C), 0); // x15 = (10 & 4)
+        assert_eq!(rd(&mem, 0x90), 5); // loop ran 5 times
+        assert_eq!(rd(&mem, 0x94), 30); // C.LW round-trip of 0x80
+        assert_eq!(rd(&mem, 0x98), 10); // x12 = (30 - 20)
     }
 }
 

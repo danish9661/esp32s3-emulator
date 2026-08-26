@@ -1943,3 +1943,238 @@ fn ulp_runs_poked_program_via_bus() {
     }
     assert_eq!(m.soc.read32(ULP_BASE + 0x0C), 0x1234_5678);
 }
+
+/// MWDT0 stage 0 = interrupt (not reset): the WDT must raise TIMG0 INT_RAW.WDT
+/// (source 52), the interrupt matrix must route it to a CPU line, and the
+/// level-3 handler must run — without rebooting the machine.  This is the
+/// edge case where a watched-dog timeout is handled by firmware rather than
+/// triggering a system reset.
+#[test]
+fn wdt_interrupt_fires_instead_of_reset() {
+    use crate::asm::Asm;
+    use esp32s3_soc::memmap::{INT_MATRIX_BASE, TIMG0_BASE};
+
+    // App: literal pool first (CTR/STASH/INT_MATRIX/TIMG0), then code.  Routes
+    // TG0_WDT (source 52) -> CPU line 15 (level 3), enables the TIMG0 WDT
+    // interrupt (INT_ENA bit 2), arms MWDT0 stage 0 with an interrupt action
+    // (CONFIG0 stg0=1) and a short hold (CONFIG2 = 8), enables INTENABLE bit
+    // 15, then spins until the handler has run once and stashes 0xCAFE.
+    const CTR: u32 = 0x3FC8_0100;
+    const STASH: u32 = 0x3FC8_0104;
+    let mut a = Asm::new(IRAM_BASE);
+    let l_ctr = a.offset();
+    a.lit(0);
+    let l_stash = a.offset();
+    a.lit(0);
+    let l_mat = a.offset();
+    a.lit(0);
+    let l_timg = a.offset();
+    a.lit(0);
+    let code_start = a.pc();
+    let p = a.l32r(2); // INT_MATRIX_BASE
+    a.patch_l32r(p, IRAM_BASE + l_mat as u32);
+    a.movi_n(3, 15);
+    a.s32i(3, 2, 4 * 52); // INT_MATRIX_BASE + 4*52: TG0_WDT -> line 15
+    let p = a.l32r(2); // TIMG0_BASE
+    a.patch_l32r(p, IRAM_BASE + l_timg as u32);
+    a.movi_n(3, 8);
+    a.s32i(3, 2, 0x50); // WDT_CONFIG2 (hold0) = 8
+    a.li(3, 0xA000_0000u32 as i32); // WDT_CONFIG0: EN | stg0=interrupt(1<<29)
+    a.s32i(3, 2, 0x48);
+    a.movi_n(3, 4);
+    a.s32i(3, 2, 0x70); // INT_ENA bit 2 (WDT)
+    a.li(3, 0x8000); // INTENABLE bit 15
+    a.wsr(228, 3);
+    a.rsil(4, 0);
+    let loop_start = a.pc();
+    let p = a.l32r(2); // CTR
+    a.patch_l32r(p, IRAM_BASE + l_ctr as u32);
+    a.l32i(3, 2, 0);
+    a.addi(4, 3, -1);
+    a.bnez(4, loop_start);
+    a.li(4, 0xCAFE);
+    let p = a.l32r(5); // STASH
+    a.patch_l32r(p, IRAM_BASE + l_stash as u32);
+    a.s32i(4, 5, 0);
+    let done = a.pc();
+    a.j(done);
+    a.bytes_mut()[l_ctr..l_ctr + 4].copy_from_slice(&CTR.to_le_bytes());
+    a.bytes_mut()[l_stash..l_stash + 4].copy_from_slice(&STASH.to_le_bytes());
+    a.bytes_mut()[l_mat..l_mat + 4].copy_from_slice(&INT_MATRIX_BASE.to_le_bytes());
+    a.bytes_mut()[l_timg..l_timg + 4].copy_from_slice(&TIMG0_BASE.to_le_bytes());
+
+    // Level-3 handler (a6-a9 only): CTR += 1, clear WDT INT (INT_CLR bit 2), rfi 3.
+    let mut h = Asm::new(0x4000_01C0);
+    h.li(6, CTR as i32);
+    h.l32i(7, 6, 0);
+    h.addi(7, 7, 1);
+    h.s32i(7, 6, 0);
+    h.li(8, TIMG0_BASE as i32);
+    h.movi_n(9, 4);
+    h.s32i(9, 8, 0x7C); // INT_CLR bit 2 (WDT)
+    h.rfi(3);
+    assert!(
+        h.bytes().len() <= 0x40,
+        "handler fits the 64-byte vector slot"
+    );
+
+    let mut m = Esp32S3::new();
+    m.load_image(IRAM_BASE, a.bytes());
+    m.load_image(0x4000_01C0, h.bytes());
+    m.cpu[0].pc = code_start;
+    for _ in 0..2000 {
+        if m.cpu[0].pc == done {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.cpu[0].pc, done, "app finished its loop");
+    assert_eq!(m.soc.read32(STASH), 0xCAFE, "stash after WDT interrupt");
+    assert_eq!(
+        m.soc.read32(CTR),
+        1,
+        "handler ran exactly once (no reset, no re-fire)"
+    );
+    assert_eq!(m.soc.read32(INT_MATRIX_BASE + 4 * 52), 15, "matrix write");
+}
+
+/// MWDT0 stage 0 = reset: when the watchdog times out the machine must reboot.
+/// The app prints 'R' to the UART on every boot; a WDT reset re-runs the boot
+/// sequence, so the UART stream accumulates multiple 'R's.  This is the
+/// canonical "system reset on watchdog" edge case.
+#[test]
+fn wdt_reset_reboots_machine() {
+    use crate::asm::Asm;
+    use crate::rom_stub::APP_FLASH_OFFSET;
+
+    // App (single IRAM segment): print 'R' (UART0 FIFO), arm MWDT0 stage 0 =
+    // reset (CONFIG0 stg0=2) with a short hold (CONFIG2 = 4), then loop
+    // forever.  Each WDT timeout triggers a machine reboot, re-printing 'R'.
+    const APP_ENTRY: u32 = IRAM_BASE;
+    let mut a = Asm::new(IRAM_BASE);
+    // Print 'R' to UART0 (0x60000000) — printed once per boot.
+    a.li(2, 0x6000_0000);
+    a.movi_n(3, 0x52); // 'R'
+    a.s32i(3, 2, 0); // UART0 FIFO <- 'R'
+    // Arm MWDT0 (TIMG0_BASE) stage 0 = reset (CONFIG0 stg0=2) with a short
+    // hold (CONFIG2 = 4), then loop forever; the timeout reboots.
+    a.li(2, TIMG0_BASE as i32); // a2 = 0x6001F000
+    a.movi_n(3, 4);
+    a.s32i(3, 2, 0x50); // WDT_CONFIG2 (hold0) = 4
+    a.li(3, 0xC000_0000u32 as i32); // WDT_CONFIG0: EN | stg0=reset(2<<29)
+    a.s32i(3, 2, 0x48);
+    let here = a.pc();
+    a.j(here); // loop forever (WDT will reset)
+    let app = a.bytes().to_vec();
+
+    let img = esp_app_image(IRAM_BASE, APP_ENTRY, &app);
+    let mut flash = std::vec![0xFFu8; 0x200_000];
+    flash[APP_FLASH_OFFSET as usize..APP_FLASH_OFFSET as usize + img.len()].copy_from_slice(&img);
+
+    let mut m = Esp32S3::new();
+    m.boot_from_flash(&flash);
+    // Drain the UART each step and accumulate so a reboot's FIFO clear does
+    // not drop the 'R' printed before it.
+    let mut out = std::vec::Vec::new();
+    for _ in 0..5000 {
+        m.step();
+        out.extend(m.take_uart_tx(0));
+    }
+    let r_count = out.iter().filter(|&&b| b == b'R').count();
+    assert!(
+        r_count >= 2,
+        "WDT reset must reboot the machine (>=2 'R's), got {r_count} (out={out:?})"
+    );
+}
+
+/// Cross-core interrupt (FROM_CPU_INTR1, source 80): core 0 writes
+/// SYSTEM.CPU_INT_FROM_CPU_1 to assert an interrupt on core 1; the interrupt
+/// matrix maps source 80 to core 1's line 15; core 1's level-3 ISR must run
+/// and wake the idle core.  This is the FreeRTOS SMP yield path.
+#[test]
+fn cross_core_interrupt_yields_to_other_core() {
+    use crate::asm::Asm;
+    use crate::rom_stub::APP_FLASH_OFFSET;
+    use esp32s3_soc::memmap::{INT_MATRIX_BASE, SYSTEM_BASE};
+
+    const CORE1_CODE: u32 = IRAM_BASE + 0x200;
+    const CTR: u32 = 0x3FC8_0300;
+    const STASH: u32 = 0x3FC8_0304;
+
+    // Core 0 (IRAM segment): release core 1 (APPCPU_CTRL_A), route source 80
+    // (FROM_CPU_INTR1) -> core 1 line 15, assert the cross-core interrupt
+    // (SYSTEM.CPU_INT_FROM_CPU_1 = 1), then loop.
+    let mut a0 = Asm::new(IRAM_BASE);
+    a0.li(6, CORE1_CODE as i32);
+    a0.li(7, (SYSTEM_BASE + 4) as i32); // APPCPU_CTRL_A
+    a0.s32i(6, 7, 0); // release core 1
+    a0.li(6, (INT_MATRIX_BASE + 4 * (512 + 80)) as i32); // cpu1, src80
+    a0.movi_n(7, 15);
+    a0.s32i(7, 6, 0); // route FROM_CPU_INTR1 -> core1 line 15
+    a0.li(6, (SYSTEM_BASE + 0x34) as i32); // CPU_INT_FROM_CPU_1
+    a0.movi_n(7, 1);
+    a0.s32i(7, 6, 0); // assert cross-core interrupt to core 1
+    let here0 = a0.pc();
+    a0.j(here0);
+    let core0 = a0.bytes().to_vec();
+
+    // Core 1 (segment at CORE1_CODE): enable INTENABLE bit 15 (level 3), then
+    // idle on CTR.  When the cross-core ISR runs it bumps CTR, so the loop
+    // exits and stashes 0xCAFE.
+    let mut a1 = Asm::new(CORE1_CODE);
+    a1.li(2, CTR as i32); // a2 = CTR addr
+    a1.li(3, 0x8000); // INTENABLE bit 15
+    a1.wsr(228, 3);
+    a1.rsil(4, 0);
+    let loop1 = a1.pc();
+    a1.l32i(3, 2, 0); // a3 = CTR
+    a1.addi(4, 3, -1); // a4 = CTR - 1
+    a1.bnez(4, loop1); // while CTR < 1: spin
+    a1.li(4, 0xCAFE);
+    a1.li(5, STASH as i32);
+    a1.s32i(4, 5, 0); // stash 0xCAFE once woken
+    let done1 = a1.pc();
+    a1.j(done1);
+    let core1 = a1.bytes().to_vec();
+
+    // Core-1 level-3 ISR (vector 0x400001C0): CTR += 1, clear the cross-core
+    // register, rfi 3.
+    let mut h = Asm::new(0x4000_01C0);
+    h.li(6, CTR as i32);
+    h.l32i(7, 6, 0);
+    h.addi(7, 7, 1);
+    h.s32i(7, 6, 0); // CTR += 1
+    h.li(8, (SYSTEM_BASE + 0x34) as i32);
+    h.movi_n(9, 0);
+    h.s32i(9, 8, 0); // clear CPU_INT_FROM_CPU_1 (deassert)
+    h.rfi(3);
+    assert!(
+        h.bytes().len() <= 0x40,
+        "ISR fits the 64-byte vector slot"
+    );
+
+    let img = esp_app_image_multi(IRAM_BASE, &[(IRAM_BASE, &core0), (CORE1_CODE, &core1)]);
+    let mut flash = std::vec![0xFFu8; 0x200_000];
+    flash[APP_FLASH_OFFSET as usize..APP_FLASH_OFFSET as usize + img.len()].copy_from_slice(&img);
+
+    let mut m = Esp32S3::new();
+    m.boot_from_flash(&flash);
+    m.load_image(0x4000_01C0, h.bytes()); // core-1 ISR
+    for _ in 0..5000 {
+        if m.soc.read32(STASH) != 0 {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(
+        m.soc.read32(STASH),
+        0xCAFE,
+        "core 1 woke via cross-core interrupt"
+    );
+    assert_eq!(
+        m.soc.read32(CTR),
+        1,
+        "cross-core ISR ran exactly once (no re-fire)"
+    );
+    assert_eq!(m.cpu[1].pc, done1, "core 1 reached done after ISR");
+}

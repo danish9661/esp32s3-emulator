@@ -176,7 +176,7 @@ impl Sdmmc {
             }
             3 => {
                 // SEND_RCA (R6): assign/return our RCA.
-                resp[0] = (self.rca << 16);
+                resp[0] = self.rca << 16;
                 self.card_state = CardState::Stby;
             }
             7 => {
