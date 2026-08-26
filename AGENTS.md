@@ -90,7 +90,8 @@ Core design:
          pokes (peripheral correct, driver path not modeled): I2C (Wire driver
          documented known limitation — root-caused to the esp-idf i2c driver's
          internal `cmd_link`/`xQueueGenericSendFromISR` init ABI), RTC_IO, ULP
-         (program execution NOT modeled), SDMMC (card-command FSM NOT modeled),
+         (program execution NOW modeled — rv32im core, P5 candidate retired),
+         SDMMC (card-command FSM NOW modeled, P5 candidate retired),
          Deep-sleep (esp-idf `esp_deep_sleep_start` hangs in sleep *preparation*
          — documented), LP_I2C, LP_UART, ECDSA, and the P5 register-store stubs
          (SENSITIVE/WCL/PERI_BACKUP/SYSCON/I2S-boot/PARLIO-assist via
@@ -1649,5 +1650,56 @@ Core design:
     RX pop + recv-int clear, INT_CLR) + the arduino-cli poke sketch
     `tools/sketches/esp32s3_usb_serial` (direct register writes of `USBCDC:OK`
     to `0x60038000`, merge confirmed in `run_flash` output between `USB TEST
-    START`/`END`) → USB CDC TX validated end-to-end. RX validated by unit
-    tests. **USB-Serial-JTAG is retired as a P5 candidate.**
+     START`/`END`) → USB CDC TX validated end-to-end. RX validated by unit
+     tests. **USB-Serial-JTAG is retired as a P5 candidate.**
+
+  - 2026-08-26: **SD/MMC host + simulated SD card (P5 — new peripheral via
+    arduino-cli validation)**. `esp32s3-soc/src/sdmmc.rs` (previously a bare
+    register store) now models the DesignWare MMC host at `0x6002_8000` AND a
+    simulated SD card behind it: writing `CMD` (0x2C, `start_command` bit 31)
+    issues a command to the card, which fills `RESP0..3` (0x30..0x3C) and
+    latches `RINTSTS` cmd_done (bit 2) / data_over (bit 3); block transfers use
+    the PIO FIFO (0x100). `CMD` bitfield per `sdmmc_struct.h`: `cmd_index`
+    [5:0], `response_expect` bit 6, `response_long`(R2) bit 7, `data_expected`
+    bit 9, `rw` bit 10 (0=read,1=write), `send_init` bit 15, `update_clk_reg`
+    bit 21, `start_command` bit 31. The card implements GO_IDLE/IF_COND/ACMD41
+    (ready after 2nd call, SDHC/CCS set)/ALL_SEND_CID(R2)/SEND_RCA/SELECT/
+    SEND_CSD/CID/STATUS/SET_BLOCKLEN/READ_SINGLE_BLOCK/WRITE_BLOCK; a single
+    512-byte `block` buffer round-trips writes. `CDETECT` reads 0 (card
+    present), `WRTPRT` 0. 3 unit tests (`tests` in sdmmc.rs: init sequence,
+    read-block pattern, write→read round-trip) + the arduino-cli poke sketch
+    `tools/sketches/esp32s3_sdmmc` (full init + block R/W via register pokes)
+    → `SDMMC PASS` under `run_flash`. **KNOWN LIMITATION**: the esp-idf
+    `SD_MMC`/`SD` driver uses the IDMAC DMA path (not modeled) and CMD6/CMD51/
+    SDIO; only the PIO FIFO data path is functional — validation is via direct
+    register pokes, consistent with RMT/I2C/TWAI/HMAC/etc. **SDMMC is retired
+     as a P5 candidate (register + simulated-card path).** Remaining P5 work:
+     ULP-RISC-V core execution (task 3) + the documented I2C `Wire` driver
+     limitation; Touch excluded per user directive.
+
+  - 2026-08-26: **ULP-RISC-V core execution (P5 — new peripheral via arduino-cli
+    validation)**. `esp32s3-soc/src/ulp.rs` is now a **functional rv32im core**
+    (was a register store). The ULP-RISC-V runs firmware from `RTC_SLOW_MEM`
+    (`0x5000_0000`, 8 KB, already mapped on the SoC bus). Writing the `core`
+    `sw_start` bit (bit 0 of `0x6000_8100`, the ULP block = RTC_CNTL page +
+    0x100) releases the core; it runs one instruction per `Soc::tick_timers`
+    step (`self.ulp.step(&mut self.rtc_slow[..])`), executes the program, and
+    halts on `ebreak` (sets the `debug` halted flag). Stores to the ULP `reg`
+    slots (`0x6000_810C..`, the 16 general-purpose communication words) land in
+    the shared `regs` array so the main CPU can poll them. Decoder implements
+    LUI/AUIPC/JAL/JALR/BRANCH/LOAD/STORE/OP-IMM/OP(+M mul/div/rem)/FENCE/SYSTEM
+    (rv32im). The RTC_CNTL page dispatch now carves `0x100..0x200` out to the
+    `Ulp` core, **except** `0x130` (RTC_CNTL_SLP_WAKEUP_CAUSE) which stays in
+    `Rtc` so deep-sleep keeps working. 3 unit tests in `ulp.rs` (program runs +
+    writes reg slot, ebreak halts + debug flag, register store round-trip) + a
+    machine test `ulp_runs_poked_program_via_bus` + the arduino-cli poke sketch
+    `tools/sketches/esp32s3_ulp` (hand-assembled rv32im program stores
+    `0x12345678` to reg slot 0 then ebreaks; main core polls) → `ULP POKE PASS`
+    under `run_flash`. **KNOWN LIMITATION**: the RISC-V **compressed (C)
+    extension** and RV32F/D are not modeled, and the ULP can only reach
+    `RTC_SLOW_MEM` + the ULP `reg` slots (other RTC peripheral accesses are
+    ignored). Real ULP firmware is typically compiled with `-march=rv32imc`, so
+    the C extension will be needed for genuine esp-idf ULP programs — noted as a
+    follow-up. **ULP-RISC-V core execution is validated and retired as a P5
+    candidate** (alongside the documented I2C `Wire` driver limitation; Touch
+    excluded per user directive).

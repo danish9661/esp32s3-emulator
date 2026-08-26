@@ -1663,10 +1663,10 @@ fn sdmmc_registers_round_trip() {
 
     let mut m = Esp32S3::new();
     m.soc.write32(SDMMC_BASE + 0x00, 0x000F_0001); // CTRL
-    m.soc.write32(SDMMC_BASE + 0x2C, 0x8020_0000); // CMD
+    m.soc.write32(SDMMC_BASE + 0x2C, 0x0020_0000); // CMD (no start bit -> stores)
     m.soc.write32(SDMMC_BASE + 0x30, 0xCAFE_BEEF); // RESP0
     assert_eq!(m.soc.read32(SDMMC_BASE + 0x00), 0x000F_0001);
-    assert_eq!(m.soc.read32(SDMMC_BASE + 0x2C), 0x8020_0000);
+    assert_eq!(m.soc.read32(SDMMC_BASE + 0x2C), 0x0020_0000);
     assert_eq!(m.soc.read32(SDMMC_BASE + 0x30), 0xCAFE_BEEF);
 }
 
@@ -1921,4 +1921,25 @@ fn i2s_gdma_out_feeds_tx_fifo() {
         rx0,
         rx1
     );
+}
+
+#[test]
+fn ulp_runs_poked_program_via_bus() {
+    use esp32s3_soc::memmap::RTC_SLOW_BASE;
+    use esp32s3_soc::ulp::ULP_BASE;
+    let mut m = Esp32S3::new();
+    // Hand-assembled rv32im program: store 0x12345678 to ULP reg slot 0 then ebreak.
+    let prog: [u32; 6] = [
+        0x6000_80B7, 0x10C0_8093, 0x1234_5137, 0x6781_0113, 0x0020_A023, 0x0010_0073,
+    ];
+    for (i, w) in prog.iter().enumerate() {
+        m.soc.write32(RTC_SLOW_BASE + (i as u32) * 4, *w);
+    }
+    // Release the ULP core.
+    m.soc.write32(ULP_BASE, 1);
+    // Run only the ULP (via tick_timers) — no Xtensa execution needed.
+    for _ in 0..200 {
+        m.soc.tick_timers(1);
+    }
+    assert_eq!(m.soc.read32(ULP_BASE + 0x0C), 0x1234_5678);
 }

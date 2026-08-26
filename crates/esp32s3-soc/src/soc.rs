@@ -42,6 +42,7 @@ use crate::rtc::Rtc;
 use crate::rtc_i2c::RtcI2c;
 use crate::rtc_io::RtcIo;
 use crate::sdmmc::Sdmmc;
+use crate::ulp::{Ulp, ULP_OFF_END, ULP_OFF_START};
 use crate::sha::Sha;
 use crate::sigmadelta::Sdm;
 use crate::spi::Spi;
@@ -151,6 +152,8 @@ pub struct Soc {
     /// (0x60038000), NOT UART0 — the S3's ROM messages come out of the USB-CDC
     /// port on real hardware. `Esp32S3::take_usb_serial_tx` drains this too.
     usb: UsbSerialJtag,
+    /// ULP-RISC-V coprocessor (its own rv32im core; runs from RTC_SLOW_MEM).
+    ulp: Ulp,
     uarts: [Uart; 3],
     gpio: Gpio,
     ledc: Lcdc,
@@ -257,6 +260,7 @@ impl Soc {
             rtc_fast: Box::new([0; RTC_FAST_SIZE as usize]),
             uarts: [Uart::new(), Uart::new(), Uart::new()],
             usb: UsbSerialJtag::new(),
+            ulp: Ulp::new(),
             gpio: Gpio::new(),
             ledc: Lcdc::new(),
             mcpwm: Mcpwm::new(),
@@ -468,6 +472,9 @@ impl Soc {
 
     pub fn tick_timers(&mut self, cycles: u64) {
         for _ in 0..cycles {
+            // ULP-RISC-V coprocessor: run one instruction per machine step when
+            // released (the `core` sw_start bit). RTC_SLOW_MEM is its code/data.
+            self.ulp.step(&mut self.rtc_slow[..]);
             self.timg[0].tick(1);
             self.timg[1].tick(1);
             self.systimer.tick(1);
@@ -994,8 +1001,18 @@ impl Soc {
                     }
                 } else if off < 0x400 {
                     // RTC_CNTL page (0x000..0x400).  The ULP-RISC-V control
-                    // block (0x100..0x200) is handled inside `Rtc`.
-                    if is_write {
+                    // block (0x100..0x200) is carved out to the `Ulp` core.
+                    if in_range!(off, ULP_OFF_START, ULP_OFF_END - ULP_OFF_START) && off != 0x130 {
+                        // RTC_CNTL_SLP_WAKEUP_CAUSE (0x130) lives in RTC_CNTL,
+                        // not the ULP block; route it to `Rtc` (deep-sleep).
+                        let full = 0x6000_8000 + off;
+                        if is_write {
+                            self.ulp.write32(full, value);
+                            0
+                        } else {
+                            self.ulp.read32(full)
+                        }
+                    } else if is_write {
                         self.rtc.write32(off, value);
                         0
                     } else {
