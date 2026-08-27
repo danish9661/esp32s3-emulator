@@ -7,10 +7,15 @@
 //! instruction (verified failure mode 2026-08-15).
 
 use esp32s3_soc::gdma::{GDMA_BASE, GDMA_I2S0_PERIPH};
+use esp32s3_soc::gpio::{GPIO_ENABLE_W1TS, GPIO_OUT_W1TC, GPIO_OUT_W1TS};
 use esp32s3_soc::memmap::{
     ASSIST_DEBUG_BASE, GPIO_BASE, I2S0_BASE, I2S1_BASE, IRAM_BASE, LCD_CAM_BASE, PERI_BACKUP_BASE,
     SENSITIVE_BASE, SYSCON_BASE, TIMG0_BASE, UART0_BASE, WCL_BASE,
 };
+use esp32s3_soc::sdmmc::{
+    BLKSIZ, BYTCNT, CMD, CMDARG, IDMAC_CTRL, IDMAC_DBADDR, RINTSTS, SDMMC_BASE,
+};
+use esp32s3_soc::soc::EVT_GPIO;
 
 use xtensa_core::Bus;
 
@@ -1713,7 +1718,8 @@ fn twai_loopback_transmits_and_receives() {
     m.soc.write32(b + 0x00, 1);
     // Acceptance filter: code 0, mask 0xFFFFFFFF (all don't-care) -> accept all.
     for off in [0x40u32, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C] {
-        m.soc.write32(b + off, if off < 0x50 { 0 } else { 0xFFFF_FFFF });
+        m.soc
+            .write32(b + off, if off < 0x50 { 0 } else { 0xFFFF_FFFF });
     }
     // Leave reset, enter self-test mode (stm = bit 2) -> TX loops back to RX.
     m.soc.write32(b + 0x00, 1 << 2);
@@ -2235,4 +2241,92 @@ fn cross_core_interrupt_yields_to_other_core() {
         "cross-core ISR ran exactly once (no re-fire)"
     );
     assert_eq!(m.cpu[1].pc, done1, "core 1 reached done after ISR");
+}
+
+#[test]
+fn sdmmc_idmac_walks_descriptors() {
+    let mut m = Esp32S3::new();
+    let sd = SDMMC_BASE;
+
+    // Descriptor ring + data buffers in DRAM.
+    let desc_w = 0x3FCE_0000; // write descriptor
+    let buf_w = 0x3FCE_1000; // write data buffer
+    let desc_r = 0x3FCE_2000; // read descriptor
+    let buf_r = 0x3FCE_3000; // read data buffer
+
+    // Fill the write buffer with a recognizable pattern (LE words).
+    for i in 0..128u32 {
+        m.soc.write32(buf_w + i * 4, i.wrapping_mul(0x0101_0101));
+    }
+
+    // Write descriptor: OWN|FS|LD, size 512, buffer = buf_w, next = 0.
+    m.soc.write32(desc_w, (1 << 31) | (1 << 1) | (1 << 2));
+    m.soc.write32(desc_w + 4, 512);
+    m.soc.write32(desc_w + 8, buf_w);
+    m.soc.write32(desc_w + 12, 0);
+
+    // Enable IDMAC and point it at the descriptor.
+    m.soc.write32(sd + IDMAC_CTRL, 1);
+    m.soc.write32(sd + IDMAC_DBADDR, desc_w);
+    m.soc.write32(sd + BLKSIZ, 512);
+    m.soc.write32(sd + BYTCNT, 512);
+
+    // Issue CMD24 (WRITE_BLOCK): data expected + RW (host->card).
+    m.soc.write32(sd + CMDARG, 0);
+    m.soc
+        .write32(sd + CMD, 24 | (1 << 6) | (1 << 9) | (1 << 10) | (1 << 31));
+
+    // The descriptor OWN bit is cleared (host now owns it) and DATA_OVER latched.
+    assert_eq!(
+        m.soc.read32(desc_w) & (1 << 31),
+        0,
+        "descriptor OWN cleared"
+    );
+    assert!(
+        m.soc.read32(sd + RINTSTS) & (1 << 3) != 0,
+        "DATA_OVER latched after IDMAC write"
+    );
+
+    // Read it back via IDMAC: descriptor points at buf_r.
+    m.soc.write32(desc_r, (1 << 31) | (1 << 1) | (1 << 2));
+    m.soc.write32(desc_r + 4, 512);
+    m.soc.write32(desc_r + 8, buf_r);
+    m.soc.write32(desc_r + 12, 0);
+    m.soc.write32(sd + IDMAC_DBADDR, desc_r);
+    m.soc.write32(sd + CMDARG, 0);
+    m.soc
+        .write32(sd + CMD, 17 | (1 << 6) | (1 << 9) | (1 << 31));
+
+    // The read buffer must match the written pattern (card round-trips).
+    let mut mismatch = 0;
+    for i in 0..128u32 {
+        if m.soc.read32(buf_r + i * 4) != i.wrapping_mul(0x0101_0101) {
+            mismatch += 1;
+        }
+    }
+    assert_eq!(mismatch, 0, "IDMAC read-back matches IDMAC write");
+}
+
+/// GPIO output edges are reported to the host via `drain_events` as
+/// `EVT_GPIO` events (Wokwi-style pin observers).
+#[test]
+fn gpio_edge_emits_event() {
+    let mut m = Esp32S3::default();
+    m.soc.write32(GPIO_BASE + GPIO_ENABLE_W1TS, 1 << 2);
+    m.soc.write32(GPIO_BASE + GPIO_OUT_W1TS, 1 << 2);
+    m.soc.tick_timers(1);
+    let evs = m.soc.drain_events();
+    assert!(
+        evs.iter()
+            .any(|e| e.kind == EVT_GPIO && e.a == 2 && e.b == 1),
+        "rising edge on pin 2"
+    );
+    m.soc.write32(GPIO_BASE + GPIO_OUT_W1TC, 1 << 2);
+    m.soc.tick_timers(1);
+    let evs = m.soc.drain_events();
+    assert!(
+        evs.iter()
+            .any(|e| e.kind == EVT_GPIO && e.a == 2 && e.b == 0),
+        "falling edge on pin 2"
+    );
 }

@@ -13,10 +13,14 @@
 //! `debug` halted flag). Stores to the ULP `reg` slots land in the shared `regs`
 //! array so the main CPU can poll them.
 //!
-//! **Known limitation:** RV32F/D are not modeled, and the ULP can only reach
-//! `RTC_SLOW_MEM` + the ULP `reg` slots (other RTC peripheral accesses are
-//! ignored). The compressed (C) extension IS modeled. Validation is via the
-//! `esp32s3_ulp` direct-poke sketch (hand-assembled rv32im/rv32imc program).
+//! **Memory model:** the ULP core has full access to the SoC bus — it can read
+//! `RTC_SLOW_MEM`, its own `reg` slots, RTC_CNTL/RTC_IO, GPIO, DRAM, and any
+//! other peripheral — so real esp-idf ULP programs can sense peripherals and
+//! share buffers with the main CPU. The compressed (C) extension IS modeled.
+//! Validation is via the `esp32s3_ulp` direct-poke sketch (hand-assembled
+//! rv32im/rv32imc program) and the `ulp_runs_*` unit tests.
+
+use xtensa_core::Bus;
 
 use crate::memmap::RTC_SLOW_BASE;
 use crate::memmap::RTC_SLOW_SIZE;
@@ -97,8 +101,9 @@ impl Ulp {
         self.running && !self.halted
     }
 
-    /// Run one ULP instruction. `rtc_slow` is the ULP code/data memory.
-    pub fn step(&mut self, rtc_slow: &mut [u8]) {
+    /// Run one ULP instruction. `bus` is the full SoC bus (used for code, data,
+    /// and peripheral access).
+    pub fn step(&mut self, bus: &mut dyn Bus) {
         if !self.is_running() {
             return;
         }
@@ -109,13 +114,13 @@ impl Ulp {
             self.regs[self.idx(ULP_BASE + DEBUG_OFF)] |= 1;
             return;
         }
-        let lo = read16(rtc_slow, pc - RTC_SLOW_BASE);
+        let lo = fetch16(bus, pc);
         let next = if (lo & 0x3) == 0x3 {
             // 32-bit instruction: read the high half too.
-            let hi = read16(rtc_slow, pc - RTC_SLOW_BASE + 2);
-            self.exec((lo as u32) | ((hi as u32) << 16), rtc_slow)
+            let hi = fetch16(bus, pc + 2);
+            self.exec((lo as u32) | ((hi as u32) << 16), bus)
         } else {
-            self.exec16(lo, rtc_slow)
+            self.exec16(lo, bus)
         };
         if self.halted {
             self.regs[self.idx(ULP_BASE + DEBUG_OFF)] |= 1;
@@ -124,7 +129,7 @@ impl Ulp {
         self.pc = next;
     }
 
-    fn exec(&mut self, insn: u32, mem: &mut [u8]) -> u32 {
+    fn exec(&mut self, insn: u32, bus: &mut dyn Bus) -> u32 {
         let opcode = insn & 0x7F;
         let rd = ((insn >> 7) & 0x1F) as usize;
         let funct3 = (insn >> 12) & 0x7;
@@ -189,14 +194,14 @@ impl Ulp {
             0x03 => {
                 // LOAD
                 let addr = self.x[rs1].wrapping_add(imm_i);
-                let v = self.load(mem, addr, funct3);
+                let v = self.load(bus, addr, funct3);
                 self.x[rd] = v;
             }
             0x23 => {
                 // STORE
                 let addr = self.x[rs1].wrapping_add(imm_s_se);
                 let v = self.x[rs2];
-                self.store(mem, addr, v, funct3);
+                self.store(bus, addr, v, funct3);
             }
             0x13 => {
                 // OP-IMM
@@ -312,7 +317,7 @@ impl Ulp {
     }
 
     /// Execute one 16-bit (compressed) instruction. Returns the next PC.
-    fn exec16(&mut self, insn: u16, mem: &mut [u8]) -> u32 {
+    fn exec16(&mut self, insn: u16, bus: &mut dyn Bus) -> u32 {
         let insn = insn as u32;
         let pc = self.pc;
         let mut next = pc.wrapping_add(2);
@@ -351,7 +356,7 @@ impl Ulp {
                     let uimm =
                         (bit(5) << 4) | (bit(12) << 3) | (bit(11) << 2) | (bit(10) << 1) | bit(6);
                     let addr = self.x[rs1].wrapping_add(uimm << 2);
-                    self.x[rd] = self.load(mem, addr, 2);
+                    self.x[rd] = self.load(bus, addr, 2);
                 }
                 6 => {
                     // C.SW: mem[x1' + (uimm[6:2] << 2)] = rs2'.
@@ -360,7 +365,7 @@ impl Ulp {
                     let uimm =
                         (bit(5) << 4) | (bit(12) << 3) | (bit(11) << 2) | (bit(10) << 1) | bit(6);
                     let addr = self.x[rs1].wrapping_add(uimm << 2);
-                    self.store(mem, addr, self.x[rs2], 2);
+                    self.store(bus, addr, self.x[rs2], 2);
                 }
                 _ => {
                     self.halted = true;
@@ -526,7 +531,7 @@ impl Ulp {
                             | (bit(5) << 1)
                             | bit(4);
                         let addr = self.x[2].wrapping_add(uimm << 2);
-                        self.x[rd] = self.load(mem, addr, 2);
+                        self.x[rd] = self.load(bus, addr, 2);
                     }
                 }
                 4 => {
@@ -566,7 +571,7 @@ impl Ulp {
                         | (bit(10) << 1)
                         | bit(9);
                     let addr = self.x[2].wrapping_add(uimm << 2);
-                    self.store(mem, addr, self.x[rs2], 2);
+                    self.store(bus, addr, self.x[rs2], 2);
                 }
                 _ => {
                     self.halted = true;
@@ -581,55 +586,34 @@ impl Ulp {
         next
     }
 
-    /// Load from ULP-visible memory: the `reg` slots (ULP_BASE+0x0C..) or
-    /// `RTC_SLOW_MEM`. Other addresses read as 0.
-    fn load(&self, mem: &[u8], addr: u32, funct3: u32) -> u32 {
+    /// Load from ULP-visible memory: the `reg` slots (ULP_BASE+0x0C..) or any
+    /// address reachable on the SoC bus (RTC_SLOW_MEM, peripherals, DRAM).
+    fn load(&self, bus: &mut dyn Bus, addr: u32, _funct3: u32) -> u32 {
         if (ULP_BASE + REG_SLOT_OFF..ULP_BASE + ULP_OFF_END).contains(&addr) {
             let i = self.idx(addr);
-            let v = if i < REG_COUNT { self.regs[i] } else { 0 };
-            match funct3 {
-                0 => (v as i8) as i32 as u32,
-                1 => (v as i16) as i32 as u32,
-                2 => v,
-                4 => (v as u8) as u32,
-                5 => (v as u16) as u32,
-                _ => v,
-            }
-        } else if (RTC_SLOW_BASE..RTC_SLOW_BASE + RTC_SLOW_SIZE).contains(&addr) {
-            read32(mem, addr - RTC_SLOW_BASE)
+            if i < REG_COUNT { self.regs[i] } else { 0 }
         } else {
-            0
+            // RTC_SLOW_MEM, peripherals, DRAM, etc. all live on the bus.
+            bus.read32(addr)
         }
     }
 
-    /// Store to ULP-visible memory (reg slots or RTC_SLOW_MEM).
-    fn store(&mut self, mem: &mut [u8], addr: u32, v: u32, funct3: u32) {
+    /// Store to ULP-visible memory (reg slots or any SoC-bus address).
+    fn store(&mut self, bus: &mut dyn Bus, addr: u32, v: u32, _funct3: u32) {
         if (ULP_BASE + REG_SLOT_OFF..ULP_BASE + ULP_OFF_END).contains(&addr) {
             let i = self.idx(addr);
             if i < REG_COUNT {
-                let cur = self.regs[i];
-                self.regs[i] = match funct3 {
-                    0 => (v & 0xFF) | (cur & 0xFFFF_FF00),
-                    1 => (v & 0xFFFF) | (cur & 0xFFFF_0000),
-                    2 => v,
-                    _ => v,
-                };
+                self.regs[i] = v;
             }
-        } else if (RTC_SLOW_BASE..RTC_SLOW_BASE + RTC_SLOW_SIZE).contains(&addr) {
-            let off = (addr - RTC_SLOW_BASE) as usize;
-            mem[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        } else {
+            bus.write32(addr, v);
         }
     }
 }
 
-fn read32(mem: &[u8], off: u32) -> u32 {
-    let o = off as usize;
-    u32::from_le_bytes([mem[o], mem[o + 1], mem[o + 2], mem[o + 3]])
-}
-
-fn read16(mem: &[u8], off: u32) -> u16 {
-    let o = off as usize;
-    u16::from_le_bytes([mem[o], mem[o + 1]])
+/// Fetch a little-endian 16-bit value from the bus at `addr`.
+fn fetch16(bus: &mut dyn Bus, addr: u32) -> u16 {
+    (bus.read8(addr) as u16) | ((bus.read8(addr + 1) as u16) << 8)
 }
 
 /// Sign-extend `v` (a value with `n` meaningful low bits) to a 32-bit word.
@@ -672,6 +656,50 @@ fn c_b_imm(insn: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use xtensa_core::Bus;
+
+    /// Minimal `Bus` backing only `RTC_SLOW_MEM` (used for unit tests that
+    /// don't touch real peripherals).
+    struct TestBus {
+        rtc: Vec<u8>,
+    }
+    impl Bus for TestBus {
+        fn read8(&mut self, addr: u32) -> u32 {
+            let o = (addr - RTC_SLOW_BASE) as usize;
+            if o < self.rtc.len() {
+                self.rtc[o] as u32
+            } else {
+                0
+            }
+        }
+        fn read16(&mut self, addr: u32) -> u32 {
+            self.read8(addr) | (self.read8(addr + 1) << 8)
+        }
+        fn read32(&mut self, addr: u32) -> u32 {
+            self.read8(addr)
+                | (self.read8(addr + 1) << 8)
+                | (self.read8(addr + 2) << 16)
+                | (self.read8(addr + 3) << 24)
+        }
+        fn write8(&mut self, addr: u32, val: u32) {
+            let o = (addr - RTC_SLOW_BASE) as usize;
+            if o < self.rtc.len() {
+                self.rtc[o] = val as u8;
+            }
+        }
+        fn write16(&mut self, addr: u32, val: u32) {
+            self.write8(addr, val & 0xFF);
+            self.write8(addr + 1, (val >> 8) & 0xFF);
+        }
+        fn write32(&mut self, addr: u32, val: u32) {
+            self.write8(addr, val & 0xFF);
+            self.write8(addr + 1, (val >> 8) & 0xFF);
+            self.write8(addr + 2, (val >> 16) & 0xFF);
+            self.write8(addr + 3, (val >> 24) & 0xFF);
+        }
+    }
 
     /// Hand-assembled rv32im program: store 0x12345678 to ULP reg slot 0, then
     /// `ebreak`. Words (LE): lui/addi to build the reg-slot address, lui/addi
@@ -692,16 +720,18 @@ mod tests {
     #[test]
     fn ulp_runs_program_and_writes_reg_slot() {
         let mut ulp = Ulp::new();
-        let mut mem = [0u8; RTC_SLOW_SIZE as usize];
+        let mut bus = TestBus {
+            rtc: vec![0u8; RTC_SLOW_SIZE as usize],
+        };
         for (i, w) in PROG.iter().enumerate() {
-            mem[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            bus.write32(RTC_SLOW_BASE + (i as u32) * 4, *w);
         }
         // Release the core.
         ulp.write32(ULP_BASE, 1);
         assert!(ulp.is_running());
         // Run until halted.
         for _ in 0..100 {
-            ulp.step(&mut mem[..]);
+            ulp.step(&mut bus);
             if !ulp.is_running() {
                 break;
             }
@@ -713,10 +743,12 @@ mod tests {
     #[test]
     fn ulp_halts_on_ebreak_sets_debug_flag() {
         let mut ulp = Ulp::new();
-        let mut mem = [0u8; RTC_SLOW_SIZE as usize];
-        mem[0..4].copy_from_slice(&0x0010_0073u32.to_le_bytes()); // ebreak
+        let mut bus = TestBus {
+            rtc: vec![0u8; RTC_SLOW_SIZE as usize],
+        };
+        bus.write32(RTC_SLOW_BASE, 0x0010_0073); // ebreak
         ulp.write32(ULP_BASE, 1);
-        ulp.step(&mut mem[..]);
+        ulp.step(&mut bus);
         assert!(!ulp.is_running());
         // debug register (off 0x08 -> idx 2) halted bit set.
         assert_eq!(ulp.regs[2] & 1, 1);
@@ -749,26 +781,27 @@ mod tests {
     #[test]
     fn ulp_runs_compressed_rv32imc_program() {
         let mut ulp = Ulp::new();
-        let mut mem = [0u8; RTC_SLOW_SIZE as usize];
-        mem[..C_PROG.len()].copy_from_slice(C_PROG);
+        let mut rtc = vec![0u8; RTC_SLOW_SIZE as usize];
+        rtc[..C_PROG.len()].copy_from_slice(C_PROG);
+        let mut bus = TestBus { rtc };
         ulp.write32(ULP_BASE, 1);
         for _ in 0..200 {
             if !ulp.is_running() {
                 break;
             }
-            ulp.step(&mut mem[..]);
+            ulp.step(&mut bus);
         }
         assert!(!ulp.is_running(), "ULP did not halt");
         // SP-relative (C.LWSP/C.SWSP): x8 = base+0x80 stored at both 0x50 and 0x78.
-        assert_eq!(rd(&mem, 0x50), 0x5000_0080);
-        assert_eq!(rd(&mem, 0x78), 0x5000_0080);
+        assert_eq!(rd(&bus.rtc, 0x50), 0x5000_0080);
+        assert_eq!(rd(&bus.rtc, 0x78), 0x5000_0080);
         // Arithmetic results in the 0x80 data region.
-        assert_eq!(rd(&mem, 0x80), 30); // x10 = (10+20) <<2 >>2
-        assert_eq!(rd(&mem, 0x84), 14); // x13 = (10 ^ 4)
-        assert_eq!(rd(&mem, 0x88), 14); // x14 = (10 | 4)
-        assert_eq!(rd(&mem, 0x8C), 0); // x15 = (10 & 4)
-        assert_eq!(rd(&mem, 0x90), 5); // loop ran 5 times
-        assert_eq!(rd(&mem, 0x94), 30); // C.LW round-trip of 0x80
-        assert_eq!(rd(&mem, 0x98), 10); // x12 = (30 - 20)
+        assert_eq!(rd(&bus.rtc, 0x80), 30); // x10 = (10+20) <<2 >>2
+        assert_eq!(rd(&bus.rtc, 0x84), 14); // x13 = (10 ^ 4)
+        assert_eq!(rd(&bus.rtc, 0x88), 14); // x14 = (10 | 4)
+        assert_eq!(rd(&bus.rtc, 0x8C), 0); // x15 = (10 & 4)
+        assert_eq!(rd(&bus.rtc, 0x90), 5); // loop ran 5 times
+        assert_eq!(rd(&bus.rtc, 0x94), 30); // C.LW round-trip of 0x80
+        assert_eq!(rd(&bus.rtc, 0x98), 10); // x12 = (30 - 20)
     }
 }

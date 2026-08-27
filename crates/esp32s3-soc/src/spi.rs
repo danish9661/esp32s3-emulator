@@ -1,5 +1,6 @@
 //! ESP32-S3 GPSPI2/GPSPI3 (general-purpose SPI) master model.
 //!
+
 //! Register layout per the S3 TRM GPSPI chapter / spi_struct.h (GPSPI2 at
 //! 0x6002_4000, GPSPI3 at 0x6002_5000; 0x6002_8000 is the SD/MMC host, a
 //! separate peripheral — see sdmmc.rs).
@@ -25,6 +26,8 @@
 //! MISO input has no device attached, so RX phases read back zeros.
 
 // Register offsets (TRM GPSPI chapter).
+use alloc::vec::Vec;
+
 pub const SPI_CMD: u32 = 0x00;
 pub const SPI_ADDR: u32 = 0x04;
 pub const SPI_CTRL: u32 = 0x08;
@@ -111,6 +114,12 @@ pub struct Spi {
     regs: [u32; REG_COUNT],
     idx: u32,
     txn: Option<Txn>,
+    /// MOSI byte stream of the last completed transfer (host reads it on an
+    /// `EVT_SPI_XFER` event). `None` until a transfer finishes.
+    last_tx: Option<Vec<u8>>,
+    /// MISO bytes injected by the host for the next transfer (a virtual SPI
+    /// device's response). `None` => read back zeros (no device).
+    pending_miso: Option<Vec<u8>>,
 }
 
 impl Spi {
@@ -119,7 +128,19 @@ impl Spi {
             regs: [0; REG_COUNT],
             idx,
             txn: None,
+            last_tx: None,
+            pending_miso: None,
         }
+    }
+
+    /// Inject MISO bytes for the next transfer (host virtual device response).
+    pub fn inject_miso(&mut self, bytes: &[u8]) {
+        self.pending_miso = Some(bytes.to_vec());
+    }
+
+    /// Take the MOSI byte stream of the last completed transfer (host side).
+    pub fn take_last_tx(&mut self) -> Option<Vec<u8>> {
+        self.last_tx.take()
     }
 
     /// Advance `cycles` APB cycles; finishes the transaction when the bit
@@ -147,18 +168,78 @@ impl Spi {
         }
     }
 
-    /// Finish the transaction: sample MISO (no device -> zeros) into the
-    /// data buffer, latch trans_done, and clear CMD.usr (self-clearing,
-    /// TRM SPI_CMD.usr).
+    /// Finish the transaction: sample MISO (no device -> zeros, or the host
+    /// injected bytes) into the data buffer, latch trans_done, and clear
+    /// CMD.usr (self-clearing, TRM SPI_CMD.usr). Captures the MOSI bytes for
+    /// the host event queue.
     fn complete(&mut self) {
-        if self.txn.as_ref().filter(|t| t.have_miso).is_some() {
-            let zeros = [0u32; DATA_WORDS];
+        let have_mosi = self.txn.as_ref().is_some_and(|t| t.have_mosi);
+        let have_miso = self.txn.as_ref().is_some_and(|t| t.have_miso);
+        if have_miso {
+            let mut buf = [0u32; DATA_WORDS];
+            if let Some(miso) = self.pending_miso.take() {
+                // Shift the injected MISO bytes (MSB-first) into the
+                // left-aligned data buffer.
+                let mut bitpos = 0u32;
+                for &byte in &miso {
+                    for j in (0..8).rev() {
+                        let w = (bitpos / 32) as usize;
+                        let wbit = 31 - (bitpos % 32);
+                        if w < DATA_WORDS {
+                            buf[w] &= !(1u32 << wbit);
+                            buf[w] |= (((byte >> j) & 1) as u32) << wbit;
+                        }
+                        bitpos += 1;
+                    }
+                }
+            }
             self.regs[SPI_DATA_BUF as usize / 4..SPI_DATA_BUF as usize / 4 + DATA_WORDS]
-                .copy_from_slice(&zeros);
+                .copy_from_slice(&buf);
+        }
+        if have_mosi {
+            if let Some(t) = self.txn.as_ref() {
+                self.last_tx = Some(Self::collect_mosi(t));
+            }
+        } else {
+            self.last_tx = Some(Vec::new());
         }
         self.regs[(SPI_INT_RAW / 4) as usize] |= INT_TRANS_DONE;
         self.regs[(SPI_CMD / 4) as usize] &= !CMD_USR;
         self.txn = None;
+    }
+
+    /// Extract the MOSI byte stream from a finished transaction's left-aligned
+    /// data buffer (MSB-first). For full-duplex (doutdin) the MOSI portion is
+    /// the first half of the data bits; for half-duplex MOSI it is the whole
+    /// data phase. The host reads this on an `EVT_SPI_XFER` event.
+    fn collect_mosi(t: &Txn) -> Vec<u8> {
+        let bits = if t.have_mosi {
+            if t.have_miso {
+                t.data_bits / 2
+            } else {
+                t.data_bits
+            }
+        } else {
+            0
+        };
+        let nbytes = bits.div_ceil(8);
+        let mut out = Vec::with_capacity(nbytes as usize);
+        for b in 0..nbytes {
+            let mut byte = 0u8;
+            for j in 0..8 {
+                let bitidx = b * 8 + j;
+                let w = (bitidx / 32) as usize;
+                let wbit = 31 - (bitidx % 32);
+                let v = if w < DATA_WORDS {
+                    (t.buf[w] >> wbit) & 1
+                } else {
+                    0
+                };
+                byte = (byte << 1) | v as u8;
+            }
+            out.push(byte);
+        }
+        out
     }
 
     /// Trigger a transfer if CMD.usr was set; snapshots all phase config.

@@ -137,6 +137,27 @@ Core design:
 - Commit-ready, formatted with `cargo fmt`, clippy-clean.
 
 ## Status log (append, newest last)
+  - 2026-08-27: **Virtual-peripheral event API (Wokwi / rp2040js style) lands**.
+    `soc.rs` gained a host-observable event queue: `EmuEvent { kind, a, b }`
+    with `EVT_GPIO` (pin edges, diffed against `last_gpio_out` per
+    `drain_events`), `EVT_SPI_XFER` (chan + `spi_take_tx` for the MOSI bytes),
+    `EVT_I2C_START/WRITE/READ/STOP`. `Soc` owns `events`/`last_gpio_out`/
+    `pending_spi_tx` and exposes `drain_events()` / `spi_take_tx` /
+    `spi_inject_miso` / `i2c_inject_rx`; `tick_timers` collects them. `spi.rs`
+    records `last_tx` (after `collect_mosi`) and applies injected MISO into the
+    data buffer; `i2c.rs` FSM emits events and drives the slave SDA from
+    `Op.shift_in` (popped from `pending_rx` on each READ comd) so an injected
+    byte round-trips into the RX FIFO. `wasm-bridge` `Emulator` exposes the same
+    four methods plus a `#[wasm_bindgen] EmuEvent`; `web/emu_api.js` is a
+    rp2040js-style `PeripheralBridge` (gpio.onChange / spi.onTransfer /
+    i2c.on{Start,Write,Read,Stop}) that drains events each frame and routes
+    device responses back via the injection hooks. 3 new tests
+    (`spi::mosi_transfer_exposes_tx_and_injected_miso`,
+    `i2c::read_with_injected_rx_delivers_byte_and_emits_events`,
+    `i2c::write_emits_write_events`) + `machine_tests::gpio_edge_emits_event`
+    validate the full path (incl. the `shift_in` double-pop bug fix). All
+    workspace tests green, clippy clean, `wasm-pack build` regenerated
+    `web/pkg`.
   - 2026-08-22: **SPI master driver path validated via arduino-cli (P5)**.
     The Arduino `SPI` library (`SPI.begin` / `transfer` / `transferBytes` /
     `transfer16` / `beginTransaction`) drives GPSPI2 (FSPI) through the
@@ -1683,16 +1704,20 @@ Core design:
     (ready after 2nd call, SDHC/CCS set)/ALL_SEND_CID(R2)/SEND_RCA/SELECT/
     SEND_CSD/CID/STATUS/SET_BLOCKLEN/READ_SINGLE_BLOCK/WRITE_BLOCK; a single
     512-byte `block` buffer round-trips writes. `CDETECT` reads 0 (card
-    present), `WRTPRT` 0. 3 unit tests (`tests` in sdmmc.rs: init sequence,
-    read-block pattern, write→read round-trip) + the arduino-cli poke sketch
-    `tools/sketches/esp32s3_sdmmc` (full init + block R/W via register pokes)
-    → `SDMMC PASS` under `run_flash`. **KNOWN LIMITATION**: the esp-idf
-    `SD_MMC`/`SD` driver uses the IDMAC DMA path (not modeled) and CMD6/CMD51/
-    SDIO; only the PIO FIFO data path is functional — validation is via direct
-    register pokes, consistent with RMT/I2C/TWAI/HMAC/etc. **SDMMC is retired
-     as a P5 candidate (register + simulated-card path).** Remaining P5 work:
-     ULP-RISC-V core execution (task 3) + the documented I2C `Wire` driver
-     limitation; Touch excluded per user directive.
+     present), `WRTPRT` 0. 3 unit tests (`tests` in sdmmc.rs: init sequence,
+     read-block pattern, write→read round-trip) + the arduino-cli poke sketch
+     `tools/sketches/esp32s3_sdmmc` (full init + block R/W via register pokes)
+     → `SDMMC PASS` under `run_flash`. The **IDMAC** (DesignWare internal DMA)
+     path IS now modeled: when `IDMAC_CTRL` (0x80) bit 0 is set, issuing a data
+     command walks the descriptor ring at `IDMAC_DBADDR` (0x88) and copies
+     between the DRAM descriptor buffers and the card `storage` (the walk runs in
+     `soc.rs`, which owns the bus); `sdmmc_idmac_walks_descriptors` is a machine
+     test. **RESIDUAL KNOWN LIMITATION**: the esp-idf `SD_MMC` driver's SDIO /
+     ACMD51(SCR)/CMD6 negotiation may still need richer card responses for a
+     full FAT filesystem mount; block-level (PIO + IDMAC) transfers are
+     functional — validation is via direct register pokes, consistent with
+     RMT/I2C/TWAI/HMAC/etc. **SDMMC is retired as a P5 candidate (register +
+     simulated-card + IDMAC path).**
 
   - 2026-08-26: **ULP-RISC-V core execution (P5 — new peripheral via arduino-cli
     validation)**. `esp32s3-soc/src/ulp.rs` is now a **functional rv32im core**

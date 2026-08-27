@@ -34,6 +34,11 @@
 //! INT_RAW & INT_ENA (TRM I2C_INT_STATUS) so the driver ISR can read the
 //! cause. The matrix + CPU delivery is wired in soc.rs int_pending.
 
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
+
+use crate::soc::{EVT_I2C_READ, EVT_I2C_START, EVT_I2C_STOP, EVT_I2C_WRITE, EmuEvent};
+
 // Register offsets (TRM I2C chapter / i2c_struct.h member order).
 pub const I2C_SCL_LOW_PERIOD: u32 = 0x00;
 pub const I2C_CTR: u32 = 0x04;
@@ -111,6 +116,9 @@ struct Op {
     remain: u64,
     /// ACK level the master sends after a READ byte (comd.ack_val).
     ack: u32,
+    /// Injected byte to shift in on a READ (from the host virtual device),
+    /// `None` => bus reads back 1 (no device / 0xFF).
+    shift_in: Option<u8>,
 }
 
 /// One I2C controller (I2C0 = idx 0, I2C1 = idx 1).
@@ -135,6 +143,10 @@ pub struct I2c {
     /// data), so `tx_head`/`tx_cnt` persist across re-runs and the retry
     /// re-NACKs instead of succeeding on an empty FIFO.
     tx_pos: u32,
+    /// Host-observable event queue (START/WRITE/READ/STOP), drained per frame.
+    events: Vec<EmuEvent>,
+    /// Injected RX bytes for the next master-read (host virtual device supply).
+    pending_rx: VecDeque<u8>,
 }
 
 impl I2c {
@@ -154,12 +166,21 @@ impl I2c {
             scl: 1,
             sda: 1,
             tx_pos: 0,
+            events: Vec::new(),
+            pending_rx: VecDeque::new(),
         }
     }
 
     /// Module clock divisor (APB cycles per I2C module clock).
     fn div(&self) -> u64 {
         u64::from((self.regs[(I2C_CLK_CONF / 4) as usize] >> CLK_SCLK_DIV_NUM_SHIFT) & 0xFF) + 1
+    }
+
+    /// Inject RX bytes for the next master-read (host virtual device supply).
+    pub fn inject_rx(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.pending_rx.push_back(b);
+        }
     }
 
     /// SCL low half width in APB cycles: (value + 1) module clocks.
@@ -214,6 +235,11 @@ impl I2c {
                 // SDA falls while SCL is high, held for start_hold.
                 self.scl = 1;
                 self.sda = 0;
+                self.events.push(EmuEvent {
+                    kind: EVT_I2C_START,
+                    a: self.idx,
+                    b: 0,
+                });
                 self.op = Some(Op {
                     kind,
                     slot,
@@ -222,6 +248,7 @@ impl I2c {
                     phase: 0,
                     remain: self.start_hold_len(),
                     ack: 0,
+                    shift_in: None,
                 });
             }
             OP_STOP => {
@@ -229,6 +256,11 @@ impl I2c {
                 // condition (SDA rising while SCL high).
                 self.scl = 1;
                 self.sda = 0;
+                self.events.push(EmuEvent {
+                    kind: EVT_I2C_STOP,
+                    a: self.idx,
+                    b: 0,
+                });
                 self.op = Some(Op {
                     kind,
                     slot,
@@ -237,6 +269,7 @@ impl I2c {
                     phase: 0,
                     remain: self.stop_hold_len(),
                     ack: 0,
+                    shift_in: None,
                 });
             }
             OP_WRITE => {
@@ -259,6 +292,7 @@ impl I2c {
                         phase: 0,
                         remain: self.start_hold_len(),
                         ack: 0,
+                        shift_in: None,
                     });
                     return;
                 }
@@ -273,12 +307,14 @@ impl I2c {
                     phase: 0,
                     remain: self.low_len(),
                     ack: 0,
+                    shift_in: None,
                 });
             }
             OP_READ => {
-                // Slave drives SDA (none: reads back 1).
+                // Slave drives SDA (injected byte, else none: reads back 1).
+                let shift_in = self.pending_rx.pop_front();
                 self.scl = 0;
-                self.sda = 1;
+                self.sda = shift_in.map_or(1u32, |b| ((b >> 7) & 1) as u32);
                 self.op = Some(Op {
                     kind,
                     slot,
@@ -287,6 +323,7 @@ impl I2c {
                     phase: 0,
                     remain: self.low_len(),
                     ack: (value >> COMD_ACK_VAL_SHIFT) & 1,
+                    shift_in,
                 });
             }
             _ => {
@@ -370,6 +407,11 @@ impl I2c {
                     self.regs[(I2C_SR / 4) as usize] |= SR_RESP_REC;
                     self.tx_pos += 1;
                     op.bytes_left = op.bytes_left.saturating_sub(1);
+                    self.events.push(EmuEvent {
+                        kind: EVT_I2C_WRITE,
+                        a: self.idx,
+                        b: op.byte,
+                    });
                 } else if op.phase == 8 {
                     // ACK low done: clock high, SDA released. With no slave
                     // present the bus pull-up holds SDA high -> NACK, which
@@ -401,17 +443,21 @@ impl I2c {
             }
             OP_READ => {
                 if self.scl == 0 {
-                    // Low half done: clock high.  SDA stays as set — the
-                    // data low phases release it high and the ACK low
-                    // phase drives op.ack (phase==7).
+                    // Low half done: just clock high; SDA is driven by the
+                    // slave (or held by the master's ACK) and sampled during
+                    // the high half. Do NOT change SDA here.
                     self.scl = 1;
                     op.remain = high;
                 } else if op.phase < 7 {
-                    // Sample the line during the high half; next bit.
+                    // Sample the line during the high half; then set up the
+                    // next bit's low half with the slave's value (or 1 if no
+                    // device injected a byte).
                     op.byte = (op.byte << 1) | self.sda;
                     op.phase += 1;
                     self.scl = 0;
-                    self.sda = 1;
+                    self.sda = op
+                        .shift_in
+                        .map_or(1u32, |b| ((b >> (7 - op.phase)) & 1) as u32);
                     op.remain = low;
                 } else if op.phase == 7 {
                     // Last data bit sampled: master ACK cycle driving its
@@ -427,6 +473,11 @@ impl I2c {
                     self.sda = op.ack;
                     op.remain = low;
                     op.bytes_left = op.bytes_left.saturating_sub(1);
+                    self.events.push(EmuEvent {
+                        kind: EVT_I2C_READ,
+                        a: self.idx,
+                        b: op.byte,
+                    });
                 } else if op.phase == 8 {
                     op.phase = 9;
                     self.scl = 1;
@@ -436,8 +487,9 @@ impl I2c {
                     if op.bytes_left > 0 {
                         op.phase = 0;
                         op.byte = 0;
+                        op.shift_in = self.pending_rx.pop_front();
                         self.scl = 0;
-                        self.sda = 1;
+                        self.sda = op.shift_in.map_or(1u32, |b| ((b >> 7) & 1) as u32);
                         op.remain = low;
                     } else {
                         finished = true;
@@ -498,11 +550,12 @@ impl I2c {
         }
     }
 
-    /// Advance `cycles` APB cycles through the bus operation.
-    pub fn tick(&mut self, cycles: u64) {
+    /// Advance `cycles` APB cycles through the bus operation, returning any
+    /// host-observable events (START/WRITE/READ/STOP) generated this call.
+    pub fn tick(&mut self, cycles: u64) -> Vec<EmuEvent> {
         for _ in 0..cycles {
             let Some(op) = self.op.as_mut() else {
-                return;
+                return core::mem::take(&mut self.events);
             };
             if op.remain > 0 {
                 op.remain -= 1;
@@ -511,6 +564,7 @@ impl I2c {
                 self.advance();
             }
         }
+        core::mem::take(&mut self.events)
     }
 
     /// Current driven output levels: (SCL, SDA), idle = (1, 1).

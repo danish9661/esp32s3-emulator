@@ -2,6 +2,7 @@
 //! clock divider).
 
 use esp32s3_soc::i2c::*;
+use esp32s3_soc::soc::{EVT_I2C_READ, EVT_I2C_START, EVT_I2C_STOP, EVT_I2C_WRITE};
 
 /// Configures `i2c` for a fast master: low = 2 APB cycles, high = 1 APB
 /// cycle per SCL pulse (scl_low_period=1, scl_high_period=1, div=1).
@@ -123,6 +124,60 @@ fn master_read_shifts_ones_into_fifo() {
     assert_eq!(i2c.read32(I2C_DATA), 0xFF);
     assert_eq!(i2c.read32(I2C_DATA), 0xFF);
     assert_eq!(i2c.read32(I2C_DATA), 0, "empty fifo reads 0");
+}
+
+/// A master READ with an injected slave byte delivers it into the RX FIFO
+/// and emits EVT_I2C_START / EVT_I2C_READ / EVT_I2C_STOP events (Wokwi-style
+/// virtual-I2C round trip).
+#[test]
+fn read_with_injected_rx_delivers_byte_and_emits_events() {
+    let mut i2c = I2c::new(0);
+    setup_master(&mut i2c);
+    i2c.inject_rx(&[0x57]); // virtual device's response
+    i2c.write32(I2C_COMD, 6 << 11); // RSTART
+    i2c.write32(I2C_COMD + 4, (3 << 11) | 1); // READ 1 byte
+    i2c.write32(I2C_COMD + 8, 2 << 11); // STOP
+    i2c.write32(I2C_COMD + 12, 4 << 11); // END
+    i2c.write32(I2C_CTR, (1 << 4) | (1 << 5)); // trans_start
+    let mut evs = Vec::new();
+    for _ in 0..100 {
+        evs.extend(i2c.tick(1));
+    }
+    assert_eq!(i2c.read32(I2C_SR) >> 8 & 0x3F, 1, "rx fifo count");
+    assert_eq!(i2c.read32(I2C_DATA), 0x57, "injected byte");
+    assert!(evs.iter().any(|e| e.kind == EVT_I2C_START && e.a == 0));
+    assert!(
+        evs.iter()
+            .any(|e| e.kind == EVT_I2C_READ && e.a == 0 && e.b == 0x57)
+    );
+    assert!(evs.iter().any(|e| e.kind == EVT_I2C_STOP && e.a == 0));
+}
+
+/// A master WRITE emits EVT_I2C_WRITE events carrying each transmitted byte.
+#[test]
+fn write_emits_write_events() {
+    let mut i2c = I2c::new(0);
+    setup_master(&mut i2c);
+    i2c.write32(I2C_DATA, 0xA0); // addr 0x50, write
+    i2c.write32(I2C_DATA, 0xAA);
+    i2c.write32(I2C_COMD, 6 << 11); // RSTART
+    i2c.write32(I2C_COMD + 4, (1 << 11) | 1); // WRITE 1 byte
+    i2c.write32(I2C_COMD + 8, (1 << 11) | 1); // WRITE 1 byte
+    i2c.write32(I2C_COMD + 12, 2 << 11); // STOP
+    i2c.write32(I2C_COMD + 16, 4 << 11); // END
+    i2c.write32(I2C_CTR, (1 << 4) | (1 << 5)); // trans_start
+    let mut evs = Vec::new();
+    for _ in 0..100 {
+        evs.extend(i2c.tick(1));
+    }
+    assert!(
+        evs.iter()
+            .any(|e| e.kind == EVT_I2C_WRITE && e.a == 0 && e.b == 0xA0)
+    );
+    assert!(
+        evs.iter()
+            .any(|e| e.kind == EVT_I2C_WRITE && e.a == 0 && e.b == 0xAA)
+    );
 }
 
 /// clk_conf.sclk_div_num scales every timing register (module clock =

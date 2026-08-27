@@ -5,9 +5,9 @@ extern crate std;
 
 pub mod bus;
 pub mod cpu;
+pub mod ee;
 mod exec;
 pub mod generated;
-pub mod ee;
 
 pub use bus::Bus;
 pub use cpu::{Cpu, StepResult};

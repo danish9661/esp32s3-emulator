@@ -5,8 +5,13 @@
 //! SD card behind it: writing `CMD` (0x2C) with `start_command` (bit 31) set
 //! issues a command to the (modeled) card, which fills `RESP0..3` (0x30..0x3C)
 //! and latches the command-done / data-over interrupts (`RINTSTS` 0x44, bits
-//! 2 and 3). Block data transfers use the PIO FIFO (0x100): a `CMD17` (read)
-//! serves a 512-byte block, a `CMD24` (write) receives one.
+//! 2 and 3).
+//!
+//! Data transfers use either the PIO FIFO (0x100) or the **IDMAC** (internal
+//! DMA). The IDMAC descriptor walk itself runs in `soc.rs` (it needs the bus to
+//! reach DRAM descriptor buffers); this module exposes the card model and the
+//! descriptor metadata. Block data transfers are served from a multi-block
+//! `storage` array indexed by the command's LBA (SDHC byte-address / 512).
 //!
 //! Register layout / `CMD` bitfield from `sdmmc_struct.h`:
 //! - `cmd_index`   bits [5:0]
@@ -21,12 +26,23 @@
 //! - `update_clk_reg`    bit 21  (clock-only update, no command)
 //! - `start_command`     bit 31
 //!
-//! The DMA (`IDMAC`) path used by the full esp-idf SD/MMC driver is NOT
-//! modeled — only the PIO FIFO data path is functional. Validated by the
-//! `esp32s3_sdmmc` poke sketch (direct register pokes of the full init
-//! sequence + a block read/write round-trip).
+//! IDMAC registers (`sdmmc_struct.h`):
+//! - `idmac_ctrl`   0x80  (bit 0 = enable, bit 1 = reset)
+//! - `idmac_bsize`  0x84  (descriptor ring length, in descriptors)
+//! - `idmac_dbaddr` 0x88  (descriptor list base, DRAM pointer)
+//! - `idmac_rintsts` 0x8C (DMA transfer-complete / error status, w1c)
+//! - `idmac_status` 0x90
+//!
+//! Validated by the `esp32s3_sdmmc` poke sketch (direct register pokes of the
+//! full init sequence + PIO block read/write) and the IDMAC machine test
+//! (`sdmmc_idmac_walks_descriptors`).
+
+const BLOCK_LEN: usize = 512;
+const STORAGE_BLOCKS: usize = 1024; // 512 KB modeled card
 
 use alloc::collections::VecDeque;
+use alloc::vec;
+use alloc::vec::Vec;
 
 pub const SDMMC_BASE: u32 = 0x6002_8000;
 
@@ -50,10 +66,18 @@ pub const STATUS: u32 = 0x48;
 pub const CDETECT: u32 = 0x50;
 pub const WRTPRT: u32 = 0x54;
 pub const FIFO: u32 = 0x100;
+pub const IDMAC_CTRL: u32 = 0x80;
+pub const IDMAC_BSIZE: u32 = 0x84;
+pub const IDMAC_DBADDR: u32 = 0x88;
+pub const IDMAC_RINTSTS: u32 = 0x8C;
+pub const IDMAC_STATUS: u32 = 0x90;
 
 // RINTSTS / MINTSTS interrupt bits.
 const INT_CMD_DONE: u32 = 1 << 2;
 const INT_DATA_OVER: u32 = 1 << 3;
+
+// IDMAC_RINTSTS bits.
+const IDMAC_TI: u32 = 1 << 0; // transfer complete
 
 // CMD bit positions.
 const CMD_INDEX: u32 = 0x3F; // bits [5:0]
@@ -64,8 +88,6 @@ const CMD_RW: u32 = 1 << 10; // 0 = read from card, 1 = write to card
 const CMD_UPDATE_CLK: u32 = 1 << 21;
 const CMD_START: u32 = 1 << 31;
 
-const BLOCK_LEN: usize = 512;
-
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum CardState {
     Idle,
@@ -75,6 +97,14 @@ enum CardState {
     Tran,
 }
 
+/// Pending IDMAC transfer, consumed by `soc.rs` which owns the bus.
+pub struct IdmacXfer {
+    pub write: bool, // true = host->card, false = card->host
+    pub bytcnt: u32,
+    pub dbaddr: u32,
+    pub lba: u32,
+}
+
 /// Simulated SD card + host controller.
 pub struct Sdmmc {
     regs: [u32; 0x400 / 4],
@@ -82,13 +112,20 @@ pub struct Sdmmc {
     app_cmd: bool,
     acmd41_count: u32,
     rca: u32,
-    /// Modeled card storage: a single 512-byte block (round-trips writes).
-    block: [u8; BLOCK_LEN],
-    /// Pending data transfer FIFO (bytes).
+    /// Modeled card storage: STORAGE_BLOCKS x 512-byte blocks (round-trips
+    /// writes), indexed by LBA. Initialized with a recognizable byte pattern.
+    storage: Vec<u8>,
+    /// Current transfer LBA (set by CMD17/18/24/25).
+    lba: u32,
+    /// Pending data transfer FIFO (bytes) for the PIO path.
     data: VecDeque<u8>,
     data_remaining: usize,
     data_dir: u8, // 0 = read (card->host), 1 = write (host->card)
     data_active: bool,
+    /// Set when the next data command serves the SCR register instead of storage.
+    serve_scr: bool,
+    /// Pending IDMAC transfer (None for PIO).
+    idmac: Option<IdmacXfer>,
 }
 
 impl Default for Sdmmc {
@@ -99,8 +136,8 @@ impl Default for Sdmmc {
 
 impl Sdmmc {
     pub fn new() -> Self {
-        let mut block = [0u8; BLOCK_LEN];
-        for (i, b) in block.iter_mut().enumerate() {
+        let mut storage = vec![0u8; STORAGE_BLOCKS * BLOCK_LEN];
+        for (i, b) in storage.iter_mut().enumerate() {
             *b = i as u8; // recognizable pattern
         }
         Self {
@@ -109,11 +146,14 @@ impl Sdmmc {
             app_cmd: false,
             acmd41_count: 0,
             rca: 0x1234,
-            block,
+            storage,
+            lba: 0,
             data: VecDeque::new(),
             data_remaining: 0,
             data_dir: 0,
             data_active: false,
+            serve_scr: false,
+            idmac: None,
         }
     }
 
@@ -140,13 +180,25 @@ impl Sdmmc {
             return;
         }
         // The next command is an ACMD only if CMD55 preceded it.
+        let is_acmd = self.app_cmd;
         self.app_cmd = false;
+
+        // Record the transfer LBA for data commands (SDHC: arg = block addr).
+        match index {
+            17 | 18 | 24 | 25 => self.lba = arg,
+            _ => {}
+        }
+        self.serve_scr = is_acmd && index == 51; // ACMD51 = SEND_SCR (data)
 
         let mut resp = [0u32; 4];
         match index {
             0 => {
                 // GO_IDLE_STATE: card -> idle.
                 self.card_state = CardState::Idle;
+                resp[0] = 0;
+            }
+            6 => {
+                // SWITCH_FUNC (R1): benign.
                 resp[0] = 0;
             }
             8 => {
@@ -193,9 +245,9 @@ impl Sdmmc {
                 }
             }
             9 => {
-                // SEND_CSD (R2): fixed CSD.
-                resp[0] = 0x4000_0000;
-                resp[1] = 0x1234_5678;
+                // SEND_CSD (R2): fixed CSD (SDHC, size ~ 256 MB).
+                resp[0] = 0x4000_00B5;
+                resp[1] = 0x5B59_0000;
                 resp[2] = 0x9ABC_DEF0;
                 resp[3] = 0x1357_2468;
             }
@@ -214,12 +266,8 @@ impl Sdmmc {
                 // SET_BLOCKLEN: arg = block length.
                 resp[0] = 0;
             }
-            17 | 18 => {
-                // READ_SINGLE_BLOCK / READ_MULTIPLE_BLOCK.
-                resp[0] = 0;
-            }
-            24 | 25 => {
-                // WRITE_BLOCK / WRITE_MULTIPLE_BLOCK.
+            51 => {
+                // SEND_SCR (ACMD51, R1 + 8-byte data): benign R1.
                 resp[0] = 0;
             }
             _ => {
@@ -242,9 +290,25 @@ impl Sdmmc {
         }
         // Command done.
         self.regs[self.idx(RINTSTS)] |= INT_CMD_DONE;
-        // If data was expected, set up the PIO transfer (rw: 0=read,1=write).
+        // If data was expected, set up the transfer. IDMAC if enabled, else PIO.
         if data_exp {
-            self.begin_data(rw);
+            let idmac_en = (self.regs[self.idx(IDMAC_CTRL)] & 1) != 0;
+            if idmac_en {
+                let bytcnt = self.regs[self.idx(BYTCNT)];
+                let bytcnt = if bytcnt == 0 {
+                    BLOCK_LEN as u32
+                } else {
+                    bytcnt
+                };
+                self.idmac = Some(IdmacXfer {
+                    write: rw,
+                    bytcnt,
+                    dbaddr: self.regs[self.idx(IDMAC_DBADDR)],
+                    lba: self.lba,
+                });
+            } else {
+                self.begin_data(rw);
+            }
         }
     }
 
@@ -264,23 +328,77 @@ impl Sdmmc {
         self.data_active = true;
         self.data.clear();
         if !write {
-            // Load the block into the data FIFO (byte stream, LE words on read).
-            self.data
-                .extend(self.block[..bytcnt.min(BLOCK_LEN)].iter().cloned());
-            if bytcnt > BLOCK_LEN {
+            // Load the data FIFO from storage (or SCR) byte stream, LE words.
+            let src = self.data_source(bytcnt);
+            let n = bytcnt.min(src.len());
+            self.data.extend(src[..n].iter().cloned());
+            if bytcnt > self.data.len() {
                 self.data.resize(bytcnt, 0);
             }
         }
     }
 
-    /// Finish a write transfer: copy received bytes into the block.
+    /// Source bytes for a read transfer (SCR for ACMD51, else storage).
+    fn data_source(&self, bytcnt: usize) -> Vec<u8> {
+        if self.serve_scr {
+            // SCR: SD_SPEC=2, bus widths 1-bit+4-bit supported.
+            vec![0x02, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00]
+                .into_iter()
+                .cycle()
+                .take(bytcnt)
+                .collect()
+        } else {
+            let base = (self.lba as usize) * BLOCK_LEN;
+            let end = (base + bytcnt).min(self.storage.len());
+            self.storage[base..end].to_vec()
+        }
+    }
+
+    /// Finish a PIO write transfer: copy received bytes into storage.
     fn finish_write(&mut self) {
-        let n = self.data.len().min(BLOCK_LEN);
+        let base = (self.lba as usize) * BLOCK_LEN;
+        let n = self.data.len();
+        if base + n > self.storage.len() {
+            self.storage.resize(base + n, 0);
+        }
         for (i, b) in self.data.iter().take(n).enumerate() {
-            self.block[i] = *b;
+            self.storage[base + i] = *b;
         }
         self.data_active = false;
         self.data_remaining = 0;
+        self.regs[self.idx(RINTSTS)] |= INT_DATA_OVER;
+    }
+
+    /// Take a pending IDMAC transfer (consumed by `soc.rs`).
+    pub fn take_idmac(&mut self) -> Option<IdmacXfer> {
+        self.idmac.take()
+    }
+
+    /// Copy `data` (host->card) into storage at the transfer LBA.
+    pub fn idmac_store(&mut self, lba: u32, data: &[u8]) {
+        let base = (lba as usize) * BLOCK_LEN;
+        let end = base + data.len();
+        if end > self.storage.len() {
+            self.storage.resize(end, 0);
+        }
+        self.storage[base..end].copy_from_slice(data);
+        self.regs[self.idx(IDMAC_RINTSTS)] |= IDMAC_TI;
+        self.regs[self.idx(RINTSTS)] |= INT_DATA_OVER;
+    }
+
+    /// Return `len` bytes from storage at the transfer LBA (card->host).
+    pub fn idmac_load(&self, lba: u32, len: usize) -> Vec<u8> {
+        let base = (lba as usize) * BLOCK_LEN;
+        let end = (base + len).min(self.storage.len());
+        if base >= self.storage.len() {
+            return vec![0u8; len];
+        }
+        self.storage[base..end].to_vec()
+    }
+
+    /// Mark an IDMAC transfer complete (called by `soc.rs` after the walk).
+    pub fn finish_idmac(&mut self) {
+        self.regs[self.idx(IDMAC_RINTSTS)] |= IDMAC_TI;
         self.regs[self.idx(RINTSTS)] |= INT_DATA_OVER;
     }
 
@@ -290,6 +408,7 @@ impl Sdmmc {
             WRTPRT => 0,  // bit0=0 means not write-protected
             RINTSTS => self.regs[self.idx(RINTSTS)],
             MINTSTS => self.regs[self.idx(RINTSTS)],
+            IDMAC_RINTSTS => self.regs[self.idx(IDMAC_RINTSTS)],
             FIFO => {
                 if self.data_active && self.data_dir == 0 {
                     // Read 4 bytes (LE) from the data FIFO.
@@ -318,12 +437,12 @@ impl Sdmmc {
 
     pub fn write32(&mut self, offset: u32, value: u32) {
         match offset {
-            RINTSTS => {
+            RINTSTS | MINTSTS => {
                 // Write-1-to-clear.
                 self.regs[self.idx(RINTSTS)] &= !value;
             }
-            MINTSTS => {
-                self.regs[self.idx(RINTSTS)] &= !value;
+            IDMAC_RINTSTS => {
+                self.regs[self.idx(IDMAC_RINTSTS)] &= !value;
             }
             CMD => {
                 if value & CMD_START != 0 {
@@ -449,5 +568,18 @@ mod tests {
             }
         }
         assert_eq!(mismatch, 0);
+    }
+
+    #[test]
+    fn acmd51_serves_scr() {
+        let mut d = Sdmmc::new();
+        issue(&mut d, 0, 0, false, false, false);
+        d.write32(BYTCNT, 8);
+        issue(&mut d, 55, 0, true, false, false); // CMD55
+        issue(&mut d, 51, 0, true, true, false); // ACMD51 SEND_SCR
+        assert!(d.read32(RINTSTS) & INT_CMD_DONE != 0);
+        let w0 = d.read32(FIFO);
+        // SCR first byte = 0x02 (SD_SPEC=2), second = 0x00, third = 0x00, fourth = 0x03.
+        assert_eq!(w0, 0x0300_0002);
     }
 }

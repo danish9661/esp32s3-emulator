@@ -1,4 +1,5 @@
 import init, { Emulator } from './pkg/wasm_bridge.js';
+import { PeripheralBridge } from './emu_api.js';
 
 const NUM_PINS = 40; // visualize GPIO 0..39
 
@@ -25,6 +26,7 @@ for (let i = 0; i < NUM_PINS; i++) {
 }
 
 let emu = null;
+let bridge = null; // PeripheralBridge (virtual devices)
 let flashBytes = null; // last loaded firmware, for reset
 let timer = null;
 let totalSteps = 0;
@@ -53,6 +55,7 @@ function tick() {
   totalSteps += n;
   appendSerial(emu.uart_read());
   renderGpio();
+  if (bridge) bridge.dispatch(); // route SPI/I2C/GPIO events to virtual devices
   setStatus(`pc=0x${emu.pc().toString(16)}  steps=${totalSteps}`);
 }
 
@@ -72,6 +75,18 @@ async function loadFlash(bytes) {
   stopLoop();
   emu = new Emulator();
   emu.load_flash(bytes);
+
+  // Virtual-peripheral bridge (rp2040js-style event API). Adjust the
+  // callbacks below to model real Wokwi-style parts (SPI flash, I2C sensors,
+  // GPIO buttons, ...). The demo just logs I2C activity to the console.
+  if (typeof PeripheralBridge !== 'undefined') {
+    bridge = new PeripheralBridge(emu);
+    bridge.i2c.onStart((chan) => console.log(`[i2c${chan}] START`));
+    bridge.i2c.onWrite((chan, byte) => console.log(`[i2c${chan}] WRITE 0x${byte.toString(16)}`));
+    bridge.i2c.onRead((chan) => { console.log(`[i2c${chan}] READ`); return undefined; });
+    bridge.i2c.onStop((chan) => console.log(`[i2c${chan}] STOP`));
+  }
+
   flashBytes = bytes;
   totalSteps = 0;
   els.console.textContent = '';

@@ -121,3 +121,28 @@ fn clk_gate_halts_transfer() {
     s.tick(1);
     assert_eq!(s.signal_level(101), 1);
 }
+
+/// A MOSI transfer exposes the MCU's byte stream via `take_last_tx` for the
+/// host to inspect, and an injected MISO byte lands in the data buffer
+/// (Wokwi-style virtual-SPI round trip).
+#[test]
+fn mosi_transfer_exposes_tx_and_injected_miso() {
+    let mut s = Spi::new(0);
+    setup_mosi(&mut s, 0xA5);
+    s.write32(SPI_USER, (1 << 27) | (1 << 28)); // usr_mosi + usr_miso
+    s.inject_miso(&[0x3C]); // virtual device's response
+    s.write32(SPI_CMD, 1 << 24);
+    for _ in 0..200 {
+        sample(&mut s);
+        if s.read32(SPI_CMD) & (1 << 24) == 0 {
+            break;
+        }
+    }
+    assert_eq!(s.read32(SPI_CMD) & (1 << 24), 0, "usr self-clears");
+    // The host reads back exactly what the firmware transmitted.
+    assert_eq!(s.take_last_tx(), Some(vec![0xA5]));
+    // And the injected MISO byte is shifted into the buffer MSB-first.
+    assert_eq!(s.read32(SPI_DATA_BUF) >> 24, 0x3C);
+    // No leftover transfer pending.
+    assert_eq!(s.take_last_tx(), None);
+}

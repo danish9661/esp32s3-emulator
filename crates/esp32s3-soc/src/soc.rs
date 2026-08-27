@@ -52,6 +52,33 @@ use crate::uart::Uart;
 use crate::ulp::{ULP_OFF_END, ULP_OFF_START, Ulp};
 use crate::usb_serial_jtag::{USB_SERIAL_JTAG_INTR_SOURCE, UsbSerialJtag};
 
+/// A host-observable emulator event, drained once per animation frame and
+/// dispatched to virtual-peripheral JS objects (Wokwi-style). This is a plain
+/// struct so the wasm-bridge can map it onto a `#[wasm_bindgen]` type without
+/// coupling `esp32s3-soc` to `wasm-bindgen`.
+///
+/// `kind` discriminates the event; `a`/`b` carry scalar payload:
+/// * `EVT_GPIO` (0): `a` = pin number, `b` = level (0/1).
+/// * `EVT_SPI_XFER` (1): `a` = channel (0=GPSPI2, 1=GPSPI3), `b` = MOSI byte
+///   count; the bytes themselves are retrieved via [`Soc::spi_take_tx`].
+/// * `EVT_I2C_START` (2): `a` = channel.
+/// * `EVT_I2C_WRITE` (3): `a` = channel, `b` = data byte.
+/// * `EVT_I2C_READ` (4): `a` = channel, `b` = data byte (value the MCU read).
+/// * `EVT_I2C_STOP` (5): `a` = channel.
+#[derive(Clone, Copy, Debug)]
+pub struct EmuEvent {
+    pub kind: u8,
+    pub a: u32,
+    pub b: u32,
+}
+
+pub const EVT_GPIO: u8 = 0;
+pub const EVT_SPI_XFER: u8 = 1;
+pub const EVT_I2C_START: u8 = 2;
+pub const EVT_I2C_WRITE: u8 = 3;
+pub const EVT_I2C_READ: u8 = 4;
+pub const EVT_I2C_STOP: u8 = 5;
+
 macro_rules! in_range {
     ($addr:expr, $base:expr, $size:expr) => {
         ($base..$base + $size).contains(&$addr)
@@ -246,6 +273,15 @@ pub struct Soc {
     /// reads would be redirected to those mapped flash pages (garbage).
     /// Cleared by `Esp32S3::step` once core 0 leaves the ROM (stub done).
     rom_boot_mode: bool,
+
+    /// Host-observable event queue (GPIO/SPI/I2C), drained once per frame by
+    /// the wasm bridge and dispatched to virtual-peripheral JS objects.
+    events: Vec<EmuEvent>,
+    /// Last GPIO output mask reported via `drain_events` (for edge detection).
+    last_gpio_out: u32,
+    /// Most recent SPI MOSI byte stream per channel, retrieved by the host
+    /// when it sees an `EVT_SPI_XFER` event.
+    pending_spi_tx: [Vec<u8>; 2],
 }
 
 impl Soc {
@@ -306,6 +342,9 @@ impl Soc {
             appcpu_ctrl_a: 0,
             cpu_int_from_cpu: [0, 0],
             rom_boot_mode: false,
+            events: Vec::new(),
+            last_gpio_out: 0,
+            pending_spi_tx: [Vec::new(), Vec::new()],
         }
     }
 
@@ -455,6 +494,54 @@ impl Soc {
         out
     }
 
+    /// Drain all host-observable events accumulated since the last call
+    /// (GPIO edges + SPI/I2C transactions). The wasm bridge calls this once
+    /// per animation frame and dispatches each event to the matching
+    /// virtual-peripheral JS object (Wokwi-style). GPIO edge detection runs
+    /// against the last reported output mask, so only net transitions survive
+    /// a step batch (cheap, and matches per-frame rendering anyway).
+    pub fn drain_events(&mut self) -> Vec<EmuEvent> {
+        let cur = self.gpio_output();
+        let prev = self.last_gpio_out;
+        if cur != prev {
+            // gpio_output() is a u32 mask, so only pins 0..32 are observable.
+            for i in 0..self.gpio.pin_count().min(32) {
+                let bit = 1u32 << i;
+                if (cur & bit) != (prev & bit) {
+                    self.events.push(EmuEvent {
+                        kind: EVT_GPIO,
+                        a: i as u32,
+                        b: (cur >> i) & 1,
+                    });
+                }
+            }
+            self.last_gpio_out = cur;
+        }
+        core::mem::take(&mut self.events)
+    }
+
+    /// Retrieve the MOSI byte stream of the most recent SPI transfer on
+    /// `chan` (0=GPSPI2, 1=GPSPI3) and clear it. Call this when an
+    /// `EVT_SPI_XFER` event arrives; feed the response back with
+    /// [`Soc::spi_inject_miso`].
+    pub fn spi_take_tx(&mut self, chan: usize) -> Vec<u8> {
+        core::mem::take(&mut self.pending_spi_tx[chan])
+    }
+
+    /// Inject MISO bytes for the next SPI transfer on `chan`
+    /// (0=GPSPI2, 1=GPSPI3). The bytes are shifted into the RX buffer at
+    /// transfer completion, so a virtual SPI device can answer the MCU.
+    pub fn spi_inject_miso(&mut self, chan: usize, bytes: &[u8]) {
+        self.spi[chan].inject_miso(bytes);
+    }
+
+    /// Inject RX bytes for the next I2C master-read on `chan`
+    /// (0=I2CEXT0, 1=I2CEXT1). Each byte is returned to the MCU on a READ
+    /// command; an empty supply reads back 0xFF (no device).
+    pub fn i2c_inject_rx(&mut self, chan: usize, bytes: &[u8]) {
+        self.i2c[chan].inject_rx(bytes);
+    }
+
     /// ROM-boot phase flag (see the `rom_boot_mode` field docs).
     pub fn rom_boot_mode(&self) -> bool {
         self.rom_boot_mode
@@ -473,16 +560,39 @@ impl Soc {
     pub fn tick_timers(&mut self, cycles: u64) {
         for _ in 0..cycles {
             // ULP-RISC-V coprocessor: run one instruction per machine step when
-            // released (the `core` sw_start bit). RTC_SLOW_MEM is its code/data.
-            self.ulp.step(&mut self.rtc_slow[..]);
+            // released (the `core` sw_start bit). It has full access to the SoC
+            // bus (RTC_SLOW_MEM, peripherals, DRAM). Swapped out via
+            // mem::replace to satisfy the borrow checker: `ulp.step` needs
+            // `&mut self` as its bus while `ulp` must be a separate local.
+            if self.ulp.is_running() {
+                let mut ulp = core::mem::take(&mut self.ulp);
+                ulp.step(&mut *self);
+                self.ulp = ulp;
+            }
             self.timg[0].tick(1);
             self.timg[1].tick(1);
             self.systimer.tick(1);
             self.ledc.tick();
             self.spi[0].tick(1);
+            if let Some(tx) = self.spi[0].take_last_tx() {
+                self.pending_spi_tx[0] = tx;
+                self.events.push(EmuEvent {
+                    kind: EVT_SPI_XFER,
+                    a: 0,
+                    b: self.pending_spi_tx[0].len() as u32,
+                });
+            }
             self.spi[1].tick(1);
-            self.i2c[0].tick(1);
-            self.i2c[1].tick(1);
+            if let Some(tx) = self.spi[1].take_last_tx() {
+                self.pending_spi_tx[1] = tx;
+                self.events.push(EmuEvent {
+                    kind: EVT_SPI_XFER,
+                    a: 1,
+                    b: self.pending_spi_tx[1].len() as u32,
+                });
+            }
+            self.events.extend(self.i2c[0].tick(1));
+            self.events.extend(self.i2c[1].tick(1));
             self.adc.tick(1);
             self.rmt.tick();
             self.mcpwm.tick();
@@ -1157,6 +1267,58 @@ impl Soc {
             crate::sdmmc::SDMMC_BASE => {
                 if is_write {
                     self.sdmmc.write32(off, value);
+                    // If a CMD started a data transfer with IDMAC enabled, walk
+                    // the descriptor ring now (needs DRAM access via the bus).
+                    if let Some(xfer) = self.sdmmc.take_idmac() {
+                        let mut transfers: Vec<(u32, usize)> = Vec::new();
+                        let mut desc = xfer.dbaddr;
+                        let mut remaining = xfer.bytcnt as usize;
+                        loop {
+                            let des0 = self.read32(desc);
+                            let des1 = self.read32(desc.wrapping_add(4));
+                            let buf = self.read32(desc.wrapping_add(8));
+                            let mut size = (des1 & 0x1FFF) as usize;
+                            if size == 0 {
+                                size = 4096;
+                            }
+                            let size = size.min(remaining);
+                            transfers.push((buf, size));
+                            // Host now owns the descriptor: clear OWN (bit 31).
+                            self.write32(desc, des0 & !(1u32 << 31));
+                            remaining = remaining.saturating_sub(size);
+                            if des0 & (1u32 << 2) != 0 {
+                                break; // LD (last descriptor)
+                            }
+                            let next = self.read32(desc.wrapping_add(12));
+                            if next == 0 {
+                                break;
+                            }
+                            desc = next;
+                        }
+                        if xfer.write {
+                            // host -> card: gather descriptor buffers from DRAM.
+                            let mut data: Vec<u8> = Vec::new();
+                            for &(buf, size) in &transfers {
+                                for i in 0..size {
+                                    data.push(self.read8(buf.wrapping_add(i as u32)) as u8);
+                                }
+                            }
+                            self.sdmmc.idmac_store(xfer.lba, &data);
+                        } else {
+                            // card -> host: scatter storage into descriptor buffers.
+                            let data = self.sdmmc.idmac_load(xfer.lba, xfer.bytcnt as usize);
+                            let mut off = 0usize;
+                            for &(buf, size) in &transfers {
+                                for i in 0..size {
+                                    if off < data.len() {
+                                        self.write8(buf.wrapping_add(i as u32), data[off] as u32);
+                                        off += 1;
+                                    }
+                                }
+                            }
+                        }
+                        self.sdmmc.finish_idmac();
+                    }
                     0
                 } else {
                     self.sdmmc.read32(off)
