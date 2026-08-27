@@ -42,7 +42,6 @@ use crate::rtc::Rtc;
 use crate::rtc_i2c::RtcI2c;
 use crate::rtc_io::RtcIo;
 use crate::sdmmc::Sdmmc;
-use crate::ulp::{Ulp, ULP_OFF_END, ULP_OFF_START};
 use crate::sha::Sha;
 use crate::sigmadelta::Sdm;
 use crate::spi::Spi;
@@ -50,7 +49,8 @@ use crate::systimer::Systimer;
 use crate::timg::{INT_T0, INT_T1, INT_WDT, Timg};
 use crate::twai::{TWAI_BASE, Twai};
 use crate::uart::Uart;
-use crate::usb_serial_jtag::{UsbSerialJtag, USB_SERIAL_JTAG_INTR_SOURCE};
+use crate::ulp::{ULP_OFF_END, ULP_OFF_START, Ulp};
+use crate::usb_serial_jtag::{USB_SERIAL_JTAG_INTR_SOURCE, UsbSerialJtag};
 
 macro_rules! in_range {
     ($addr:expr, $base:expr, $size:expr) => {

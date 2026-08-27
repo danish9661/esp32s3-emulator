@@ -940,39 +940,52 @@ Core design:
    ok=1` → `I2C POKE PASS` (0x488 = END_DETECT|TRANS_COMPLETE|NACK, confirming
    the FSM runs to completion, NACK is latched with no device, bus returns
    idle, and READ fills the RX FIFO). All 124+ workspace tests still green,
-    clippy/wasm32 clean. **Wire-driver limitation (PRECISELY ROOT-CAUSED
-    2026-08-24)**: the Arduino `Wire` `endTransmission` scan times out
-    (`other=119`, returns code 3/4 = timeout; never the NACK code 2) under the
-    real esp-idf i2c *driver* stack, whereas the direct-poke sketch (which
-    reads `INT_RAW` directly) passes — so the peripheral model is CORRECT.
-    Disassembly of `i2c_master_isr_handler_default` (0x40377af4) + FreeRTOS
-    probes prove the failure is 100% firmware-internal, NOT an emulator gap:
-      • The ISR fires 336× on **core1** (src42→line3, verified PC hits
-        0x40377af4), which is correct — earlier "ISR never ran" was a bad
-        probe address (the ISR is 0x40375ea8, not 0x40375e9c).
-      • The NACK path (`bbci a7,10` at 0x40377b14) records `i2c_obj->+12=6/
-        +16=2`, sends the event via `xQueueGenericSendFromISR`, then because
-        `INT_STATUS=0x488` has bits 3+7 set it routes into the command loop
-        (0x40377b74) → error path (0x40377d2b). That loop handles the END
-        command and resets internal counters but **never sets
-        `cmd_link->+193` (the done flag)** the ISR reads at 0x40377bf5.
-      • The success give (0x40377c12) is therefore NEVER taken — 336/336
-        gives are the ABORT give (0x40377db1, `+193=0`), which frees the
-        semaphore (driver's `xQueueSemaphoreTake` consumes the SAME handle
-        0x3FC86118 — the sync handles MATCH) but leaves `cmd_link->ret` at
-        its initial `ESP_ERR_TIMEOUT`, so `endTransmission` reports timeout.
-    The `cmd_link->done`/`ret` handshake is entirely inside the esp-idf i2c
-    driver (a firmware-owned struct the ISR is meant to populate on the NACK
-    branch); it cannot be influenced by any peripheral register bit, so an
-    `i2c.rs` status-bit change CANNOT fix it (and an "abort-on-NACK" change
-    would _break_ the poke sketch, which legitimately expects `INT_RAW=0x488`
-    with the END command completing). I2C is validated at the peripheral
-    level; the Wire-driver path is a documented known limitation (consistent
-    with how RMT/GDMA/MCPWM/PCNT/TWAI were each first proven via direct
-    pokes). The only path to fixing it is ABI-level modeling of the esp-idf
-    i2c driver's cmd_link completion in the harness — a large effort requiring
-    the exact `cmd_link` struct offsets from esp-idf source (unavailable
-    offline here), out of scope unless explicitly funded.
+     clippy/wasm32 clean. **Wire-driver limitation (PRECISELY ROOT-CAUSED
+     2026-08-24, re-confirmed + decision finalized 2026-08-27)**: the Arduino
+     `Wire` `endTransmission` scan times out (`other=119`, never the NACK code
+     2) under the real esp-idf i2c *driver* stack, whereas the direct-poke
+     sketch passes — so the **peripheral model is CORRECT**. Disassembly of
+     `i2c_master_isr_handler_default` (0x40377af4) + the full
+     `s_i2c_synchronous_transaction` (0x420234ec) → `s_i2c_send_commands`
+     (0x420230f4) call chain (2026-08-27) pins the failure to firmware-internal
+     driver state, NOT an emulator gap:
+       • The ISR fires on **core1** (src42→line3) with `INT_RAW=0x488`
+         (END_DETECT|TRANS_COMPLETE|NACK) and the NACK path (`bbci a7,10` @
+         0x40377b14) records `i2c_obj->+12=6/+16=2` and sends the completion
+         event via `xQueueGenericSendFromISR` — correct behavior.
+       • The task blocks in `xQueueReceive` (0x420231df) waiting for that
+         event. **KEY NEW FINDING (2026-08-27)**: the blocked task does NOT
+         context-switch away — it stays parked at the `xQueueReceive` call, so
+         unblocking needs NO FreeRTOS TCB/scheduler emulation (a shim forcing
+         the call to return `pdTRUE` makes the sketch *complete* and print
+         `I2C WIRE PASS`). This rules out the whole "scheduler glue" theory.
+       • The NACK verdict is read from the esp-idf driver's **`cmd_link`**
+         struct, NOT from I2C registers: `bus+0x28 = 0x5a8` is the offset of
+         the embedded `cmd_link` array inside the `i2c_master_bus_t`
+         (0x3fcecefc; `bus+0x24=0x6001302c`=INT_ST, `bus+0x2c=0x40377af4`=ISR
+         handler). Re-asserting `INT_RAW`/`INT_ENA` NACK bits did NOT change
+         the verdict — the firmware reads `cmd_link->ret`, which the ISR's
+         command-loop handshake (0x40377b74) never populates. The real
+         completion semaphore is a single handle at **`bus+0xF4/0xF8 =
+         0x3fce9724`** (correcting the earlier wrong bus+168/172 claim).
+       • With the shim's `buf[0]=1` ("done" message) the firmware loops back
+         into its command processor and reports **`found=119` (all ACK)**
+         instead of `found=0 nack=119`, because `cmd_link->ret` stays at its
+         initial `ESP_ERR_TIMEOUT`/success — the firmware never gets the NACK
+         recorded by the ISR's NACK branch.
+     The `cmd_link->done`/`ret` handshake is 100% firmware-owned (the ISR is
+     meant to populate it on the NACK branch); no peripheral register bit can
+     influence it, so an `i2c.rs` change CANNOT fix it (and an
+     "abort-on-NACK" change would _break_ the poke sketch, which legitimately
+     expects `INT_RAW=0x488` with the END command completing). **DECISION
+     (2026-08-27, user-approved)**: accept the Wire-driver path as a
+     **documented known limitation**, consistent with how RMT/GDMA/MCPWM/PCNT/
+     TWAI/HMAC/DS/RSA were each first proven via direct pokes. The peripheral
+     (`i2c.rs`) is validated end-to-end via `tools/sketches/esp32s3_i2c_poke`
+     (`I2C POKE PASS`). The only path to a real fix is ABI-level modeling of
+     the esp-idf i2c driver's `cmd_link` completion in the harness — a large,
+     esp-idf-version-specific effort requiring the exact `cmd_link` struct
+     offsets from esp-idf source (unavailable offline here), out of scope.
   - 2026-08-22: **LEDC PWM driver path validated via arduino-cli (P5)**. The
     Arduino 3.3.10 `ledc` driver (`ledcAttach(pin, freq, res)` /
     `ledcWrite(pin, duty)`, the real esp-idf ledc stack with the HAL

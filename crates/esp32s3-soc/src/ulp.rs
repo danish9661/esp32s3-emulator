@@ -203,8 +203,20 @@ impl Ulp {
                 let a = self.x[rs1];
                 let v = match funct3 {
                     0 => a.wrapping_add(imm_i),
-                    2 => if (a as i32) < (imm_i as i32) { 1 } else { 0 },
-                    3 => if a < imm_i { 1 } else { 0 },
+                    2 => {
+                        if (a as i32) < (imm_i as i32) {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    3 => {
+                        if a < imm_i {
+                            1
+                        } else {
+                            0
+                        }
+                    }
                     4 => a ^ imm_i,
                     6 => a | imm_i,
                     7 => a & imm_i,
@@ -228,8 +240,20 @@ impl Ulp {
                     (0x00, 0) => a.wrapping_add(b),
                     (0x20, 0) => a.wrapping_sub(b),
                     (0x00, 1) => a << (b & 0x1F),
-                    (0x00, 2) => if (a as i32) < (b as i32) { 1 } else { 0 },
-                    (0x00, 3) => if a < b { 1 } else { 0 },
+                    (0x00, 2) => {
+                        if (a as i32) < (b as i32) {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    (0x00, 3) => {
+                        if a < b {
+                            1
+                        } else {
+                            0
+                        }
+                    }
                     (0x00, 4) => a ^ b,
                     (0x00, 5) => a >> (b & 0x1F),
                     (0x20, 5) => ((a as i32) >> (b & 0x1F)) as u32,
@@ -324,11 +348,8 @@ impl Ulp {
                     // C.LW: rd'=x8..x15 = mem[x1' + (uimm[6:2] << 2)].
                     let rd = 8 + ((insn >> 2) & 0x7) as usize;
                     let rs1 = 8 + ((insn >> 7) & 0x7) as usize;
-                    let uimm = (bit(5) << 4)
-                        | (bit(12) << 3)
-                        | (bit(11) << 2)
-                        | (bit(10) << 1)
-                        | bit(6);
+                    let uimm =
+                        (bit(5) << 4) | (bit(12) << 3) | (bit(11) << 2) | (bit(10) << 1) | bit(6);
                     let addr = self.x[rs1].wrapping_add(uimm << 2);
                     self.x[rd] = self.load(mem, addr, 2);
                 }
@@ -336,11 +357,8 @@ impl Ulp {
                     // C.SW: mem[x1' + (uimm[6:2] << 2)] = rs2'.
                     let rs2 = 8 + ((insn >> 2) & 0x7) as usize;
                     let rs1 = 8 + ((insn >> 7) & 0x7) as usize;
-                    let uimm = (bit(5) << 4)
-                        | (bit(12) << 3)
-                        | (bit(11) << 2)
-                        | (bit(10) << 1)
-                        | bit(6);
+                    let uimm =
+                        (bit(5) << 4) | (bit(12) << 3) | (bit(11) << 2) | (bit(10) << 1) | bit(6);
                     let addr = self.x[rs1].wrapping_add(uimm << 2);
                     self.store(mem, addr, self.x[rs2], 2);
                 }
@@ -640,14 +658,20 @@ fn c_j_imm(insn: u32) -> u32 {
 /// Decode the 9-bit (signed, ×2) offset of a C.BEQZ / C.BNEZ instruction.
 fn c_b_imm(insn: u32) -> u32 {
     let b = |x: u32| (insn >> x) & 1;
-    let imm =
-        (b(3) << 1) | (b(4) << 2) | (b(10) << 3) | (b(11) << 4) | (b(2) << 5) | (b(5) << 6) | (b(6) << 7) | (b(12) << 8);
+    let imm = (b(3) << 1)
+        | (b(4) << 2)
+        | (b(10) << 3)
+        | (b(11) << 4)
+        | (b(2) << 5)
+        | (b(5) << 6)
+        | (b(6) << 7)
+        | (b(12) << 8);
     sext(imm, 9)
 }
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     /// Hand-assembled rv32im program: store 0x12345678 to ULP reg slot 0, then
     /// `ebreak`. Words (LE): lui/addi to build the reg-slot address, lui/addi
@@ -711,11 +735,11 @@ fn c_b_imm(insn: u32) -> u32 {
     /// C.MV+C.<op>, C.LW/C.SW, C.BEQZ, C.J, C.MV and C.EBREAK. It computes a set
     /// of results into `RTC_SLOW_MEM` (base 0x5000_0000 + 0x80 data region).
     const C_PROG: &[u8] = &[
-        0x37, 0x01, 0x00, 0x50, 0x00, 0x01, 0xa2, 0xc8, 0xc6, 0x44, 0xa6, 0xdc, 0x29, 0x45, 0xd1, 0x45,
-        0x2e, 0x95, 0x2a, 0x86, 0x0d, 0x8e, 0x0a, 0x05, 0x09, 0x85, 0x9d, 0x89, 0xb2, 0x86, 0xad, 0x8e,
-        0x32, 0x87, 0x4d, 0x8f, 0xb2, 0x87, 0xed, 0x8f, 0x08, 0xc0, 0x54, 0xc0, 0x18, 0xc4, 0x5c, 0xc4,
-        0x10, 0xcc, 0x91, 0x47, 0x81, 0x48, 0x85, 0x08, 0x99, 0xc3, 0xfd, 0x17, 0xed, 0xbf, 0x23, 0x28,
-        0x14, 0x01, 0x04, 0x40, 0x44, 0xc8, 0x02, 0x90,
+        0x37, 0x01, 0x00, 0x50, 0x00, 0x01, 0xa2, 0xc8, 0xc6, 0x44, 0xa6, 0xdc, 0x29, 0x45, 0xd1,
+        0x45, 0x2e, 0x95, 0x2a, 0x86, 0x0d, 0x8e, 0x0a, 0x05, 0x09, 0x85, 0x9d, 0x89, 0xb2, 0x86,
+        0xad, 0x8e, 0x32, 0x87, 0x4d, 0x8f, 0xb2, 0x87, 0xed, 0x8f, 0x08, 0xc0, 0x54, 0xc0, 0x18,
+        0xc4, 0x5c, 0xc4, 0x10, 0xcc, 0x91, 0x47, 0x81, 0x48, 0x85, 0x08, 0x99, 0xc3, 0xfd, 0x17,
+        0xed, 0xbf, 0x23, 0x28, 0x14, 0x01, 0x04, 0x40, 0x44, 0xc8, 0x02, 0x90,
     ];
 
     fn rd(mem: &[u8], off: usize) -> u32 {
@@ -748,4 +772,3 @@ fn c_b_imm(insn: u32) -> u32 {
         assert_eq!(rd(&mem, 0x98), 10); // x12 = (30 - 20)
     }
 }
-

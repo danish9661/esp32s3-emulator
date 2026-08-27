@@ -265,7 +265,8 @@ impl Sdmmc {
         self.data.clear();
         if !write {
             // Load the block into the data FIFO (byte stream, LE words on read).
-            self.data.extend(self.block[..bytcnt.min(BLOCK_LEN)].iter().cloned());
+            self.data
+                .extend(self.block[..bytcnt.min(BLOCK_LEN)].iter().cloned());
             if bytcnt > BLOCK_LEN {
                 self.data.resize(bytcnt, 0);
             }
@@ -286,7 +287,7 @@ impl Sdmmc {
     pub fn read32(&mut self, offset: u32) -> u32 {
         match offset {
             CDETECT => 0, // bit0=0 means card present
-            WRTPRT => 0, // bit0=0 means not write-protected
+            WRTPRT => 0,  // bit0=0 means not write-protected
             RINTSTS => self.regs[self.idx(RINTSTS)],
             MINTSTS => self.regs[self.idx(RINTSTS)],
             FIFO => {
@@ -310,11 +311,7 @@ impl Sdmmc {
             }
             _ => {
                 let i = self.idx(offset);
-                if i < self.regs.len() {
-                    self.regs[i]
-                } else {
-                    0
-                }
+                if i < self.regs.len() { self.regs[i] } else { 0 }
             }
         }
     }
@@ -454,5 +451,3 @@ mod tests {
         assert_eq!(mismatch, 0);
     }
 }
-
-

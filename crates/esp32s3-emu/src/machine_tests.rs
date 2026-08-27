@@ -1930,7 +1930,12 @@ fn ulp_runs_poked_program_via_bus() {
     let mut m = Esp32S3::new();
     // Hand-assembled rv32im program: store 0x12345678 to ULP reg slot 0 then ebreak.
     let prog: [u32; 6] = [
-        0x6000_80B7, 0x10C0_8093, 0x1234_5137, 0x6781_0113, 0x0020_A023, 0x0010_0073,
+        0x6000_80B7,
+        0x10C0_8093,
+        0x1234_5137,
+        0x6781_0113,
+        0x0020_A023,
+        0x0010_0073,
     ];
     for (i, w) in prog.iter().enumerate() {
         m.soc.write32(RTC_SLOW_BASE + (i as u32) * 4, *w);
@@ -2148,10 +2153,7 @@ fn cross_core_interrupt_yields_to_other_core() {
     h.movi_n(9, 0);
     h.s32i(9, 8, 0); // clear CPU_INT_FROM_CPU_1 (deassert)
     h.rfi(3);
-    assert!(
-        h.bytes().len() <= 0x40,
-        "ISR fits the 64-byte vector slot"
-    );
+    assert!(h.bytes().len() <= 0x40, "ISR fits the 64-byte vector slot");
 
     let img = esp_app_image_multi(IRAM_BASE, &[(IRAM_BASE, &core0), (CORE1_CODE, &core1)]);
     let mut flash = std::vec![0xFFu8; 0x200_000];

@@ -261,10 +261,6 @@ fn main() {
                 m.cpu[0].reg(10)
             );
         }
-        // Watch: is the AES task taking the op_complete_sem (interrupt path)?
-        if m.cpu[0].pc == 0x4201396c && m.cpu[0].reg(10) == 0x3fc98138 {
-            println!("AES-SEM-TAKE@{i} pc0=0x4201396c");
-        }
         let r1 = m.cpu[1].step(&mut m.soc);
         let pc = m.cpu[0].pc;
         if let StepResult::Exception { cause } = r {

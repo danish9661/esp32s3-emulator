@@ -110,7 +110,11 @@ mod tests {
         // a spurious illegal-instruction exception on real S3 silicon, where
         // the DSP ISA is implemented).
         let o = enc(0x0007_0000);
-        assert!(matches!(o, Some(Opcode::OPCODE_EE_STF_64_XP)), "got {:?}", o);
+        assert!(
+            matches!(o, Some(Opcode::OPCODE_EE_STF_64_XP)),
+            "got {:?}",
+            o
+        );
     }
 }
 

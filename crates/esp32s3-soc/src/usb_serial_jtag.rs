@@ -105,13 +105,13 @@ impl UsbSerialJtag {
                 v
             }
             INT_RAW => self.regs[(INT_RAW / 4) as usize],
-            INT_ST => {
-                self.regs[(INT_RAW / 4) as usize] & self.regs[(INT_ENA / 4) as usize]
-            }
+            INT_ST => self.regs[(INT_RAW / 4) as usize] & self.regs[(INT_ENA / 4) as usize],
             INT_ENA => self.regs[(INT_ENA / 4) as usize],
             OUT_EP1_ST => {
                 let n = (self.rx.len() as u32) & 0x7F;
-                (n << 1 & OUT_EP1_WR_ADDR) | (n << 9 & OUT_EP1_RD_ADDR) | (n << 17 & OUT_EP1_REC_DATA_CNT)
+                (n << 1 & OUT_EP1_WR_ADDR)
+                    | (n << 9 & OUT_EP1_RD_ADDR)
+                    | (n << 17 & OUT_EP1_REC_DATA_CNT)
             }
             _ if offset.is_multiple_of(4) && offset < (REG_COUNT * 4) as u32 => {
                 self.regs[(offset / 4) as usize]
@@ -180,11 +180,20 @@ mod tests {
     #[test]
     fn ep1_conf_signals_writable_and_rx_avail() {
         let mut d = UsbSerialJtag::new();
-        assert_eq!(d.read32(EP1_CONF) & CONF_SERIAL_IN_EP_DATA_FREE, CONF_SERIAL_IN_EP_DATA_FREE);
+        assert_eq!(
+            d.read32(EP1_CONF) & CONF_SERIAL_IN_EP_DATA_FREE,
+            CONF_SERIAL_IN_EP_DATA_FREE
+        );
         assert_eq!(d.read32(EP1_CONF) & CONF_SERIAL_OUT_EP_DATA_AVAIL, 0);
         d.inject_rx(b'X');
-        assert_eq!(d.read32(EP1_CONF) & CONF_SERIAL_OUT_EP_DATA_AVAIL, CONF_SERIAL_OUT_EP_DATA_AVAIL);
-        assert_eq!(d.read32(INT_RAW) & INT_SERIAL_OUT_RECV_PKT, INT_SERIAL_OUT_RECV_PKT);
+        assert_eq!(
+            d.read32(EP1_CONF) & CONF_SERIAL_OUT_EP_DATA_AVAIL,
+            CONF_SERIAL_OUT_EP_DATA_AVAIL
+        );
+        assert_eq!(
+            d.read32(INT_RAW) & INT_SERIAL_OUT_RECV_PKT,
+            INT_SERIAL_OUT_RECV_PKT
+        );
     }
 
     #[test]
@@ -208,4 +217,3 @@ mod tests {
         assert_eq!(d.read32(INT_RAW) & INT_SERIAL_IN_EMPTY, 0);
     }
 }
-
