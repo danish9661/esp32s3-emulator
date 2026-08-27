@@ -6,7 +6,7 @@
 // frame into the TX buffer, issue a transmission request, then poll the RX
 // buffer status and compare the looped-back frame to what was sent.
 
-#define TWAI 0x6000C000u
+#define TWAI 0x6002B000u
 
 static volatile uint32_t* R(uint32_t off) {
   return (volatile uint32_t*)(TWAI + off);
@@ -24,9 +24,9 @@ void setup() {
 
   // Enter reset mode (rm = bit0) so the acceptance filter is writable.
   *R(0x00) = 1;
-  // Acceptance filter: code 0, mask 0 -> accept all frames.
+  // Acceptance filter: code 0, mask 0xFFFFFFFF (all don't-care) -> accept all.
   *R(0x40) = 0; *R(0x44) = 0; *R(0x48) = 0; *R(0x4C) = 0;
-  *R(0x50) = 0; *R(0x54) = 0; *R(0x58) = 0; *R(0x5C) = 0;
+  *R(0x50) = 0xFFFFFFFFu; *R(0x54) = 0xFFFFFFFFu; *R(0x58) = 0xFFFFFFFFu; *R(0x5C) = 0xFFFFFFFFu;
   // Leave reset, enter self-test mode (stm = bit2) so TX loops back to RX.
   *R(0x00) = (1u << 2);
 

@@ -1,6 +1,6 @@
 //! ESP32-S3 TWAI (Two-Wire Automotive Interface, CAN 2.0B) controller model.
 //!
-//! Register block at `0x6000_C000` (TRM TWAI chapter; `soc/twai_struct.h`). The
+//! Register block at `0x6002_B000` (`DR_REG_TWAI_BASE` from `soc/reg_base.h`). The
 //! registers are 8-bit but mapped to the LSB of every 32-bit word, so each
 //! register occupies one 32-bit slot and only its low byte is significant.
 //!
@@ -21,10 +21,11 @@
 //! to end. Real bus arbitration/ACK/error-frame timing is not modeled.
 
 /// TWAI register-block base (APB).
-pub const TWAI_BASE: u32 = 0x6000_C000;
+pub const TWAI_BASE: u32 = 0x6002_B000;
 
-/// TWAI interrupt source for the interrupt matrix (esp32s3 interrupts.h
-/// `ETS_TWAI_INTR_SOURCE = 37`).
+/// TWAI interrupt source for the interrupt matrix (esp32s3 `interrupts.h`
+/// `ETS_TWAI_INTR_SOURCE = 37`; verified against the positional enum where
+/// `ETS_LEDC_INTR_SOURCE = 35` (explicit) → EFUSE=36 → TWAI=37.
 pub const TWAI_INTR_SOURCE: u32 = 37;
 
 /// Number of bytes in the shared TX/RX frame buffer.
@@ -86,17 +87,18 @@ impl Twai {
         self.mode & 1 != 0
     }
 
-    /// Acceptance filter: a frame is accepted when, for each of the first
-    /// four frame bytes, `(byte & amr[i]) == (acr[i] & amr[i])` — i.e. the
-    /// masked identifier bytes match the acceptance code (PeliCAN 4-byte
-    /// filter; `amr[i]==0` accepts any value, giving accept-all).
+    /// Acceptance filter (PeliCAN/SJA1000 semantics): a frame is accepted when
+    /// for each of the first four frame bytes, the bits gated by the mask match
+    /// the acceptance code: `(byte & !amr[i]) == (acr[i] & !amr[i])`. An `amr`
+    /// bit of 0 means "must equal ACR", a 1 means "don't care" — so `amr[i] ==
+    /// 0xFF` accepts any value (accept-all).
     fn accepts(&self, frame: &[u8; FRAME_LEN]) -> bool {
         frame
             .iter()
             .zip(self.acr.iter())
             .zip(self.amr.iter())
             .take(4)
-            .all(|((f, acr), amr)| (f & amr) == (acr & amr))
+            .all(|((f, acr), amr)| (f & !amr) == (acr & !amr))
     }
 
     /// Begin a transmission: copy the TX buffer into the RX buffer (loopback)

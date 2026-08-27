@@ -44,7 +44,12 @@ fn acceptance_filter_configured_only_in_reset_mode() {
 #[test]
 fn self_test_loopback_receives_transmitted_frame() {
     let mut t = Twai::new();
-    // Enter self-test mode (stm = bit2), rm = 0.
+    // Enter reset mode and program accept-all (AMR all 0xFF), then leave reset
+    // in self-test mode (stm = bit2), rm = 0.
+    t.write32(MODE, 1);
+    for off in [0x50u32, 0x54, 0x58, 0x5C] {
+        t.write32(off, 0xFF);
+    }
     t.write32(MODE, 1 << 2);
     // Load a 13-byte frame into the TX buffer (operational mode).
     let tx: [u8; 13] = [
@@ -85,8 +90,14 @@ fn transmit_asserts_ti_and_ri_then_release_clears_ri() {
 #[test]
 fn accept_all_mask_passes_every_frame() {
     let mut t = Twai::new();
+    // Enter reset mode, program the acceptance filter to accept-all (AMR all
+    // 0xFF = don't-care every bit), then leave reset in self-test mode.
+    t.write32(MODE, 1);
+    for off in [0x50u32, 0x54, 0x58, 0x5C] {
+        t.write32(off, 0xFF);
+    }
     t.write32(MODE, 1 << 2);
-    // Default AMR = 0 (accept all). Transmit a frame with a non-zero header.
+    // Transmit a frame with a non-zero header.
     let tx: [u8; 13] = [
         0x04, 0xFF, 0x00, 0xAA, 0x01, 0x02, 0x03, 0x04, 0, 0, 0, 0, 0,
     ];

@@ -7,6 +7,7 @@ pub mod bus;
 pub mod cpu;
 mod exec;
 pub mod generated;
+pub mod ee;
 
 pub use bus::Bus;
 pub use cpu::{Cpu, StepResult};

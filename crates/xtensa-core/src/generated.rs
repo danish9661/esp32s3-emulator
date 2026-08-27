@@ -5729,10 +5729,11 @@ pub fn decode_inst(insn: u32) -> Option<Opcode> {
     // Any instruction that reaches here undecoded is, in practice, an
     // unimplemented TIE/DSP (`ee.*`) coprocessor instruction (the ISA
     // coverage audit confirms only `ee.*` mnemonics are undecoded by real
-    // ESP32-S3 firmware). Route it to a dedicated unimplemented opcode so the
-    // core halts cleanly instead of raising a spurious illegal-instruction
-    // exception.
-    Some(Opcode::OPCODE_EE_UNIMPLEMENTED)
+    // ESP32-S3 firmware). Route it through the dedicated `ee` decoder so the
+    // `format_32` TIE/DSP extensions have a single, inspectable home. The
+    // default there is a dedicated unimplemented opcode so the core halts
+    // cleanly instead of raising a spurious illegal-instruction exception.
+    Some(crate::ee::decode_ee_or_unimplemented(insn))
 }
 
 /// Decode an instruction in the 'inst16a' slot. Returns None on undefined.

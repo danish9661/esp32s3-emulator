@@ -1698,6 +1698,62 @@ fn lp_uart_registers_round_trip() {
     assert_eq!(m.soc.read32(LP_UART_BASE + 0x20), 0x1234_5678);
 }
 
+/// Poke the TWAI/CAN controller through the bus (mirrors the `esp32s3_twai`
+/// arduino-cli sketch): enter self-test (loopback) mode, load a 13-byte
+/// frame, transmit, poll the RX-buffer status, and confirm the looped-back
+/// frame matches plus RRB clears `rbs`.
+#[test]
+fn twai_loopback_transmits_and_receives() {
+    use esp32s3_soc::twai::TWAI_BASE;
+
+    let mut m = Esp32S3::new();
+    let b = TWAI_BASE;
+
+    // Enter reset mode so the acceptance filter is writable.
+    m.soc.write32(b + 0x00, 1);
+    // Acceptance filter: code 0, mask 0xFFFFFFFF (all don't-care) -> accept all.
+    for off in [0x40u32, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C] {
+        m.soc.write32(b + off, if off < 0x50 { 0 } else { 0xFFFF_FFFF });
+    }
+    // Leave reset, enter self-test mode (stm = bit 2) -> TX loops back to RX.
+    m.soc.write32(b + 0x00, 1 << 2);
+
+    // Load a 13-byte frame: DLC=8 standard data frame, ID 0x123, payload 0x13..0x1C.
+    let tx: [u32; 13] = [
+        0x08, 0x24, 0x60, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
+    ];
+    for (i, &v) in tx.iter().enumerate() {
+        m.soc.write32(b + 0x40 + (i as u32) * 4, v);
+    }
+
+    // Transmission request (command.tr = bit 0).
+    m.soc.write32(b + 0x04, 1);
+
+    // Poll the RX-buffer status bit (SR.rbs = bit 0); advance the timers in
+    // case the loopback is gated on a tick.
+    let mut got = false;
+    for _ in 0..1000 {
+        if m.soc.read32(b + 0x08) & 1 != 0 {
+            got = true;
+            break;
+        }
+        m.soc.tick_timers(1);
+    }
+    assert!(got, "TWAI loopback: RX buffer never filled");
+
+    let mut matched = true;
+    for (i, &v) in tx.iter().enumerate() {
+        if m.soc.read32(b + 0x40 + (i as u32) * 4) != v {
+            matched = false;
+        }
+    }
+    assert!(matched, "TWAI loopback: received frame differs from sent");
+
+    // Release the RX buffer (command.rrb = bit 2) and confirm rbs clears.
+    m.soc.write32(b + 0x04, 1 << 2);
+    assert_eq!(m.soc.read32(b + 0x08) & 1, 0, "TWAI RRB did not clear rbs");
+}
+
 /// Poke the legacy deep-sleep path directly (mirrors the `esp32s3_deepsleep_poke`
 /// arduino-cli sketch): program a sleep period, write `RTC_CNTL_SLEEP_EN`, then
 /// step until the machine fast-forwards and reboots with the timer wakeup cause.

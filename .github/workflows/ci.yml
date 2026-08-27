@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (host)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+  firmware:
+    name: Firmware smoke test (arduino-cli + run_flash)
+    runs-on: ubuntu-latest
+    needs: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install arduino-cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+      - name: Install ESP32 core
+        run: |
+          arduino-cli config init --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json || true
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.10
+      - name: Build hello sketch
+        run: arduino-cli compile -b esp32:esp32:esp32s3 tools/sketches/esp32s3_hello --output-dir /tmp/hello
+      - name: Boot in emulator
+        run: |
+          cargo run -q --release -p esp32s3-emu --example run_flash -- /tmp/hello/esp32s3_hello.ino.merged.bin > /tmp/boot.log 2>&1
+          grep -E "boot OK|Hello from ESP32-S3" /tmp/boot.log || (echo "BOOT FAILED"; cat /tmp/boot.log; exit 1)

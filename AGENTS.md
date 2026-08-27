@@ -184,10 +184,12 @@ Core design:
     (`generator0/1`, 2-bit selectors per event: 0=keep,1=high,2=low,3=toggle)
     updates the output; the level is exposed to the GPIO matrix via the PWM0
     OUT0A..OUT2B signals (160..165, `gpio_sig_map.h`). `int_pending` = source
-    **31** (`ETS_PWM0_INTR_SOURCE`, `interrupts.h` — PWM1=32, LEDC=33, TWAI=35;
-    note the existing RMT=40/PCNT=41/I2C=42/43 wiring is verified-correct against
-    the same header, while `TWAI=37` in `twai.rs` does NOT match the header's
-    35 and should be re-checked). Wired into `soc.rs` (mmio arm `MCPWM_BASE`,
+     **31** (`ETS_PWM0_INTR_SOURCE`, `interrupts.h` — PWM1=32, LEDC=33;
+     note the existing RMT=40/PCNT=41/I2C=42/43 wiring is verified-correct against
+     the same header. `TWAI=37` is correct — `ETS_LEDC_INTR_SOURCE = 35` is an
+     explicit enum value, so EFUSE=36 → TWAI=37; an earlier "TWAI=35, twai.rs
+     should be re-checked" note was a miscount and is now resolved). Wired into
+     `soc.rs` (mmio arm `MCPWM_BASE`,
     `signal_level`, `tick`, `int_pending`). 6 unit tests (`tests/mcpwm.rs`)
     assert 50%/25% up-mode duty, operator A/B signal mapping, live
     `timer_status`, stop/hold, and prescale. Validated end-to-end with
@@ -906,7 +908,8 @@ Core design:
     wasm32 clean. Committed as 15ea7b3.
  - 2026-08-22: **TWAI / CAN (P5 — new peripheral via arduino-cli validation)**.
    `esp32s3-soc/src/twai.rs` models the ESP32-S3 TWAI (CAN 2.0B) controller:
-   register block @ 0x6000_C000 (PeliCAN-style, `soc/twai_struct.h`), registers
+    register block @ 0x6002_B000 (PeliCAN-style, `soc/twai_struct.h` — real
+    S3 base, NOT 0x6000_C000; confirmed via `DR_REG_TWAI_BASE` in `reg_base.h`), registers
    8-bit but mapped to the LSB of every 32-bit word. Implements mode/command/
    status/interrupt(IR)/interrupt-enable(IER), bus timing, error counters, a
    4-byte acceptance filter (ACR/AMR, only writable in reset mode), and the
@@ -918,12 +921,13 @@ Core design:
    the acceptance filter) — this is exactly how `TWAI_MODE_NO_ACK` / the
    `self_reception` flag exercise the receive path with no real bus. IR read
    clears all interrupts except RI (cleared by RX-buffer release, `rrb`);
-   `twai.int_pending` = raw & IER. Source = `ETS_TWAI_INTR_SOURCE = 37`, wired
-   into `soc.rs::int_pending` + the mmio arm `TWAI_BASE`. Real bus
-   arbitration/ACK/error-frame timing is not modeled. Unit tests
-   (`tests/twai.rs`, 5): reset-mode default, ACR/AMR config vs op-mode buffer
-   aliasing, self-test loopback round-trip, TI/RI assert + RRB clear, accept-all
-    filter. Validated end-to-end with `tools/sketches/esp32s3_twai` (direct
+    `twai.int_pending` = raw & IER. Source = `ETS_TWAI_INTR_SOURCE = 37` (verified:
+    `ETS_LEDC_INTR_SOURCE = 35` is an explicit enum value, so EFUSE=36 → TWAI=37),
+    wired into `soc.rs::int_pending` + the mmio arm `TWAI_BASE`. Real bus
+    arbitration/ACK/error-frame timing is not modeled. Unit tests
+    (`tests/twai.rs`, 5): reset-mode default, ACR/AMR config vs op-mode buffer
+    aliasing, self-test loopback round-trip, TI/RI assert + RRB clear, accept-all
+     filter. Validated end-to-end with `tools/sketches/esp32s3_twai` (direct
     register pokes: reset → accept-all filter → STM → load frame → `tr` → poll
     `rbs` → compare) → `TWAI LOOPBACK PASS` / `TWAI RRB OK`. 124 workspace tests
     green (+5 TWAI), clippy/wasm32 clean.
@@ -1757,4 +1761,65 @@ Core design:
       limitation (peripheral validated via direct poke); Touch excluded per
       user directive. All other modeled peripherals (incl. ULP rv32imc, WDT,
       dual-core cross-core IRQs) are validated.
+
+  - 2026-08-27: **TWAI driver-path validated via arduino-cli (P5)**.
+    Added `tools/sketches/esp32s3_twai_driver` using the esp-idf `driver/twai.h`
+    API in `TWAI_MODE_NO_ACK` self-test loopback (`twai_driver_install` →
+    `twai_driver_start` → `twai_transmit` → `twai_receive`, then RRB). This
+    exercises the **full real esp-idf driver stack** (hal + ISR + FreeRTOS
+    queue), not just register pokes. Two model bugs were found and fixed along
+    the way:
+    (1) **Wrong TWAI base**: the model had `TWAI_BASE = 0x6000_C000` — the
+    classic-ESP32 address. The real S3 base is `DR_REG_TWAI_BASE = 0x6002_B000`
+    (confirmed in `reg_base.h`, and by disassembling the driver's
+    `twai_hal_init` which loads `a8 = 0x6002b000`). The driver's
+    `twai_driver_install_v2` checks `mode_reg == 0` (reset state) and failed
+    with "hardware not in reset state" at the old base. Fixed to `0x6002_B000`;
+    the poke sketch's `#define TWAI` and `run_flash` probe addr tracked it.
+    (2) **Wrong acceptance-filter formula**: the model's `accepts()` used
+    `(f & amr) == (acr & amr)`, which with `TWAI_FILTER_CONFIG_ACCEPT_ALL`
+    (amr=0xFFFFFFFF, acr=0) requires `f == 0` and rejects everything. The
+    correct PeliCAN semantics are `(f & !amr) == (acr & !amr)` (amr bits are
+    *don't-care*), so amr=0xFF accepts all. Fixed; the poke sketch now writes
+    AMR=0xFFFFFFFF (accept-all) and the twai.rs unit tests
+    `accept_all_mask_passes_every_frame` / `self_test_loopback_receives_
+    transmitted_frame` set AMR=0xFF in reset mode.
+    **INTERRUPT SOURCE CORRECTED (disambiguation)**: an earlier AGENTS.md note
+    claimed `TWAI=37` was wrong and should be 35. That note was a miscount — the
+    `interrupts.h` enum has explicit assignments (`ETS_LEDC_INTR_SOURCE = 35`),
+    so tracing yields EFUSE=36 → `ETS_TWAI_INTR_SOURCE = 37`. The model's
+    original `37` was correct all along; the driver sketch passes with `37`
+    (the ISR runs, copies the looped-back frame to the rx queue, releases the
+    buffer, `twai_receive` returns it). Changing it to `35` (LEDC) misrouted the
+    interrupt and caused an ISR re-entry loop → "TWAI DRIVER RX FAIL". Reverted
+    to `37`. Validated: `esp32s3_twai_driver` → `TWAI DRIVER LOOPBACK PASS`;
+    `esp32s3_twai` (poke) → `TWAI LOOPBACK PASS` / `TWAI RRB OK`. Added machine
+    test `twai_loopback_transmits_and_receives` (bus-level loopback + RRB) in
+    `crates/esp32s3-emu/src/machine_tests.rs`. All workspace tests green, clippy
+     clean. **TWAI is retired as a P5 candidate (driver-path validated).**
+     Remaining P5 driver-path gaps: I2C (Wire) esp-idf driver (documented known
+     limitation); I2S and LCD_CAM driver-path sketches still pending; Touch
+     excluded per user directive.
+
+  - 2026-08-27: **Xtensa `ee.*` DSP/TIE `format_32` decoder scaffolded (P5
+    hardening follow-up)**. The existing auto-generated `generated.rs` already
+    decodes ~129 `ee.*` TIE/DSP opcodes (FFT / vector-MAC / vector-load /
+    broadcast-load / GPIO / quarter-round accumulators) and routes every other
+    undecoded instruction (the ISA-coverage audit's 29 `ee.*` mnemonics) to
+    `OPCODE_EE_UNIMPLEMENTED`. New `crates/xtensa-core/src/ee.rs` is the
+    dedicated, inspectable home for the `format_32` TIE/DSP extensions: it
+    provides `is_format32(insn)` (4-byte => low nibble of byte 0 in 14..=15),
+    `is_ee_opcode(op)` (contiguous discriminant block 498..=753, no_std-friendly
+    since `format!` is unavailable in lib code), `ee_family(op)` (coarse
+    vmac/fld/gpio label for diagnostics), and `decode_ee(insn)` -- the
+    `decode_inst` catch-all now delegates to `ee::decode_ee_or_unimplemented`.
+    `decode_ee` currently returns `OPCODE_EE_UNIMPLEMENTED` (behavior-preserving)
+    with a documented TODO for per-family recognition (mirroring the
+    `fld_inst_*` conditions already in `generated.rs`). 4 unit tests in `ee.rs`
+    plus the existing `ee_dsp_*` lib tests all green; `cargo clippy -p xtensa-core`
+    clean, full `--workspace` test suite green. NOTE: `gen_decode.py` currently
+    REGENERATES a smaller decoder (5097 lines vs the committed 8678), so
+    `generated.rs` must NOT be regenerated (it would drop decode entries) --
+    extend the TIE decoder via `ee.rs`, not by re-running the generator.
+
 
