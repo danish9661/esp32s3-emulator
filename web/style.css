@@ -6,6 +6,10 @@
   --accent: #2ea043;
   --led-on: #f5c211;
   --led-off: #21262d;
+  --gpio-in: #388bfd;
+  --gpio-out-hi: #f5c211;
+  --gpio-out-lo: #21262d;
+  --red: #b62324;
 }
 
 * { box-sizing: border-box; }
@@ -18,18 +22,19 @@ body {
 }
 
 header {
-  padding: 12px 20px;
+  padding: 10px 20px;
   border-bottom: 1px solid var(--border);
 }
 header h1 { margin: 0; font-size: 18px; }
 header small { color: #8b949e; font-weight: normal; }
 
+/* ── Controls bar ── */
 .controls {
   display: flex;
   flex-wrap: wrap;
-  gap: 12px;
+  gap: 10px;
   align-items: center;
-  padding: 12px 20px;
+  padding: 10px 20px;
   border-bottom: 1px solid var(--border);
   background: var(--panel);
 }
@@ -39,56 +44,192 @@ button {
   color: #fff;
   border: none;
   border-radius: 6px;
-  padding: 6px 14px;
+  padding: 5px 12px;
   font-size: 13px;
   cursor: pointer;
 }
 button:disabled { background: #30363d; cursor: not-allowed; opacity: 0.6; }
-button#stop { background: #b62324; }
+button#stop { background: var(--red); }
 .steps input[type=range] { vertical-align: middle; }
 .status { margin-left: auto; font-size: 12px; color: #8b949e; }
 
+/* ── Layout ── */
 main {
   display: grid;
-  grid-template-columns: 1fr 320px;
-  gap: 16px;
-  padding: 16px 20px;
+  grid-template-columns: 1fr 340px;
+  gap: 12px;
+  padding: 12px 16px;
+  height: calc(100vh - 90px);
 }
-@media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; }
+  .sidebar { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+}
+@media (max-width: 600px) {
+  .sidebar { grid-template-columns: 1fr; }
+}
 
-.console-wrap h2, .gpio-wrap h2 { font-size: 13px; color: #8b949e; margin: 0 0 6px; }
+/* ── Console ── */
+.console-wrap { display: flex; flex-direction: column; min-height: 0; }
+.console-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.console-toolbar h2 { margin: 0; font-size: 13px; color: #8b949e; white-space: nowrap; }
+.console-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.tb-btn {
+  background: #21262d;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 12px;
+  cursor: pointer;
+  line-height: 1.2;
+}
+.tb-btn:hover { background: #30363d; }
+.tb-btn.sm { padding: 2px 6px; font-size: 11px; }
+.search-input {
+  background: #010409;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  padding: 3px 8px;
+  font-size: 12px;
+  width: 120px;
+}
+.search-input:focus { border-color: #58a6ff; outline: none; }
+.search-status { font-size: 11px; color: #8b949e; min-width: 40px; }
+.auto-scroll-toggle {
+  font-size: 11px;
+  color: #8b949e;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+}
+.auto-scroll-toggle input { cursor: pointer; }
+
 .console {
   background: #010409;
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 10px;
-  height: 70vh;
+  flex: 1;
   overflow: auto;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   white-space: pre-wrap;
   word-break: break-word;
+  line-height: 1.4;
 }
 
+/* Search highlight */
+.console mark {
+  background: #bb8009;
+  color: #000;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+.console mark.current {
+  background: #f0883e;
+}
+
+/* ── Sidebar ── */
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+.sidebar h2 {
+  font-size: 13px;
+  color: #8b949e;
+  margin: 0 0 4px;
+}
+
+/* ── GPIO grid ── */
+.gpio-wrap { flex: 0 0 auto; }
+.gpio-controls { display: flex; gap: 4px; margin-bottom: 6px; }
 .gpio-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, 34px);
-  gap: 6px;
+  grid-template-columns: repeat(auto-fill, minmax(54px, 1fr));
+  gap: 4px;
 }
-.led {
-  width: 34px;
-  height: 34px;
-  border-radius: 6px;
-  background: var(--led-off);
-  border: 1px solid var(--border);
+.gpio-cell {
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  padding: 4px 2px;
   font-size: 9px;
   color: #8b949e;
+  transition: background 0.1s, border-color 0.15s;
+  cursor: default;
+  line-height: 1.3;
 }
-.led.on {
-  background: var(--led-on);
-  color: #000;
-  box-shadow: 0 0 8px var(--led-on);
+.gpio-cell .pin-num { font-weight: 600; font-size: 10px; }
+.gpio-cell .pin-label { font-size: 8px; opacity: 0.7; }
+.gpio-cell .pin-state { font-weight: 700; font-size: 11px; }
+
+/* GPIO states */
+.gpio-cell.out-hi {
+  background: rgba(245, 194, 17, 0.2);
+  border-color: var(--gpio-out-hi);
+  color: var(--led-on);
 }
+.gpio-cell.out-lo {
+  background: var(--led-off);
+  border-color: #30363d;
+  color: #8b949e;
+}
+.gpio-cell.input {
+  background: rgba(56, 139, 253, 0.1);
+  border-color: var(--gpio-in);
+  color: var(--gpio-in);
+}
+
+/* ── Virtual devices ── */
+.vdev-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.vdev {
+  background: #010409;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  flex: 1;
+  min-height: 60px;
+  max-height: 200px;
+  overflow: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.vdev-line { line-height: 1.4; }
+
+/* ── Tooltip on GPIO hover ── */
+.gpio-cell[data-tip]:hover::after {
+  content: attr(data-tip);
+  position: absolute;
+  background: #1c2128;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 11px;
+  color: var(--fg);
+  white-space: nowrap;
+  z-index: 10;
+  pointer-events: none;
+  margin-top: 2px;
+}
+.gpio-cell { position: relative; }

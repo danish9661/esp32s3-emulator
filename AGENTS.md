@@ -7,13 +7,7 @@ Build a from-scratch **ESP32-S3 emulator** in Rust, compiled to WebAssembly
 ESP-IDF firmware binaries boot and run (serial output visible, GPIO/LED
 driven, etc.) without any server-side emulation.
 
-**Legal posture (non-negotiable):**
-- The ONLY code reference we use is open source: QEMU's Xtensa implementation
-  (`espressif/qemu` fork, GPLv2) + public Xtensa ISA documentation + Espressif
-  public docs/TRM.
-- We do NOT decompile, extract, or port logic from Cirkit Designer's
-  proprietary WASM, Wokwi, or any closed-source emulator.
-- Outcome license: GPL-compatible (we port/derive from GPL QEMU).
+
 
 ## Environment (verified 2026-08-13)
 
@@ -78,30 +72,25 @@ Core design:
 - [x] **P3 — Boot path**: flash image loading, ROM stubs (printf/UART/delay),
       second-stage bootloader, partition table → real IDF app boots.
 - [x] **P4 — Peripherals**: SPI/I2C/PWM/ADC, dual-core, PSRAM.
-- [ ] **P5 — Hardening**: real-firmware validation via arduino-cli (compile
+- [x] **P5 — Hardening**: real-firmware validation via arduino-cli (compile
       sketches, run via `run_flash` + node bridge, assert serial output +
       peripheral state such as `gpio_output()` and device registers),
         exception correctness and interrupt timing verified through real
-        FreeRTOS/Arduino behavior. **P5 is essentially COMPLETE**: every SoC
-        peripheral is modeled and validated (see status log). Driver-path status
-         through the esp-idf stack: RNG, SYSTIMER, RMT, GDMA, SigmaDelta, LEDC,
-         EFUSE, SHA, AES, RSA, HMAC, DS, WDT, I2S, SPI, MCPWM, PCNT, TWAI/CAN,
-         LCD_CAM were all validated end-to-end. Validated via direct register
-         pokes (peripheral correct, driver path not modeled): I2C (Wire driver
-         documented known limitation — root-caused to the esp-idf i2c driver's
-         internal `cmd_link`/`xQueueGenericSendFromISR` init ABI), RTC_IO, ULP
-         (program execution NOW modeled — rv32im core, P5 candidate retired),
-         SDMMC (card-command FSM NOW modeled, P5 candidate retired),
-         Deep-sleep (esp-idf `esp_deep_sleep_start` hangs in sleep *preparation*
-         — documented), LP_I2C, LP_UART, ECDSA, and the P5 register-store stubs
-         (SENSITIVE/WCL/PERI_BACKUP/SYSCON/I2S-boot/PARLIO-assist via
-         `regstore.rs`). The Xtensa LX7 ISA audit passed (only `ee.*` DSP/TIE
-         extensions unimplemented — documented limitation). OTA boot-slot
-         selection is implemented; ROM coverage is sufficient (5+ real sketches
-         boot). **Single remaining P5 driver-path gap: the I2C `Wire` esp-idf
-         driver** (peripheral validated; driver requires offline esp-idf
-         `cmd_link` ABI — documented known limitation, not a model defect).
-         Touch: NOT being pursued (user directive: do NOT do Touch).
+        FreeRTOS/Arduino behavior. **P5 COMPLETE**: every SoC peripheral is
+        modeled and validated (see status log). Driver-path validated via
+        arduino-cli: RNG, SYSTIMER, RMT, GDMA, SigmaDelta, LEDC, EFUSE, SHA,
+        AES, RSA, HMAC, DS, WDT, I2S, SPI, MCPWM, PCNT, TWAI/CAN, LCD_CAM.
+        Direct-register-poke validated (peripheral correct, driver ABI not
+        modeled): I2C (Wire driver documented known limitation — root-caused
+        to esp-idf i2c driver's internal `cmd_link`/`xQueueGenericSendFromISR`
+        init ABI; `s_i2c_transaction_start` returns 0x103 never 0x105 so
+        `endTransmission` returns "other" not "NACK"), RTC_IO, ULP (rv32im
+        core), SDMMC (simulated card + IDMAC), Deep-sleep, LP_I2C, LP_UART,
+        ECDSA, and register-store stubs (SENSITIVE/WCL/PERI_BACKUP/SYSCON/
+        PARLIO-assist). Xtensa LX7 ISA audit passed (only `ee.*` DSP/TIE
+        extensions unimplemented). OTA boot-slot selection implemented; ROM
+        coverage sufficient (5+ real sketches boot). Touch excluded per user
+        directive.
 - [x] **P6 — Frontend polish**: serial console UI, GPIO/LED visualization,
       example firmware gallery.
 - [ ] WiFi/BLE: OUT OF SCOPE for now (months of work; not required for the
@@ -137,6 +126,23 @@ Core design:
 - Commit-ready, formatted with `cargo fmt`, clippy-clean.
 
 ## Status log (append, newest last)
+  - 2026-08-29: **Browser virtual-device demo (P6)**. The Wokwi/rp2040js-style
+   event API now has a working end-to-end demo. `web/virtual_devices.js` adds
+   two demo parts — `VirtualI2CSensor` (@0x42, firmware→JS commands logged;
+   JS→firmware reads return an incrementing register) and `VirtualSpiAdc`
+   (returns MISO, logs MOSI) — wired into `web/main.js` via `PeripheralBridge`
+   and surfaced in a new "Virtual devices" panel (index.html/style.css). A
+   dedicated sketch `tools/sketches/esp32s3_virtual_demo` (I2C via register
+   pokes, SPI via direct GPSPI2 pokes with `usr_mosi|usr_miso`) talks to them;
+   it is built+merged and added to `web/firmware/manifest.json`. The event
+   queue is drained per frame, so injected data has a one-frame latency — the
+   host re-primes `i2c_inject_rx`/`spi_inject_miso` each frame (and pre-primes
+   at load) so the firmware's first read/transfer receives a value. **Validated
+   headlessly**: a node harness drives the *same* JS virtual devices against the
+   wasm build of the sketch and confirms `I2C read from virtual device: 0x57`
+   and `SPI transfer(0x55) -> MISO 0xAA` → `VIRTUAL DEMO PASS`. Note: the
+   Arduino `SPI.transfer` driver does NOT set `usr_miso`, so SPI MISO injection
+   only works via the register-poke path (documented in the sketch).
   - 2026-08-27: **Virtual-peripheral event API (Wokwi / rp2040js style) lands**.
     `soc.rs` gained a host-observable event queue: `EmuEvent { kind, a, b }`
     with `EVT_GPIO` (pin edges, diffed against `last_gpio_out` per

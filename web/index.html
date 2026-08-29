@@ -20,12 +20,12 @@
       Examples:
       <select id="gallery"><option value="">— select —</option></select>
     </label>
-    <button id="run" disabled>Run</button>
-    <button id="stop" disabled>Stop</button>
-    <button id="reset" disabled>Reset</button>
+    <button id="run" disabled>▶ Run</button>
+    <button id="stop" disabled>⏸ Stop</button>
+    <button id="reset" disabled>↻ Reset</button>
     <label class="steps">
       Steps/frame:
-      <input type="range" id="steps" min="1000" max="200000" step="1000" value="40000" />
+      <input type="range" id="steps" min="1000" max="500000" step="1000" value="40000" />
       <span id="stepsVal">40000</span>
     </label>
     <span id="status" class="status"></span>
@@ -33,13 +33,39 @@
 
   <main>
     <section class="console-wrap">
-      <h2>Serial console (UART0)</h2>
+      <div class="console-toolbar">
+        <h2>Serial console</h2>
+        <div class="console-actions">
+          <input type="text" id="searchInput" class="search-input" placeholder="Search..." />
+          <button id="searchBtn" class="tb-btn" title="Find next (Enter)">🔍</button>
+          <button id="searchPrevBtn" class="tb-btn" title="Find previous">⬆</button>
+          <span id="searchStatus" class="search-status"></span>
+          <button id="copyBtn" class="tb-btn" title="Copy all output">📋 Copy</button>
+          <button id="clearBtn" class="tb-btn" title="Clear console">🗑 Clear</button>
+          <label class="auto-scroll-toggle" title="Auto-scroll">
+            <input type="checkbox" id="autoScroll" checked />
+            ⬇ Auto
+          </label>
+        </div>
+      </div>
       <pre id="console" class="console"></pre>
     </section>
-    <section class="gpio-wrap">
-      <h2>GPIO outputs</h2>
-      <div id="gpio" class="gpio-grid"></div>
-    </section>
+
+    <aside class="sidebar">
+      <section class="gpio-wrap">
+        <h2>GPIO outputs</h2>
+        <div class="gpio-controls">
+          <button id="gpioExpandAll" class="tb-btn sm">Expand</button>
+          <button id="gpioCollapseAll" class="tb-btn sm">Collapse</button>
+        </div>
+        <div id="gpio" class="gpio-grid"></div>
+      </section>
+
+      <section class="vdev-wrap">
+        <h2>Virtual devices</h2>
+        <pre id="vdev" class="vdev"></pre>
+      </section>
+    </aside>
   </main>
 
   <script type="module" src="./main.js"></script>

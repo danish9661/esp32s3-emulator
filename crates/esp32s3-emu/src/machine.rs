@@ -102,6 +102,23 @@ impl Esp32S3 {
         self.asleep
     }
 
+    /// Remaining steps to fast-forward while in deep-sleep.
+    pub fn sleep_remaining(&self) -> u64 {
+        self.sleep_remaining
+    }
+
+    /// Fast-forward up to `max_steps` of a deep-sleep period. Returns the
+    /// number of steps consumed (may be less than `max_steps` if the sleep
+    /// period ended). After this, `is_asleep()` will be false.
+    pub fn fast_forward_sleep(&mut self, max_steps: u64) -> u64 {
+        let skip = self.sleep_remaining.min(max_steps);
+        self.sleep_remaining -= skip;
+        if self.sleep_remaining == 0 {
+            self.wake();
+        }
+        skip
+    }
+
     /// Enter deep-sleep for `ticks` (slow-clock) steps; the CPU halts until
     /// the period elapses, then the machine reboots with the wakeup cause set.
     pub fn begin_sleep(&mut self, ticks: u64) {

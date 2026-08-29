@@ -3,5 +3,12 @@
   { "name": "periph — GPIO blink + sensors", "file": "esp32s3_periph.merged.bin" },
   { "name": "uart_echo — UART loopback", "file": "esp32s3_uart_echo.merged.bin" },
   { "name": "spi — SPI master transfer", "file": "esp32s3_spi.merged.bin" },
-  { "name": "i2c — I2C bus scan", "file": "esp32s3_i2c.merged.bin" }
+  { "name": "i2c — I2C bus scan", "file": "esp32s3_i2c.merged.bin" },
+  { "name": "uart_multi — UART0/1/2 TX", "file": "esp32s3_uart_multi.merged.bin" },
+  { "name": "gpio_interrupt — GPIO edge IRQ", "file": "esp32s3_gpio_interrupt.merged.bin" },
+  { "name": "timer_alarm — TIMG0 alarm IRQ", "file": "esp32s3_timer_alarm.merged.bin" },
+  { "name": "spi_wide — SPI 8/16/32-bit", "file": "esp32s3_spi_wide.merged.bin" },
+  { "name": "multi_irq — timer+UART+GPIO IRQs", "file": "esp32s3_multi_irq.merged.bin" },
+  { "name": "multi_periph — timer UART GPIO together", "file": "esp32s3_gpio_uart_timer.merged.bin" },
+  { "name": "virtual_demo — I2C/SPI virtual devices", "file": "esp32s3_virtual_demo.merged.bin" }
 ]

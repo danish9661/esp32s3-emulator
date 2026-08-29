@@ -58,6 +58,25 @@ impl Emulator {
         }
     }
 
+    /// Batch step with early-exit on reset/sleep. Returns the number of steps
+    /// actually executed. This avoids wasting cycles after a WDT reset or
+    /// deep-sleep entry — the caller can re-prime peripherals and continue.
+    /// Deep-sleep is fast-forwarded inline (no JS round-trip per tick).
+    pub fn step_batch(&mut self, n: u32) -> u32 {
+        let mut i = 0u32;
+        while i < n {
+            // If deep-sleeping, fast-forward inline — the CPU is halted.
+            if self.inner.is_asleep() {
+                let skip = self.inner.fast_forward_sleep((n - i) as u64);
+                i += skip as u32;
+                continue;
+            }
+            self.inner.step();
+            i += 1;
+        }
+        i
+    }
+
     /// Drain all pending UART/console bytes (UTF-8 serial output) and return
     /// them. Call this once per animation frame.
     pub fn uart_read(&mut self) -> Vec<u8> {

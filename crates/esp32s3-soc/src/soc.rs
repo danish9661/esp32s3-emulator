@@ -1575,6 +1575,21 @@ impl Soc {
         self.i2c[n].int_raw()
     }
 
+    /// Debug: read 4 bytes LE from DRAM (validation harness).
+    pub fn read_dram(&self, addr: u32) -> u32 {
+        if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE) {
+            let o = (addr - DRAM_BASE) as usize;
+            u32::from_le_bytes([
+                self.sram[o],
+                self.sram[o + 1],
+                self.sram[o + 2],
+                self.sram[o + 3],
+            ])
+        } else {
+            0
+        }
+    }
+
     /// Debug: per-channel GDMA interrupt/peri state (validation harness).
     pub fn gdma_debug(&self) -> Vec<(u32, u32, u32, u32, u32, u32)> {
         self.gdma.debug_state()
@@ -1756,59 +1771,93 @@ impl Bus for Soc {
 
     fn read32(&mut self, addr: u32) -> u32 {
         let addr = ioblock_remap(addr);
+        // Fast path: aligned SRAM reads (the overwhelmingly common case).
+        // DRAM alias: 0x3FC80000-0x3FD00000; IRAM alias: 0x40378000-0x403E0000
+        // (offset 0x6F0000 into the same 512 KB backing).
+        if addr & 3 == 0 && in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE) {
+            let o = (addr - DRAM_BASE) as usize;
+            return u32::from_le_bytes([
+                self.sram[o],
+                self.sram[o + 1],
+                self.sram[o + 2],
+                self.sram[o + 3],
+            ]);
+        }
+        if addr & 3 == 0 && in_range!(addr, IRAM_BASE, IRAM_WINDOW_SIZE) {
+            let o = (addr - IRAM_BASE) as usize;
+            if o < SRAM0_SIZE as usize {
+                return u32::from_le_bytes([
+                    self.iram0[o],
+                    self.iram0[o + 1],
+                    self.iram0[o + 2],
+                    self.iram0[o + 3],
+                ]);
+            }
+            let o = DIRAM_DATA_BASE - DRAM_BASE + (addr - DIRAM_INST_BASE);
+            let o = o as usize;
+            return u32::from_le_bytes([
+                self.sram[o],
+                self.sram[o + 1],
+                self.sram[o + 2],
+                self.sram[o + 3],
+            ]);
+        }
+        // Slow path: unaligned or non-SRAM — fall back to byte-by-byte.
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE)
             || in_range!(addr, IRAM_BASE, IRAM_WINDOW_SIZE)
         {
-            u32::from_le_bytes([
+            return u32::from_le_bytes([
                 self.ram8(addr),
                 self.ram8(addr + 1),
                 self.ram8(addr + 2),
                 self.ram8(addr + 3),
-            ])
-        } else if in_range!(addr, IROM_BASE, IROM_SIZE) {
+            ]);
+        }
+        if in_range!(addr, IROM_BASE, IROM_SIZE) {
             let o = (addr - IROM_BASE) as usize;
-            u32::from_le_bytes([
+            return u32::from_le_bytes([
                 self.irom[o],
                 self.irom[o + 1],
                 self.irom[o + 2],
                 self.irom[o + 3],
-            ])
-        } else if in_range!(addr, FLASH_DATA_BASE, FLASH_WINDOW_SIZE)
+            ]);
+        }
+        if in_range!(addr, FLASH_DATA_BASE, FLASH_WINDOW_SIZE)
             || in_range!(addr, FLASH_INST_BASE, FLASH_WINDOW_SIZE)
         {
-            u32::from_le_bytes([
+            return u32::from_le_bytes([
                 self.cache_read8(addr),
                 self.cache_read8(addr + 1),
                 self.cache_read8(addr + 2),
                 self.cache_read8(addr + 3),
-            ])
-        } else if in_range!(addr, RTC_SLOW_BASE, RTC_SLOW_SIZE) {
+            ]);
+        }
+        if in_range!(addr, RTC_SLOW_BASE, RTC_SLOW_SIZE) {
             let o = (addr - RTC_SLOW_BASE) as usize;
-            u32::from_le_bytes([
+            return u32::from_le_bytes([
                 self.rtc_slow[o],
                 self.rtc_slow[o + 1],
                 self.rtc_slow[o + 2],
                 self.rtc_slow[o + 3],
-            ])
-        } else if in_range!(addr, RTC_FAST_BASE, RTC_FAST_SIZE)
+            ]);
+        }
+        if in_range!(addr, RTC_FAST_BASE, RTC_FAST_SIZE)
             || in_range!(addr, RTC_FAST_DATA_BASE, RTC_FAST_SIZE)
         {
-            // RTC_FAST_DATA_BASE (0x3FF18000) sits BELOW RTC_FAST_BASE (0x600F8000);
-            // select by comparing against the higher base so the 0x600F8000 window
-            // does not alias into the 0x3FF18000 window (TRM RTC_FAST_MEM).
             let base = if addr < RTC_FAST_BASE {
                 RTC_FAST_DATA_BASE
             } else {
                 RTC_FAST_BASE
             };
             let o = (addr - base) as usize;
-            u32::from_le_bytes([
+            return u32::from_le_bytes([
                 self.rtc_fast[o],
                 self.rtc_fast[o + 1],
                 self.rtc_fast[o + 2],
                 self.rtc_fast[o + 3],
-            ])
-        } else if in_range!(addr, APB_START, APB_END) {
+            ]);
+        }
+        if in_range!(addr, APB_START, APB_END) {
             self.mmio32(addr, false, 0)
         } else {
             0
@@ -1862,10 +1911,28 @@ impl Bus for Soc {
 
     fn write32(&mut self, addr: u32, val: u32) {
         let addr = ioblock_remap(addr);
+        let bytes = val.to_le_bytes();
+        // Fast path: aligned SRAM writes (the overwhelmingly common case).
+        if addr & 3 == 0 && in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE) {
+            let o = (addr - DRAM_BASE) as usize;
+            self.sram[o..o + 4].copy_from_slice(&bytes);
+            return;
+        }
+        if addr & 3 == 0 && in_range!(addr, IRAM_BASE, IRAM_WINDOW_SIZE) {
+            let o = (addr - IRAM_BASE) as usize;
+            if o < SRAM0_SIZE as usize {
+                self.iram0[o..o + 4].copy_from_slice(&bytes);
+                return;
+            }
+            let o = (DIRAM_DATA_BASE - DRAM_BASE + (addr - DIRAM_INST_BASE)) as usize;
+            self.sram[o..o + 4].copy_from_slice(&bytes);
+            return;
+        }
+        // Slow path: unaligned or non-SRAM — fall back to byte-by-byte.
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE)
             || in_range!(addr, IRAM_BASE, IRAM_WINDOW_SIZE)
         {
-            for (i, b) in val.to_le_bytes().into_iter().enumerate() {
+            for (i, b) in bytes.into_iter().enumerate() {
                 self.ram_write8(addr + i as u32, b);
             }
         } else if in_range!(addr, IROM_BASE, IROM_SIZE) {
@@ -1873,26 +1940,22 @@ impl Bus for Soc {
         } else if in_range!(addr, FLASH_DATA_BASE, FLASH_WINDOW_SIZE)
             || in_range!(addr, FLASH_INST_BASE, FLASH_WINDOW_SIZE)
         {
-            // Cache windows: only MMU-mapped PSRAM pages are writable.
-            for (i, b) in val.to_le_bytes().into_iter().enumerate() {
+            for (i, b) in bytes.into_iter().enumerate() {
                 self.cache_write8(addr + i as u32, b);
             }
         } else if in_range!(addr, RTC_SLOW_BASE, RTC_SLOW_SIZE) {
             let o = (addr - RTC_SLOW_BASE) as usize;
-            self.rtc_slow[o..o + 4].copy_from_slice(&val.to_le_bytes());
+            self.rtc_slow[o..o + 4].copy_from_slice(&bytes);
         } else if in_range!(addr, RTC_FAST_BASE, RTC_FAST_SIZE)
             || in_range!(addr, RTC_FAST_DATA_BASE, RTC_FAST_SIZE)
         {
-            // RTC_FAST_DATA_BASE (0x3FF18000) sits BELOW RTC_FAST_BASE (0x600F8000);
-            // select by comparing against the higher base so the 0x600F8000 window
-            // does not alias into the 0x3FF18000 window (TRM RTC_FAST_MEM).
             let base = if addr < RTC_FAST_BASE {
                 RTC_FAST_DATA_BASE
             } else {
                 RTC_FAST_BASE
             };
             let o = (addr - base) as usize;
-            self.rtc_fast[o..o + 4].copy_from_slice(&val.to_le_bytes());
+            self.rtc_fast[o..o + 4].copy_from_slice(&bytes);
         } else if in_range!(addr, APB_START, APB_END) {
             self.mmio32(addr, true, val);
         }
