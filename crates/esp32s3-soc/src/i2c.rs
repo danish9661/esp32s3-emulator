@@ -558,12 +558,13 @@ impl I2c {
         }
     }
 
-    /// Advance `cycles` APB cycles through the bus operation, returning any
-    /// host-observable events (START/WRITE/READ/STOP) generated this call.
-    pub fn tick(&mut self, cycles: u64) -> Vec<EmuEvent> {
+    /// Advance `cycles` APB cycles through the bus operation. Events are
+    /// buffered internally; call `drain_events()` to collect them after
+    /// ticking.  This avoids allocating a Vec on every tick (the hot path).
+    pub fn tick(&mut self, cycles: u64) {
         for _ in 0..cycles {
             let Some(op) = self.op.as_mut() else {
-                return core::mem::take(&mut self.events);
+                return;
             };
             if op.remain > 0 {
                 op.remain -= 1;
@@ -572,7 +573,31 @@ impl I2c {
                 self.advance();
             }
         }
-        core::mem::take(&mut self.events)
+    }
+
+    /// True when no bus operation is in progress (the common idle case).
+    #[inline]
+    pub fn is_idle(&self) -> bool {
+        self.op.is_none()
+    }
+
+    /// Number of APB cycles until the next phase transition.  Returns 0
+    /// when idle (caller should skip the tick entirely).
+    #[inline]
+    pub fn remaining_cycles(&self) -> u64 {
+        self.op.as_ref().map_or(0, |op| op.remain)
+    }
+
+    /// Drain buffered events produced by `tick()`.  Returns an iterator
+    /// that also clears the internal buffer.
+    pub fn drain_events(&mut self) -> alloc::vec::Drain<'_, EmuEvent> {
+        self.events.drain(..)
+    }
+
+    /// True when there are buffered events to drain.
+    #[inline]
+    pub fn has_events(&self) -> bool {
+        !self.events.is_empty()
     }
 
     /// Current driven output levels: (SCL, SDA), idle = (1, 1).

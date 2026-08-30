@@ -118,11 +118,18 @@ impl Systimer {
     /// Advance time: each work-enabled unit counter ticks 1 per cycle, then
     /// armed alarms are checked against the counters.
     pub fn tick(&mut self, cycles: u64) {
+        let conf = self.regs[(CONF / 4) as usize];
+        // Fast path: skip when no unit is counting and no alarm is armed.
+        let any_unit = conf & (UNIT0_WORK_EN | UNIT1_WORK_EN);
+        let any_alarm = self.armed.iter().any(|&a| a);
+        if any_unit == 0 && !any_alarm {
+            return;
+        }
         for _ in 0..cycles {
-            if self.regs[(CONF / 4) as usize] & UNIT0_WORK_EN != 0 {
+            if conf & UNIT0_WORK_EN != 0 {
                 self.units[0].counter = (self.units[0].counter + 1) & COUNTER_MASK;
             }
-            if self.regs[(CONF / 4) as usize] & UNIT1_WORK_EN != 0 {
+            if conf & UNIT1_WORK_EN != 0 {
                 self.units[1].counter = (self.units[1].counter + 1) & COUNTER_MASK;
             }
             self.check_alarms();

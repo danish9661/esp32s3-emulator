@@ -591,8 +591,23 @@ impl Soc {
                     b: self.pending_spi_tx[1].len() as u32,
                 });
             }
-            self.events.extend(self.i2c[0].tick(1));
-            self.events.extend(self.i2c[1].tick(1));
+            // I2C bus: skip entirely when idle (common case during boot);
+            // when active, batch the remaining cycles to avoid per-step
+            // function-call overhead on the hot path.
+            if !self.i2c[0].is_idle() {
+                let n = self.i2c[0].remaining_cycles().max(1);
+                self.i2c[0].tick(n);
+                if self.i2c[0].has_events() {
+                    self.events.extend(self.i2c[0].drain_events());
+                }
+            }
+            if !self.i2c[1].is_idle() {
+                let n = self.i2c[1].remaining_cycles().max(1);
+                self.i2c[1].tick(n);
+                if self.i2c[1].has_events() {
+                    self.events.extend(self.i2c[1].drain_events());
+                }
+            }
             self.adc.tick(1);
             self.rmt.tick();
             self.mcpwm.tick();

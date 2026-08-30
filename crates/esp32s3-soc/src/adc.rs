@@ -212,6 +212,16 @@ impl Adc {
     /// Advance `cycles` APB cycles: finish pending oneshot conversions and
     /// service the digital timer trigger.
     pub fn tick(&mut self, cycles: u64) {
+        // Fast path: no pending oneshot and no digital timer → nothing to do.
+        let ctrl2 = self.apb[(APB_CTRL2 / 4) as usize];
+        let digital_active =
+            ctrl2 & APB_TIMER_EN != 0 && ctrl2 & APB_TIMER_SEL != 0;
+        if self.oneshot_pending[0] == 0
+            && self.oneshot_pending[1] == 0
+            && !digital_active
+        {
+            return;
+        }
         for _ in 0..cycles {
             for unit in 0..NUM_UNITS {
                 if self.oneshot_pending[unit] > 0 {

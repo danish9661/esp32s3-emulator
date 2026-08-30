@@ -145,11 +145,20 @@ impl Timg {
 
     /// Advance time by `cycles` (1 cycle = 1 CPU clock; dividers per CONFIG).
     pub fn tick(&mut self, cycles: u64) {
+        // Fast path: both timers disabled AND WDT disabled AND cali done → nothing to tick.
+        let t0_en = self.regs[((T0CONFIG) / 4) as usize] & CFG_EN != 0;
+        let t1_en = self.regs[((T0CONFIG + 0x24) / 4) as usize] & CFG_EN != 0;
+        let wdt_en = self.regs[(WDT_CONFIG0 / 4) as usize] & WDT_EN != 0;
+        if !t0_en && !t1_en && !wdt_en && self.cali_done {
+            return;
+        }
         for _ in 0..cycles {
             Self::tick_timer(&mut self.regs, &mut self.t0, 0);
             Self::tick_timer(&mut self.regs, &mut self.t1, 1);
             self.tick_cali();
-            self.tick_wdt();
+            if wdt_en {
+                self.tick_wdt();
+            }
         }
     }
 

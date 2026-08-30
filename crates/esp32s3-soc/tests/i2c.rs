@@ -141,7 +141,8 @@ fn read_with_injected_rx_delivers_byte_and_emits_events() {
     i2c.write32(I2C_CTR, (1 << 4) | (1 << 5)); // trans_start
     let mut evs = Vec::new();
     for _ in 0..100 {
-        evs.extend(i2c.tick(1));
+        i2c.tick(1);
+        evs.extend(i2c.drain_events());
     }
     assert_eq!(i2c.read32(I2C_SR) >> 8 & 0x3F, 1, "rx fifo count");
     assert_eq!(i2c.read32(I2C_DATA), 0x57, "injected byte");
@@ -168,7 +169,8 @@ fn write_emits_write_events() {
     i2c.write32(I2C_CTR, (1 << 4) | (1 << 5)); // trans_start
     let mut evs = Vec::new();
     for _ in 0..100 {
-        evs.extend(i2c.tick(1));
+        i2c.tick(1);
+        evs.extend(i2c.drain_events());
     }
     assert!(
         evs.iter()

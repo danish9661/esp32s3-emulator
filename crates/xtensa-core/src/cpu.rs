@@ -429,8 +429,17 @@ impl Cpu {
     ///   PS = (PS & ~INTLEVEL) | level | EXCM, pc = VECBASE + vector.
     /// - NMI: same as level 2..6 plus its sticky INTSET bit is cleared.
     pub(crate) fn check_interrupts<B: Bus>(&mut self, bus: &mut B) -> bool {
-        let intset = self.intset_live(bus);
         let intenable = self.sregs[SR_INTENABLE as usize];
+        let intset_sw = self.sregs[SR_INTSET as usize];
+        // Fast path: if no interrupts are globally enabled and no software
+        // interrupt bits are set, skip the expensive int_pending scan entirely.
+        // During early boot (before FreeRTOS enables interrupts) this skips
+        // ~22 peripheral register reads per instruction.
+        if intenable == 0 && intset_sw == 0 {
+            self.dbg_irq_skipped_level0 += 1;
+            return false;
+        }
+        let intset = intset_sw | bus.int_pending(self.core_id);
         let level = if intset & (1 << NMI_LINE) != 0 {
             NMI_LEVEL
         } else {
