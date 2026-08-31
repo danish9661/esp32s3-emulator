@@ -51,8 +51,24 @@ pub struct UsbSerialJtag {
     regs: [u32; REG_COUNT],
     /// Bytes emitted on the USB-CDC TX line (host console output).
     tx_out: Vec<u8>,
+    /// Total EP1 writes (diagnostic counter).
+    pub ep1_writes: u64,
+    /// Total wr_done events (diagnostic counter).
+    pub wr_done_count: u64,
     /// Received-but-unread bytes (the RX FIFO).
     rx: VecDeque<u8>,
+    /// True when `serial_in_empty_int` has been cleared by the ISR but
+    /// the TX FIFO is still empty — the host poll timer should
+    /// re-assert it.  Models the level-triggered `serial_in_empty_int`
+    /// on real USB-Serial-JTAG hardware (the host periodically polls
+    /// the device via IN tokens, and the interrupt stays asserted as
+    /// long as the TX FIFO has space).
+    need_reassert: bool,
+    /// Countdown (in tick() calls) until the next re-assertion.
+    /// Models the USB host polling interval (~1 ms ≈ 1000 APB cycles).
+    /// This prevents the ISR from firing every step, which would kill
+    /// performance.
+    reassert_countdown: u32,
 }
 
 impl UsbSerialJtag {
@@ -60,13 +76,50 @@ impl UsbSerialJtag {
         Self {
             regs: [0u32; REG_COUNT],
             tx_out: Vec::new(),
+            ep1_writes: 0,
+            wr_done_count: 0,
             rx: VecDeque::new(),
+            need_reassert: false,
+            reassert_countdown: 0,
         }
     }
 
     /// Drain the bytes this device emitted (host console output).
     pub fn take_tx(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.tx_out)
+    }
+
+    /// Periodic tick — models the USB host polling the device (IN tokens).
+    /// On real hardware the `serial_in_empty_int` is level-triggered:
+    /// asserted whenever the TX FIFO is empty and the device is
+    /// configured.  The host sends IN tokens at the USB polling interval
+    /// (e.g. 1 ms for full-speed).  Our edge-triggered `wr_done` model
+    /// only fires once, so the CDC TX FreeRTOS task stalls after its
+    /// first drain.  This method re-asserts the interrupt periodically
+    /// when the ISR has cleared it but the FIFO is still empty, keeping
+    /// the TX task cycling so it can drain subsequent `Serial.write()`
+    /// batches.
+    pub fn tick(&mut self) {
+        if self.need_reassert {
+            if self.reassert_countdown > 0 {
+                self.reassert_countdown -= 1;
+            } else {
+                self.need_reassert = false;
+                // Re-assert serial_in_empty_int only if ENA is set.
+                if self.regs[(INT_ENA / 4) as usize] & INT_SERIAL_IN_EMPTY != 0 {
+                    self.regs[(INT_RAW / 4) as usize] |= INT_SERIAL_IN_EMPTY;
+                    // After re-asserting, the ISR will fire and clear
+                    // again.  Re-arm the countdown so we don't re-assert
+                    // immediately on the next tick (avoid ISR storm).
+                    self.reassert_countdown = 100;
+                }
+            }
+        }
+    }
+
+    /// Diagnostic: total EP1 writes and wr_done events.
+    pub fn diagnostics(&self) -> (u64, u64) {
+        (self.ep1_writes, self.wr_done_count)
     }
 
     /// Bytes queued (debug probe).
@@ -125,16 +178,25 @@ impl UsbSerialJtag {
             EP1 => {
                 // TX byte -> host console (captured immediately).
                 self.tx_out.push((value & 0xFF) as u8);
+                self.ep1_writes += 1;
             }
             EP1_CONF => {
                 // wr_done: latch serial_in_empty_int so the driver's TX-done
                 // ISR/poll proceeds (host "read" the IN packet already).
                 if value & CONF_WR_DONE != 0 {
                     self.regs[(INT_RAW / 4) as usize] |= INT_SERIAL_IN_EMPTY;
+                    self.wr_done_count += 1;
                 }
             }
             INT_CLR => {
+                let cleared = self.regs[(INT_RAW / 4) as usize] & value;
                 self.regs[(INT_RAW / 4) as usize] &= !value;
+                // When the ISR clears serial_in_empty_int, remember to
+                // re-assert it on the next tick if the FIFO is still
+                // empty (level-triggered behavior).
+                if cleared & INT_SERIAL_IN_EMPTY != 0 {
+                    self.need_reassert = true;
+                }
             }
             INT_ENA => {
                 self.regs[(INT_ENA / 4) as usize] = value;

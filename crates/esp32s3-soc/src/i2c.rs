@@ -82,7 +82,7 @@ const COMD_DONE: u32 = 1 << 31;
 // INT_RAW bits (TRM I2C_INT_RAW): end_detect + trans_complete + nack.
 const INT_END_DETECT: u32 = 1 << 3;
 const INT_TRANS_COMPLETE: u32 = 1 << 7;
-const _INT_NACK: u32 = 1 << 10;
+const INT_NACK: u32 = 1 << 10;
 
 // Master op codes (IDF i2c_ll.h I2C_LL_CMD_*).
 const OP_RSTART: u32 = 6;
@@ -414,20 +414,12 @@ impl I2c {
                     });
                 } else if op.phase == 8 {
                     // ACK low done: clock high, SDA released. With no slave
-                    // present the bus pull-up holds SDA high -> NACK.
-                    // INT_NACK is NOT latched here: on real ESP32-S3 silicon
-                    // the NACK interrupt is only set for data bytes during
-                    // master-receive (READ), not for the address byte's ACK
-                    // cycle during master-transmit (WRITE).  The esp-idf
-                    // master ISR checks NACK (bit 10) *first* in INT_ST;
-                    // if it is set the ISR takes the msg=2 (NACK) path
-                    // which sets bus->status=6 → s_i2c_transaction_start
-                    // returns ESP_ERR_INVALID_STATE (0x103) instead of the
-                    // expected success/error.  SR_RESP_REC is still latched
-                    // so the byte count / event trail remains correct.
+                    // present the bus pull-up holds SDA high -> NACK, which
+                    // the master detects via nack_int_raw (bit 10).
                     op.phase = 9;
                     self.scl = 1;
                     self.sda = 1;
+                    self.regs[(I2C_INT_RAW / 4) as usize] |= INT_NACK;
                     op.remain = high;
                 } else {
                     // ACK high done: next byte or command end.

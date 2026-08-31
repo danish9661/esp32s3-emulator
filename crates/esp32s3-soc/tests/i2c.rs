@@ -218,11 +218,9 @@ fn sclk_div_scales_period() {
 }
 
 /// A WRITE issued with an empty TX FIFO must still drive the bus and, with
-/// no slave present, the SDA line is released high.  On real ESP32-S3
-/// silicon the INT_NACK interrupt is NOT latched for the address byte's ACK
-/// cycle during master-transmit — only for data bytes during master-receive.
-/// The END command latches INT_END_DETECT + INT_TRANS_COMPLETE so the
-/// esp-idf master ISR takes the TRANS_COMPLETE (msg=1) path.
+/// no slave present, the SDA line is released high → NACK (bit 10).  The
+/// END command latches INT_END_DETECT + INT_TRANS_COMPLETE so the esp-idf
+/// master ISR takes the TRANS_COMPLETE (msg=1) path.
 #[test]
 fn write_with_empty_fifo_nacks() {
     let mut i2c = I2c::new(0);
@@ -242,11 +240,11 @@ fn write_with_empty_fifo_nacks() {
     }
     assert!(scl_low_seen, "empty-FIFO WRITE must still drive SCL");
     assert_ne!(i2c.read32(I2C_COMD) & (1 << 31), 0, "comd done");
-    // END clears INT_NACK so the ISR takes the TRANS_COMPLETE path.
-    assert_eq!(
+    // NACK is set: no slave present, SDA released high during ACK cycle.
+    assert_ne!(
         i2c.read32(I2C_INT_RAW) & (1 << 10),
         0,
-        "END clears nack_int_raw"
+        "empty-FIFO WRITE raises nack_int_raw"
     );
     assert_ne!(
         i2c.read32(I2C_INT_RAW) & (1 << 7),

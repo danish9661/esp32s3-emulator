@@ -7,6 +7,7 @@
 
 use std::env;
 use std::fs;
+use std::time::Instant;
 
 use esp32s3_emu::Esp32S3;
 use xtensa_core::cpu::SR_EPC1;
@@ -41,6 +42,7 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(48_000_000);
+    let t0 = Instant::now();
     let mut uart_buf: Vec<u8> = Vec::new();
     let mut last_pc = 0u32;
     let mut last_uart_len = 0usize;
@@ -196,10 +198,25 @@ fn main() {
         last_uart_len = uart_buf.len();
     }
 
+    // --- Final drain: grab any remaining UART/USB-Serial TX bytes ---
+    {
+        let tx = m.take_uart_tx(0);
+        uart_buf.extend_from_slice(&tx);
+    }
+
+    // --- USB-Serial-JTAG diagnostics ---
+    {
+        let (ep1, wr_done) = m.soc.usb_serial_diagnostics();
+        println!("== usb-serial-jtag: ep1_writes={ep1}, wr_done={wr_done}");
+    }
+
     // --- Final report ---
+    let elapsed = t0.elapsed();
+    let mips = max_steps as f64 / elapsed.as_secs_f64() / 1_000_000.0;
     println!(
-        "\n== end: core0 pc {:#010x}, core1 pc {:#010x}, {} steps ==",
-        m.cpu[0].pc, m.cpu[1].pc, max_steps
+        "\n== end: core0 pc {:#010x}, core1 pc {:#010x}, {} steps in {:.2}s ({:.1} MIPS) ==",
+        m.cpu[0].pc, m.cpu[1].pc, max_steps,
+        elapsed.as_secs_f64(), mips
     );
     for c in 0..2 {
         let cpu = &m.cpu[c];

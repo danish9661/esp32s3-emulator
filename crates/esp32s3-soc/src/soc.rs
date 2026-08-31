@@ -470,6 +470,11 @@ impl Soc {
         self.usb.take_tx()
     }
 
+    /// Diagnostic: USB-Serial-JTAG (EP1 writes, wr_done events).
+    pub fn usb_serial_diagnostics(&self) -> (u64, u64) {
+        self.usb.diagnostics()
+    }
+
     /// Append host-generated console bytes to UART `n`'s TX stream (the
     /// ROM `ets_printf` mailbox path).
     pub fn uart_push_tx(&mut self, n: usize, bytes: &[u8]) {
@@ -642,6 +647,10 @@ impl Soc {
                 }
             };
             self.pcnt.tick(&pcnt_input);
+            // USB-Serial-JTAG: re-assert serial_in_empty_int when the
+            // ISR cleared it but the FIFO is still empty (level-triggered
+            // host-poll behavior).
+            self.usb.tick();
         }
         self.rtc.tick(cycles);
         self.pll.tick(cycles);
