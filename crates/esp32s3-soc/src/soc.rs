@@ -274,6 +274,17 @@ pub struct Soc {
     /// Cleared by `Esp32S3::step` once core 0 leaves the ROM (stub done).
     rom_boot_mode: bool,
 
+    /// Cached interrupt source bitmap, valid only while `src_valid` is true.
+    /// Each bit corresponds to an ETS_*_INTR_SOURCE number.  Set by
+    /// `int_pending()` on the first call after `tick_timers()` invalidates it.
+    /// The second core within the same step reuses this cache, halving the
+    /// 22-peripheral scan from 2 calls/step to 1 call/step.
+    cached_src: u128,
+    /// Whether `cached_src` is current.  Cleared by `tick_timers()` (which
+    /// may change peripheral interrupt state) and by `write32()` / `inject_rx`
+    /// paths that modify interrupt state between ticks.
+    src_valid: bool,
+
     /// Host-observable event queue (GPIO/SPI/I2C), drained once per frame by
     /// the wasm bridge and dispatched to virtual-peripheral JS objects.
     events: Vec<EmuEvent>,
@@ -342,6 +353,8 @@ impl Soc {
             appcpu_ctrl_a: 0,
             cpu_int_from_cpu: [0, 0],
             rom_boot_mode: false,
+            cached_src: 0,
+            src_valid: false,
             events: Vec::new(),
             last_gpio_out: 0,
             pending_spi_tx: [Vec::new(), Vec::new()],
@@ -558,6 +571,10 @@ impl Soc {
     }
 
     pub fn tick_timers(&mut self, cycles: u64) {
+        // Invalidate the per-step interrupt source bitmap cache.  Peripheral
+        // tick() calls may change int_raw (alarm matches, timer overflows),
+        // so any cached bitmap from a previous step is stale.
+        self.src_valid = false;
         for _ in 0..cycles {
             // ULP-RISC-V coprocessor: run one instruction per machine step when
             // released (the `core` sw_start bit). It has full access to the SoC
@@ -1619,10 +1636,11 @@ impl Soc {
     pub fn crypto_dma_debug_log(&self) -> Vec<(u32, u32)> {
         self.crypto_dma.debug_log()
     }
-}
 
-impl Bus for Soc {
-    fn int_pending(&mut self, cpu: usize) -> u32 {
+    /// Scan all peripheral interrupt status registers and build the source
+    /// bitmap (excluding per-cpu cross-core bits).  Called from `int_pending()`
+    /// when the per-step cache is invalid.
+    fn scan_peripheral_sources(&mut self) -> u128 {
         // Peripheral sources asserted per the TRM interrupt-source table
         // (esp32s3 interrupts.h ETS_*_INTR_SOURCE numbers): UART0/1/2 =
         // 27/28/29, TIMG0 T0/T1/WDT = 50/51/52, TIMG1 T0/T1/WDT =
@@ -1632,7 +1650,7 @@ impl Bus for Soc {
         // esp32_timg.c / esp32_uart.c update_irq); the matrix then
         // resolves the asserted sources to the requesting CPU's lines
         // (per-CPU core_0/core_1 maps, TRM interrupt matrix).  u128 bitmap:
-        // sources 79/80 (cross-core) and 94/95 sit beyond u64.
+        // sources 94/95 sit beyond u64.
         let mut src = 0u128;
         for (i, u) in self.uarts.iter().enumerate() {
             if u.int_st() != 0 {
@@ -1652,18 +1670,12 @@ impl Bus for Soc {
                 src |= 1 << (base + 2);
             }
         }
-        // SYSTIMER target0/1/2 = sources 57/58/59 (esp32s3 interrupts.h).
         let sst = self.systimer.int_st();
         for n in 0..3 {
             if sst & (1 << n) != 0 {
                 src |= 1 << (57 + n);
             }
         }
-        // I2C master (I2CEXT0/1) = sources 42/43, GPSPI2/GPSPI3 = 21/22
-        // (esp32s3 interrupts.h ETS_I2C_EXT*_INTR_SOURCE /
-        // ETS_SPI2/3_INTR_SOURCE). The driver ISR waits on a semaphore for
-        // trans_complete / trans_done, so the done bit must reach the CPU or
-        // the Arduino Wire/SPI library blocks forever.
         for (i, ic) in self.i2c.iter().enumerate() {
             if ic.int_st() != 0 {
                 src |= 1 << (42 + i);
@@ -1674,75 +1686,66 @@ impl Bus for Soc {
                 src |= 1 << (21 + i);
             }
         }
-        // RMT TX (channels 0..3) = source 40 (ETS_RMT_INTR_SOURCE).  The
-        // Arduino/esp-idf RMT driver waits on the tx_end interrupt (or a
-        // semaphore given from its ISR), so the done bit must reach the CPU
-        // or rmt_write_items blocks forever.
         if self.rmt.int_st() != 0 {
             src |= 1 << crate::rmt::RMT_INTR_SOURCE;
         }
-        // PCNT threshold events (units 0..3) = source 41 (ETS_PCNT_INTR_SOURCE).
         if self.pcnt.int_st() != 0 {
             src |= 1 << crate::pcnt::PCNT_INTR_SOURCE;
         }
-        // GDMA (shared interrupt, sources = OUT/IN channel done/eof). The
-        // firmware GDMA ISR (esp-idf gdma_hal) reads each channel's int_st and
-        // dispatches to the registered tx/rx-event callback.
         if self.gdma.int_pending() {
             src |= 1 << crate::gdma::GDMA_INTR_SOURCE;
         }
-        // Crypto/shared GDMA (0x6003F000) shares the same GDMA interrupt source;
-        // its RX/TX done must also deliver the ISR so the esp-idf GDMA driver's
-        // completion callback (which clears the AES driver's "dma done" flag that
-        // `esp_aes_dma_done` polls) runs.
         if self.crypto_dma.int_pending() {
             src |= 1 << crate::gdma::GDMA_INTR_SOURCE;
         }
-        // AES DMA-done interrupt (`ETS_AES_INTR_SOURCE`, 77). The esp-idf AES
-        // driver registers its completion ISR on this source (NOT the GDMA
-        // interrupt) and waits on `op_complete_sem`.
         if self.aes.int_pending() {
             src |= 1 << 77;
         }
-        // TWAI (CAN) controller = source 37 (ETS_TWAI_INTR_SOURCE).
         if self.twai.int_pending() {
             src |= 1 << crate::twai::TWAI_INTR_SOURCE;
         }
-        // MCPWM0 group = source 31 (ETS_PWM0_INTR_SOURCE).
         if self.mcpwm.int_pending() {
             src |= 1 << crate::mcpwm::MCPWM_INTR_SOURCE;
         }
-        // RSA accelerator = source 95 (ETS_RSA_INTR_SOURCE). The esp-idf RSA
-        // driver polls the peripheral `QUERY_INTERRUPT` register for completion,
-        // but wiring the matrix source too is harmless (covered if the driver
-        // path ever registers an ISR on this source).
         if self.rsa.int_pending() {
             src |= 1 << crate::rsa::RSA_INTR_SOURCE;
         }
-        // ECDSA accelerator = source 97 (ETS_ECDSA_INTR_SOURCE). The esp-idf
-        // ECDSA driver polls `QUERY_INTERRUPT`/`INT_RAW` for completion, but
-        // wiring the matrix source is harmless (covered if it ever registers an
-        // ISR on this source).
         if self.ecdsa.int_pending() {
             src |= 1 << crate::ecdsa::ECDSA_INTR_SOURCE;
         }
-        // USB-Serial-JTAG (CDC-ACM console) = source 96
-        // (ETS_USB_SERIAL_JTAG_INTR_SOURCE).
         if self.usb.int_pending() {
             src |= 1 << USB_SERIAL_JTAG_INTR_SOURCE;
         }
-        // Cross-core interrupts: SYSTEM.CPU_INT_FROM_CPU_0/1 (0x600C0030/34)
-        // assert the FROM_CPU_INTR0/1 sources = 79/80 (esp32s3 interrupts.h
-        // ETS_FROM_CPU_INTR0/1; the esp-idf crosscore_int.c allocates
-        // ETS_FROM_CPU_INTR0 on core 0 and ETS_FROM_CPU_INTR1 on core 1).
-        // FreeRTOS SMP depends on this to force scheduler yields on the
-        // target core (ipc_task's esp_crosscore_int_send_yield); without it
-        // a blocking task never gets switched out and the boot stalls.
-        // NOTE: the bitmap must be u128 — source 79/80 exceed u64's range.
+        self.cached_src = src;
+        self.src_valid = true;
+        src
+    }
+}
+
+impl Bus for Soc {
+    fn int_pending(&mut self, cpu: usize) -> u32 {
+        // Per-step cache: `tick_timers()` invalidates src_valid at the start
+        // of each step.  The first int_pending call (core 0) recomputes the
+        // full 22-peripheral source bitmap; the second call (core 1) reuses
+        // it.  Between the two calls, only cpu[1].step() instructions execute
+        // (no tick_timers), so peripheral state is effectively identical.
+        // Worst case: a cpu[1] INT_CLR write is delayed 1 step — negligible.
+        //
+        // The cross-core FROM_CPU bit is per-cpu, so it is NOT cached — it is
+        // added separately below after the cached_or_fresh source bitmap.
+        let src = if self.src_valid {
+            self.cached_src
+        } else {
+            self.scan_peripheral_sources()
+        };
+
+        // Cross-core: SYSTEM.CPU_INT_FROM_CPU_0/1 assert FROM_CPU_INTR0/1
+        // = sources 79/80.  This is per-cpu so it must not be cached.
+        let mut final_src = src;
         if self.cpu_int_from_cpu[cpu] & 1 != 0 {
-            src |= 1 << (79 + cpu);
+            final_src |= 1 << (79 + cpu);
         }
-        self.intc.pending_lines(cpu, src)
+        self.intc.pending_lines(cpu, final_src)
     }
 
     fn read8(&mut self, addr: u32) -> u32 {

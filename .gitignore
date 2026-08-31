@@ -9,3 +9,6 @@ web/firmware/*.bin
 
 # arduino-cli in-tree build output
 tools/sketches/*/build/
+
+# reference materials
+help/

@@ -82,7 +82,7 @@ const COMD_DONE: u32 = 1 << 31;
 // INT_RAW bits (TRM I2C_INT_RAW): end_detect + trans_complete + nack.
 const INT_END_DETECT: u32 = 1 << 3;
 const INT_TRANS_COMPLETE: u32 = 1 << 7;
-const INT_NACK: u32 = 1 << 10;
+const _INT_NACK: u32 = 1 << 10;
 
 // Master op codes (IDF i2c_ll.h I2C_LL_CMD_*).
 const OP_RSTART: u32 = 6;
