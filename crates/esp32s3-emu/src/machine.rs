@@ -30,6 +30,12 @@ pub struct Esp32S3 {
     asleep: bool,
     /// Remaining steps to fast-forward while `asleep`.
     sleep_remaining: u64,
+    /// Dedup state for the ROM console doubling bug: the ROM's putc at
+    /// 0x40043CE8 writes each char to BOTH UART0 (0x60000000) and
+    /// USB-Serial-JTAG (0x60038000).  Merging both FIFOs doubles every char.
+    /// Track the last emitted byte so the UART duplicate can be dropped.
+    last_console_byte: Option<u8>,
+    last_console_was_usb: bool,
 }
 
 impl Esp32S3 {
@@ -40,6 +46,8 @@ impl Esp32S3 {
             flash: Vec::new(),
             asleep: false,
             sleep_remaining: 0,
+            last_console_byte: None,
+            last_console_was_usb: false,
         }
     }
 
@@ -93,6 +101,8 @@ impl Esp32S3 {
         self.soc = Soc::new();
         self.asleep = false;
         self.sleep_remaining = 0;
+        self.last_console_byte = None;
+        self.last_console_was_usb = false;
         let f = self.flash.clone();
         self.boot_from_flash(&f);
     }
@@ -233,9 +243,15 @@ impl Esp32S3 {
         // printf (which sets putc1 itself — the real firmware boot works
         // without this write; bare-metal tests must install putc1 first).
         // Mirror the bootloader's state instead: putc1 = the real ROM's
-        // uart_tx_one_char @ 0x40000648 (the real silicon boot leaves this
-        // behind), so ROM-call tests printing before any install work too.
-        self.soc.write32(0x3FCE_F754, 0x4000_0648); // _putc1 = uart_tx_one_char
+        // uart_tx_one_char @ 0x40048C30 (ESP32-S3 ROM writes to the
+        // USB-Serial-JTAG FIFO, NOT UART0 — see soc.rs comment).  The
+        // older 0x40000648 version targets UART0 and would double all
+        // console output (rom_puts also feeds USB-Serial-JTAG).
+        // The boot ROM's console (uart_tx_one_char) emits via the
+        // USB-Serial-JTAG FIFO, not UART0 — merge it into UART0's stream
+        // so console output lands in the same place the app's Serial
+        // prints go.
+        self.soc.write32(0x3FCE_F754, 0x4004_8C30); // _putc1 = uart_tx_one_char (USB-Serial-JTAG)
         self.soc.write32(0x3FCE_FFB8, 1); // uart0 tx enabled
     }
 
@@ -245,19 +261,69 @@ impl Esp32S3 {
     pub fn take_uart_tx(&mut self, n: usize) -> Vec<u8> {
         let mut out = self.soc.take_uart_tx(n);
         if n == 0 {
-            // The ROM's console (uart_tx_one_char) emits via the
-            // USB-Serial-JTAG FIFO, not UART0 — merge it into UART0's stream
-            // so console output lands in the same place the app's Serial
-            // prints go.
-            out.extend_from_slice(&self.soc.take_usb_serial_tx());
+            let usb = self.soc.take_usb_serial_tx();
+            // Dedup the ROM doubling bug: the ROM's putc (0x40043CE8) writes
+            // each char to BOTH UART0 and USB.  When merging, the UART copy is
+            // a duplicate of the previous USB byte.  Drop it.
+            let mut filtered_usb = Vec::new();
+            let mut filtered_uart = Vec::new();
+            // First handle same-call dedup: if both FIFOs have identical content,
+            // the UART copy is a duplicate — keep USB only.
+            if !usb.is_empty() && out == usb {
+                filtered_uart.clear();
+                filtered_usb = usb;
+            } else {
+                // Cross-call dedup: check each uart byte against last emitted
+                for &b in &out {
+                    if self.last_console_was_usb && self.last_console_byte == Some(b) {
+                        // UART duplicate of previous USB — drop
+                    } else {
+                        filtered_uart.push(b);
+                    }
+                }
+                for &b in &usb {
+                    // USB bytes are never deduped (they are the primary)
+                    filtered_usb.push(b);
+                }
+            }
+            out = filtered_uart;
+            // Update dedup state from what we actually emit
+            if let Some(&last) = filtered_usb.last() {
+                self.last_console_byte = Some(last);
+                self.last_console_was_usb = true;
+            } else if let Some(&last) = out.last() {
+                self.last_console_byte = Some(last);
+                self.last_console_was_usb = false;
+            }
+            // Merge: USB first (primary), then UART (filtered), then host
+            let mut merged = filtered_usb;
+            merged.extend_from_slice(&out);
+            out = merged;
         }
         if n == 0 && self.soc.read32(HOST_PRINTF) != 0 {
             let msg = self.format_host_printf();
-            self.soc.uart_push_tx(0, &msg);
             out.extend_from_slice(&msg);
+            // Host printf bytes update dedup state too (treated as non-USB)
+            if let Some(&last) = out.last() {
+                self.last_console_byte = Some(last);
+                self.last_console_was_usb = false;
+            }
         }
         out
     }
+
+    /// Diagnostic: drain each console source separately (uart0, usb, host_printf).
+    pub fn take_uart_tx_split(&mut self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let uart0 = self.soc.take_uart_tx(0);
+        let usb = self.soc.take_usb_serial_tx();
+        let host = if self.soc.read32(HOST_PRINTF) != 0 {
+            self.format_host_printf()
+        } else {
+            Vec::new()
+        };
+        (uart0, usb, host)
+    }
+
     /// Format the pending `ets_printf` message (host printf mailbox) and
     /// clear the mailbox.  `%d %u %x %X %p %s %c %%` with `-`/`0` flags,
     /// decimal width and `l`/`h`/`z` length prefixes are supported — the

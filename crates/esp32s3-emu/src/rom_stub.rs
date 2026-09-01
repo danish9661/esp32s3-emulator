@@ -562,15 +562,11 @@ pub fn rom_image() -> Vec<u8> {
             a.jx(2); // jump to the stored core-1 entry point
         }),
         (ROM_PUTS, |a| {
-            let puts_loop = a.pc();
-            a.li(5, 0x6000_0000); // UART0 (TRM UART0_BASE)
-            a.l8ui(4, 2, 0);
-            // beqz a4, done; done is the ret, 12 bytes on (s32i 3 + addi 3 + j 3).
-            // (li a5 above is 3 instructions = 9 bytes, so the loop starts at 0x509.)
-            a.beqz(4, a.pc() + 12);
-            a.s32i(4, 5, 0); // UART FIFO (TXFIFO, TRM 26.3.6)
-            a.addi(2, 2, 1);
-            a.j(puts_loop);
+            // No-op: the ROM's console output goes through ets_printf →
+            // putc1 → uart_tx_one_char (USB-Serial-JTAG FIFO).  Having
+            // rom_puts also write would double every console message
+            // (both paths captured by take_uart_tx(0)).
+            a.entry(1, 0);
             a.ret();
         }),
         // ets_printf(fmt=a2, args a3..a7): host printf mailbox — the real

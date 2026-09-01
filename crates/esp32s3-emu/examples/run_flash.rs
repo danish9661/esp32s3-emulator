@@ -76,8 +76,7 @@ fn main() {
         // ROM stub region.  Without this, cache_read8 bypasses the MMU
         // forever and the app can never read flash through the cache.
         if m.soc.rom_boot_mode()
-            && !(pc >= esp32s3_emu::rom_stub::ROM_BASE
-                && pc < esp32s3_emu::rom_stub::ROM_END)
+            && !(pc >= esp32s3_emu::rom_stub::ROM_BASE && pc < esp32s3_emu::rom_stub::ROM_END)
         {
             m.soc.set_rom_boot_mode(false);
         }
@@ -204,19 +203,16 @@ fn main() {
         uart_buf.extend_from_slice(&tx);
     }
 
-    // --- USB-Serial-JTAG diagnostics ---
-    {
-        let (ep1, wr_done) = m.soc.usb_serial_diagnostics();
-        println!("== usb-serial-jtag: ep1_writes={ep1}, wr_done={wr_done}");
-    }
-
     // --- Final report ---
     let elapsed = t0.elapsed();
     let mips = max_steps as f64 / elapsed.as_secs_f64() / 1_000_000.0;
     println!(
         "\n== end: core0 pc {:#010x}, core1 pc {:#010x}, {} steps in {:.2}s ({:.1} MIPS) ==",
-        m.cpu[0].pc, m.cpu[1].pc, max_steps,
-        elapsed.as_secs_f64(), mips
+        m.cpu[0].pc,
+        m.cpu[1].pc,
+        max_steps,
+        elapsed.as_secs_f64(),
+        mips
     );
     for c in 0..2 {
         let cpu = &m.cpu[c];

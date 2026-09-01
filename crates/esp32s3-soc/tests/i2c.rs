@@ -251,11 +251,7 @@ fn write_with_empty_fifo_nacks() {
         0,
         "END sets trans_complete"
     );
-    assert_ne!(
-        i2c.read32(I2C_INT_RAW) & (1 << 3),
-        0,
-        "END sets end_detect"
-    );
+    assert_ne!(i2c.read32(I2C_INT_RAW) & (1 << 3), 0, "END sets end_detect");
 }
 
 /// FIFO reset bits clear the pointers.

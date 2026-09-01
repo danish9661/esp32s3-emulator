@@ -51,10 +51,6 @@ pub struct UsbSerialJtag {
     regs: [u32; REG_COUNT],
     /// Bytes emitted on the USB-CDC TX line (host console output).
     tx_out: Vec<u8>,
-    /// Total EP1 writes (diagnostic counter).
-    pub ep1_writes: u64,
-    /// Total wr_done events (diagnostic counter).
-    pub wr_done_count: u64,
     /// Received-but-unread bytes (the RX FIFO).
     rx: VecDeque<u8>,
     /// True when `serial_in_empty_int` has been cleared by the ISR but
@@ -76,8 +72,6 @@ impl UsbSerialJtag {
         Self {
             regs: [0u32; REG_COUNT],
             tx_out: Vec::new(),
-            ep1_writes: 0,
-            wr_done_count: 0,
             rx: VecDeque::new(),
             need_reassert: false,
             reassert_countdown: 0,
@@ -115,11 +109,6 @@ impl UsbSerialJtag {
                 }
             }
         }
-    }
-
-    /// Diagnostic: total EP1 writes and wr_done events.
-    pub fn diagnostics(&self) -> (u64, u64) {
-        (self.ep1_writes, self.wr_done_count)
     }
 
     /// Bytes queued (debug probe).
@@ -178,14 +167,12 @@ impl UsbSerialJtag {
             EP1 => {
                 // TX byte -> host console (captured immediately).
                 self.tx_out.push((value & 0xFF) as u8);
-                self.ep1_writes += 1;
             }
             EP1_CONF => {
                 // wr_done: latch serial_in_empty_int so the driver's TX-done
                 // ISR/poll proceeds (host "read" the IN packet already).
                 if value & CONF_WR_DONE != 0 {
                     self.regs[(INT_RAW / 4) as usize] |= INT_SERIAL_IN_EMPTY;
-                    self.wr_done_count += 1;
                 }
             }
             INT_CLR => {

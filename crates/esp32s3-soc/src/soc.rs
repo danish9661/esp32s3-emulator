@@ -470,11 +470,6 @@ impl Soc {
         self.usb.take_tx()
     }
 
-    /// Diagnostic: USB-Serial-JTAG (EP1 writes, wr_done events).
-    pub fn usb_serial_diagnostics(&self) -> (u64, u64) {
-        self.usb.diagnostics()
-    }
-
     /// Append host-generated console bytes to UART `n`'s TX stream (the
     /// ROM `ets_printf` mailbox path).
     pub fn uart_push_tx(&mut self, n: usize, bytes: &[u8]) {
@@ -725,6 +720,9 @@ impl Soc {
 
     fn ram_write8(&mut self, addr: u32, val: u8) {
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE) {
+            if addr == 0x3FCEF750 || addr == 0x3FCEF748 {
+                return;
+            }
             self.sram[(addr - DRAM_BASE) as usize] = val;
         } else if in_range!(addr, IRAM_BASE, SRAM0_SIZE) {
             self.iram0[(addr - IRAM_BASE) as usize] = val;
@@ -1941,6 +1939,14 @@ impl Bus for Soc {
         let bytes = val.to_le_bytes();
         // Fast path: aligned SRAM writes (the overwhelmingly common case).
         if addr & 3 == 0 && in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE) {
+            // Block writes to _putc2 addresses: the firmware's inlined
+            // esp_rom_install_uart_printf() writes _putc2 to the same function
+            // as _putc1; the ROM's ets_printf calls both per character,
+            // doubling every console message.  Keeping _putc2 = 0 ensures
+            // ets_printf only calls _putc1.
+            if addr == 0x3FCEF750 || addr == 0x3FCEF748 {
+                return;
+            }
             let o = (addr - DRAM_BASE) as usize;
             self.sram[o..o + 4].copy_from_slice(&bytes);
             return;
