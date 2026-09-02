@@ -10,8 +10,8 @@ use esp32s3_soc::Soc;
 use esp32s3_soc::memmap::{
     DRAM_BASE, IRAM_BASE, IROM_BASE, IROM_SIZE, RTC_FAST_DATA_BASE, RTC_FAST_SIZE, SRAM_BYTES,
 };
+use xtensa_core::generated::{Opcode, Opnd, insn_len};
 use xtensa_core::{Bus, Cpu, StepResult};
-use xtensa_core::generated::{Opcode, Opnd};
 
 use crate::rom_stub;
 use crate::rom_stub::HOST_PRINTF;
@@ -100,6 +100,10 @@ pub struct Esp32S3 {
     last_console_was_usb: bool,
     /// Block cache: pc -> decoded block of up to 16 insns until branch.
     block_cache: alloc::boxed::Box<[Option<Block>; 4096]>,
+    /// Global tick parity for `step_fast`: toggled before every fast-block
+    /// op so peripheral time advances once per two ops (the single-step
+    /// ratio), shared by both cores' loops within a macro-step.
+    fast_tick: bool,
 }
 
 impl Esp32S3 {
@@ -117,6 +121,7 @@ impl Esp32S3 {
                 v.resize_with(4096, || None);
                 v.into_boxed_slice().try_into().unwrap()
             },
+            fast_tick: false,
         }
     }
 
@@ -136,57 +141,58 @@ impl Esp32S3 {
                 if block.pc == pc && self.soc.int_pending(0) == 0 {
                     // Use TB only for non-test code (keep timer tests precise)
                     if !(pc >= 0x40000000 && pc < 0x40002000) {
-                        let mut ok = true;
-                        for i in 0..block.len as usize {
-                            self.soc.tick_timers(1);
-                            if self.soc.consume_reset() {
-                                self.reset();
-                                return StepResult::Ok;
+                        // Bulk tick for the whole block
+                        self.soc.tick_timers(block.len as u64);
+                        if self.soc.consume_reset() {
+                            self.reset();
+                            return StepResult::Ok;
+                        }
+                        if self.asleep {
+                            if self.sleep_remaining == 0 {
+                                self.wake();
+                            } else {
+                                self.sleep_remaining -= 1;
                             }
-                            if self.asleep {
-                                if self.sleep_remaining == 0 {
-                                    self.wake();
-                                } else {
-                                    self.sleep_remaining -= 1;
-                                }
-                                ok = false;
-                                break;
-                            }
-                            if let Some(ticks) = self.soc.consume_sleep_request() {
-                                self.asleep = true;
-                                self.sleep_remaining = ticks.max(1);
-                                ok = false;
-                                break;
-                            }
-                            if self.soc.int_pending(0) != 0 {
-                                ok = false;
-                                break;
-                            }
-                            if let Some(op) = &block.ops[i] {
-                                self.cpu[0].pc = op.pc;
-                                let res = self.cpu[0].execute_decoded(&mut self.soc, op.opcode, &op.opnds, op.len);
-                                match res {
-                                    StepResult::Ok => {
-                                        if self.cpu[0].pc == op.pc {
-                                            self.cpu[0].pc = op.pc + op.len;
+                            return StepResult::Ok;
+                        }
+                        if let Some(ticks) = self.soc.consume_sleep_request() {
+                            self.asleep = true;
+                            self.sleep_remaining = ticks.max(1);
+                            return StepResult::Ok;
+                        }
+                        if self.soc.int_pending(0) != 0 {
+                            // Interrupt became pending due to bulk tick — fall through to single-step
+                        } else {
+                            for i in 0..block.len as usize {
+                                if let Some(op) = &block.ops[i] {
+                                    self.cpu[0].pc = op.pc;
+                                    let res = self.cpu[0].execute_decoded(
+                                        &mut self.soc,
+                                        op.opcode,
+                                        &op.opnds,
+                                        op.len,
+                                    );
+                                    match res {
+                                        StepResult::Ok => {
+                                            if self.cpu[0].pc == op.pc {
+                                                self.cpu[0].pc = op.pc + op.len;
+                                            }
+                                        }
+                                        other => {
+                                            self.cpu[1].step(&mut self.soc);
+                                            return other;
                                         }
                                     }
-                                    other => {
-                                        self.cpu[1].step(&mut self.soc);
-                                        return other;
-                                    }
                                 }
                             }
-                        }
-                        if ok {
                             self.cpu[1].step(&mut self.soc);
                             let next_pc = self.cpu[0].pc;
                             let next_idx = (next_pc as usize) & 0xFFF;
                             if self.block_cache[next_idx].is_none()
                                 || self.block_cache[next_idx].as_ref().unwrap().pc != next_pc
                             {
-                                if let Some(nb) = Self::build_block(next_pc, &mut self.soc) {
-                                    self.block_cache[next_idx] = Some(nb);
+                                if let Some(new_block) = Self::build_block(next_pc, &mut self.soc) {
+                                    self.block_cache[next_idx] = Some(new_block);
                                 }
                             }
                             return StepResult::Ok;
@@ -222,7 +228,8 @@ impl Esp32S3 {
         let r = self.cpu[0].step(&mut self.soc);
         // Build and cache a block for the orig_pc for next time (hot loops)
         let idx = (orig_pc as usize) & 0xFFF;
-        if self.block_cache[idx].is_none() || self.block_cache[idx].as_ref().unwrap().pc != orig_pc {
+        if self.block_cache[idx].is_none() || self.block_cache[idx].as_ref().unwrap().pc != orig_pc
+        {
             if let Some(block) = Self::build_block(orig_pc, &mut self.soc) {
                 self.block_cache[idx] = Some(block);
             }
@@ -239,12 +246,144 @@ impl Esp32S3 {
         r
     }
 
+    /// Advance both cores by one fast block each (block-at-a-time execution).
+    /// Returns `(core0_result, core1_result, instructions_executed)`.
+    ///
+    /// Each core runs its cached straight-line block (`Soc::fast_len_for`,
+    /// branch op inclusive). Peripheral time advances INSIDE the op loop via
+    /// `fast_maybe_tick` — one tick per two ops globally, exactly the
+    /// single-step ratio — so firmware-observed peripheral state stays near
+    /// identical to single-stepping (a bulk tick upfront was tried and broke
+    /// MCPWM duty sampling: frozen mid-block time aliases the firmware's pin
+    /// sampling). CCOUNT stays per-instruction exact (delay loops are safe),
+    /// and interrupts dispatch once per core at its block end (QEMU TB
+    /// granularity, ≤16 instructions late). `step` is untouched and remains
+    /// the precise single-step path the machine tests use.
+    pub fn step_fast(&mut self) -> (StepResult, StepResult, u32) {
+        let llen = self.soc.fast_len_for(0, self.cpu[0].pc);
+        let flen = self.soc.fast_len_for(1, self.cpu[1].pc);
+        let (Some(llen), Some(flen)) = (llen, flen) else {
+            // Undecodable pc (raises ILLEGAL below): single-step both cores
+            // with the exact single-step plumbing for one tick.
+            self.soc.tick_timers(1);
+            if self.soc.consume_reset() {
+                self.reset();
+                return (StepResult::Ok, StepResult::Ok, 0);
+            }
+            if self.asleep {
+                if self.sleep_remaining == 0 {
+                    self.wake();
+                } else {
+                    self.sleep_remaining -= 1;
+                }
+                return (StepResult::Ok, StepResult::Ok, 0);
+            }
+            if let Some(ticks) = self.soc.consume_sleep_request() {
+                self.asleep = true;
+                self.sleep_remaining = ticks.max(1);
+                return (StepResult::Ok, StepResult::Ok, 0);
+            }
+            let r0 = self.cpu[0].step(&mut self.soc);
+            if self.soc.rom_boot_mode()
+                && !(self.cpu[0].pc >= rom_stub::ROM_BASE && self.cpu[0].pc < rom_stub::ROM_END)
+            {
+                self.soc.set_rom_boot_mode(false);
+            }
+            let r1 = self.cpu[1].step(&mut self.soc);
+            return (r0, r1, 2);
+        };
+        // Deep-sleep plumbing mirrors `step` (per macro-step; entry mid-block
+        // takes effect here, ≤16 instructions late).
+        if self.asleep {
+            if self.sleep_remaining == 0 {
+                self.wake();
+            } else {
+                self.sleep_remaining -= 1;
+            }
+            return (StepResult::Ok, StepResult::Ok, 0);
+        }
+        if let Some(ticks) = self.soc.consume_sleep_request() {
+            self.asleep = true;
+            self.sleep_remaining = ticks.max(1);
+            return (StepResult::Ok, StepResult::Ok, 0);
+        }
+        let (r0, n0) = self.run_fast_core(0, llen);
+        let (r1, n1) = self.run_fast_core(1, flen);
+        if self.soc.rom_boot_mode()
+            && !(self.cpu[0].pc >= rom_stub::ROM_BASE && self.cpu[0].pc < rom_stub::ROM_END)
+        {
+            // The ROM stub's flash reads (via the data window) must bypass the
+            // MMU; once core 0 jumps into the app, the app's window reads go
+            // through the MMU again (see `Soc::rom_boot_mode`).
+            self.soc.set_rom_boot_mode(false);
+        }
+        (r0, r1, n0 + n1)
+    }
+
+    /// One global timer tick per two executed ops (see `step_fast`): called
+    /// before every op in the fast-block loop. Preserves the single-step
+    /// tick-per-two-instructions ratio while keeping peripheral time gradual
+    /// inside blocks. A WDT/system reset raised by the tick reboots
+    /// immediately (the block is abandoned).
+    #[inline]
+    fn fast_maybe_tick(&mut self) -> bool {
+        self.fast_tick = !self.fast_tick;
+        if !self.fast_tick {
+            return false;
+        }
+        self.soc.tick_timers(1);
+        if self.soc.consume_reset() {
+            self.reset();
+            return true;
+        }
+        false
+    }
+
+    /// Run up to `len` instructions on `core` via `step_one` (no per-op
+    /// interrupt dispatch), stopping early on a reset, any non-Ok result, or
+    /// pc deviation (taken branch at the block end, or an unexpected flow
+    /// change — the cached entry only stores the run length, so any
+    /// deviation ends the run). Dispatches interrupts once at the end.
+    /// Returns (result, instructions_executed).
+    fn run_fast_core(&mut self, core: usize, len: u8) -> (StepResult, u32) {
+        let mut n = 0u32;
+        for _ in 0..len {
+            if self.fast_maybe_tick() {
+                return (StepResult::Ok, n);
+            }
+            let pc0 = self.cpu[core].pc;
+            let r = self.cpu[core].step_one(&mut self.soc);
+            // `step_one` records the fetched length even on exception paths,
+            // so no re-fetch is needed to verify fall-through advance.
+            let elen = self.cpu[core].last_len();
+            n += 1;
+            match r {
+                StepResult::Ok => {
+                    let pc = self.cpu[core].pc;
+                    // Fall-through continues the block. A pc matching LBEG is
+                    // the zero-overhead-loop wrap (taken branches end cached
+                    // runs, so any other deviation ends this run).
+                    if pc != pc0.wrapping_add(elen)
+                        && pc != self.cpu[core].sreg(xtensa_core::cpu::SR_LBEG)
+                    {
+                        break;
+                    }
+                }
+                other => return (other, n),
+            }
+        }
+        self.cpu[core].check_interrupts(&mut self.soc);
+        (StepResult::Ok, n)
+    }
+
     fn build_block(pc: u32, soc: &mut Soc) -> Option<Block> {
         // Only cache hot boot ROM loop (0x40000400) — keep timer/qsort tests precise
         if !(pc >= 0x40000400 && pc < 0x40001000) {
             return None;
         }
-        use xtensa_core::generated::{decode_inst, decode_inst16a, decode_inst16b, insn_len, opnds};
+        use xtensa_core::generated::{
+            decode_inst, decode_inst16a, decode_inst16b, insn_len, opnds,
+        };
         let mut block = Block {
             pc,
             ops: [None; 16],
@@ -308,14 +447,8 @@ impl Esp32S3 {
                 break;
             }
         }
-        if block.len == 0 {
-            None
-        } else {
-            Some(block)
-        }
+        if block.len == 0 { None } else { Some(block) }
     }
-
-
 
     /// Re-run the boot sequence from the last loaded flash image.  Used when a
     /// peripheral (WDT) triggers a system reset.
@@ -487,6 +620,23 @@ impl Esp32S3 {
     /// Also drains the ROM `ets_printf` mailbox (rom_stub::HOST_PRINTF):
     /// formats the pending message and emits it via UART0.
     pub fn take_uart_tx(&mut self, n: usize) -> Vec<u8> {
+        // Fast path: nothing pending in any console source — return without
+        // touching the merge/dedup state. The full paired drain below runs
+        // only when bytes exist, so its ROM-doubling pairing semantics are
+        // unchanged (batching the drain itself was tried and corrupts the
+        // doubled early-boot log because both cores print concurrently).
+        // With all sources empty the full path would also emit nothing and
+        // leave the dedup state untouched, so this is behavior-identical.
+        if n == 0 {
+            if !self.soc.uart_tx_pending(0)
+                && !self.soc.usb_tx_pending()
+                && self.soc.read32(HOST_PRINTF) == 0
+            {
+                return Vec::new();
+            }
+        } else if !self.soc.uart_tx_pending(n) {
+            return Vec::new();
+        }
         let mut out = self.soc.take_uart_tx(n);
         if n == 0 {
             let usb = self.soc.take_usb_serial_tx();

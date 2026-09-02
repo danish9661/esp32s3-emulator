@@ -141,7 +141,15 @@ help/                   Reference materials (gitignored)
 ### Execution Model
 
 1. **Step-based**: `Cpu::step(&mut bus)` executes **one instruction** and
-   returns a `StepResult` (normal / halted / exception).
+   returns a `StepResult` (normal / halted / exception). Tests and precise
+   paths use this.
+2. **Block-based (fast path)**: `Esp32S3::step_fast()` runs one cached
+   straight-line block per core (≤16 instructions, branch op inclusive;
+   only block lengths are cached, decode stays in the CPU cache) with
+   interrupts once per core at the block end (QEMU TB granularity).
+   Peripheral time advances inside the block at the exact single-step
+   ratio. `run_flash` and the browser use this; it reports instructions
+   executed.
 2. **Dual-core serialized**: `Esp32S3::step()` runs `tick_timers(1)`, then
    core 0's instruction, then core 1's instruction — serialized per step.
 3. **Peripheral ticks**: Every step, `tick_timers()` calls each peripheral's

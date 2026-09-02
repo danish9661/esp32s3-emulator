@@ -126,6 +126,72 @@ Core design:
 - Commit-ready, formatted with `cargo fmt`, clippy-clean.
 
 ## Status log (append, newest last)
+  - 2026-09-03: **Block-at-a-time execution lands: 17.4 → 30.4M insns/s
+    (+75%), i.e. 8.7 → 15.2 in legacy step units — the 15 MIPS goal**.
+    Firmware boots in 3.2s wall (was 5.5s), fully deterministic across runs.
+    Design (all additive; `Cpu::step` untouched so every machine test keeps
+    exact single-step semantics):
+    (1) `xtensa-core/cpu.rs`: `step` split into `step_one` (fetch/decode/
+    exec, no interrupt check) + trailing `check_interrupts` (now `pub`);
+    new `Cpu::last_len` records the fetched length so drivers verify
+    fall-through without re-fetching.
+    (2) `esp32s3-soc/soc.rs`: lean block-boundary cache (per core 4096×
+    (tag u32 + len u8) = 20KB; only control flow cached, decode stays in
+    the Cpu decode cache) + `fast_len_for`/`build_fast_len` (branch-
+    inclusive runs ≤16 ops, windowed CALL/ENTRY/RETW included — per-op
+    window checks still run inside `step_one`).
+    (3) `esp32s3-emu/machine.rs`: `step_fast()` runs one cached block per
+    core per macro-step with interrupts once per core at block end (QEMU TB
+    granularity, ≤16 insns late); `run_fast_core` aborts on any pc
+    deviation (LBEG carve-out keeps zero-overhead loops inside blocks).
+    Peripheral time advances INSIDE the op loop (`fast_maybe_tick`: one
+    tick per two ops globally = the exact single-step ratio) — a bulk tick
+    upfront was tried first (30.0M insns/s) but FROZE mid-block time and
+    broke MCPWM sampling (70%/40% FAIL); gradual ticks pass (52%/26%).
+    Deliberately NO flush on RAM writes (hot write path untouched; no
+    in-tree firmware does post-execution SMC — loader writes precede the
+    jump, WDT reset builds a fresh SoC; branch-inserting mid-block SMC
+    documented as known limitation).
+    (4) `run_flash.rs`: loop counts instructions (`STEPS` now means insns,
+    default 96M = old 48M-step work); `wasm-bridge step_batch` budgets
+    `2*n` insns (≈ same per-frame work/time as before).
+    Validated: 35/35 suites green; 30+ sketches boot with identical UART
+    (MCPWM/LEDC/SDM duties within PASS tolerances; sampling-sensitive
+    values shift slightly from coarser time granularity, all passing);
+    pre-existing failures unchanged (verified via stash A/B): multi_irq
+    timer ISRs at 0, gpio_uart_timer Core-1 WDT panic. Clippy/fmt clean
+    (only pre-existing warns). Avg block ~5.6 insns/macro-step (call-heavy
+    FreeRTOS); remaining ceiling is shorter blocks, not per-op cost.
+  - 2026-09-03: **Speed pass: 8.7 → 9.8 MIPS full-boot (+13%), 8.9 → 11.2 MIPS
+    boot-phase (+26%)**. Measured split (same-path `Instant` bench in a
+    throwaway `splitbench` example, since removed): `tick_timers` 37.5%,
+    `cpu.step` x2 cores 34.8%, `take_uart_tx` drains 27.7%. Changes (all
+    behavior-preserving, validated byte-identical UART on 14 sketches):
+    (1) `xtensa-core/cpu.rs`: decode cache now stores `opnds`+`len`+`wmask`
+    (`DecodeEntry` alias) — skips the giant `opnds()` match plus the window-
+    mask loop on every cache hit. (2) `esp32s3-soc/soc.rs`: `in_range!` is a
+    single `wrapping_sub < size` compare instead of `Range::contains`.
+    (3) `soc.rs tick_timers`: RMT/MCPWM/LCD_CAM/I2S ticks gated on new
+    `is_active()` (each mirrors its tick's own early-out, so a skipped tick
+    would have no-opped identically); PCNT tick skipped unless first-sample
+    pending or `is_counting()` (any unit out of reset + unpaused). SDM/LEDC
+    still tick unconditionally (SDM has no idle state; LEDC's gate costs as
+    much as its tick). (4) `esp32s3-emu/machine.rs take_uart_tx`: fast path
+    returns empty when UART+USB FIFOs and HOST_PRINTF are all empty (drain is
+    28% of runtime, empty 99%+ of steps); the full paired drain below is
+    untouched. (5) `run_flash.rs`: UART1-RXREADY scan gated on new bytes only.
+    REJECTED (documented): batching the console drain every 1024 steps
+    corrupted the early-boot log (138 vs 102 bytes) — the ROM-doubling dedup
+    pairs each UART byte with its USB twin in the same drain call, and both
+    cores printing concurrently interleave across wide windows, so
+    `out != usb` defeats the single-byte cross-call state. Per-step paired
+    drain is required. Ceiling notes: no-`tick_timers` hits 33 MIPS but the
+    firmware hangs in a CCOUNT spin (not the same path — not a real target);
+    the remaining gap to the 15 MIPS goal needs block-at-a-time execution
+    (the `machine.rs` TB path is ROM-range-only and `run_flash` bypasses it),
+    a bigger, timing-sensitive project. 35/35 test binaries green, clippy
+    clean (one pre-existing `is_branch` dead-code warn), wasm32 clean, fmt
+    clean except pre-existing `machine.rs` import order.
   - 2026-08-29: **Browser virtual-device demo (P6)**. The Wokwi/rp2040js-style
    event API now has a working end-to-end demo. `web/virtual_devices.js` adds
    two demo parts — `VirtualI2CSensor` (@0x42, firmware→JS commands logged;

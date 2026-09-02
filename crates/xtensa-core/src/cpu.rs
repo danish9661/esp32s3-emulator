@@ -18,11 +18,19 @@
 
 use crate::bus::Bus;
 use crate::exec::{self, Outcome};
-use crate::generated::{decode_inst, decode_inst16a, decode_inst16b, insn_len, opnds, Opcode, Opnd};
+use crate::generated::{
+    Opcode, Opnd, decode_inst, decode_inst16a, decode_inst16b, insn_len, opnds,
+};
 
 impl Cpu {
     /// Execute a pre-decoded op (for block cache). Like `step` but without fetch/decode/tick/int.
-    pub fn execute_decoded<B: Bus>(&mut self, bus: &mut B, opc: Opcode, opnds: &[Opnd; 8], len: u32) -> StepResult {
+    pub fn execute_decoded<B: Bus>(
+        &mut self,
+        bus: &mut B,
+        opc: Opcode,
+        opnds: &[Opnd; 8],
+        len: u32,
+    ) -> StepResult {
         // Window overflow check (same as step)
         let mut wmask = 0u32;
         for op in opnds.iter() {
@@ -65,6 +73,18 @@ impl Cpu {
     }
 }
 
+/// One decode-cache entry: fetch key (`pc`, `raw`) plus the decoded
+/// `opcode`, its operands, instruction length, and the precomputed
+/// windowed-register operand mask for the overflow check.
+type DecodeEntry = (
+    u32,
+    u32,
+    Option<crate::generated::Opcode>,
+    [crate::generated::Opnd; 8],
+    u32,
+    u32,
+);
+
 fn is_branch(opc: Opcode) -> bool {
     matches!(
         opc,
@@ -98,8 +118,6 @@ fn is_branch(opc: Opcode) -> bool {
             | Opcode::OPCODE_JX
     )
 }
-
-
 
 // Special register numbers (QEMU cpu.h "SR enum").  ESP32-S3 has no NDEPC,
 // so double exceptions reuse EPC1.
@@ -305,13 +323,20 @@ pub struct Cpu {
     user_sregs: [u32; 256],
     pub(crate) windowbase_next: Option<u32>,
     pub icount: u64,
+    /// Length in bytes of the most recently executed instruction (set by
+    /// `step_one` on every path that reaches fetch). Lets block drivers
+    /// verify pc advance without re-fetching the length.
+    last_len: u32,
     /// Debug counters for interrupt-delivery diagnosis (run_flash probes).
     pub dbg_irq_taken: u64,
     pub dbg_irq_skipped_level0: u64,
     /// Decode cache for WASM/native speed: direct-mapped cache of
-    /// `pc -> (raw, opc)` to avoid `decode_inst` match per step.
-    /// 8k entries = 32KB, covers hot loops (boot copy, FreeRTOS, IDA).
-    decode_cache: alloc::boxed::Box<[(u32, u32, Option<crate::generated::Opcode>); 8192]>,
+    /// `pc -> (raw, opc, opnds, len, wmask)` to avoid the `decode_inst` match
+    /// AND the `opnds` match per step. Hot loops (boot copy, FreeRTOS) hit
+    /// 95%+ of the time; `opnds()` is the larger of the two matches, so
+    /// caching it is the bigger win. `wmask` is the precomputed windowed-
+    /// register operand mask for the overflow check.
+    decode_cache: alloc::boxed::Box<[DecodeEntry; 8192]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,11 +363,14 @@ impl Cpu {
             user_sregs: [0; 256],
             windowbase_next: None,
             icount: 0,
+            last_len: 0,
             dbg_irq_taken: 0,
             dbg_irq_skipped_level0: 0,
             decode_cache: {
                 let mut v = alloc::vec::Vec::with_capacity(8192);
-                v.resize_with(8192, || (0, 0, None));
+                v.resize_with(8192, || {
+                    (0, 0, None, [crate::generated::Opnd::imm(0); 8], 0, 0)
+                });
                 v.into_boxed_slice().try_into().unwrap()
             },
         };
@@ -357,6 +385,13 @@ impl Cpu {
     }
 
     // --- register file -----------------------------------------------------
+
+    /// Length in bytes of the last instruction `step_one` executed
+    /// (for block drivers verifying fall-through advance).
+    #[inline]
+    pub fn last_len(&self) -> u32 {
+        self.last_len
+    }
 
     #[inline]
     pub fn windowbase(&self) -> u32 {
@@ -518,7 +553,11 @@ impl Cpu {
     /// - Level 2..6: EPC[level] = pc, EPS[level] = old PS,
     ///   PS = (PS & ~INTLEVEL) | level | EXCM, pc = VECBASE + vector.
     /// - NMI: same as level 2..6 plus its sticky INTSET bit is cleared.
-    pub(crate) fn check_interrupts<B: Bus>(&mut self, bus: &mut B) -> bool {
+    ///
+    /// Public so block-at-a-time drivers (machine `step_fast`) can execute
+    /// several instructions via `step_one` and dispatch interrupts once at
+    /// the block boundary, mirroring QEMU's TB-granularity delivery.
+    pub fn check_interrupts<B: Bus>(&mut self, bus: &mut B) -> bool {
         let intenable = self.sregs[SR_INTENABLE as usize];
         let intset_sw = self.sregs[SR_INTSET as usize];
         // Fast path: if no interrupts are globally enabled and no software
@@ -585,6 +624,28 @@ impl Cpu {
     /// happened (see StepResult).
     #[inline(always)]
     pub fn step<B: Bus>(&mut self, bus: &mut B) -> StepResult {
+        let r = self.step_one(bus);
+        if !matches!(r, StepResult::Ok) {
+            return r;
+        }
+        // Interrupt dispatch at the instruction boundary (QEMU runs
+        // check_interrupts before the next translation block).  pc has
+        // already advanced to the next instruction, so EPC[level] /
+        // EPS[level] let the handler return with RFE/RFI to the
+        // instruction after the one that took the interrupt.
+        self.check_interrupts(bus);
+        StepResult::Ok
+    }
+
+    /// Execute one instruction WITHOUT the trailing interrupt check.
+    /// Identical to `step` otherwise (CCOUNT advance, fetch, decode,
+    /// window-overflow check, execute, loop-end check). Public so
+    /// block-at-a-time drivers can run several instructions back-to-back
+    /// and dispatch interrupts once at the block boundary (QEMU TB
+    /// granularity); the caller must invoke `check_interrupts` afterwards
+    /// or interrupts would never deliver.
+    #[inline(always)]
+    pub fn step_one<B: Bus>(&mut self, bus: &mut B) -> StepResult {
         // CCOUNT (SR 234) advances one cycle per instruction on real
         // silicon — the boot ROM's delays (0x40041A76: `rsr.ccount; sub;
         // bltu`) spin on it and would loop forever with a frozen counter.
@@ -594,15 +655,21 @@ impl Cpu {
         let raw_full = bus.read32(pc);
         let b0 = (raw_full & 0xFF) as u8;
         let len = insn_len(b0);
-        let raw = if len == 2 { raw_full & 0xFFFF } else { raw_full };
+        let raw = if len == 2 {
+            raw_full & 0xFFFF
+        } else {
+            raw_full
+        };
 
-        // Decode cache: direct-mapped 4k entries, keyed by pc+raw
-        // Hot loops (boot copy, FreeRTOS) hit 95%+ of the time, avoiding the
-        // large `match` in `decode_inst`.
+        // Decode cache: direct-mapped 8k entries, keyed by pc+raw.
+        // Hot loops (boot copy, FreeRTOS) hit 95%+ of the time, avoiding both
+        // large matches (`decode_inst` and the even larger `opnds`). The
+        // window-operand mask is precomputed at fill time.
         let idx = (pc as usize) & 0x1FFF;
-        let (cached_pc, cached_raw, cached_opc) = self.decode_cache[idx];
-        let (opc, insn) = if cached_pc == pc && cached_raw == raw {
-            (cached_opc, raw)
+        let (cached_pc, cached_raw, cached_opc, cached_opnds, cached_len, cached_wmask) =
+            &self.decode_cache[idx];
+        let (opc, o, len, wmask) = if *cached_pc == pc && *cached_raw == raw {
+            (*cached_opc, *cached_opnds, *cached_len, *cached_wmask)
         } else {
             let (opc, insn) = match len {
                 2 => {
@@ -615,9 +682,17 @@ impl Cpu {
                 }
                 _ => (decode_inst(raw), raw),
             };
-            self.decode_cache[idx] = (pc, raw, opc);
-            (opc, insn)
+            let opnds = opnds(opc.unwrap_or(Opcode::OPCODE_ILL), insn, pc);
+            let mut wmask = 0u32;
+            for op in opnds.iter() {
+                if op.is_reg {
+                    wmask |= 1u32 << (op.value & 31);
+                }
+            }
+            self.decode_cache[idx] = (pc, raw, opc, opnds, len, wmask);
+            (opc, opnds, len, wmask)
         };
+        self.last_len = len;
 
         let opc = match opc {
             Some(o) => o,
@@ -629,22 +704,14 @@ impl Cpu {
             }
         };
 
-        let o = opnds(opc, insn, pc);
-
         // Generic window-overflow check: QEMU ORs 1<<v for every AR
         // register operand (visible and hidden) of the instruction and
         // raises WINDOW_OVERFLOWx if (highest bit)/4 > active window units.
-        // The check is ACTIVE only with WOE set and EXCM clear (QEMU
-        // xtensa_get_tb_cpu_state: `(PS & (WOE|EXCM)) == WOE`; otherwise the
-        // window field is 3, making r/4 > window inert for a0-a15) — the
+        // `wmask` is precomputed at decode-cache fill time. The check is
+        // ACTIVE only with WOE set and EXCM clear (QEMU
+        // xtensa_get_tb_cpu_state: `(PS & (WOE|EXCM)) == WOE`); the
         // exception vectors run with EXCM, and the raw s32e/l32e/rfwo
         // window-handler code must not re-trigger the overflow.
-        let mut wmask = 0u32;
-        for op in o.iter() {
-            if op.is_reg {
-                wmask |= 1u32 << (op.value & 31);
-            }
-        }
         if wmask != 0 && self.sregs[SR_PS as usize] & (PS_WOE | PS_EXCM) == PS_WOE {
             let r = 31 - wmask.leading_zeros();
             if r / 4 > self.window() {
@@ -679,12 +746,6 @@ impl Cpu {
         }
         self.sync_windowbase();
         self.icount += 1;
-        // Interrupt dispatch at the instruction boundary (QEMU runs
-        // check_interrupts before the next translation block).  pc has
-        // already advanced to the next instruction, so EPC[level] /
-        // EPS[level] let the handler return with RFE/RFI to the
-        // instruction after the one that took the interrupt.
-        self.check_interrupts(bus);
         StepResult::Ok
     }
 }

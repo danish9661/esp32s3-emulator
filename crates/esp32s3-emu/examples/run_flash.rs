@@ -34,52 +34,34 @@ fn main() {
     let uart1_inject: Option<Vec<u8>> = env::var("UART_INJECT").ok().map(|s| s.into_bytes());
     let mut uart1_injected = false;
 
-    // Step budget: STEPS=N overrides the default (48M).  The loop also
-    // exits early when the firmware has been idle (no UART output AND
-    // no PC change) for 2M consecutive steps — indicates setup() is done
-    // and the firmware is in its main loop or halted.
-    let max_steps: usize = env::var("STEPS")
+    // Step budget in INSTRUCTIONS (`step_fast` executes whole blocks and
+    // reports how many instructions ran): one old loop iteration stepped a
+    // single instruction per core (2/cross-core pair), so the old 48M-step
+    // default ~= 96M instructions.  The loop also exits early when the
+    // firmware has been idle (no UART output AND no PC change) for 2M
+    // consecutive steps — indicates setup() is done and the firmware is in
+    // its main loop or halted.
+    let max_insns: usize = env::var("STEPS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(48_000_000);
+        .unwrap_or(96_000_000);
     let t0 = Instant::now();
     let mut uart_buf: Vec<u8> = Vec::new();
     let mut last_pc = 0u32;
     let mut last_uart_len = 0usize;
     let mut stuck = 0u32;
     let mut idle_steps: usize = 0;
+    let mut executed: u64 = 0;
+    let mut i: usize = 0; // macro-step counter (diagnostics only)
 
-    for i in 0..max_steps {
-        m.soc.tick_timers(1);
-
-        // WDT / peripheral reset → reboot.
-        if m.soc.consume_reset() {
-            m.reset();
-            continue;
+    loop {
+        if executed >= max_insns as u64 {
+            break;
         }
-
-        // Deep-sleep fast-forward.
-        if m.is_asleep() {
-            m.tick_sleep_one();
-            continue;
-        }
-        if let Some(ticks) = m.soc.consume_sleep_request() {
-            m.begin_sleep(ticks);
-            continue;
-        }
-
-        let r = m.cpu[0].step(&mut m.soc);
-        let r1 = m.cpu[1].step(&mut m.soc);
+        let (r, r1, n) = m.step_fast();
+        executed += n as u64;
+        i += 1;
         let pc = m.cpu[0].pc;
-
-        // Transition out of ROM-boot flash mode once the PC leaves the
-        // ROM stub region.  Without this, cache_read8 bypasses the MMU
-        // forever and the app can never read flash through the cache.
-        if m.soc.rom_boot_mode()
-            && !(pc >= esp32s3_emu::rom_stub::ROM_BASE && pc < esp32s3_emu::rom_stub::ROM_END)
-        {
-            m.soc.set_rom_boot_mode(false);
-        }
 
         // --- AES DMA flag workaround ---
         // The esp-idf AES driver polls a completion flag (0x3fcec85c) that its
@@ -140,7 +122,15 @@ fn main() {
             // These are ee.* extensions that are never on the boot path.
         }
 
-        // --- UART output ---
+        // --- UART output (every step): the drain must stay per-step.
+        // `take_uart_tx(0)` merges the UART0 and USB-Serial-JTAG FIFOs and
+        // its ROM-doubling dedup pairs each UART byte with its USB twin in
+        // the same drain call. Both cores print concurrently during boot,
+        // so any batching wider than a step interleaves the two streams
+        // across drain windows (`out != usb`) and the single-byte
+        // cross-call state lets doubled bytes through — batching this was
+        // tried and corrupted the early-boot log line. The per-step drain
+        // itself is cheap (empty Vec handoffs + a DRAM fast-path read).
         let tx = m.take_uart_tx(0);
         let tx1 = m.take_uart_tx(1);
         if !tx1.is_empty() {
@@ -152,7 +142,9 @@ fn main() {
 
         // UART1 RX injection: once the app prints the ready marker, push
         // the host payload into UART1 RX (the echo sketch reads it back).
-        if !uart1_injected {
+        // Gated on new bytes: the buffer only changes when a drain above
+        // appended, so scanning every step is wasted O(buffer) work.
+        if !uart1_injected && (!tx.is_empty() || !tx1.is_empty()) {
             if let Some(bytes) = &uart1_inject {
                 if uart_buf.windows(b"RXREADY".len()).any(|w| w == b"RXREADY") {
                     for &b in bytes {
@@ -199,18 +191,21 @@ fn main() {
 
     // --- Final drain: grab any remaining UART/USB-Serial TX bytes ---
     {
+        let tx1 = m.take_uart_tx(1);
+        uart_buf.extend_from_slice(&tx1);
         let tx = m.take_uart_tx(0);
         uart_buf.extend_from_slice(&tx);
     }
 
-    // --- Final report ---
+    // --- Final report (MIPS = executed instructions/sec) ---
     let elapsed = t0.elapsed();
-    let mips = max_steps as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+    let mips = executed as f64 / elapsed.as_secs_f64() / 1_000_000.0;
     println!(
-        "\n== end: core0 pc {:#010x}, core1 pc {:#010x}, {} steps in {:.2}s ({:.1} MIPS) ==",
+        "\n== end: core0 pc {:#010x}, core1 pc {:#010x}, {} insns ({} macro-steps) in {:.2}s ({:.1} MIPS) ==",
         m.cpu[0].pc,
         m.cpu[1].pc,
-        max_steps,
+        executed,
+        i,
         elapsed.as_secs_f64(),
         mips
     );

@@ -141,6 +141,18 @@ impl Mcpwm {
     }
 
     /// Advance the PWM state machines by one SoC step (called from `tick_timers`).
+    /// True when any timer is running (`start >= 2`). The SoC skips `tick()`
+    /// otherwise — `tick` would `continue` for every stopped timer
+    /// identically, so gating is behavior-preserving.
+    pub fn is_active(&self) -> bool {
+        for t in 0..NTIMER {
+            if (self.timer_cfg1(t) >> TIMER_START_SHIFT) & 0x7 >= 2 {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn tick(&mut self) {
         for t in 0..NTIMER {
             let cfg1 = self.timer_cfg1(t);

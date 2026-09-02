@@ -172,6 +172,13 @@ impl Rmt {
         }
     }
 
+    /// True when any TX channel is mid-transfer. The SoC skips `tick()`
+    /// otherwise — `tick` would no-op identically (it only advances active
+    /// channels), so gating is behavior-preserving.
+    pub fn is_active(&self) -> bool {
+        self.tx.iter().any(|t| t.active)
+    }
+
     /// Advance all active TX channels by `TICKS_PER_STEP`.
     pub fn tick(&mut self) {
         for ch in 0..NUM_TX_CH {

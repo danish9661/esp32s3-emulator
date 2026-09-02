@@ -331,6 +331,14 @@ impl I2s {
     }
 
     /// Advance the serial shift paths by one emulator step.
+    /// True while transmitting or receiving. The SoC skips `tick()`
+    /// otherwise — `tick_tx`/`tick_rx` both return immediately when their
+    /// busy flag is clear, so gating is behavior-preserving. (Conservative:
+    /// a loopback-idle RX also keeps the gate open; its tick no-ops.)
+    pub fn is_active(&self) -> bool {
+        self.tx_busy || self.rx_busy
+    }
+
     pub fn tick(&mut self) {
         self.tick_tx();
         self.tick_rx();

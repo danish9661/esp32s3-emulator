@@ -169,6 +169,12 @@ impl LcdCam {
     }
 
     /// Advance the parallel transfer by one emulator step (one PCLK half-cycle).
+    /// True mid-transfer. The SoC skips `tick()` otherwise — `tick`
+    /// returns immediately when `!busy`, so gating is behavior-preserving.
+    pub fn is_active(&self) -> bool {
+        self.busy
+    }
+
     pub fn tick(&mut self) {
         if !self.busy {
             return;

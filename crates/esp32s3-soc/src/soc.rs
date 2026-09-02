@@ -14,6 +14,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use xtensa_core::Bus;
+use xtensa_core::generated::{Opcode, decode_inst, decode_inst16a, decode_inst16b, insn_len};
 
 use crate::adc::Adc;
 use crate::aes::Aes;
@@ -81,12 +82,20 @@ pub const EVT_I2C_STOP: u8 = 5;
 
 macro_rules! in_range {
     ($addr:expr, $base:expr, $size:expr) => {
-        ($base..$base + $size).contains(&$addr)
+        ($addr).wrapping_sub($base) < ($size)
     };
 }
 
 // SRAM window size used in range checks (kept in sync with DRAM_SIZE).
 const SRAM_BASE_RANGE: u32 = DRAM_SIZE;
+
+// Block-boundary cache geometry (see `Soc::fast_tag`): 4096 entries per
+// core, indexed by `(pc >> 1) & mask`. Only flow lengths are cached, so the
+// table is 20 KB total — the decoded ops themselves stay in the Cpu decode
+// cache, which revalidates `raw` on every op.
+const FAST_CACHE_SIZE: usize = 4096;
+const FAST_TAG_INVALID: u32 = 0xFFFF_FFFF;
+const FAST_MAX_OPS: u8 = 16;
 
 // Xtensa "I/O block" aliases (xtensa/config/system.h: XSHAL_IOBLOCK_CACHED/
 // BYPASS). On ESP32-S3 these are cached/uncached VADDR windows over the SAME
@@ -293,6 +302,22 @@ pub struct Soc {
     /// Most recent SPI MOSI byte stream per channel, retrieved by the host
     /// when it sees an `EVT_SPI_XFER` event.
     pending_spi_tx: [Vec<u8>; 2],
+
+    /// Block-boundary cache for block-at-a-time execution (machine
+    /// `step_fast`): per core, `fast_tag[c][i]` is the block-start pc
+    /// (`FAST_TAG_INVALID` = empty) and `fast_len[c][i]` the instruction
+    /// count (1..=16) of the straight-line run starting there, branch op
+    /// inclusive. Only control flow is cached — decode still goes through
+    /// the Cpu decode cache on every op (which revalidates `raw`, so
+    /// patched immediates/data execute correctly), and the runner aborts on
+    /// any pc deviation. Deliberately NOT flushed on RAM writes: the hot
+    /// write path (stack spills) stays untouched, and no in-tree firmware
+    /// modifies code after executing it (the loader writes precede the jump;
+    /// WDT reset builds a fresh SoC). Known limitation: inserting a branch
+    /// into the middle of an already-cached block is not observed until the
+    /// entry is evicted by index collision.
+    fast_tag: [Box<[u32; FAST_CACHE_SIZE]>; 2],
+    fast_len: [Box<[u8; FAST_CACHE_SIZE]>; 2],
 }
 
 impl Soc {
@@ -358,6 +383,14 @@ impl Soc {
             events: Vec::new(),
             last_gpio_out: 0,
             pending_spi_tx: [Vec::new(), Vec::new()],
+            fast_tag: [
+                Box::new([FAST_TAG_INVALID; FAST_CACHE_SIZE]),
+                Box::new([FAST_TAG_INVALID; FAST_CACHE_SIZE]),
+            ],
+            fast_len: [
+                Box::new([0; FAST_CACHE_SIZE]),
+                Box::new([0; FAST_CACHE_SIZE]),
+            ],
         }
     }
 
@@ -452,6 +485,119 @@ impl Soc {
 
     pub fn take_uart_tx(&mut self, n: usize) -> Vec<u8> {
         self.uarts[n].take_tx()
+    }
+
+    /// True when UART `n` has undrained console bytes. Cheap field read for
+    /// the host console fast path (avoids Vec handoffs when idle).
+    pub fn uart_tx_pending(&self, n: usize) -> bool {
+        self.uarts[n].tx_len() != 0
+    }
+
+    /// True when the USB-Serial-JTAG controller has undrained TX bytes.
+    pub fn usb_tx_pending(&self) -> bool {
+        self.usb.tx_len() != 0
+    }
+
+    /// Block-cache index for a pc (both cores share the function, never the
+    /// arrays).
+    #[inline]
+    fn fast_idx(pc: u32) -> usize {
+        ((pc >> 1) as usize) & (FAST_CACHE_SIZE - 1)
+    }
+
+    /// Look up (building on first touch) the straight-line instruction count
+    /// starting at `pc` for `core`. Returns None when the first op doesn't
+    /// decode — the caller falls back to single-step, which raises ILLEGAL
+    /// through the normal path.
+    pub fn fast_len_for(&mut self, core: usize, pc: u32) -> Option<u8> {
+        let idx = Self::fast_idx(pc);
+        if self.fast_tag[core][idx] == pc {
+            let l = self.fast_len[core][idx];
+            if l > 0 {
+                return Some(l);
+            }
+        }
+        let built = self.build_fast_len(pc)?;
+        self.fast_tag[core][idx] = pc;
+        self.fast_len[core][idx] = built;
+        Some(built)
+    }
+
+    /// Decode the straight-line run at `pc`: up to `FAST_MAX_OPS` ops,
+    /// branch op inclusive (the runner stops on any pc deviation, so windowed
+    /// calls/returns are safe to include — the per-op window checks still run
+    /// inside `step_one`). Matches the machine `is_branch` list.
+    fn build_fast_len(&mut self, pc: u32) -> Option<u8> {
+        let mut cur = pc;
+        let mut n = 0u8;
+        for _ in 0..FAST_MAX_OPS {
+            let b0 = Bus::read8(self, cur) as u8;
+            let len = insn_len(b0);
+            if len == 0 || len > 4 {
+                break;
+            }
+            let raw = if len == 2 {
+                Bus::read16(self, cur)
+            } else {
+                Bus::read32(self, cur)
+            };
+            let opc = if len == 2 {
+                if b0 & 0xf <= 11 {
+                    decode_inst16a(raw)
+                } else {
+                    decode_inst16b(raw)
+                }
+            } else {
+                decode_inst(raw)
+            };
+            let opc = match opc {
+                Some(o) => o,
+                None => break,
+            };
+            n += 1;
+            if Self::fast_is_branch(opc) {
+                break;
+            }
+            cur = cur.wrapping_add(len);
+        }
+        if n == 0 { None } else { Some(n) }
+    }
+
+    /// Branch terminators for fast blocks (same set as machine `is_branch`:
+    /// any op that can leave the linear flow ends the run, inclusive).
+    fn fast_is_branch(opc: Opcode) -> bool {
+        matches!(
+            opc,
+            Opcode::OPCODE_J
+                | Opcode::OPCODE_CALL0
+                | Opcode::OPCODE_CALL4
+                | Opcode::OPCODE_CALL8
+                | Opcode::OPCODE_CALL12
+                | Opcode::OPCODE_CALLX0
+                | Opcode::OPCODE_CALLX4
+                | Opcode::OPCODE_CALLX8
+                | Opcode::OPCODE_CALLX12
+                | Opcode::OPCODE_RET
+                | Opcode::OPCODE_RETW
+                | Opcode::OPCODE_RET_N
+                | Opcode::OPCODE_RFI
+                | Opcode::OPCODE_RFE
+                | Opcode::OPCODE_LOOP
+                | Opcode::OPCODE_LOOPNEZ
+                | Opcode::OPCODE_LOOPGTZ
+                | Opcode::OPCODE_ENTRY
+                | Opcode::OPCODE_BNE
+                | Opcode::OPCODE_BEQ
+                | Opcode::OPCODE_BLT
+                | Opcode::OPCODE_BLTU
+                | Opcode::OPCODE_BGE
+                | Opcode::OPCODE_BGEU
+                | Opcode::OPCODE_BNEZ
+                | Opcode::OPCODE_BEQZ
+                | Opcode::OPCODE_BNEZ_N
+                | Opcode::OPCODE_BEQZ_N
+                | Opcode::OPCODE_JX
+        )
     }
 
     /// Push one received byte into UART `n`'s RX FIFO (host console input).
@@ -626,22 +772,39 @@ impl Soc {
                 }
             }
             self.adc.tick(1);
-            self.rmt.tick();
-            self.mcpwm.tick();
+            // Waveform peripherals: skip the tick while idle. Each gate
+            // mirrors its tick's own early-out (inactive RMT channels /
+            // stopped MCPWM timers / non-busy LCD / non-busy I2S), so a
+            // skipped tick would have no-opped identically.
+            if self.rmt.is_active() {
+                self.rmt.tick();
+            }
+            if self.mcpwm.is_active() {
+                self.mcpwm.tick();
+            }
             self.sdm.tick();
-            self.lcd_cam.tick();
-            self.i2s[0].tick();
-            self.i2s[1].tick();
+            if self.lcd_cam.is_active() {
+                self.lcd_cam.tick();
+            }
+            if self.i2s[0].is_active() {
+                self.i2s[0].tick();
+            }
+            if self.i2s[1].is_active() {
+                self.i2s[1].tick();
+            }
             // PCNT samples its unit/channel signal inputs via the GPIO-matrix
             // input routing (FUNC_IN_SEL_CFG); resolve each signal index to the
-            // GPIO pin's current level.
-            let pcnt_input = |sig: u32| -> u32 {
-                match self.gpio.in_sel(sig) {
-                    Some((pin, inv)) => self.gpio.pin_level(pin) ^ (inv as u32),
-                    None => 0,
-                }
-            };
-            self.pcnt.tick(&pcnt_input);
+            // GPIO pin's current level. Skipped while no unit is counting
+            // (and after the one-time prev-level sampling) — the common case.
+            if !self.pcnt.is_init() || self.pcnt.is_counting() {
+                let pcnt_input = |sig: u32| -> u32 {
+                    match self.gpio.in_sel(sig) {
+                        Some((pin, inv)) => self.gpio.pin_level(pin) ^ (inv as u32),
+                        None => 0,
+                    }
+                };
+                self.pcnt.tick(&pcnt_input);
+            }
             // USB-Serial-JTAG: re-assert serial_in_empty_int when the
             // ISR cleared it but the FIFO is still empty (level-triggered
             // host-poll behavior).

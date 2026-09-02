@@ -58,23 +58,33 @@ impl Emulator {
         }
     }
 
-    /// Batch step with early-exit on reset/sleep. Returns the number of steps
-    /// actually executed. This avoids wasting cycles after a WDT reset or
+    /// Batch step with early-exit on reset/sleep. Returns the number of
+    /// INSTRUCTIONS actually executed (blocks run whole straight-line runs
+    /// via `step_fast`). This avoids wasting cycles after a WDT reset or
     /// deep-sleep entry — the caller can re-prime peripherals and continue.
     /// Deep-sleep is fast-forwarded inline (no JS round-trip per tick).
+    /// The `n` budget is scaled ×2: one legacy step ran one instruction per
+    /// core (2 total), so `2*n` instructions is the same per-frame work and
+    /// emulated time as before.
     pub fn step_batch(&mut self, n: u32) -> u32 {
-        let mut i = 0u32;
-        while i < n {
+        let budget = n.saturating_mul(2);
+        let mut done = 0u32;
+        let mut calls = 0u32;
+        // `calls` bounds the loop for non-advancing macro-steps (WDT reset /
+        // sleep entry report 0 instructions but still consume the call, as
+        // the old per-step loop did).
+        while done < budget && calls < n.max(1) {
+            calls += 1;
             // If deep-sleeping, fast-forward inline — the CPU is halted.
             if self.inner.is_asleep() {
-                let skip = self.inner.fast_forward_sleep((n - i) as u64);
-                i += skip as u32;
+                let skip = self.inner.fast_forward_sleep((budget - done) as u64);
+                done = done.saturating_add(skip as u32);
                 continue;
             }
-            self.inner.step();
-            i += 1;
+            let (_, _, k) = self.inner.step_fast();
+            done = done.saturating_add(k);
         }
-        i
+        done
     }
 
     /// Drain all pending UART/console bytes (UTF-8 serial output) and return

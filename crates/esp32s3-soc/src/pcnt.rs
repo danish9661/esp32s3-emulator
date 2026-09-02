@@ -106,6 +106,26 @@ impl Pcnt {
         self.int_raw & self.regs[INT_ENA_OFF]
     }
 
+    /// True once the first tick has sampled the previous signal levels.
+    pub fn is_init(&self) -> bool {
+        self.init
+    }
+
+    /// True when at least one unit is out of reset and unpaused, i.e. the
+    /// tick would sample inputs. Lets the SoC skip the GPIO-matrix input
+    /// resolution entirely while the counter is idle (the common case).
+    pub fn is_counting(&self) -> bool {
+        let ctrl = self.regs[CTRL_OFF];
+        for u in 0..4 {
+            // pulse_cnt_rst_uX (bit u*2) holds the counter in reset;
+            // cnt_pause_uX (bit u*2+1) freezes counting.
+            if (ctrl >> (u * 2)) & 0b11 == 0 {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Advance the counters by sampling the unit/channel signal levels. `input`
     /// resolves a GPIO-matrix input-signal index to its current logical level.
     pub fn tick<F: Fn(u32) -> u32>(&mut self, input: &F) {
