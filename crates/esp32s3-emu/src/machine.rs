@@ -94,6 +94,35 @@ impl Esp32S3 {
         r
     }
 
+    /// Like `step` but without `tick_timers` — for `step_batch` bulk tick.
+    pub fn step_without_tick(&mut self) -> StepResult {
+        if self.soc.consume_reset() {
+            self.reset();
+            return StepResult::Ok;
+        }
+        if self.asleep {
+            if self.sleep_remaining == 0 {
+                self.wake();
+            } else {
+                self.sleep_remaining -= 1;
+            }
+            return StepResult::Ok;
+        }
+        if let Some(ticks) = self.soc.consume_sleep_request() {
+            self.asleep = true;
+            self.sleep_remaining = ticks.max(1);
+            return StepResult::Ok;
+        }
+        let r = self.cpu[0].step(&mut self.soc);
+        if self.soc.rom_boot_mode()
+            && !(self.cpu[0].pc >= rom_stub::ROM_BASE && self.cpu[0].pc < rom_stub::ROM_END)
+        {
+            self.soc.set_rom_boot_mode(false);
+        }
+        self.cpu[1].step(&mut self.soc);
+        r
+    }
+
     /// Re-run the boot sequence from the last loaded flash image.  Used when a
     /// peripheral (WDT) triggers a system reset.
     pub fn reset(&mut self) {

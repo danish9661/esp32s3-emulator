@@ -1755,6 +1755,7 @@ impl Bus for Soc {
         self.intc.pending_lines(cpu, final_src)
     }
 
+    #[inline(always)]
     fn read8(&mut self, addr: u32) -> u32 {
         let addr = ioblock_remap(addr);
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE)
@@ -1794,6 +1795,7 @@ impl Bus for Soc {
         lo | (hi << 8)
     }
 
+    #[inline(always)]
     fn read32(&mut self, addr: u32) -> u32 {
         let addr = ioblock_remap(addr);
         // Fast path: aligned SRAM reads (the overwhelmingly common case).
@@ -1801,31 +1803,40 @@ impl Bus for Soc {
         // (offset 0x6F0000 into the same 512 KB backing).
         if addr & 3 == 0 && in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE) {
             let o = (addr - DRAM_BASE) as usize;
-            return u32::from_le_bytes([
-                self.sram[o],
-                self.sram[o + 1],
-                self.sram[o + 2],
-                self.sram[o + 3],
-            ]);
+            // SAFETY: o < SRAM_BASE_RANGE <= SRAM_BYTES, checked by in_range
+            return u32::from_le_bytes(unsafe {
+                [
+                    *self.sram.get_unchecked(o),
+                    *self.sram.get_unchecked(o + 1),
+                    *self.sram.get_unchecked(o + 2),
+                    *self.sram.get_unchecked(o + 3),
+                ]
+            });
         }
         if addr & 3 == 0 && in_range!(addr, IRAM_BASE, IRAM_WINDOW_SIZE) {
             let o = (addr - IRAM_BASE) as usize;
             if o < SRAM0_SIZE as usize {
-                return u32::from_le_bytes([
-                    self.iram0[o],
-                    self.iram0[o + 1],
-                    self.iram0[o + 2],
-                    self.iram0[o + 3],
-                ]);
+                // SAFETY: o < SRAM0_SIZE, checked above
+                return u32::from_le_bytes(unsafe {
+                    [
+                        *self.iram0.get_unchecked(o),
+                        *self.iram0.get_unchecked(o + 1),
+                        *self.iram0.get_unchecked(o + 2),
+                        *self.iram0.get_unchecked(o + 3),
+                    ]
+                });
             }
             let o = DIRAM_DATA_BASE - DRAM_BASE + (addr - DIRAM_INST_BASE);
             let o = o as usize;
-            return u32::from_le_bytes([
-                self.sram[o],
-                self.sram[o + 1],
-                self.sram[o + 2],
-                self.sram[o + 3],
-            ]);
+            // SAFETY: o < SRAM_BYTES, DIRAM window is within sram backing
+            return u32::from_le_bytes(unsafe {
+                [
+                    *self.sram.get_unchecked(o),
+                    *self.sram.get_unchecked(o + 1),
+                    *self.sram.get_unchecked(o + 2),
+                    *self.sram.get_unchecked(o + 3),
+                ]
+            });
         }
         // Slow path: unaligned or non-SRAM — fall back to byte-by-byte.
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE)
@@ -1934,6 +1945,7 @@ impl Bus for Soc {
         }
     }
 
+    #[inline(always)]
     fn write32(&mut self, addr: u32, val: u32) {
         let addr = ioblock_remap(addr);
         let bytes = val.to_le_bytes();
