@@ -11,9 +11,71 @@ use esp32s3_soc::memmap::{
     DRAM_BASE, IRAM_BASE, IROM_BASE, IROM_SIZE, RTC_FAST_DATA_BASE, RTC_FAST_SIZE, SRAM_BYTES,
 };
 use xtensa_core::{Bus, Cpu, StepResult};
+use xtensa_core::generated::{Opcode, Opnd};
 
 use crate::rom_stub;
 use crate::rom_stub::HOST_PRINTF;
+
+#[derive(Clone, Copy, Debug)]
+struct DecodedOp {
+    opcode: Opcode,
+    opnds: [Opnd; 8],
+    pc: u32,
+    raw: u32,
+    len: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Block {
+    pc: u32,
+    ops: [Option<DecodedOp>; 16],
+    len: u8,
+}
+
+impl Default for Block {
+    fn default() -> Self {
+        Self {
+            pc: 0,
+            ops: [None; 16],
+            len: 0,
+        }
+    }
+}
+
+fn is_branch(opc: Opcode) -> bool {
+    matches!(
+        opc,
+        Opcode::OPCODE_J
+            | Opcode::OPCODE_CALL0
+            | Opcode::OPCODE_CALL4
+            | Opcode::OPCODE_CALL8
+            | Opcode::OPCODE_CALL12
+            | Opcode::OPCODE_CALLX0
+            | Opcode::OPCODE_CALLX4
+            | Opcode::OPCODE_CALLX8
+            | Opcode::OPCODE_CALLX12
+            | Opcode::OPCODE_RET
+            | Opcode::OPCODE_RETW
+            | Opcode::OPCODE_RET_N
+            | Opcode::OPCODE_RFI
+            | Opcode::OPCODE_RFE
+            | Opcode::OPCODE_LOOP
+            | Opcode::OPCODE_LOOPNEZ
+            | Opcode::OPCODE_LOOPGTZ
+            | Opcode::OPCODE_ENTRY
+            | Opcode::OPCODE_BNE
+            | Opcode::OPCODE_BEQ
+            | Opcode::OPCODE_BLT
+            | Opcode::OPCODE_BLTU
+            | Opcode::OPCODE_BGE
+            | Opcode::OPCODE_BGEU
+            | Opcode::OPCODE_BNEZ
+            | Opcode::OPCODE_BEQZ
+            | Opcode::OPCODE_BNEZ_N
+            | Opcode::OPCODE_BEQZ_N
+            | Opcode::OPCODE_JX
+    )
+}
 
 pub struct Esp32S3 {
     /// Both ESP32-S3 LX7 cores.  Core 1 is gated at reset by the ROM stub
@@ -36,6 +98,8 @@ pub struct Esp32S3 {
     /// Track the last emitted byte so the UART duplicate can be dropped.
     last_console_byte: Option<u8>,
     last_console_was_usb: bool,
+    /// Block cache: pc -> decoded block of up to 16 insns until branch.
+    block_cache: alloc::boxed::Box<[Option<Block>; 4096]>,
 }
 
 impl Esp32S3 {
@@ -48,6 +112,11 @@ impl Esp32S3 {
             sleep_remaining: 0,
             last_console_byte: None,
             last_console_was_usb: false,
+            block_cache: {
+                let mut v = alloc::vec::Vec::with_capacity(4096);
+                v.resize_with(4096, || None);
+                v.into_boxed_slice().try_into().unwrap()
+            },
         }
     }
 
@@ -81,7 +150,15 @@ impl Esp32S3 {
             self.sleep_remaining = ticks.max(1);
             return StepResult::Ok;
         }
+        let orig_pc = self.cpu[0].pc;
         let r = self.cpu[0].step(&mut self.soc);
+        // Build and cache a block for the orig_pc for next time (hot loops)
+        let idx = (orig_pc as usize) & 0xFFF;
+        if self.block_cache[idx].is_none() || self.block_cache[idx].as_ref().unwrap().pc != orig_pc {
+            if let Some(block) = Self::build_block(orig_pc, &mut self.soc) {
+                self.block_cache[idx] = Some(block);
+            }
+        }
         if self.soc.rom_boot_mode()
             && !(self.cpu[0].pc >= rom_stub::ROM_BASE && self.cpu[0].pc < rom_stub::ROM_END)
         {
@@ -94,34 +171,63 @@ impl Esp32S3 {
         r
     }
 
-    /// Like `step` but without `tick_timers` — for `step_batch` bulk tick.
-    pub fn step_without_tick(&mut self) -> StepResult {
-        if self.soc.consume_reset() {
-            self.reset();
-            return StepResult::Ok;
-        }
-        if self.asleep {
-            if self.sleep_remaining == 0 {
-                self.wake();
-            } else {
-                self.sleep_remaining -= 1;
+    fn build_block(pc: u32, soc: &mut Soc) -> Option<Block> {
+        use xtensa_core::generated::{decode_inst, decode_inst16a, decode_inst16b, insn_len, opnds};
+        let mut block = Block {
+            pc,
+            ops: [None; 16],
+            len: 0,
+        };
+        let mut cur_pc = pc;
+        for i in 0..16 {
+            let b0 = soc.read8(cur_pc) as u8;
+            let len = insn_len(b0);
+            if len == 0 || len > 4 {
+                break;
             }
-            return StepResult::Ok;
+            let raw = match len {
+                2 => soc.read16(cur_pc),
+                _ => soc.read32(cur_pc),
+            };
+            let opc = match len {
+                2 => {
+                    if b0 & 0xf <= 11 {
+                        decode_inst16a(raw)
+                    } else {
+                        decode_inst16b(raw)
+                    }
+                }
+                _ => decode_inst(raw),
+            };
+            let opc = match opc {
+                Some(o) => o,
+                None => break,
+            };
+            let opnds = opnds(opc, raw, cur_pc);
+            block.ops[i] = Some(DecodedOp {
+                opcode: opc,
+                opnds,
+                pc: cur_pc,
+                raw,
+                len,
+            });
+            block.len = (i + 1) as u8;
+            if is_branch(opc) {
+                break;
+            }
+            cur_pc = cur_pc.wrapping_add(len);
+            if cur_pc.wrapping_sub(pc) > 64 {
+                break;
+            }
         }
-        if let Some(ticks) = self.soc.consume_sleep_request() {
-            self.asleep = true;
-            self.sleep_remaining = ticks.max(1);
-            return StepResult::Ok;
+        if block.len == 0 {
+            None
+        } else {
+            Some(block)
         }
-        let r = self.cpu[0].step(&mut self.soc);
-        if self.soc.rom_boot_mode()
-            && !(self.cpu[0].pc >= rom_stub::ROM_BASE && self.cpu[0].pc < rom_stub::ROM_END)
-        {
-            self.soc.set_rom_boot_mode(false);
-        }
-        self.cpu[1].step(&mut self.soc);
-        r
     }
+
+
 
     /// Re-run the boot sequence from the last loaded flash image.  Used when a
     /// peripheral (WDT) triggers a system reset.
@@ -132,6 +238,11 @@ impl Esp32S3 {
         self.sleep_remaining = 0;
         self.last_console_byte = None;
         self.last_console_was_usb = false;
+        self.block_cache = {
+            let mut v = alloc::vec::Vec::with_capacity(4096);
+            v.resize_with(4096, || None);
+            v.into_boxed_slice().try_into().unwrap()
+        };
         let f = self.flash.clone();
         self.boot_from_flash(&f);
     }
