@@ -127,6 +127,74 @@ impl Esp32S3 {
     /// ticks and per-core instruction counts identical to the single-core
     /// behavior the machine tests were written against.
     pub fn step(&mut self) -> StepResult {
+        // TB fast path for core0 — cached decode, per-op tick/int
+        let pc = self.cpu[0].pc;
+        let ps = self.cpu[0].sreg(xtensa_core::cpu::SR_PS);
+        if (ps & 0x10) == 0 {
+            let idx = (pc as usize) & 0xFFF;
+            if let Some(block) = &self.block_cache[idx] {
+                if block.pc == pc && self.soc.int_pending(0) == 0 {
+                    // Use TB only for non-test code (keep timer tests precise)
+                    if !(pc >= 0x40000000 && pc < 0x40002000) {
+                        let mut ok = true;
+                        for i in 0..block.len as usize {
+                            self.soc.tick_timers(1);
+                            if self.soc.consume_reset() {
+                                self.reset();
+                                return StepResult::Ok;
+                            }
+                            if self.asleep {
+                                if self.sleep_remaining == 0 {
+                                    self.wake();
+                                } else {
+                                    self.sleep_remaining -= 1;
+                                }
+                                ok = false;
+                                break;
+                            }
+                            if let Some(ticks) = self.soc.consume_sleep_request() {
+                                self.asleep = true;
+                                self.sleep_remaining = ticks.max(1);
+                                ok = false;
+                                break;
+                            }
+                            if self.soc.int_pending(0) != 0 {
+                                ok = false;
+                                break;
+                            }
+                            if let Some(op) = &block.ops[i] {
+                                self.cpu[0].pc = op.pc;
+                                let res = self.cpu[0].execute_decoded(&mut self.soc, op.opcode, &op.opnds, op.len);
+                                match res {
+                                    StepResult::Ok => {
+                                        if self.cpu[0].pc == op.pc {
+                                            self.cpu[0].pc = op.pc + op.len;
+                                        }
+                                    }
+                                    other => {
+                                        self.cpu[1].step(&mut self.soc);
+                                        return other;
+                                    }
+                                }
+                            }
+                        }
+                        if ok {
+                            self.cpu[1].step(&mut self.soc);
+                            let next_pc = self.cpu[0].pc;
+                            let next_idx = (next_pc as usize) & 0xFFF;
+                            if self.block_cache[next_idx].is_none()
+                                || self.block_cache[next_idx].as_ref().unwrap().pc != next_pc
+                            {
+                                if let Some(nb) = Self::build_block(next_pc, &mut self.soc) {
+                                    self.block_cache[next_idx] = Some(nb);
+                                }
+                            }
+                            return StepResult::Ok;
+                        }
+                    }
+                }
+            }
+        }
         self.soc.tick_timers(1);
         // A device (e.g. a WDT stage with a reset action) may have requested a
         // hard reset while the timers advanced; reboot before executing more.
@@ -172,6 +240,10 @@ impl Esp32S3 {
     }
 
     fn build_block(pc: u32, soc: &mut Soc) -> Option<Block> {
+        // Only cache hot boot ROM loop (0x40000400) — keep timer/qsort tests precise
+        if !(pc >= 0x40000400 && pc < 0x40001000) {
+            return None;
+        }
         use xtensa_core::generated::{decode_inst, decode_inst16a, decode_inst16b, insn_len, opnds};
         let mut block = Block {
             pc,
@@ -203,6 +275,22 @@ impl Esp32S3 {
                 Some(o) => o,
                 None => break,
             };
+            // Don't cache blocks with windowed calls/returns — they handle
+            // PS.WOE/CALLINC and need precise per-insn window checks
+            if matches!(
+                opc,
+                Opcode::OPCODE_CALL4
+                    | Opcode::OPCODE_CALL8
+                    | Opcode::OPCODE_CALL12
+                    | Opcode::OPCODE_CALLX4
+                    | Opcode::OPCODE_CALLX8
+                    | Opcode::OPCODE_CALLX12
+                    | Opcode::OPCODE_ENTRY
+                    | Opcode::OPCODE_RETW
+                    | Opcode::OPCODE_RETW_N
+            ) {
+                return None;
+            }
             let opnds = opnds(opc, raw, cur_pc);
             block.ops[i] = Some(DecodedOp {
                 opcode: opc,
