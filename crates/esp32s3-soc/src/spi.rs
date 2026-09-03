@@ -37,6 +37,7 @@
 //! live slave waveform on Q are not modeled.
 
 // Register offsets (TRM GPSPI chapter).
+use alloc::vec;
 use alloc::vec::Vec;
 
 pub const SPI_CMD: u32 = 0x00;
@@ -105,10 +106,10 @@ const DATA_WORDS: usize = 16;
 struct Txn {
     /// APB cycles per SPI clock bit.
     bit_cycles: u64,
-    /// SPI clock period (clkcnt_n+1) and low cycles per period
-    /// (clkcnt_n - clkcnt_h), TRM SPI_CLOCK.
-    period: u64,
-    low_cycles: u64,
+    /// APB ticks the clock stays LOW per SPI clock cycle:
+    /// (clkcnt_n - clkcnt_h) * (clkdiv_pre+1) (TRM SPI_CLOCK: the (clkcnt_n+1)
+    /// counter runs on the pre-divided clock).
+    low_ticks: u64,
     /// Total bit slots: command + address + dummy + data.
     total_bits: u64,
     cmd_bits: u64,
@@ -117,16 +118,36 @@ struct Txn {
     data_bits: u64,
     have_mosi: bool,
     have_miso: bool,
+    /// DMA-backed (GDMA-fed) transfer: MOSI bits come from staged GDMA
+    /// bytes, MISO lands in `dma_rx` instead of the data buffer.
+    dma: bool,
     /// Idle clock level (CPOL).
     ck_pol: u32,
     /// Idle MOSI level (CTRL.d_pol).
     d_pol: u32,
     cmd_value: u32,
     addr_value: u32,
-    /// Data buffer snapshot (left-aligned MSB-first).
-    buf: [u32; DATA_WORDS],
+    /// Data buffer snapshot (left-aligned MSB-first); 16 words for USR
+    /// transfers, sized to cover data_bits for DMA transfers.
+    buf: Vec<u32>,
     /// APB cycles remaining.
     remain: u64,
+}
+
+/// Phase/timing plan shared by USR and DMA triggers.
+struct TxnPlan {
+    bit_cycles: u64,
+    low_ticks: u64,
+    cmd_bits: u64,
+    addr_bits: u64,
+    dummy_cycles: u64,
+    data_bits: u64,
+    have_mosi: bool,
+    have_miso: bool,
+    ck_pol: u32,
+    d_pol: u32,
+    cmd_value: u32,
+    addr_value: u32,
 }
 
 /// One general-purpose SPI controller (GPSPI2 = idx 0, GPSPI3 = idx 1).
@@ -140,6 +161,13 @@ pub struct Spi {
     /// MISO bytes injected by the host for the next transfer (a virtual SPI
     /// device's response). `None` => read back zeros (no device).
     pending_miso: Option<Vec<u8>>,
+    /// GDMA-staged TX bytes for a DMA-backed master transfer (fed by the
+    /// GDMA `out` walk, consumed by `dma_trigger`).
+    dma_tx: Vec<u8>,
+    /// Captured RX bytes of the last DMA-backed transfer (served to the
+    /// GDMA `in` walk via `dma_rx_word`; overwritten per transfer, never
+    /// drained, so the IN link may start before or after completion).
+    dma_rx: Vec<u8>,
 }
 
 impl Spi {
@@ -150,6 +178,8 @@ impl Spi {
             txn: None,
             last_tx: None,
             pending_miso: None,
+            dma_tx: Vec::new(),
+            dma_rx: Vec::new(),
         }
     }
 
@@ -255,11 +285,24 @@ impl Spi {
     /// Finish the transaction: sample MISO (no device -> zeros, or the host
     /// injected bytes) into the data buffer, latch trans_done, and clear
     /// CMD.usr (self-clearing, TRM SPI_CMD.usr). Captures the MOSI bytes for
-    /// the host event queue.
+    /// the host event queue. DMA-backed transfers capture MISO into `dma_rx`
+    /// (served to the GDMA `in` walk) instead of the data buffer.
     fn complete(&mut self) {
         let have_mosi = self.txn.as_ref().is_some_and(|t| t.have_mosi);
         let have_miso = self.txn.as_ref().is_some_and(|t| t.have_miso);
-        if have_miso {
+        let dma = self.txn.as_ref().is_some_and(|t| t.dma);
+        let data_bits = self.txn.as_ref().map_or(0, |t| t.data_bits);
+        if dma {
+            // MISO byte stream over the data phase (zeros unless injected).
+            let nbytes = data_bits.div_ceil(8) as usize;
+            let mut rx = vec![0u8; nbytes];
+            if let Some(miso) = self.pending_miso.take() {
+                for (i, b) in miso.iter().enumerate().take(nbytes) {
+                    rx[i] = *b;
+                }
+            }
+            self.dma_rx = rx;
+        } else if have_miso {
             let mut buf = [0u32; DATA_WORDS];
             if let Some(miso) = self.pending_miso.take() {
                 // Shift the injected MISO bytes (MSB-first) into the
@@ -307,6 +350,7 @@ impl Spi {
             0
         };
         let nbytes = bits.div_ceil(8);
+        let nwords = t.buf.len();
         let mut out = Vec::with_capacity(nbytes as usize);
         for b in 0..nbytes {
             let mut byte = 0u8;
@@ -314,7 +358,7 @@ impl Spi {
                 let bitidx = b * 8 + j;
                 let w = (bitidx / 32) as usize;
                 let wbit = 31 - (bitidx % 32);
-                let v = if w < DATA_WORDS {
+                let v = if w < nwords {
                     (t.buf[w] >> wbit) & 1
                 } else {
                     0
@@ -334,6 +378,37 @@ impl Spi {
         if cmd & CMD_USR == 0 || self.txn.is_some() || self.is_slave() {
             return;
         }
+        let plan = self.plan();
+        let total_bits = plan.cmd_bits + plan.addr_bits + plan.dummy_cycles + plan.data_bits;
+        if total_bits == 0 {
+            // Nothing to shift out: the transfer ends immediately.
+            self.regs[(SPI_CMD / 4) as usize] &= !CMD_USR;
+            return;
+        }
+        let buf =
+            self.regs[SPI_DATA_BUF as usize / 4..SPI_DATA_BUF as usize / 4 + DATA_WORDS].to_vec();
+        self.txn = Some(Txn {
+            bit_cycles: plan.bit_cycles,
+            low_ticks: plan.low_ticks,
+            total_bits,
+            cmd_bits: plan.cmd_bits,
+            addr_bits: plan.addr_bits,
+            data_bits: plan.data_bits,
+            have_mosi: plan.have_mosi,
+            have_miso: plan.have_miso,
+            dma: false,
+            ck_pol: plan.ck_pol,
+            d_pol: plan.d_pol,
+            cmd_value: plan.cmd_value,
+            addr_value: plan.addr_value,
+            buf,
+            remain: total_bits * plan.bit_cycles,
+        });
+    }
+
+    /// Snapshot the phase/timing config from USER/USER1/USER2/MS_DLEN/
+    /// CLOCK/MISC/CTRL.
+    fn plan(&self) -> TxnPlan {
         let user = self.regs[(SPI_USER / 4) as usize];
         let user1 = self.regs[(SPI_USER1 / 4) as usize];
         let user2 = self.regs[(SPI_USER2 / 4) as usize];
@@ -377,29 +452,19 @@ impl Spi {
         let n = ((clock >> CLOCK_CLKCNT_N_SHIFT) & 0x3F) as u64;
         let h = ((clock >> 6) & 0x3F) as u64;
         let low_cycles = (n + 1) - (h + 1).min(n + 1);
+        let pre_plus1 = ((clock >> CLOCK_CLKDIV_PRE_SHIFT) & 0xF) as u64 + 1;
         let bit_cycles = if clock & CLOCK_EQU_SYSCLK != 0 {
             1
         } else {
-            let pre = ((clock >> CLOCK_CLKDIV_PRE_SHIFT) & 0xF) as u64 + 1;
-            (pre * (n + 1)).max(1)
+            (pre_plus1 * (n + 1)).max(1)
         };
-        let total_bits = cmd_bits + addr_bits + dummy_cycles + data_bits;
-        if total_bits == 0 {
-            // Nothing to shift out: the transfer ends immediately.
-            self.regs[(SPI_CMD / 4) as usize] &= !CMD_USR;
-            return;
-        }
-        let mut buf = [0u32; DATA_WORDS];
-        buf.copy_from_slice(
-            &self.regs[SPI_DATA_BUF as usize / 4..SPI_DATA_BUF as usize / 4 + DATA_WORDS],
-        );
-        self.txn = Some(Txn {
+        let low_ticks = low_cycles * pre_plus1;
+        TxnPlan {
             bit_cycles,
-            period: n + 1,
-            low_cycles,
-            total_bits,
+            low_ticks,
             cmd_bits,
             addr_bits,
+            dummy_cycles,
             data_bits,
             have_mosi,
             have_miso,
@@ -407,9 +472,72 @@ impl Spi {
             d_pol: (ctrl >> 20) & 1,
             cmd_value: (user2 >> USER2_CMD_VALUE_SHIFT) & 0xFFFF,
             addr_value: self.regs[(SPI_ADDR / 4) as usize],
+        }
+    }
+
+    /// Append GDMA-fed bytes to the DMA TX staging (called by the GDMA
+    /// `out` walk before `dma_trigger`).
+    pub fn spi_dma_feed(&mut self, bytes: &[u8]) {
+        self.dma_tx.extend_from_slice(bytes);
+    }
+
+    /// Start a DMA-backed master transfer from the staged GDMA bytes. The
+    /// MOSI bits come from `dma_tx` (not data_buf); MISO lands in `dma_rx`
+    /// for the GDMA `in` walk. `data_bits` follows MS_DLEN as usual, or the
+    /// staged length when that is larger (an unset MS_DLEN means 1 bit).
+    pub fn dma_trigger(&mut self) {
+        if self.txn.is_some() || self.is_slave() {
+            return;
+        }
+        let staged = core::mem::take(&mut self.dma_tx);
+        let plan = self.plan();
+        let fed_bits = staged.len() as u64 * 8;
+        let data_bits = plan.data_bits.max(fed_bits);
+        let total_bits = plan.cmd_bits + plan.addr_bits + plan.dummy_cycles + data_bits;
+        if total_bits == 0 {
+            return;
+        }
+        // Pack staged bytes MSB-first, left-aligned (same layout as data_buf).
+        let nwords = data_bits.div_ceil(32) as usize;
+        let mut buf = vec![0u32; nwords];
+        for (i, &byte) in staged.iter().enumerate() {
+            let w = i / 4;
+            if w < nwords {
+                buf[w] |= (byte as u32) << (24 - 8 * (i % 4));
+            }
+        }
+        self.txn = Some(Txn {
+            bit_cycles: plan.bit_cycles,
+            low_ticks: plan.low_ticks,
+            total_bits,
+            cmd_bits: plan.cmd_bits,
+            addr_bits: plan.addr_bits,
+            data_bits,
+            have_mosi: plan.have_mosi,
+            have_miso: plan.have_miso,
+            dma: true,
+            ck_pol: plan.ck_pol,
+            d_pol: plan.d_pol,
+            cmd_value: plan.cmd_value,
+            addr_value: plan.addr_value,
             buf,
-            remain: total_bits * bit_cycles,
+            remain: total_bits * plan.bit_cycles,
         });
+    }
+
+    /// Little-endian word of the last DMA transfer's captured RX bytes at
+    /// byte offset `off` (zeros beyond the capture; served to the GDMA `in`
+    /// walk word by word).
+    pub fn dma_rx_word(&self, off: u32) -> u32 {
+        let o = off as usize;
+        let b = |i: usize| {
+            if i < self.dma_rx.len() {
+                self.dma_rx[i]
+            } else {
+                0
+            }
+        };
+        u32::from_le_bytes([b(o), b(o + 1), b(o + 2), b(o + 3)])
     }
 
     fn txn(&self) -> Option<&Txn> {
@@ -423,7 +551,7 @@ impl Spi {
             return 0;
         }
         let idx = (bit / 32) as usize;
-        if idx >= DATA_WORDS {
+        if idx >= t.buf.len() {
             return 0;
         }
         let w = t.buf[idx];
@@ -458,10 +586,14 @@ impl Spi {
         if elapsed >= t.total_bits * t.bit_cycles {
             return t.ck_pol;
         }
-        let phase = (elapsed % t.bit_cycles) % t.period;
-        // Mode 0/2: idle low, clock low for low_cycles then high for the
-        // rest of each period; mode 1/3 (ck_idle_edge=1) inverted.
-        t.ck_pol ^ u32::from(phase >= t.low_cycles)
+        // One SPI clock cycle is bit_cycles APB ticks; the (clkcnt_n+1)
+        // counter runs on the pre-divided clock, so it stays LOW for
+        // low_ticks = low_cycles * (clkdiv_pre+1) ticks of each cycle.
+        // (With clkdiv_pre=0 this reduces to the old phase computation.)
+        let phase = elapsed % t.bit_cycles;
+        // Mode 0/2: idle low, clock low for low_ticks then high for the
+        // rest of each cycle; mode 1/3 (ck_idle_edge=1) inverted.
+        t.ck_pol ^ u32::from(phase >= t.low_ticks)
     }
 
     /// CS line level at `elapsed` APB cycles (active low during transfer).

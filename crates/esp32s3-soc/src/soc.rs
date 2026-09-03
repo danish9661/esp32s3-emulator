@@ -721,6 +721,20 @@ impl Soc {
         self.i2c[chan].inject_rx(bytes);
     }
 
+    /// Host-driven I2C slave master-write: if `addr7` matches, capture
+    /// `bytes` into the slave's RX FIFO on `chan` (0=I2CEXT0, 1=I2CEXT1),
+    /// latching the slave status and completion interrupts. Only acts in
+    /// slave mode.
+    pub fn i2c_slave_inject_write(&mut self, chan: usize, addr7: u32, bytes: &[u8]) {
+        self.i2c[chan].slave_inject_write(addr7, bytes);
+    }
+
+    /// Host-driven I2C slave master-read: if `addr7` matches, pop up to `n`
+    /// bytes from the slave's TX FIFO on `chan`. Only acts in slave mode.
+    pub fn i2c_slave_take_read(&mut self, chan: usize, addr7: u32, n: usize) -> Vec<u8> {
+        self.i2c[chan].slave_take_read(addr7, n)
+    }
+
     /// ROM-boot phase flag (see the `rom_boot_mode` field docs).
     pub fn rom_boot_mode(&self) -> bool {
         self.rom_boot_mode
@@ -1150,6 +1164,9 @@ impl Soc {
                         // (GDMA_DESC_BASE), buffer/next are full 32-bit
                         // addresses. Copy `length` bytes between each frame and
                         // the connected peripheral.
+                        // SPI DMA transfers trigger once per OUT-link start
+                        // (all descriptors staged first); see below.
+                        let mut spi_dma_pending: Option<usize> = None;
                         let mut desc = link_addr;
                         loop {
                             let dw0 = self.read32(desc);
@@ -1275,6 +1292,34 @@ impl Soc {
                                         k += 4;
                                     }
                                     self.gdma.set_out_eof_des_addr(ch, desc);
+                                } else if peri == crate::gdma::GDMA_SPI2_PERIPH
+                                    || peri == crate::gdma::GDMA_SPI3_PERIPH
+                                {
+                                    // SPI master DMA: stage the descriptor's
+                                    // bytes (address order) for one DMA-backed
+                                    // transfer, triggered after the walk (see
+                                    // below) so multi-descriptor chains send
+                                    // once. The transfer runs like a USR op
+                                    // (waveform + trans_done); start the IN
+                                    // link after trans_done latches.
+                                    let idx = if peri == crate::gdma::GDMA_SPI2_PERIPH {
+                                        0
+                                    } else {
+                                        1
+                                    };
+                                    let mut k = 0u32;
+                                    while k + 4 <= len {
+                                        let w = self.read32(buf + k);
+                                        self.spi[idx].spi_dma_feed(&w.to_le_bytes());
+                                        k += 4;
+                                    }
+                                    if k < len {
+                                        let w = self.read32(buf + k);
+                                        let tail = &w.to_le_bytes()[..(len - k) as usize];
+                                        self.spi[idx].spi_dma_feed(tail);
+                                    }
+                                    self.gdma.set_out_eof_des_addr(ch, desc);
+                                    spi_dma_pending = Some(idx);
                                 }
                             } else {
                                 // IN (RX) channel: copy from the peripheral's data
@@ -1312,6 +1357,25 @@ impl Soc {
                                         k += 4;
                                     }
                                     self.gdma.raise_in_done(ch);
+                                } else if peri == crate::gdma::GDMA_SPI2_PERIPH
+                                    || peri == crate::gdma::GDMA_SPI3_PERIPH
+                                {
+                                    // SPI RX: copy the last DMA transfer's
+                                    // captured bytes into the descriptor's DRAM
+                                    // buffer (zeros beyond the capture; start
+                                    // this link after trans_done latches).
+                                    let idx = if peri == crate::gdma::GDMA_SPI2_PERIPH {
+                                        0
+                                    } else {
+                                        1
+                                    };
+                                    let mut k = 0u32;
+                                    while k + 4 <= len {
+                                        let w = self.spi[idx].dma_rx_word(k);
+                                        self.write32(buf + k, w);
+                                        k += 4;
+                                    }
+                                    self.gdma.raise_in_done(ch);
                                 }
                             }
                             // DMA hands the descriptor back: clear owner.
@@ -1320,6 +1384,10 @@ impl Soc {
                                 break;
                             }
                             desc = next;
+                        }
+                        if let Some(idx) = spi_dma_pending {
+                            // One DMA-backed SPI transfer per OUT-link start.
+                            self.spi[idx].dma_trigger();
                         }
                         if is_out {
                             self.gdma.raise_out_done(ch);

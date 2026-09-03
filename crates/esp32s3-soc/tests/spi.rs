@@ -65,8 +65,10 @@ fn clock_divider_prescaler() {
             pulses += 1;
         }
     }
-    // 4-cycle slots (pre=1, n=1): two 2-cycle clock periods per bit slot.
-    assert_eq!(pulses, 16, "two clock pulses per bit");
+    // pre=1, n=1: one 4-tick SPI clock per bit slot (TRM SPI_CLOCK:
+    // spi_clk = system/(clkdiv_pre+1)/(clkcnt_n+1)), low for
+    // (n-h)*(pre+1) = 2 ticks of each cycle.
+    assert_eq!(pulses, 8, "one clock pulse per bit");
     assert_eq!(high, 16);
 }
 
@@ -195,4 +197,60 @@ fn slave_mode_gates_master_trigger() {
     m.slave_inject_write(&[0xFF]);
     assert_eq!(m.read32(SPI_INT_RAW) & 1, 0, "inert in master mode");
     assert!(m.slave_take_read(1).is_empty());
+}
+
+/// DMA-backed transfer: GDMA-fed bytes shift out on MOSI, MISO (zeros with
+/// no device) lands in dma_rx, trans_done latches, CMD.usr clears.
+#[test]
+fn dma_transfer_shifts_fed_bytes_and_captures_rx() {
+    let mut s = Spi::new(0);
+    s.write32(SPI_CLOCK, 0x1000); // 2 cyc/bit
+    s.write32(SPI_MS_DLEN, 31);
+    s.write32(SPI_USER, (1 << 27) | (1 << 28) | 1); // mosi+miso+doutdin
+    s.write32(SPI_CLK_GATE, 1);
+    s.spi_dma_feed(&[0xA5, 0x3C, 0xF0, 0x0F]);
+    s.dma_trigger();
+    for _ in 0..64 {
+        s.tick(1);
+    }
+    assert_eq!(s.read32(SPI_CMD) & (1 << 24), 0, "usr clears");
+    assert_eq!(s.read32(SPI_INT_RAW) & 1, 1, "trans_done");
+    assert_eq!(s.dma_rx_word(0), 0, "MISO zeros with no device");
+    // MOSI event stream carries the fed bytes (doutdin halves data_bits).
+    let tx = s.take_last_tx().unwrap();
+    assert_eq!(&tx[..2], &[0xA5, 0x3C]);
+}
+
+/// DMA transfer honors injected MISO into dma_rx.
+#[test]
+fn dma_transfer_captures_injected_miso() {
+    let mut s = Spi::new(0);
+    s.write32(SPI_CLOCK, 0x1000);
+    s.write32(SPI_MS_DLEN, 15);
+    s.write32(SPI_USER, (1 << 27) | (1 << 28) | 1);
+    s.write32(SPI_CLK_GATE, 1);
+    s.inject_miso(&[0x5A]);
+    s.spi_dma_feed(&[0xFF, 0x00]);
+    s.dma_trigger();
+    for _ in 0..32 {
+        s.tick(1);
+    }
+    assert_eq!(s.dma_rx_word(0) & 0xFF, 0x5A);
+}
+
+/// DMA transfers longer than the 64-byte data buffer work (sized buffer).
+#[test]
+fn dma_transfer_beyond_data_buffer() {
+    let mut s = Spi::new(0);
+    s.write32(SPI_CLOCK, 0x1000);
+    s.write32(SPI_MS_DLEN, 639); // 640 bits
+    s.write32(SPI_USER, (1 << 27) | (1 << 28) | 1);
+    s.write32(SPI_CLK_GATE, 1);
+    s.spi_dma_feed(&[0xA5; 80]);
+    s.dma_trigger();
+    for _ in 0..1280 {
+        s.tick(1);
+    }
+    assert_eq!(s.read32(SPI_INT_RAW) & 1, 1, "trans_done");
+    assert_eq!(s.dma_rx_word(76), 0);
 }

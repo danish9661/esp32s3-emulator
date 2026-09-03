@@ -264,3 +264,70 @@ fn fifo_reset_clears_counters() {
     i2c.write32(I2C_FIFO_CONF, 1 << 13); // tx_fifo_rst
     assert_eq!(i2c.read32(I2C_SR) >> 18 & 0x3F, 0, "tx fifo cleared");
 }
+
+/// Slave mode is CTR.ms_mode clear; the master command list does not run
+/// there (trans_start is a no-op).
+#[test]
+fn slave_mode_gates_master_command_list() {
+    let mut i = I2c::new(0);
+    i.write32(I2C_CTR, 0); // slave mode
+    assert!(i.is_slave());
+    i.write32(I2C_COMD, (6 << 11) | (4 << 11)); // garbage comds (RSTART|END-ish)
+    i.write32(I2C_CTR, 1 << 5); // trans_start
+    assert!(i.is_idle(), "no master op runs in slave mode");
+    assert_eq!(i.int_raw() & (1 << 7), 0);
+}
+
+/// Host-driven master-write: address match captures bytes into the RX FIFO,
+/// latches SR.slave_addressed, and raises the completion interrupts.
+#[test]
+fn slave_inject_write_captures_rx_and_status() {
+    let mut i = I2c::new(0);
+    i.write32(I2C_CTR, 0);
+    i.write32(I2C_SLAVE_ADDR, 0x42);
+    i.slave_inject_write(0x42, &[0x11, 0x22]);
+    // RX FIFO readable through the DATA port.
+    assert_eq!(i.read32(I2C_DATA), 0x11);
+    assert_eq!(i.read32(I2C_DATA), 0x22);
+    // SR: slave_addressed set, slave_rw clear (write).
+    let sr = i.read32(I2C_SR);
+    assert_eq!(sr & (1 << 5), 1 << 5, "slave_addressed");
+    assert_eq!(sr & (1 << 1), 0, "slave_rw=0 for write");
+    // INT_RAW: TRANS_START + DET_START + RXFIFO_WM + TRANS_COMPLETE + END_DETECT.
+    let raw = i.int_raw();
+    assert_eq!(raw & (1 << 9), 1 << 9, "trans_start");
+    assert_eq!(raw & (1 << 0), 1 << 0, "rxfifo_wm");
+    assert_eq!(raw & (1 << 7), 1 << 7, "trans_complete");
+    assert_eq!(raw & (1 << 3), 1 << 3, "end_detect");
+}
+
+/// A mismatched address is ignored (the slave NACKs it on real HW).
+#[test]
+fn slave_inject_write_ignores_wrong_address() {
+    let mut i = I2c::new(0);
+    i.write32(I2C_CTR, 0);
+    i.write32(I2C_SLAVE_ADDR, 0x42);
+    i.slave_inject_write(0x43, &[0xFF]);
+    assert_eq!(i.int_raw(), 0);
+    assert_eq!(i.read32(I2C_SR) & (1 << 5), 0);
+}
+
+/// Host-driven master-read returns preloaded TX bytes with slave_rw set;
+/// a dry TX FIFO raises TXFIFO_UDF.
+#[test]
+fn slave_take_read_returns_tx_and_underflow_flags() {
+    let mut i = I2c::new(0);
+    i.write32(I2C_CTR, 0);
+    i.write32(I2C_SLAVE_ADDR, 0x42);
+    i.write32(I2C_DATA, 0xA5); // TX preload
+    let got = i.slave_take_read(0x42, 1);
+    assert_eq!(got, vec![0xA5]);
+    let sr = i.read32(I2C_SR);
+    assert_eq!(sr & (1 << 5), 1 << 5, "slave_addressed");
+    assert_eq!(sr & (1 << 1), 1 << 1, "slave_rw=1 for read");
+    assert_eq!(i.int_raw() & (1 << 7), 1 << 7, "trans_complete");
+    // Second read with an empty TX FIFO: UDF + empty return.
+    let got2 = i.slave_take_read(0x42, 2);
+    assert!(got2.is_empty());
+    assert_eq!(i.int_raw() & (1 << 12), 1 << 12, "txfifo_udf");
+}

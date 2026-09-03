@@ -33,6 +33,18 @@
 //! Interrupts: END latches INT_RAW.trans_complete (bit 7); INT_STATUS =
 //! INT_RAW & INT_ENA (TRM I2C_INT_STATUS) so the driver ISR can read the
 //! cause. The matrix + CPU delivery is wired in soc.rs int_pending.
+//!
+//! Slave mode: when CTR.ms_mode is clear the controller is a slave. The
+//! external master does not exist in the emulator, so the host drives slave
+//! exchanges synchronously at the FIFO level (the exact bytes-and-interrupt
+//! contract the firmware observes): `slave_inject_write` emulates a
+//! master-write-to-slave (address match against SLAVE_ADDR, bytes into the
+//! RX FIFO, SR.slave_addressed + slave_rw=0, TRANS_START + RXFIFO_WM +
+//! TRANS_COMPLETE + END_DETECT), `slave_take_read` emulates a
+//! master-read-from-slave (TX FIFO bytes out, slave_rw=1, TRANS_START +
+//! TXFIFO_WM + TRANS_COMPLETE, TXFIFO_UDF when the TX FIFO is empty).
+//! 7-bit addressing only; 10-bit (addr_10bit_en) and clock stretching are
+//! not modeled.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -63,9 +75,15 @@ pub const I2C_RXFIFO_MEM: u32 = 0x180;
 
 // CTR bits (TRM I2C_CTR).
 const CTR_TRANS_START: u32 = 1 << 5;
+const CTR_MS_MODE: u32 = 1 << 4;
+// SLAVE_ADDR bits (TRM I2C_SLAVE_ADDR @ 0x10).
+pub const I2C_SLAVE_ADDR: u32 = 0x10;
+const SLAVE_ADDR_MASK: u32 = 0x7F;
 // SR bits (TRM I2C_SR).
 const SR_RESP_REC: u32 = 1 << 0;
+const SR_SLAVE_RW: u32 = 1 << 1;
 const SR_BUS_BUSY: u32 = 1 << 4;
+const SR_SLAVE_ADDRESSED: u32 = 1 << 5;
 const SR_RXFIFO_CNT_SHIFT: u32 = 8;
 const SR_TXFIFO_CNT_SHIFT: u32 = 18;
 // FIFO_CONF bits (TRM I2C_FIFO_CONF).
@@ -80,9 +98,14 @@ const COMD_OP_CODE_SHIFT: u32 = 11;
 const COMD_OP_CODE_MASK: u32 = 0x7;
 const COMD_DONE: u32 = 1 << 31;
 // INT_RAW bits (TRM I2C_INT_RAW): end_detect + trans_complete + nack.
+const INT_RXFIFO_WM: u32 = 1 << 0;
+const INT_TXFIFO_WM: u32 = 1 << 1;
 const INT_END_DETECT: u32 = 1 << 3;
 const INT_TRANS_COMPLETE: u32 = 1 << 7;
+const INT_TRANS_START: u32 = 1 << 9;
 const INT_NACK: u32 = 1 << 10;
+const INT_TXFIFO_UDF: u32 = 1 << 12;
+const INT_DET_START: u32 = 1 << 15;
 
 // Master op codes (IDF i2c_ll.h I2C_LL_CMD_*).
 const OP_RSTART: u32 = 6;
@@ -147,6 +170,10 @@ pub struct I2c {
     events: Vec<EmuEvent>,
     /// Injected RX bytes for the next master-read (host virtual device supply).
     pending_rx: VecDeque<u8>,
+    /// Latched slave status bits (SR.slave_rw + slave_addressed) from the
+    /// last host-driven slave exchange; cleared by FIFO reset / SLAVE_ADDR
+    /// rewrite.
+    slave_sr: u32,
 }
 
 impl I2c {
@@ -168,6 +195,7 @@ impl I2c {
             tx_pos: 0,
             events: Vec::new(),
             pending_rx: VecDeque::new(),
+            slave_sr: 0,
         }
     }
 
@@ -181,6 +209,76 @@ impl I2c {
         for &b in bytes {
             self.pending_rx.push_back(b);
         }
+    }
+
+    /// True when the controller is in slave mode (CTR.ms_mode clear).
+    pub fn is_slave(&self) -> bool {
+        self.regs[(I2C_CTR / 4) as usize] & CTR_MS_MODE == 0
+    }
+
+    /// Configured 7-bit slave address (SLAVE_ADDR[6:0]).
+    fn slave_addr(&self) -> u32 {
+        self.regs[(I2C_SLAVE_ADDR / 4) as usize] & SLAVE_ADDR_MASK
+    }
+
+    /// Push one byte into the RX FIFO (drops when full, like real HW).
+    fn rx_push(&mut self, b: u8) {
+        if (self.rx_cnt as usize) < FIFO_DEPTH {
+            self.rxfifo[((self.rx_head + self.rx_cnt) % FIFO_DEPTH as u32) as usize] = b;
+            self.rx_cnt += 1;
+        }
+    }
+
+    /// Host-driven master-write-to-slave: if `addr7` matches the configured
+    /// slave address, capture `bytes` into the RX FIFO, latch
+    /// SR.slave_addressed + slave_rw=0, and raise TRANS_START + RXFIFO_WM +
+    /// TRANS_COMPLETE + END_DETECT. A mismatched address is ignored (the
+    /// slave NACKs it on real HW). Only acts in slave mode.
+    pub fn slave_inject_write(&mut self, addr7: u32, bytes: &[u8]) {
+        if !self.is_slave() || addr7 & SLAVE_ADDR_MASK != self.slave_addr() {
+            return;
+        }
+        for &b in bytes {
+            self.rx_push(b);
+            self.events.push(EmuEvent {
+                kind: EVT_I2C_WRITE,
+                a: self.idx,
+                b: u32::from(b),
+            });
+        }
+        self.slave_sr = SR_SLAVE_ADDRESSED; // slave_rw = 0 (write)
+        self.regs[(I2C_INT_RAW / 4) as usize] |=
+            INT_TRANS_START | INT_DET_START | INT_RXFIFO_WM | INT_TRANS_COMPLETE | INT_END_DETECT;
+    }
+
+    /// Host-driven master-read-from-slave: if `addr7` matches, pop up to `n`
+    /// bytes from the TX FIFO, latch SR.slave_addressed + slave_rw=1, and
+    /// raise TRANS_START + TXFIFO_WM + TRANS_COMPLETE (plus TXFIFO_UDF when
+    /// the TX FIFO runs dry). Only acts in slave mode.
+    pub fn slave_take_read(&mut self, addr7: u32, n: usize) -> Vec<u8> {
+        if !self.is_slave() || addr7 & SLAVE_ADDR_MASK != self.slave_addr() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for _ in 0..n {
+            if self.tx_cnt == 0 {
+                self.regs[(I2C_INT_RAW / 4) as usize] |= INT_TXFIFO_UDF;
+                break;
+            }
+            let b = self.txfifo[(self.tx_head % FIFO_DEPTH as u32) as usize];
+            self.tx_head += 1;
+            self.tx_cnt -= 1;
+            self.events.push(EmuEvent {
+                kind: EVT_I2C_READ,
+                a: self.idx,
+                b: u32::from(b),
+            });
+            out.push(b);
+        }
+        self.slave_sr = SR_SLAVE_ADDRESSED | SR_SLAVE_RW;
+        self.regs[(I2C_INT_RAW / 4) as usize] |=
+            INT_TRANS_START | INT_DET_START | INT_TXFIFO_WM | INT_TRANS_COMPLETE;
+        out
     }
 
     /// SCL low half width in APB cycles: (value + 1) module clocks.
@@ -519,6 +617,11 @@ impl I2c {
         if self.op.is_some() || self.pending_len > 0 {
             return;
         }
+        // In slave mode trans_start is meaningless (no command list runs);
+        // slave traffic is host-driven.
+        if self.is_slave() {
+            return;
+        }
         self.tx_pos = 0;
         // Controller clears every command's done bit on (re)start.
         for i in 0..8 {
@@ -626,12 +729,14 @@ impl I2c {
     pub fn read32(&mut self, offset: u32) -> u32 {
         match offset {
             I2C_SR => {
-                // Live status: FIFO counts + bus busy (TRM I2C_SR).
+                // Live status: FIFO counts + bus busy + latched slave bits
+                // (TRM I2C_SR).
                 let mut sr = self.regs[(I2C_SR / 4) as usize];
                 sr &= !((FIFO_DEPTH as u32 - 1) << SR_RXFIFO_CNT_SHIFT);
                 sr |= self.rx_cnt.min(FIFO_DEPTH as u32 - 1) << SR_RXFIFO_CNT_SHIFT;
                 sr &= !((FIFO_DEPTH as u32 - 1) << SR_TXFIFO_CNT_SHIFT);
                 sr |= self.tx_cnt.min(FIFO_DEPTH as u32 - 1) << SR_TXFIFO_CNT_SHIFT;
+                sr |= self.slave_sr;
                 if self.op.is_some() {
                     sr |= SR_BUS_BUSY;
                 } else {
@@ -672,6 +777,9 @@ impl I2c {
                     self.rx_head = 0;
                     self.rx_cnt = 0;
                 }
+                if value & (FIFO_CONF_TX_FIFO_RST | FIFO_CONF_RX_FIFO_RST) != 0 {
+                    self.slave_sr = 0;
+                }
             }
             I2C_DATA | I2C_TXFIFO_MEM => {
                 // FIFO port: byte pushes into the TX FIFO
@@ -684,6 +792,11 @@ impl I2c {
             }
             I2C_INT_CLR => {
                 self.regs[(I2C_INT_RAW / 4) as usize] &= !value;
+            }
+            I2C_SLAVE_ADDR => {
+                // Re-addressing drops the latched slave status.
+                self.regs[(I2C_SLAVE_ADDR / 4) as usize] = value;
+                self.slave_sr = 0;
             }
             _ if (I2C_COMD..I2C_COMD + 8 * 4).contains(&offset) => {
                 let slot = ((offset - I2C_COMD) / 4) as usize;

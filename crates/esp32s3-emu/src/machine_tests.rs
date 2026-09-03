@@ -6,11 +6,11 @@
 //! `insn()`; a fixed 4-byte-per-word layout misaligns after the first 3-byte
 //! instruction (verified failure mode 2026-08-15).
 
-use esp32s3_soc::gdma::{GDMA_BASE, GDMA_I2S0_PERIPH};
+use esp32s3_soc::gdma::{GDMA_BASE, GDMA_I2S0_PERIPH, GDMA_SPI2_PERIPH};
 use esp32s3_soc::gpio::{GPIO_ENABLE_W1TS, GPIO_OUT_W1TC, GPIO_OUT_W1TS};
 use esp32s3_soc::memmap::{
     ASSIST_DEBUG_BASE, GPIO_BASE, I2S0_BASE, I2S1_BASE, IRAM_BASE, LCD_CAM_BASE, PERI_BACKUP_BASE,
-    SENSITIVE_BASE, SYSCON_BASE, TIMG0_BASE, UART0_BASE, WCL_BASE,
+    SENSITIVE_BASE, SPI2_BASE, SYSCON_BASE, TIMG0_BASE, UART0_BASE, WCL_BASE,
 };
 use esp32s3_soc::sdmmc::{
     BLKSIZ, BYTCNT, CMD, CMDARG, IDMAC_CTRL, IDMAC_DBADDR, RINTSTS, SDMMC_BASE,
@@ -2199,6 +2199,69 @@ fn i2s_gdma_out_feeds_tx_fifo() {
         "RX words mismatch: rx0={:#x} rx1={:#x}",
         rx0,
         rx1
+    );
+}
+
+/// GDMA SPI master DMA: an OUT descriptor stages bytes for one DMA-backed
+/// SPI2 transfer (trans_done + usr clear), and the IN link copies the
+/// captured RX (zeros, no device) into DRAM with both done bits raised.
+#[test]
+fn gdma_spi_out_runs_dma_transfer_and_in_returns_rx() {
+    use esp32s3_soc::spi::{SPI_CLK_GATE, SPI_CLOCK, SPI_CMD, SPI_INT_RAW, SPI_MS_DLEN, SPI_USER};
+    let desc = 0x3FC8_1000;
+    let buf = 0x3FC8_2000;
+    let rdesc = 0x3FC8_1100;
+    let rbuf = 0x3FC8_2100;
+    let mut m = Esp32S3::new();
+    // TX descriptor: owner=1, eof=1, length=4 bytes.
+    m.soc
+        .write32(desc, (1u32 << 31) | (1u32 << 30) | (4u32 << 12));
+    m.soc.write32(desc + 4, buf);
+    m.soc.write32(desc + 8, 0);
+    m.soc.write32(buf, 0xA53C_F00F); // MSB-first bytes A5 3C F0 0F
+    // SPI2: 1024 cyc/bit (pre=15, n=63), 32-bit full-duplex, clock gate on.
+    m.soc
+        .write32(SPI2_BASE + SPI_CLOCK, (15 << 18) | (63 << 12) | (31 << 6));
+    m.soc.write32(SPI2_BASE + SPI_MS_DLEN, 31);
+    m.soc
+        .write32(SPI2_BASE + SPI_USER, (1 << 27) | (1 << 28) | 1);
+    m.soc.write32(SPI2_BASE + SPI_CLK_GATE, 1);
+    // GDMA OUT ch0 -> SPI2, start.
+    m.soc.write32(GDMA_BASE + 0xA8, GDMA_SPI2_PERIPH);
+    m.soc
+        .write32(GDMA_BASE + 0x80, (desc & 0x000F_FFFF) | (1 << 21));
+    // Run the 32-bit transfer to completion.
+    for _ in 0..40 {
+        m.soc.tick_timers(1000);
+    }
+    assert_eq!(
+        m.soc.read32(SPI2_BASE + SPI_CMD) & (1 << 24),
+        0,
+        "CMD.usr clears"
+    );
+    assert_eq!(
+        m.soc.read32(SPI2_BASE + SPI_INT_RAW) & 1,
+        1,
+        "SPI trans_done latched"
+    );
+    assert_eq!(
+        m.soc.read32(GDMA_BASE + 0x68) & 1,
+        1,
+        "GDMA out_done latched"
+    );
+    // RX descriptor + IN link start (ch0 IN block: link @ 0x20, start = bit 22).
+    m.soc
+        .write32(rdesc, (1u32 << 31) | (1u32 << 30) | (4u32 << 12));
+    m.soc.write32(rdesc + 4, rbuf);
+    m.soc.write32(rdesc + 8, 0);
+    m.soc.write32(GDMA_BASE + 0x48, GDMA_SPI2_PERIPH);
+    m.soc
+        .write32(GDMA_BASE + 0x20, (rdesc & 0x000F_FFFF) | (1 << 22));
+    assert_eq!(m.soc.read32(rbuf), 0, "RX capture is zeros (no device)");
+    assert_eq!(
+        m.soc.read32(GDMA_BASE + 0x08) & 1,
+        1,
+        "GDMA in_done latched"
     );
 }
 

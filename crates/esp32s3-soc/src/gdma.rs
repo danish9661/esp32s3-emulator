@@ -56,6 +56,14 @@ pub const DESC_BASE: u32 = 0x3FC0_0000;
 /// RMT peripheral id for `peri_sel` (`soc/gdma_struct.h` out.peri_sel comment).
 pub const GDMA_RMT_PERIPH: u32 = 9;
 
+/// SPI2 / SPI3 peripheral ids for `peri_sel` (`soc/gdma_channel.h`
+/// `SOC_GDMA_TRIG_PERIPH_SPI2` = 0, `SOC_GDMA_TRIG_PERIPH_SPI3` = 1). The
+/// GDMA `out` channel stages descriptor bytes for a DMA-backed SPI master
+/// transfer; the `in` channel copies the captured RX bytes to DRAM once the
+/// transfer's trans_done has latched (start the IN link after completion).
+pub const GDMA_SPI2_PERIPH: u32 = 0;
+pub const GDMA_SPI3_PERIPH: u32 = 1;
+
 /// SHA peripheral id for `peri_sel` (`soc/gdma_channel.h`
 /// `SOC_GDMA_TRIG_PERIPH_SHA0`).
 pub const GDMA_SHA_PERIPH: u32 = 7;

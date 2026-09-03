@@ -68,6 +68,15 @@ fn main() {
     let mut spi_slave_wrote = false;
     let mut spi_slave_read = false;
 
+    // I2C-slave host exchange (slave-sketch support): I2C_SLAVE_XCHG=1 drives
+    // both halves when the app prints its markers — a master-write-to-slave
+    // (addr 0x42, [0x11, 0x22]) on "I2C SLAVE READY", then a 1-byte
+    // master-read-from-slave (expecting the preloaded [0xA5]) on
+    // "I2C SLAVE TX-REQ".
+    let i2c_slave_xchg = env::var("I2C_SLAVE_XCHG").is_ok();
+    let mut i2c_slave_wrote = false;
+    let mut i2c_slave_read = false;
+
     // Step budget in INSTRUCTIONS (`step_fast` executes whole blocks and
     // reports how many instructions ran): one old loop iteration stepped a
     // single instruction per core (2/cross-core pair), so the old 48M-step
@@ -212,6 +221,30 @@ fn main() {
                 println!("[host] SPI slave master-read -> {got:02x?}");
                 assert_eq!(got, vec![0xA5, 0xC3], "slave TX preload mismatch");
                 spi_slave_read = true;
+            }
+        }
+
+        // I2C-slave host exchange: marker-driven, one shot per half.
+        if i2c_slave_xchg && (!tx.is_empty() || !tx1.is_empty()) {
+            if !i2c_slave_wrote
+                && uart_buf
+                    .windows(b"I2C SLAVE READY".len())
+                    .any(|w| w == b"I2C SLAVE READY")
+            {
+                m.soc.i2c_slave_inject_write(0, 0x42, &[0x11, 0x22]);
+                println!("[host] I2C slave master-write [11 22]");
+                i2c_slave_wrote = true;
+            }
+            if i2c_slave_wrote
+                && !i2c_slave_read
+                && uart_buf
+                    .windows(b"I2C SLAVE TX-REQ".len())
+                    .any(|w| w == b"I2C SLAVE TX-REQ")
+            {
+                let got = m.soc.i2c_slave_take_read(0, 0x42, 1);
+                println!("[host] I2C slave master-read -> {got:02x?}");
+                assert_eq!(got, vec![0xA5], "slave TX preload mismatch");
+                i2c_slave_read = true;
             }
         }
 
