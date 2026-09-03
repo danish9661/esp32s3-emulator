@@ -700,6 +700,20 @@ impl Soc {
         self.spi[chan].inject_miso(bytes);
     }
 
+    /// Host-driven SPI slave master-write: capture `bytes` into the slave's
+    /// data buffer on `chan` (0=GPSPI2, 1=GPSPI3), recording the bitlen and
+    /// raising trans_done. Only acts when the controller is in slave mode.
+    pub fn spi_slave_inject_write(&mut self, chan: usize, bytes: &[u8]) {
+        self.spi[chan].slave_inject_write(bytes);
+    }
+
+    /// Host-driven SPI slave master-read: return the first `nbytes` of the
+    /// slave's preloaded data buffer on `chan`, recording the bitlen and
+    /// raising trans_done. Only acts when the controller is in slave mode.
+    pub fn spi_slave_take_read(&mut self, chan: usize, nbytes: usize) -> Vec<u8> {
+        self.spi[chan].slave_take_read(nbytes)
+    }
+
     /// Inject RX bytes for the next I2C master-read on `chan`
     /// (0=I2CEXT0, 1=I2CEXT1). Each byte is returned to the MCU on a READ
     /// command; an empty supply reads back 0xFF (no device).

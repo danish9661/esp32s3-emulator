@@ -59,6 +59,15 @@ fn main() {
     let uart1_inject: Option<Vec<u8>> = env::var("UART_INJECT").ok().map(|s| s.into_bytes());
     let mut uart1_injected = false;
 
+    // SPI-slave host exchange (slave-sketch support): SPI_SLAVE_XCHG=1 drives
+    // both halves when the app prints its markers — a master-write-to-slave
+    // ([0x11, 0x22, 0x33]) on "SPI SLAVE READY", then a 2-byte
+    // master-read-from-slave (expecting the preloaded [0xA5, 0xC3]) on
+    // "SPI SLAVE TX-REQ".
+    let spi_slave_xchg = env::var("SPI_SLAVE_XCHG").is_ok();
+    let mut spi_slave_wrote = false;
+    let mut spi_slave_read = false;
+
     // Step budget in INSTRUCTIONS (`step_fast` executes whole blocks and
     // reports how many instructions ran): one old loop iteration stepped a
     // single instruction per core (2/cross-core pair), so the old 48M-step
@@ -179,6 +188,30 @@ fn main() {
                     );
                     uart1_injected = true;
                 }
+            }
+        }
+
+        // SPI-slave host exchange: marker-driven, one shot per half.
+        if spi_slave_xchg && (!tx.is_empty() || !tx1.is_empty()) {
+            if !spi_slave_wrote
+                && uart_buf
+                    .windows(b"SPI SLAVE READY".len())
+                    .any(|w| w == b"SPI SLAVE READY")
+            {
+                m.soc.spi_slave_inject_write(0, &[0x11, 0x22, 0x33]);
+                println!("[host] SPI slave master-write [11 22 33]");
+                spi_slave_wrote = true;
+            }
+            if spi_slave_wrote
+                && !spi_slave_read
+                && uart_buf
+                    .windows(b"SPI SLAVE TX-REQ".len())
+                    .any(|w| w == b"SPI SLAVE TX-REQ")
+            {
+                let got = m.soc.spi_slave_take_read(0, 2);
+                println!("[host] SPI slave master-read -> {got:02x?}");
+                assert_eq!(got, vec![0xA5, 0xC3], "slave TX preload mismatch");
+                spi_slave_read = true;
             }
         }
 

@@ -24,6 +24,17 @@
 //! quad/octal, segments, the CMD.update latch (values are used as written
 //! — functionally equivalent once firmware follows the IDF update sequence).
 //! MISO input has no device attached, so RX phases read back zeros.
+//!
+//! Slave mode: when SPI_SLAVE.slave_mode (bit 26) is set, CMD.usr no longer
+//! starts a master transaction. The external master does not exist in the
+//! emulator, so the host drives slave exchanges synchronously at the buffer
+//! level (the exact bytes-and-interrupt contract the firmware observes):
+//! `slave_inject_write` emulates a master-write-to-slave (captures the bytes
+//! into data_buf, records SLAVE1.data_bitlen, raises trans_done),
+//! `slave_take_read` emulates a master-read-from-slave (returns the
+//! firmware-preloaded data_buf bytes, records the bitlen, raises
+//! trans_done). CPU-controlled (Rd_BUF/Wr_BUF) semantics; slave DMA and the
+//! live slave waveform on Q are not modeled.
 
 // Register offsets (TRM GPSPI chapter).
 use alloc::vec::Vec;
@@ -67,6 +78,15 @@ const MS_DLEN_DATA_BITLEN_MASK: u32 = (1 << 18) - 1;
 const MISC_CK_IDLE_EDGE: u32 = 1 << 29;
 const MISC_CS0_DIS: u32 = 1 << 0;
 const MISC_CS1_DIS: u32 = 1 << 1;
+// SLAVE bits (TRM SPI_SLAVE_REG @ 0xE0, spi_struct.h `slave`: clk_mode[1:0],
+// clk_mode_13[2], rsck_data_out[3], reserved[7:4], rddma/wrdma/rdbuf/wrbuf
+// _bitlen_en[11:8], reserved[21:12], dma_seg_magic[25:22], slave_mode[26],
+// soft_reset[27], usr_conf[28]).
+const SLAVE_MODE: u32 = 1 << 26;
+// SLAVE1 fields (TRM SPI_SLAVE1_REG @ 0xE4): data_bitlen[17:0] (transfer
+// length in slave FD/HD mode), last_command[25:18], last_addr[31:26].
+pub const SPI_SLAVE1: u32 = 0xE4;
+const SLAVE1_DATA_BITLEN_MASK: u32 = (1 << 18) - 1;
 // CTRL bits (TRM SPI_CTRL): idle MOSI polarity (d_pol).
 const CTRL_D_POL: u32 = 1 << 20;
 // CLK_GATE bits (TRM SPI_CLK_GATE).
@@ -136,6 +156,70 @@ impl Spi {
     /// Inject MISO bytes for the next transfer (host virtual device response).
     pub fn inject_miso(&mut self, bytes: &[u8]) {
         self.pending_miso = Some(bytes.to_vec());
+    }
+
+    /// True when the controller is in slave mode (SPI_SLAVE.slave_mode).
+    pub fn is_slave(&self) -> bool {
+        self.regs[(SPI_SLAVE / 4) as usize] & SLAVE_MODE != 0
+    }
+
+    /// Host-driven master-write-to-slave: capture `bytes` (MSB-first) into
+    /// the data buffer as if an external master clocked them in, record the
+    /// transfer length in SLAVE1.data_bitlen, and latch trans_done. Only acts
+    /// in slave mode.
+    pub fn slave_inject_write(&mut self, bytes: &[u8]) {
+        if !self.is_slave() {
+            return;
+        }
+        let mut buf = [0u32; DATA_WORDS];
+        let mut bitpos = 0u32;
+        for &byte in bytes {
+            for j in (0..8).rev() {
+                let w = (bitpos / 32) as usize;
+                if w < DATA_WORDS {
+                    let wbit = 31 - (bitpos % 32);
+                    buf[w] &= !(1u32 << wbit);
+                    buf[w] |= (((byte >> j) & 1) as u32) << wbit;
+                }
+                bitpos += 1;
+            }
+        }
+        self.regs[SPI_DATA_BUF as usize / 4..SPI_DATA_BUF as usize / 4 + DATA_WORDS]
+            .copy_from_slice(&buf);
+        let bitlen = bitpos.min(SLAVE1_DATA_BITLEN_MASK + 1);
+        let s1 = &mut self.regs[(SPI_SLAVE1 / 4) as usize];
+        *s1 = (*s1 & !SLAVE1_DATA_BITLEN_MASK) | (bitlen & SLAVE1_DATA_BITLEN_MASK);
+        self.regs[(SPI_INT_RAW / 4) as usize] |= INT_TRANS_DONE;
+    }
+
+    /// Host-driven master-read-from-slave: return the first `nbytes` of the
+    /// firmware-preloaded data buffer (MSB-first), record the transfer length
+    /// in SLAVE1.data_bitlen, and latch trans_done. Only acts in slave mode.
+    pub fn slave_take_read(&mut self, nbytes: usize) -> Vec<u8> {
+        if !self.is_slave() {
+            return Vec::new();
+        }
+        let base = SPI_DATA_BUF as usize / 4;
+        let mut out = Vec::with_capacity(nbytes);
+        for b in 0..nbytes {
+            let mut byte = 0u8;
+            for j in 0..8 {
+                let bitidx = (b * 8 + j) as u32;
+                let w = (bitidx / 32) as usize;
+                let v = if w < DATA_WORDS {
+                    (self.regs[base + w] >> (31 - (bitidx % 32))) & 1
+                } else {
+                    0
+                };
+                byte = (byte << 1) | v as u8;
+            }
+            out.push(byte);
+        }
+        let bitlen = ((nbytes * 8) as u32).min(SLAVE1_DATA_BITLEN_MASK + 1);
+        let s1 = &mut self.regs[(SPI_SLAVE1 / 4) as usize];
+        *s1 = (*s1 & !SLAVE1_DATA_BITLEN_MASK) | (bitlen & SLAVE1_DATA_BITLEN_MASK);
+        self.regs[(SPI_INT_RAW / 4) as usize] |= INT_TRANS_DONE;
+        out
     }
 
     /// Take the MOSI byte stream of the last completed transfer (host side).
@@ -243,9 +327,11 @@ impl Spi {
     }
 
     /// Trigger a transfer if CMD.usr was set; snapshots all phase config.
+    /// In slave mode CMD.usr does not start a master transaction (slave
+    /// transfers are host-driven via slave_inject_write/slave_take_read).
     fn maybe_trigger(&mut self) {
         let cmd = self.regs[(SPI_CMD / 4) as usize];
-        if cmd & CMD_USR == 0 || self.txn.is_some() {
+        if cmd & CMD_USR == 0 || self.txn.is_some() || self.is_slave() {
             return;
         }
         let user = self.regs[(SPI_USER / 4) as usize];

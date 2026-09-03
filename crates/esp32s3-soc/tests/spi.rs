@@ -146,3 +146,53 @@ fn mosi_transfer_exposes_tx_and_injected_miso() {
     // No leftover transfer pending.
     assert_eq!(s.take_last_tx(), None);
 }
+
+/// Slave mode: a host-driven master-write captures bytes into the data
+/// buffer, records SLAVE1.data_bitlen, and latches trans_done.
+#[test]
+fn slave_inject_write_captures_rx_and_raises_done() {
+    let mut s = Spi::new(0);
+    s.write32(SPI_SLAVE, 1 << 26); // slave_mode
+    assert!(s.is_slave());
+    s.slave_inject_write(&[0x11, 0x22]);
+    assert_eq!(s.read32(SPI_DATA_BUF), 0x1122_0000);
+    assert_eq!(s.read32(SPI_SLAVE1) & 0x3FFFF, 16);
+    assert_eq!(s.read32(SPI_INT_RAW) & 1, 1, "trans_done latched");
+    // INT_CLR clears it (driver handshake).
+    s.write32(SPI_INT_CLR, 1);
+    assert_eq!(s.read32(SPI_INT_RAW) & 1, 0);
+}
+
+/// Slave mode: a host-driven master-read returns the firmware-preloaded TX
+/// bytes and records the bitlen.
+#[test]
+fn slave_take_read_returns_preloaded_tx() {
+    let mut s = Spi::new(0);
+    s.write32(SPI_SLAVE, 1 << 26);
+    s.write32(SPI_DATA_BUF, 0xA5C3_0000);
+    let got = s.slave_take_read(2);
+    assert_eq!(got, vec![0xA5, 0xC3]);
+    assert_eq!(s.read32(SPI_SLAVE1) & 0x3FFFF, 16);
+    assert_eq!(s.read32(SPI_INT_RAW) & 1, 1, "trans_done latched");
+}
+
+/// CMD.usr does not start a master transaction in slave mode, and the
+/// slave host calls are inert in master mode.
+#[test]
+fn slave_mode_gates_master_trigger() {
+    let mut s = Spi::new(0);
+    s.write32(SPI_SLAVE, 1 << 26);
+    setup_mosi(&mut s, 0xA5);
+    s.write32(SPI_CMD, 1 << 24);
+    for _ in 0..32 {
+        s.tick(1);
+    }
+    // No master transaction ran: usr still set, no trans_done, no MOSI event.
+    assert_eq!(s.read32(SPI_CMD) & (1 << 24), 1 << 24);
+    assert_eq!(s.read32(SPI_INT_RAW) & 1, 0);
+
+    let mut m = Spi::new(0);
+    m.slave_inject_write(&[0xFF]);
+    assert_eq!(m.read32(SPI_INT_RAW) & 1, 0, "inert in master mode");
+    assert!(m.slave_take_read(1).is_empty());
+}
