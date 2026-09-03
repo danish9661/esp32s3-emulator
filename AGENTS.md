@@ -126,6 +126,25 @@ Core design:
 - Commit-ready, formatted with `cargo fmt`, clippy-clean.
 
 ## Status log (append, newest last)
+  - 2026-09-03: **LEDC fade engine + driver path (P5 — item 7)**. Fade runs
+    on duty_start pulses (scale/cycle/num/inc latched per write, duty_start
+    self-clearing so ISR-chained rounds re-arm), stepping every timer clock
+    with saturation + fade-done interrupt. Validated end-to-end via the real
+    IDF fade driver (`set_fade_with_time` + blocking `fade_start` on
+    Arduino's channel): `fade err=0 final=300` → `LEDC FADE PASS`, which
+    exercises the engine, DONE through matrix source 35, the fade ISR, round
+    chaining and the completion semaphore. Two real bugs found en route:
+    (1) fade must step on timer CLOCKS, not wraps (wraps made a 100ms fade
+    take 26s — the hang); (2) the fade scale steps duty in USER units
+    (`scale<<4` reg units per step — with plain `scale` the ISR reads a
+    truncated user duty that never advances and reprograms the same round
+    forever, duty pinned oscillating 4560↔4575); (3) DUTY_RD must be a live
+    view of CH_DUTY (the ISR reads progress through it; stale zero restarts
+    every round from scratch). Also fixed along the way: a stale fade-done
+    RAW (latched by ledcWrite-programmed 1-step fades) + ENA set = level-1
+    storm inside `fade_func_install` — the sketch now clears INT_CLR first
+    (same as the driver does around install). 2 unit tests (step/done,
+    down-saturate). 36/36 green, clippy/fmt clean.
   - 2026-09-03: **RMT RX capture (P5 — item 4)**. `rmt.rs` gains 4 RX
     channels (HW 4..7): `chmconf1` rx_en edge arms a one-shot capture
     (mirroring TX_START), sampling matrix input 81+m per tick with the TX
@@ -2066,3 +2085,24 @@ Core design:
     extend the TIE decoder via `ee.rs`, not by re-running the generator.
 
 
+  - 2026-09-04: **AES chaining modes via real mbedTLS driver (item 9)**. The
+    uncommitted AES-CBC WIP failed (`AES CBC FAIL`, got `e4ef93eb…` vs want
+    `7649abac…`): root-caused as TWO stacked issues, one harness-side and one
+    a real model defect. (1) The sketch's "expected" constant mixed two NIST
+    vectors (FIPS-197 ECB key `000102…` with an SP 800-38A CBC ciphertext) —
+    PyCryptodome confirms the model output was already correct; the sketch now
+    checks the full 4-block F.2.1 vector (key `2b7e1516…`, CT `7649abac……
+    3ff1caa1…`). (2) Real defect: a DMA op ran the cipher TWICE — the GDMA
+    `out` walk feeds + transforms, then the driver's post-start TRIGGER write
+    re-encrypted the stale TEXT_IN mirror with the advanced chain, and the
+    driver read back the doubly-encrypted block. Fixed with a `text_in_fresh`
+    flag (set on TEXT_IN register writes, cleared by any transform): TRIGGER
+    runs with staged DMA bytes or a fresh poke, else no-ops as stale-DMA
+    leftover (verified via a temporary per-transform ring probe, since
+    removed: 4→2 transforms, both buffer-sourced, outputs match PyCryptodome
+    `E(P^IV)`/`E(P^C1)` exactly). Bonus: the `run_flash` AES-DMA-flag
+    workaround is deleted — the per-channel GDMA wiring (66-75) lets the real
+    RX-done ISR clear the flag, proven by the passing run with it removed.
+    Validated: 8 aes KATs, driver sketch ECB + `AES CBC PASS`, `AES POKE
+    PASS`, SHA/GDMA/RMT-driver regressions green. 36/36 suites, clippy (only
+    pre-existing warns)/fmt/wasm32 clean.

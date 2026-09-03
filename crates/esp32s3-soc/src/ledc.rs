@@ -46,6 +46,16 @@ const CH_IDLE_LV: u32 = 1 << 3;
 
 // channel duty: 19-bit field, esp-idf stores (user_duty << 4)
 const LEDC_DUTY_FRAC: u32 = 4;
+// channel conf1 fade fields (ledc_struct.h ch.conf1).
+const CH_DUTY_SCALE: u32 = 0x3FF; // bits [9:0]
+const CH_DUTY_CYCLE_SHIFT: u32 = 10; // bits [19:10]
+const CH_DUTY_NUM_SHIFT: u32 = 20; // bits [29:20]
+const CH_DUTY_INC: u32 = 1 << 30;
+const CH_DUTY_START: u32 = 1 << 31;
+// Duty field width (19 bits) and fade-done interrupt base bit
+// (duty_chng_end_lsch0..7 = INT bits 4..11).
+const DUTY_MAX: u32 = 0x7_FFFF;
+const FADE_DONE_BIT: u32 = 4;
 
 // timer conf
 const TIMER_DUTY_RES: u32 = 0xF; // bits [3:0], resolution in bits
@@ -53,11 +63,24 @@ const TIMER_CLOCK_DIV: u32 = 0x3FFFF << 4; // bits [21:4]
 const TIMER_PAUSE: u32 = 1 << 22;
 const TIMER_RST: u32 = 1 << 23;
 
+#[derive(Clone, Copy, Default)]
+struct FadeCh {
+    /// Fade running (latched by a duty_start pulse).
+    active: bool,
+    /// Timer wraps remaining before the fade completes.
+    remaining: u32,
+    /// Wraps counted toward the current duty step.
+    cycles: u32,
+}
+
 #[derive(Clone)]
 pub struct Lcdc {
     regs: [u32; REG_COUNT],
     counters: [u32; TIMER_COUNT],
     frac: [u32; TIMER_COUNT],
+    fade: [FadeCh; 8],
+    /// Any fade running (tick fast path skips the channel loop otherwise).
+    fade_any: bool,
 }
 
 impl Lcdc {
@@ -68,6 +91,8 @@ impl Lcdc {
             regs: [0; REG_COUNT],
             counters: [0; TIMER_COUNT],
             frac: [0; TIMER_COUNT],
+            fade: [FadeCh::default(); 8],
+            fade_any: false,
         }
     }
 
@@ -186,7 +211,13 @@ impl Lcdc {
         }
         let w = o / 4;
         if w < TIMER_BASE_W {
-            // channel register
+            // Channel register. DUTY_RD is a live view of the current duty
+            // (TRM: read-only readback): the fade ISR reads progress through
+            // it and chains rounds toward the target, so a stale zero would
+            // restart every round from scratch forever.
+            if w % CH_W == CH_DUTY_RD {
+                return self.regs[w - (CH_DUTY_RD - CH_DUTY)];
+            }
             return self.regs[w];
         }
         if w < INT_RAW_W {
@@ -210,10 +241,22 @@ impl Lcdc {
             match sub {
                 CH_DUTY => self.regs[w] = val,
                 CH_CONF1 => {
-                    // duty_start is a software pulse that (re)loads the duty
-                    // into the comparator; the PWM runs whenever the timer is
-                    // running and sig_out_en is set.
-                    self.regs[w] = val;
+                    // duty_start is a self-clearing start pulse (reads back
+                    // 0): every write with the bit set latches a fade run
+                    // (scale/cycle/num/inc from this same write). The real
+                    // driver rewrites it on every round (the fade ISR chains
+                    // rounds until the target), so edge-only latching would
+                    // miss re-arms against the sticky bit.
+                    self.regs[w] = val & !CH_DUTY_START;
+                    if val & CH_DUTY_START != 0 {
+                        let c = w / CH_W;
+                        self.fade[c].active = (val >> CH_DUTY_NUM_SHIFT) & 0x3FF != 0;
+                        self.fade[c].remaining = (val >> CH_DUTY_NUM_SHIFT) & 0x3FF;
+                        self.fade[c].cycles = 0;
+                        if self.fade[c].active {
+                            self.fade_any = true;
+                        }
+                    }
                 }
                 CH_CONF0 | CH_HPOINT => self.regs[w] = val,
                 CH_DUTY_RD => {} // read-only
@@ -264,9 +307,59 @@ impl Lcdc {
             self.frac[t] += 256;
             while self.frac[t] >= div {
                 self.frac[t] -= div;
-                self.counters[t] = (self.counters[t] + 1) % period;
+                let next = self.counters[t] + 1;
+                self.counters[t] = if next >= period { 0 } else { next };
+                self.fade_clock(t);
             }
         }
+    }
+
+    /// One timer-clock step on timer `t`: advance fades bound to it. Every
+    /// `duty_cycle` clocks the duty steps by `duty_scale` (up/down by
+    /// `duty_inc`), `duty_num` times, then the fade-done interrupt fires
+    /// (the driver ISR chains further rounds toward the target itself).
+    fn fade_clock(&mut self, t: usize) {
+        if !self.fade_any {
+            return;
+        }
+        let mut any = false;
+        for c in 0..CHANNEL_COUNT {
+            if self.channel_timer(c) as usize != t || !self.fade[c].active {
+                continue;
+            }
+            any = true;
+            let conf1 = self.regs[Self::ch_word(c, CH_CONF1)];
+            let need = ((conf1 >> CH_DUTY_CYCLE_SHIFT) & 0x3FF).max(1);
+            self.fade[c].cycles += 1;
+            if self.fade[c].cycles < need {
+                continue;
+            }
+            self.fade[c].cycles = 0;
+            // The fade scale steps the duty in *user* units: the driver
+            // computes rounds as `steps = delta_user / scale_user` and
+            // programs the scale value verbatim, so each hardware step must
+            // cover scale<<4 register units for the composition to converge
+            // (verified: with a plain `scale` step the ISR reads a truncated
+            // user duty that never advances, reprogramming the same round
+            // forever while CH_DUTY oscillates in place).
+            let scale = (conf1 & CH_DUTY_SCALE) << LEDC_DUTY_FRAC;
+            let duty = self.regs[Self::ch_word(c, CH_DUTY)];
+            let next = if conf1 & CH_DUTY_INC != 0 {
+                duty.saturating_add(scale).min(DUTY_MAX)
+            } else {
+                duty.saturating_sub(scale)
+            };
+            self.regs[Self::ch_word(c, CH_DUTY)] = next;
+            if self.fade[c].remaining > 0 {
+                self.fade[c].remaining -= 1;
+            }
+            if self.fade[c].remaining == 0 {
+                self.fade[c].active = false;
+                self.regs[INT_RAW_W] |= 1 << (FADE_DONE_BIT + c as u32);
+                self.regs[INT_ST_W] = self.regs[INT_RAW_W] & self.regs[INT_ENA_W];
+            }
+        }
+        self.fade_any = any;
     }
 }
 

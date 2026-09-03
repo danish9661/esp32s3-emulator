@@ -79,3 +79,39 @@ fn signal_level_maps_channels() {
     assert_eq!(l.signal_level(SIG_CH0), 1);
     assert_eq!(l.signal_level(SIG_CH7), 0);
 }
+
+/// Fade engine: duty_start latches a fade that steps the duty every
+/// `duty_cycle` timer clocks, `duty_num` times, then raises fade-done.
+#[test]
+fn fade_steps_duty_and_raises_done() {
+    let mut l = Lcdc::new();
+    l.write32(TMR0_CONF, 0x100A); // div 256 (1 clock/tick), res 10
+    l.write32(CH0_DUTY, 0); // start at 0
+    l.write32(CH0_CONF0, 4); // sig_out_en
+    // conf1: scale 1 (= 16 reg units/step), cycle 1, num 4, inc, start.
+    l.write32(0x0C, 1 | (1 << 10) | (4 << 20) | (1 << 30) | (1 << 31));
+    // 4 clocks complete the fade; extra ticks must not overrun.
+    for _ in 0..8 {
+        l.tick();
+    }
+    assert_eq!(l.read32(CH0_DUTY), 64, "4 steps x scale 16");
+    assert_ne!(l.read32(0xC0) & (1 << 4), 0, "fade-done raw bit 4");
+    l.write32(0xCC, 1 << 4); // INT_CLR
+    assert_eq!(l.read32(0xC0) & (1 << 4), 0, "done clears");
+}
+
+/// Fade down saturates at zero instead of wrapping the 19-bit field.
+#[test]
+fn fade_down_saturates_at_zero() {
+    let mut l = Lcdc::new();
+    l.write32(TMR0_CONF, 0x100A);
+    l.write32(CH0_DUTY, 0x20); // 32
+    l.write32(CH0_CONF0, 4);
+    // scale 1, cycle 1, num 4, dec, start: 32 - 64 would underflow.
+    l.write32(0x0C, 1 | (1 << 10) | (4 << 20) | (0 << 30) | (1 << 31));
+    for _ in 0..8 {
+        l.tick();
+    }
+    assert_eq!(l.read32(CH0_DUTY), 0, "saturates at zero");
+    assert_ne!(l.read32(0xC0) & (1 << 4), 0, "done still fires");
+}

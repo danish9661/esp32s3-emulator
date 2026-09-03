@@ -1220,11 +1220,13 @@ impl Soc {
                                                 }
                                                 let mut k = 0u32;
                                                 while k + 4 <= ilen {
-                                                    let w = self
-                                                        .read32(crate::aes::AES_TEXT_OUT_BASE + k);
+                                                    let w = self.aes.out_word_at(k);
                                                     self.write32(ibuf + k, w);
                                                     k += 4;
                                                 }
+                                                // DMA hands the descriptor back: clear owner
+                                                // (the driver polls owner / reads length/suc_eof).
+                                                self.write32(idesc, dw0 & !(1u32 << 31));
                                                 if inext == 0 || ieof == 1 {
                                                     break;
                                                 }
@@ -1267,7 +1269,7 @@ impl Soc {
                                     // AES ciphertext out -> DRAM.
                                     let mut k = 0u32;
                                     while k + 4 <= len {
-                                        let w = self.read32(crate::aes::AES_TEXT_OUT_BASE + k);
+                                        let w = self.aes.out_word_at(k);
                                         self.write32(buf + k, w);
                                         k += 4;
                                     }
@@ -1298,6 +1300,8 @@ impl Soc {
                                     self.gdma.raise_in_done(ch);
                                 }
                             }
+                            // DMA hands the descriptor back: clear owner.
+                            self.write32(desc, dw0 & !(1u32 << 31));
                             if next == 0 || eof == 1 {
                                 break;
                             }
@@ -1652,11 +1656,13 @@ impl Soc {
                                                 }
                                                 let mut k = 0u32;
                                                 while k + 4 <= ilen {
-                                                    let w = self
-                                                        .read32(crate::aes::AES_TEXT_OUT_BASE + k);
+                                                    let w = self.aes.out_word_at(k);
                                                     self.write32(ibuf + k, w);
                                                     k += 4;
                                                 }
+                                                // DMA hands the descriptor back: clear owner
+                                                // (the driver polls owner / reads length/suc_eof).
+                                                self.write32(idesc, idw0 & !(1u32 << 31));
                                                 if inext == 0 || ieof == 1 {
                                                     break;
                                                 }
@@ -1672,7 +1678,7 @@ impl Soc {
                                 if peri != crate::gdma::GDMA_SHA_PERIPH {
                                     let mut k = 0u32;
                                     while k + 4 <= len {
-                                        let w = self.read32(crate::aes::AES_TEXT_OUT_BASE + k);
+                                        let w = self.aes.out_word_at(k);
                                         self.write32(buf + k, w);
                                         k += 4;
                                     }
@@ -1680,6 +1686,8 @@ impl Soc {
                                     self.crypto_dma.raise_in_done(ch);
                                 }
                             }
+                            // DMA hands the descriptor back: clear owner.
+                            self.write32(desc, dw0 & !(1u32 << 31));
                             if next == 0 || eof == 1 {
                                 break;
                             }

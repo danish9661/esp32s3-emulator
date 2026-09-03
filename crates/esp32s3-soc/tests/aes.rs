@@ -121,3 +121,181 @@ fn aes_state_reads_done_after_transform() {
     // AES_STATE (0x4c) reads 2 (DONE) after a synchronous transform.
     assert_eq!(a.read32(0x4c) & 0x3, 2);
 }
+
+const AES_BLOCK_MODE: u32 = 0x94;
+const AES_IV_BASE: u32 = 0x50;
+
+fn hex_bytes(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+fn to_hex(bs: &[u8]) -> String {
+    bs.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Drive a multi-block message through the register interface the way the
+/// DMA engine does per block: program key/mode/block-mode/IV once, then for
+/// each 16-byte chunk write TEXT_IN, TRIGGER, and read TEXT_OUT back.
+/// Chaining state must persist across the separate transform() calls.
+fn run_chained(key: &[u8], mode_reg: u32, block_mode: u32, iv: &[u8; 16], pt: &[u8]) -> Vec<u8> {
+    assert_eq!(pt.len() % 16, 0);
+    let mut a = Aes::new();
+    for (i, chunk) in key.chunks(4).enumerate() {
+        let mut w = [0u8; 4];
+        w[..chunk.len()].copy_from_slice(chunk);
+        a.write32(
+            (i as u32) * 4,
+            (w[0] as u32) | ((w[1] as u32) << 8) | ((w[2] as u32) << 16) | ((w[3] as u32) << 24),
+        );
+    }
+    a.write32(AES_MODE, mode_reg);
+    a.write32(AES_BLOCK_MODE, block_mode);
+    for i in 0..4 {
+        let w = (iv[i * 4] as u32)
+            | ((iv[i * 4 + 1] as u32) << 8)
+            | ((iv[i * 4 + 2] as u32) << 16)
+            | ((iv[i * 4 + 3] as u32) << 24);
+        a.write32(AES_IV_BASE + (i as u32) * 4, w);
+    }
+    let mut out = Vec::new();
+    for blk in pt.chunks(16) {
+        for i in 0..4 {
+            let w = (blk[i * 4] as u32)
+                | ((blk[i * 4 + 1] as u32) << 8)
+                | ((blk[i * 4 + 2] as u32) << 16)
+                | ((blk[i * 4 + 3] as u32) << 24);
+            a.write32(AES_TEXT_IN_BASE + (i as u32) * 4, w);
+        }
+        a.write32(AES_TRIGGER, 1);
+        for i in 0..4 {
+            let w = a.read32(AES_TEXT_OUT_BASE + (i as u32) * 4);
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+    out
+}
+
+const CHAIN_KEY: &str = "2b7e151628aed2a6abf7158809cf4f3c";
+const CHAIN_IV: &str = "000102030405060708090a0b0c0d0e0f";
+const CHAIN_PT: &str = "6bc1bee22e409f96e93d7e117393172a6e7e9a53c57e5c7ae5de90f1a1ad576e3d529ea9dda0d0059c19774e6a76008845de27fa560d14f043bd1788a07468f8";
+
+#[test]
+fn aes128_cbc_multiblock_kat() {
+    let key = hex_bytes(CHAIN_KEY);
+    let iv: [u8; 16] = hex_bytes(CHAIN_IV).try_into().unwrap();
+    let pt = hex_bytes(CHAIN_PT);
+    // Reference generated with PyCryptodome (FIPS block-1 anchor verified).
+    let ct = run_chained(&key, 0, 1, &iv, &pt);
+    assert_eq!(
+        to_hex(&ct),
+        "7649abac8119b246cee98e9b12e9197d57c71400a906fdcc09c2e6c7361f35af796a0e99e00c09a298b33288703d20680f2c8ee0906c92619019936e05261ca4",
+        "AES-128-CBC encrypt KAT"
+    );
+    // Decrypt round-trips through the same chaining path.
+    let rt = run_chained(&key, 4, 1, &iv, &ct);
+    assert_eq!(rt, pt, "AES-128-CBC decrypt roundtrip");
+}
+
+#[test]
+fn aes128_ctr_multiblock_kat() {
+    let key = hex_bytes(CHAIN_KEY);
+    // NIST SP 800-38A F.5 counter (BE counter in the low word region).
+    let iv: [u8; 16] = hex_bytes("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff")
+        .try_into()
+        .unwrap();
+    let pt = hex_bytes(CHAIN_PT);
+    let ct = run_chained(&key, 0, 3, &iv, &pt);
+    assert_eq!(
+        to_hex(&ct),
+        "874d6191b620e3261bef6864990db6ce5855e66fa20d0d19fd7ee7265dfd24c0577e5dd1a529e74a22adbf557dcc6cccad421e65a6fc8c3697b72653b518c306",
+        "AES-128-CTR encrypt KAT (pins the INC32 counter order)"
+    );
+    let rt = run_chained(&key, 0, 3, &iv, &ct);
+    assert_eq!(rt, pt, "AES-128-CTR decrypt roundtrip");
+}
+
+#[test]
+fn aes128_cfb_ofb_multiblock_kat() {
+    let key = hex_bytes(CHAIN_KEY);
+    let iv: [u8; 16] = hex_bytes(CHAIN_IV).try_into().unwrap();
+    let pt = hex_bytes(CHAIN_PT);
+    let ct128 = run_chained(&key, 0, 5, &iv, &pt);
+    assert_eq!(
+        to_hex(&ct128),
+        "3b3fd92eb72dad20333449f8e83cfb4a08f555337bce59d9b68a32f07b1e3cb4cd6d1c902bf23f4b3af5452a46877dad46cf817b9c27bab1ee0652280f8f57f2",
+        "AES-128-CFB128 KAT"
+    );
+    assert_eq!(
+        run_chained(&key, 4, 5, &iv, &ct128),
+        pt,
+        "AES-128-CFB128 decrypt roundtrip"
+    );
+    let ct8 = run_chained(&key, 0, 4, &iv, &pt);
+    assert_eq!(
+        to_hex(&ct8),
+        "3b79424c9c0dd436bace9e0ed4586a4ff2c049aa25a347c335bb6d0f3369857c31496c905cc283cebdb3b2eb5bdef793faa8b398ee50c8c16a6b7d912d490962",
+        "AES-128-CFB8 KAT"
+    );
+    assert_eq!(
+        run_chained(&key, 4, 4, &iv, &ct8),
+        pt,
+        "AES-128-CFB8 decrypt roundtrip"
+    );
+    let cto = run_chained(&key, 0, 2, &iv, &pt);
+    assert_eq!(
+        to_hex(&cto),
+        "3b3fd92eb72dad20333449f8e83cfb4ab7da4089cdec7fe58e55ad87214c011a9ada87f1e2a3d8e23aa641ff521cbfab830d66977f1b489f8833462a87cef1b6",
+        "AES-128-OFB KAT"
+    );
+    assert_eq!(
+        run_chained(&key, 0, 2, &iv, &cto),
+        pt,
+        "AES-128-OFB decrypt roundtrip"
+    );
+}
+
+#[test]
+fn aes128_cbc_bulk_dma_single_transform() {
+    // One transform() call over a 4-block staged buffer (the GDMA path),
+    // as opposed to per-block triggers: same chained result.
+    use esp32s3_soc::aes::Aes as AesDirect;
+    let key = hex_bytes(CHAIN_KEY);
+    let iv: [u8; 16] = hex_bytes(CHAIN_IV).try_into().unwrap();
+    let pt = hex_bytes(CHAIN_PT);
+    let mut a = AesDirect::new();
+    for (i, chunk) in key.chunks(4).enumerate() {
+        let mut w = [0u8; 4];
+        w.copy_from_slice(chunk);
+        a.write32(
+            (i as u32) * 4,
+            (w[0] as u32) | ((w[1] as u32) << 8) | ((w[2] as u32) << 16) | ((w[3] as u32) << 24),
+        );
+    }
+    a.write32(AES_MODE, 0);
+    a.write32(AES_BLOCK_MODE, 1);
+    for i in 0..4 {
+        let w = (iv[i * 4] as u32)
+            | ((iv[i * 4 + 1] as u32) << 8)
+            | ((iv[i * 4 + 2] as u32) << 16)
+            | ((iv[i * 4 + 3] as u32) << 24);
+        a.write32(AES_IV_BASE + (i as u32) * 4, w);
+    }
+    for &b in &pt {
+        a.feed_text_in_byte(b);
+    }
+    a.transform();
+    // Stream the output through the FIFO-port reader (plain MMIO reads
+    // past 0x3C would hit MODE/STATE/IV registers, not ciphertext).
+    let mut out = Vec::new();
+    for k in (0..64).step_by(4) {
+        out.extend_from_slice(&a.out_word_at(k as u32).to_le_bytes());
+    }
+    assert_eq!(
+        to_hex(&out),
+        "7649abac8119b246cee98e9b12e9197d57c71400a906fdcc09c2e6c7361f35af796a0e99e00c09a298b33288703d20680f2c8ee0906c92619019936e05261ca4",
+        "bulk-fed CBC matches per-block triggering"
+    );
+}

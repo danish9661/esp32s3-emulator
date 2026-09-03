@@ -237,7 +237,23 @@ pub struct Aes {
     mode: u32,
     block_mode: u32,
     text_in: [u8; 16],
+    /// Set on direct TEXT_IN register writes, cleared by any transform.
+    /// Distinguishes a fresh register-poked block from stale TEXT_IN bytes
+    /// left over after a GDMA-fed DMA transfer (see TRIGGER below).
+    text_in_fresh: bool,
     text_out: [u8; 16],
+    /// IV register file (AES_IV_BASE + 0x50, 4 LE words). Written per
+    /// operation by the driver.
+    iv: [u8; 16],
+    /// Chaining state across blocks (CBC feedback / OFB-CFB shift / CTR
+    /// counter). Reset by IV-register writes (each driver operation sets
+    /// its IV first), then advanced per block — including across the
+    /// separate GDMA-descriptor `transform()` calls of one transfer.
+    chain: [u8; 16],
+    /// Staged DMA input bytes (a transfer may span descriptors).
+    in_buf: Vec<u8>,
+    /// This call's output bytes (served to the GDMA `in` walk / TEXT_OUT).
+    out_buf: Vec<u8>,
     in_idx: usize,
     /// AES engine state as read from `AES_STATE` (0x4c): 0 = idle, 1 = busy,
     /// 2 = done. The esp-idf AES driver (`aes_hal_wait_done`) spins until the
@@ -282,10 +298,39 @@ impl Aes {
         self.text_out[i % 16]
     }
 
+    /// Read one output word at byte offset `k` (for the GDMA `in` walks,
+    /// which stream the whole transfer buffer, possibly across repeated or
+    /// overlapping walks — hence positional, not cursor-based). Past the end
+    /// reads zero.
+    pub fn out_word_at(&self, k: u32) -> u32 {
+        let b = |j: usize| {
+            if j < self.out_buf.len() {
+                self.out_buf[j]
+            } else {
+                0
+            }
+        };
+        let j = k as usize;
+        (b(j) as u32)
+            | ((b(j + 1) as u32) << 8)
+            | ((b(j + 2) as u32) << 16)
+            | ((b(j + 3) as u32) << 24)
+    }
+
     /// Append one plaintext byte (GDMA `out` channel feed, LSB-first per word).
     pub fn feed_text_in_byte(&mut self, b: u8) {
         self.text_in[self.in_idx % 16] = b;
         self.in_idx += 1;
+        self.in_buf.push(b);
+    }
+
+    /// XOR two blocks.
+    fn xor16(a: &[u8], b: &[u8; 16]) -> [u8; 16] {
+        let mut o = [0u8; 16];
+        for i in 0..16 {
+            o[i] = a[i] ^ b[i];
+        }
+        o
     }
 
     fn nk(&self) -> usize {
@@ -300,17 +345,99 @@ impl Aes {
         self.mode & 0x4 != 0
     }
 
-    /// Run the transform on the currently buffered plaintext block.
+    /// Run the transform on the staged input. In DMA mode the GDMA `out`
+    /// walk feeds whole descriptor buffers before each call, so this
+    /// processes every complete block with the configured block mode
+    /// (ECB=0, CBC=1, OFB=2, CTR=3, CFB8=4, CFB128=5; GCM=6 falls back to
+    /// ECB, see module docs), chaining across calls via `chain`. A
+    /// non-multiple tail stays staged for the next descriptor. Direct
+    /// register pokes (no staged bytes) transform the TEXT_IN block alone.
     pub fn transform(&mut self) {
         let nk = self.nk();
         let nr = nk + 6;
         let w = key_expansion(&self.key[..nk * 4], nk);
-        let block = self.text_in;
-        self.text_out = if self.decrypt() {
-            aes_decrypt_block(&block, &w, nr)
-        } else {
-            aes_encrypt_block(&block, &w, nr)
-        };
+        let mut input = core::mem::take(&mut self.in_buf);
+        if input.is_empty() {
+            input.extend_from_slice(&self.text_in);
+        }
+        let nblocks = input.len() / 16;
+        let mut out = Vec::with_capacity(nblocks * 16);
+        self.text_in_fresh = false;
+        let dec = self.decrypt();
+        for b in 0..nblocks {
+            let blk = &input[b * 16..b * 16 + 16];
+            let o: [u8; 16] = match (self.block_mode & 0x7, dec) {
+                (1, false) => {
+                    // CBC encrypt: C = E(P ^ C_prev).
+                    let c = aes_encrypt_block(&Self::xor16(blk, &self.chain), &w, nr);
+                    self.chain.copy_from_slice(&c);
+                    c
+                }
+                (1, true) => {
+                    // CBC decrypt: P = D(C) ^ C_prev.
+                    let p = aes_decrypt_block(&blk.try_into().unwrap_or([0u8; 16]), &w, nr);
+                    let o = Self::xor16(&p, &self.chain);
+                    self.chain.copy_from_slice(blk);
+                    o
+                }
+                (2, _) => {
+                    // OFB: S = E(chain); out = in ^ S; chain = S.
+                    let s = aes_encrypt_block(&self.chain, &w, nr);
+                    let o = Self::xor16(blk, &s);
+                    self.chain.copy_from_slice(&s);
+                    o
+                }
+                (3, _) => {
+                    // CTR: S = E(chain); out = in ^ S; the 128-bit counter
+                    // advances in its low word (bytes [12..16] big-endian,
+                    // wrapping without carry — the layout standard counters
+                    // use, pinned by the NIST CTR KAT below).
+                    let s = aes_encrypt_block(&self.chain, &w, nr);
+                    let o = Self::xor16(blk, &s);
+                    let c = u32::from_be_bytes(self.chain[12..16].try_into().unwrap_or([0u8; 4]))
+                        .wrapping_add(1);
+                    self.chain[12..16].copy_from_slice(&c.to_be_bytes());
+                    o
+                }
+                (4, _) => {
+                    // CFB8: per byte S = E(chain); out = in ^ S[0].
+                    let mut o = [0u8; 16];
+                    for i in 0..16 {
+                        let s = aes_encrypt_block(&self.chain, &w, nr);
+                        o[i] = blk[i] ^ s[0];
+                        self.chain.copy_within(1.., 0);
+                        self.chain[15] = if dec { blk[i] } else { o[i] };
+                    }
+                    o
+                }
+                (5, _) => {
+                    // CFB128: S = E(chain); out = in ^ S; chain shifts in C.
+                    let s = aes_encrypt_block(&self.chain, &w, nr);
+                    let o = Self::xor16(blk, &s);
+                    if dec {
+                        self.chain.copy_from_slice(blk);
+                    } else {
+                        self.chain.copy_from_slice(&o);
+                    }
+                    o
+                }
+                _ => {
+                    if dec {
+                        aes_decrypt_block(&blk.try_into().unwrap_or([0u8; 16]), &w, nr)
+                    } else {
+                        aes_encrypt_block(&blk.try_into().unwrap_or([0u8; 16]), &w, nr)
+                    }
+                }
+            };
+            out.extend_from_slice(&o);
+        }
+        // Streaming remainder stays staged for the next descriptor.
+        self.in_buf = input[nblocks * 16..].to_vec();
+        // Mirror the last block for direct TEXT_OUT readback compat.
+        if nblocks > 0 {
+            self.text_out.copy_from_slice(&out[out.len() - 16..]);
+        }
+        self.out_buf = out;
         self.in_idx = 0;
         self.aes_state = 2; // DONE: the driver's `aes_hal_wait_done` spins until this.
         // A DMA-driven transform has completed: raise the AES DMA-done
@@ -342,20 +469,39 @@ impl Aes {
                     | ((self.text_in[i * 4 + 2] as u32) << 16)
                     | ((self.text_in[i * 4 + 3] as u32) << 24)
             }
-            0x30..=0x3C => {
-                // TEXT_OUT (ciphertext), bytes stored LSB-first per word.
-                let i = ((off - 0x30) / 4) as usize;
-                (self.text_out[i * 4] as u32)
-                    | ((self.text_out[i * 4 + 1] as u32) << 8)
-                    | ((self.text_out[i * 4 + 2] as u32) << 16)
-                    | ((self.text_out[i * 4 + 3] as u32) << 24)
-            }
             0x40 => self.mode,
             0x4c => (self.aes_state as u32) & 0x3, // STATE: idle/busy/done
+            0x50..=0x5C => {
+                // IV readback (LE words). Written per operation by the
+                // driver; also the chaining reset point (see write32).
+                let i = ((off - 0x50) / 4) as usize;
+                (self.iv[i * 4] as u32)
+                    | ((self.iv[i * 4 + 1] as u32) << 8)
+                    | ((self.iv[i * 4 + 2] as u32) << 16)
+                    | ((self.iv[i * 4 + 3] as u32) << 24)
+            }
             0x94 => self.block_mode,
             AES_INT_RAW_REG => self.int_raw,
             AES_INT_ST_REG => self.int_raw & self.int_ena,
             AES_INT_ENA_REG => self.int_ena,
+            // TEXT_OUT port (must come after the single-word regs above,
+            // whose offsets it would otherwise shadow): the GDMA `in` walk
+            // reads ascending words (one FIFO port on silicon — the address
+            // increment is the walk's fiction). Serves this call's output.
+            o if (0x30..0x90).contains(&o) => {
+                let i = ((o - 0x30) / 4) as usize;
+                let b = |j: usize| {
+                    if j < self.out_buf.len() {
+                        self.out_buf[j]
+                    } else {
+                        0
+                    }
+                };
+                (b(i * 4) as u32)
+                    | ((b(i * 4 + 1) as u32) << 8)
+                    | ((b(i * 4 + 2) as u32) << 16)
+                    | ((b(i * 4 + 3) as u32) << 24)
+            }
             _ => 0,
         }
     }
@@ -380,6 +526,7 @@ impl Aes {
                     self.text_in[i * 4 + 1] = (value >> 8) as u8;
                     self.text_in[i * 4 + 2] = (value >> 16) as u8;
                     self.text_in[i * 4 + 3] = (value >> 24) as u8;
+                    self.text_in_fresh = true;
                 }
             }
             0x30..=0x3C => {
@@ -387,14 +534,34 @@ impl Aes {
             }
             0x40 => self.mode = value & 0x7,
             0x48 => {
-                // AES_TRIGGER: the engine transforms synchronously, so mark
-                // busy (1) then done (2) — `aes_hal_wait_done` exits on DONE.
+                // AES_TRIGGER (TRM AES_TRIGGER_REG): transform synchronously,
+                // leaving DONE so `aes_hal_wait_done` exits. Transform only
+                // with DMA-staged bytes or a fresh register-poked TEXT_IN
+                // block; otherwise no-op. The esp-idf DMA driver writes
+                // TRIGGER after starting the GDMA transfer, and re-encrypting
+                // the already-consumed TEXT_IN mirror with the advanced chain
+                // would hand the driver a doubly-encrypted block.
                 self.aes_state = 1;
-                self.transform();
+                if !self.in_buf.is_empty() || self.text_in_fresh {
+                    self.transform();
+                }
+                self.aes_state = 2;
             }
             0x4c => {}
             0x90 => {} // AES_DMA_ENABLE: ignored (synchronous model)
             0x94 => self.block_mode = value,
+            0x50..=0x5C => {
+                // (merged into the IV arm below; kept for clarity)
+                let i = ((off - 0x50) / 4) as usize;
+                if i < 4 {
+                    self.iv[i * 4] = value as u8;
+                    self.iv[i * 4 + 1] = (value >> 8) as u8;
+                    self.iv[i * 4 + 2] = (value >> 16) as u8;
+                    self.iv[i * 4 + 3] = (value >> 24) as u8;
+                    self.chain.copy_from_slice(&self.iv);
+                }
+            }
+
             AES_INT_ENA_REG => self.int_ena = value,
             AES_INT_CLR_REG => {
                 // Writing any bit clears the corresponding raw interrupt.

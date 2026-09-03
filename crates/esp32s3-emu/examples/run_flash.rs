@@ -88,21 +88,6 @@ fn main() {
         i += 1;
         let pc = m.cpu[0].pc;
 
-        // --- AES DMA flag workaround ---
-        // The esp-idf AES driver polls a completion flag (0x3fcec85c) that its
-        // GDMA RX-done ISR normally clears.  The AES driver does not route the
-        // GDMA interrupt (source 63) through the interrupt matrix for this
-        // sketch, so the firmware ISR never runs in the model and the flag
-        // stays set, deadlocking the poll loop.  We simulate the ISR clearing
-        // it so the driver completes.
-        if m.cpu[1].pc == 0x4201_32c0 {
-            let flag_addr = 0x3fcec85c_u32;
-            let fv = m.soc.read32(flag_addr);
-            if fv & (1u32 << 31) != 0 {
-                m.soc.write32(flag_addr, fv & !(1u32 << 31));
-            }
-        }
-
         // --- Exception handling ---
         if let StepResult::Exception { cause } = r {
             if (32..=37).contains(&cause) {

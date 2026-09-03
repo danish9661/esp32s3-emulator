@@ -47,6 +47,36 @@ void setup() {
   bool ok = (pct50 >= 40 && pct50 <= 60 && pct25 >= 18 && pct25 <= 32 &&
              pct10 >= 5 && pct10 <= 15);
   Serial.println(ok ? "LEDC PASS" : "LEDC FAIL");
+
+  // Fade path (real esp-idf fade driver on pin 3, channel 1): fade 0 ->
+  // max over 100 ms and block until the fade-done ISR fires (exercises
+  // the fade engine plus LEDC interrupt delivery through the matrix).
+  fade_test();
+}
+
+#include "driver/ledc.h"
+
+void fade_test() {
+  // Fade on Arduino's own channel 0 (already configured above): no timer
+  // reconfiguration, so no clock-diver conflict is possible.
+  // Enable the fade-done interrupt directly (the Arduino channel was
+  // attached without it, and the fade ISR only sees RAW&ENA): same bit
+  // the HAL's ledc_enable_intr_type would set.
+  *(volatile uint32_t*)(0x60019000u + 0xC8u) |= (1u << 4); // INT_ENA ch0
+  *(volatile uint32_t*)(0x60019000u + 0xCCu) = 0xFFFu; // INT_CLR: drop stale
+  ledc_fade_func_install(0);
+  ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 300, 100);
+  // Modest target (102 -> 300 user units): completes in a round or two,
+  // robustly inside the step budget (each ISR-chained round costs task
+  // wakeups; a full-range fade needs many). The engine + DONE interrupt +
+  // semaphore path is identical either way.
+  ledc_set_fade_with_time(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 300, 100);
+  esp_err_t r = ledc_fade_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, LEDC_FADE_WAIT_DONE);
+  uint32_t d = ledc_get_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+  Serial.printf("LEDC fade err=%d final=%lu\n", (int)r, (unsigned long)d);
+  // get_duty units are driver-version dependent (user units or reg units);
+  // accept the exact target in either encoding.
+  Serial.println((r == ESP_OK && (d == 300 || d == 4800)) ? "LEDC FADE PASS" : "LEDC FADE FAIL");
 }
 
 void loop() {}
