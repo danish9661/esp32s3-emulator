@@ -96,6 +96,10 @@ const CALI_RATIO: [u64; 3] = [267, 1280, 1221];
 struct TimerState {
     counter: u64,
     hi_latched: u32,
+    /// APB-cycle accumulator for the clock divider: the 64-bit counter
+    /// advances once per DIVIDER APB cycles (TRM: timer clock =
+    /// APB_CLK / DIVIDER).
+    div_acc: u64,
 }
 
 pub struct Timg {
@@ -253,11 +257,21 @@ impl Timg {
             return;
         }
         let div = ((cfg & CFG_DIVIDER) >> 13) as u64;
-        let step: u64 = if div == 0 { 1 } else { div };
+        // Clock divider (TRM TIMG clock source): the prescaler counts APB
+        // cycles and the counter advances once per DIVIDER of them.
+        // DIVIDER=0 keeps the old every-cycle behavior. (The previous code
+        // used DIVIDER as the counter STEP, racing 80x too fast and skipping
+        // past alarm values so INT_RAW never latched — the multi_irq
+        // sketch's 100/200-count alarms at divider 80 were never hit.)
+        t.div_acc = t.div_acc.wrapping_add(1);
+        if div != 0 && t.div_acc < div {
+            return;
+        }
+        t.div_acc = 0;
         let mut new = if cfg & CFG_INCREASE != 0 {
-            t.counter.wrapping_add(step)
+            t.counter.wrapping_add(1)
         } else {
-            t.counter.wrapping_sub(step)
+            t.counter.wrapping_sub(1)
         };
         let alarm_lo = regs[((T0ALARMLO + t1_off) / 4) as usize];
         let alarm_hi = regs[((T0ALARMHI + t1_off) / 4) as usize];

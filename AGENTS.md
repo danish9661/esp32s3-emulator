@@ -126,6 +126,34 @@ Core design:
 - Commit-ready, formatted with `cargo fmt`, clippy-clean.
 
 ## Status log (append, newest last)
+  - 2026-09-03: **Browser bundle rebuilt + revalidated (P6 hygiene)**.
+    `web/pkg/` was 13h stale (predating all speed work). Rebuilt via
+    wasm-pack 0.14.0; NOTE the out-dir gotcha: `--out-dir web/pkg` resolves
+    relative to the CRATE dir, so from the workspace root the correct
+    invocation is `wasm-pack build crates/wasm-bridge --target web
+    --out-dir ../../web/pkg` (the old log line drops the `../../` and
+    misplaces output into `crates/wasm-bridge/web/pkg/` — removed).
+    Validated: `node --check` on all JS, API-compat grep (every
+    `emu.*` call in main.js exists in `wasm_bridge.d.ts`), all assets
+    serve 200, plus a functional nodejs-target harness that boots the
+    hello sketch in-wasm to `boot OK` (`NODE BOOT PASS`, 13.1M insns).
+  - 2026-09-03: **TIMG divider bug fixed — multi_irq PASSES (was a real model
+    defect, not timing)**. `timg.rs tick_timer` used DIVIDER as the counter
+    STEP (`counter += div` per tick) instead of dividing the tick rate, so at
+    divider 80 the counter raced 80× too fast and exact-equality alarm match
+    (`new == alarm`) skipped past small alarm values forever — INT_RAW never
+    latched (debug dump: CNT=0xd88682a0 vs ALARM=0x64, RAW=0). Fixed with a
+    `div_acc` prescale accumulator in `TimerState` (counter advances once per
+    DIVIDER ticks; DIVIDER=0 keeps every-tick behavior, so all existing
+    divider-0 tests are unaffected). New unit test
+    `divider_slows_counter_and_hits_small_alarms`. Validated:
+    `esp32s3_multi_irq` → `t0=1006 t1=502 PASS` (was `t0=0 t1=0 FAIL` on
+    baseline too — pre-existing failure, now retired); bonus:
+    `esp32s3_gpio_uart_timer` (previously Core-1 interrupt-WDT panic) now
+    prints `MULTI_PERIPH PASS` with ISR ticks. `timer_alarm`, both WDT
+    sketches, and the full battery still pass (alarm needs 80× more ticks
+    now but timeouts are ms-scale — no sketch is close to its timeout).
+    35/35 green, clippy/fmt/wasm32 clean.
   - 2026-09-03: **Dead ROM-only TB removed (−314 lines, −5MB)**. Audit of
     `machine.rs step()` showed the old TB could never fire: `build_block`
     only cached pcs in `[0x40000400, 0x40001000)`, while the use site

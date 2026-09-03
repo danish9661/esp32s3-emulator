@@ -103,6 +103,25 @@ fn interrupt_block_at_s3_offsets() {
 }
 
 #[test]
+fn divider_slows_counter_and_hits_small_alarms() {
+    let mut t = Timg::new();
+    // EN|INCREASE|ALARM, divider = 80 (multi_irq sketch's prescaler):
+    // the counter advances once per 80 ticks and hits alarm=2 exactly
+    // (the old code stepped by the divider and skipped past it, so RAW
+    // never latched).
+    t.write32(T0CONFIG, 0xC000_0000 | (80 << 13) | 0x400);
+    t.write32(T0ALARMLO, 2);
+    t.tick(79);
+    assert_eq!(t.read32(T0LO), 0, "no count before a full divider window");
+    t.tick(80);
+    assert_eq!(t.read32(T0LO), 1, "one count per 80 ticks");
+    assert_eq!(t.read32(INT_RAW) & INT_T0, 0, "no alarm yet");
+    t.tick(80);
+    assert_eq!(t.read32(T0LO), 2, "alarm value reached");
+    assert_ne!(t.read32(INT_RAW) & INT_T0, 0, "alarm raw latches");
+}
+
+#[test]
 fn timer_load_update_semantics() {
     let mut t = Timg::new();
     t.write32(T0LOADLO, 0xFFFF_FFFB);
