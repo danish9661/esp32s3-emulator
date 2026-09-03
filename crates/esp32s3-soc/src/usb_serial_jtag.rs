@@ -111,7 +111,8 @@ impl UsbSerialJtag {
         }
     }
 
-    /// Bytes queued (debug probe).
+    /// Bytes queued (debug probe). Inline: hot console-drain fast path.
+    #[inline]
     pub fn tx_len(&self) -> usize {
         self.tx_out.len()
     }

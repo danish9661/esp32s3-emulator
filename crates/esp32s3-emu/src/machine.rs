@@ -10,72 +10,10 @@ use esp32s3_soc::Soc;
 use esp32s3_soc::memmap::{
     DRAM_BASE, IRAM_BASE, IROM_BASE, IROM_SIZE, RTC_FAST_DATA_BASE, RTC_FAST_SIZE, SRAM_BYTES,
 };
-use xtensa_core::generated::{Opcode, Opnd, insn_len};
 use xtensa_core::{Bus, Cpu, StepResult};
 
 use crate::rom_stub;
 use crate::rom_stub::HOST_PRINTF;
-
-#[derive(Clone, Copy, Debug)]
-struct DecodedOp {
-    opcode: Opcode,
-    opnds: [Opnd; 8],
-    pc: u32,
-    raw: u32,
-    len: u32,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Block {
-    pc: u32,
-    ops: [Option<DecodedOp>; 16],
-    len: u8,
-}
-
-impl Default for Block {
-    fn default() -> Self {
-        Self {
-            pc: 0,
-            ops: [None; 16],
-            len: 0,
-        }
-    }
-}
-
-fn is_branch(opc: Opcode) -> bool {
-    matches!(
-        opc,
-        Opcode::OPCODE_J
-            | Opcode::OPCODE_CALL0
-            | Opcode::OPCODE_CALL4
-            | Opcode::OPCODE_CALL8
-            | Opcode::OPCODE_CALL12
-            | Opcode::OPCODE_CALLX0
-            | Opcode::OPCODE_CALLX4
-            | Opcode::OPCODE_CALLX8
-            | Opcode::OPCODE_CALLX12
-            | Opcode::OPCODE_RET
-            | Opcode::OPCODE_RETW
-            | Opcode::OPCODE_RET_N
-            | Opcode::OPCODE_RFI
-            | Opcode::OPCODE_RFE
-            | Opcode::OPCODE_LOOP
-            | Opcode::OPCODE_LOOPNEZ
-            | Opcode::OPCODE_LOOPGTZ
-            | Opcode::OPCODE_ENTRY
-            | Opcode::OPCODE_BNE
-            | Opcode::OPCODE_BEQ
-            | Opcode::OPCODE_BLT
-            | Opcode::OPCODE_BLTU
-            | Opcode::OPCODE_BGE
-            | Opcode::OPCODE_BGEU
-            | Opcode::OPCODE_BNEZ
-            | Opcode::OPCODE_BEQZ
-            | Opcode::OPCODE_BNEZ_N
-            | Opcode::OPCODE_BEQZ_N
-            | Opcode::OPCODE_JX
-    )
-}
 
 pub struct Esp32S3 {
     /// Both ESP32-S3 LX7 cores.  Core 1 is gated at reset by the ROM stub
@@ -98,8 +36,6 @@ pub struct Esp32S3 {
     /// Track the last emitted byte so the UART duplicate can be dropped.
     last_console_byte: Option<u8>,
     last_console_was_usb: bool,
-    /// Block cache: pc -> decoded block of up to 16 insns until branch.
-    block_cache: alloc::boxed::Box<[Option<Block>; 4096]>,
     /// Global tick parity for `step_fast`: toggled before every fast-block
     /// op so peripheral time advances once per two ops (the single-step
     /// ratio), shared by both cores' loops within a macro-step.
@@ -116,11 +52,6 @@ impl Esp32S3 {
             sleep_remaining: 0,
             last_console_byte: None,
             last_console_was_usb: false,
-            block_cache: {
-                let mut v = alloc::vec::Vec::with_capacity(4096);
-                v.resize_with(4096, || None);
-                v.into_boxed_slice().try_into().unwrap()
-            },
             fast_tick: false,
         }
     }
@@ -132,75 +63,6 @@ impl Esp32S3 {
     /// ticks and per-core instruction counts identical to the single-core
     /// behavior the machine tests were written against.
     pub fn step(&mut self) -> StepResult {
-        // TB fast path for core0 — cached decode, per-op tick/int
-        let pc = self.cpu[0].pc;
-        let ps = self.cpu[0].sreg(xtensa_core::cpu::SR_PS);
-        if (ps & 0x10) == 0 {
-            let idx = (pc as usize) & 0xFFF;
-            if let Some(block) = &self.block_cache[idx] {
-                if block.pc == pc && self.soc.int_pending(0) == 0 {
-                    // Use TB only for non-test code (keep timer tests precise)
-                    if !(pc >= 0x40000000 && pc < 0x40002000) {
-                        // Bulk tick for the whole block
-                        self.soc.tick_timers(block.len as u64);
-                        if self.soc.consume_reset() {
-                            self.reset();
-                            return StepResult::Ok;
-                        }
-                        if self.asleep {
-                            if self.sleep_remaining == 0 {
-                                self.wake();
-                            } else {
-                                self.sleep_remaining -= 1;
-                            }
-                            return StepResult::Ok;
-                        }
-                        if let Some(ticks) = self.soc.consume_sleep_request() {
-                            self.asleep = true;
-                            self.sleep_remaining = ticks.max(1);
-                            return StepResult::Ok;
-                        }
-                        if self.soc.int_pending(0) != 0 {
-                            // Interrupt became pending due to bulk tick — fall through to single-step
-                        } else {
-                            for i in 0..block.len as usize {
-                                if let Some(op) = &block.ops[i] {
-                                    self.cpu[0].pc = op.pc;
-                                    let res = self.cpu[0].execute_decoded(
-                                        &mut self.soc,
-                                        op.opcode,
-                                        &op.opnds,
-                                        op.len,
-                                    );
-                                    match res {
-                                        StepResult::Ok => {
-                                            if self.cpu[0].pc == op.pc {
-                                                self.cpu[0].pc = op.pc + op.len;
-                                            }
-                                        }
-                                        other => {
-                                            self.cpu[1].step(&mut self.soc);
-                                            return other;
-                                        }
-                                    }
-                                }
-                            }
-                            self.cpu[1].step(&mut self.soc);
-                            let next_pc = self.cpu[0].pc;
-                            let next_idx = (next_pc as usize) & 0xFFF;
-                            if self.block_cache[next_idx].is_none()
-                                || self.block_cache[next_idx].as_ref().unwrap().pc != next_pc
-                            {
-                                if let Some(new_block) = Self::build_block(next_pc, &mut self.soc) {
-                                    self.block_cache[next_idx] = Some(new_block);
-                                }
-                            }
-                            return StepResult::Ok;
-                        }
-                    }
-                }
-            }
-        }
         self.soc.tick_timers(1);
         // A device (e.g. a WDT stage with a reset action) may have requested a
         // hard reset while the timers advanced; reboot before executing more.
@@ -224,16 +86,7 @@ impl Esp32S3 {
             self.sleep_remaining = ticks.max(1);
             return StepResult::Ok;
         }
-        let orig_pc = self.cpu[0].pc;
         let r = self.cpu[0].step(&mut self.soc);
-        // Build and cache a block for the orig_pc for next time (hot loops)
-        let idx = (orig_pc as usize) & 0xFFF;
-        if self.block_cache[idx].is_none() || self.block_cache[idx].as_ref().unwrap().pc != orig_pc
-        {
-            if let Some(block) = Self::build_block(orig_pc, &mut self.soc) {
-                self.block_cache[idx] = Some(block);
-            }
-        }
         if self.soc.rom_boot_mode()
             && !(self.cpu[0].pc >= rom_stub::ROM_BASE && self.cpu[0].pc < rom_stub::ROM_END)
         {
@@ -376,80 +229,6 @@ impl Esp32S3 {
         (StepResult::Ok, n)
     }
 
-    fn build_block(pc: u32, soc: &mut Soc) -> Option<Block> {
-        // Only cache hot boot ROM loop (0x40000400) — keep timer/qsort tests precise
-        if !(pc >= 0x40000400 && pc < 0x40001000) {
-            return None;
-        }
-        use xtensa_core::generated::{
-            decode_inst, decode_inst16a, decode_inst16b, insn_len, opnds,
-        };
-        let mut block = Block {
-            pc,
-            ops: [None; 16],
-            len: 0,
-        };
-        let mut cur_pc = pc;
-        for i in 0..16 {
-            let b0 = soc.read8(cur_pc) as u8;
-            let len = insn_len(b0);
-            if len == 0 || len > 4 {
-                break;
-            }
-            let raw = match len {
-                2 => soc.read16(cur_pc),
-                _ => soc.read32(cur_pc),
-            };
-            let opc = match len {
-                2 => {
-                    if b0 & 0xf <= 11 {
-                        decode_inst16a(raw)
-                    } else {
-                        decode_inst16b(raw)
-                    }
-                }
-                _ => decode_inst(raw),
-            };
-            let opc = match opc {
-                Some(o) => o,
-                None => break,
-            };
-            // Don't cache blocks with windowed calls/returns — they handle
-            // PS.WOE/CALLINC and need precise per-insn window checks
-            if matches!(
-                opc,
-                Opcode::OPCODE_CALL4
-                    | Opcode::OPCODE_CALL8
-                    | Opcode::OPCODE_CALL12
-                    | Opcode::OPCODE_CALLX4
-                    | Opcode::OPCODE_CALLX8
-                    | Opcode::OPCODE_CALLX12
-                    | Opcode::OPCODE_ENTRY
-                    | Opcode::OPCODE_RETW
-                    | Opcode::OPCODE_RETW_N
-            ) {
-                return None;
-            }
-            let opnds = opnds(opc, raw, cur_pc);
-            block.ops[i] = Some(DecodedOp {
-                opcode: opc,
-                opnds,
-                pc: cur_pc,
-                raw,
-                len,
-            });
-            block.len = (i + 1) as u8;
-            if is_branch(opc) {
-                break;
-            }
-            cur_pc = cur_pc.wrapping_add(len);
-            if cur_pc.wrapping_sub(pc) > 64 {
-                break;
-            }
-        }
-        if block.len == 0 { None } else { Some(block) }
-    }
-
     /// Re-run the boot sequence from the last loaded flash image.  Used when a
     /// peripheral (WDT) triggers a system reset.
     pub fn reset(&mut self) {
@@ -459,11 +238,6 @@ impl Esp32S3 {
         self.sleep_remaining = 0;
         self.last_console_byte = None;
         self.last_console_was_usb = false;
-        self.block_cache = {
-            let mut v = alloc::vec::Vec::with_capacity(4096);
-            v.resize_with(4096, || None);
-            v.into_boxed_slice().try_into().unwrap()
-        };
         let f = self.flash.clone();
         self.boot_from_flash(&f);
     }

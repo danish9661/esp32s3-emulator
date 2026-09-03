@@ -36,6 +36,12 @@ pub struct Sdm {
     /// Prescale countdown per channel: advance `phase` every `prescale+1`
     /// ticks.
     sub: [u16; 8],
+    /// Set on any register write. The SoC skips `tick()` while clear: an
+    /// unconfigured modulator's output is only observable by routing its
+    /// matrix signal (93..100) without configuring it first, which no
+    /// in-tree firmware does (the driver always writes duty before the
+    /// pin is routed).
+    touched: bool,
 }
 
 impl Sdm {
@@ -48,9 +54,11 @@ impl Sdm {
             CH_OFF..=0x1C => {
                 // channel[N]: duty[7:0] | prescale[15:8]; reserved[31:16]=0.
                 self.regs[(off / 4) as usize] = val & 0xFFFF;
+                self.touched = true;
             }
             CG_OFF | MISC_OFF | VERSION_OFF => {
                 self.regs[(off / 4) as usize] = val;
+                self.touched = true;
             }
             _ => {}
         }
@@ -95,6 +103,14 @@ impl Sdm {
 
     /// Advance the modulators by one CPU tick (called from `tick_timers` per
     /// cycle).
+    /// True once firmware configured the modulator. The SoC skips `tick()`
+    /// otherwise — an untouched modulator's phases never advance, which is
+    /// unobservable unless its matrix signal is routed without any prior
+    /// configuration write (see `touched`).
+    pub fn is_active(&self) -> bool {
+        self.touched
+    }
+
     pub fn tick(&mut self) {
         for ch in 0..8 {
             let p = self.prescale(ch);

@@ -126,6 +126,29 @@ Core design:
 - Commit-ready, formatted with `cargo fmt`, clippy-clean.
 
 ## Status log (append, newest last)
+  - 2026-09-03: **Dead ROM-only TB removed (−314 lines, −5MB)**. Audit of
+    `machine.rs step()` showed the old TB could never fire: `build_block`
+    only cached pcs in `[0x40000400, 0x40001000)`, while the use site
+    excluded `[0x40000000, 0x40002000)` — empty intersection — yet every
+    step paid a cache lookup plus a ROM-range block-build attempt.
+    Removed `Block`/`DecodedOp`/`is_branch`/`build_block`/`block_cache`,
+    plus the now-unused `Cpu::execute_decoded` and cpu `is_branch`
+    (workspace is warning-free). `step()` is pure single-step;
+    `step_fast` is the only block path. 35/35 green, sketches identical.
+  - 2026-09-03: **Follow-up +7% (28.4 → 30.4M insns/s); measurement rigor**.
+    `#[inline]` on the console-drain path (`tx_len` ×2, `uart/usb_tx_
+    pending`), SDM tick gated on a new `touched` flag (safe: an unconfigured
+    modulator is only observable via matrix routing without any prior write,
+    which no in-tree firmware does), fast table 4096 → 2048 entries
+    (indistinguishable speed, half memory). Interleaved A/B vs true
+    pre-block baseline (separate worktree at c342527, pinned P-cores):
+    **1.8× throughput, stable across pairs** — absolute MIPS floats several
+    × with machine contention/turbo (shared box: 8.7 vs 2.0 baselines seen
+    for identical code), so ratios from back-to-back runs are the honest
+    metric. REJECTED after measurement: interrupt-scan dirty flags (~7% of
+    runtime — not worth the audit risk), LEDC gating (gate costs as much as
+    its tick), reduced tick rates (would change global emulated timing).
+    35/35 green, sketches byte-identical, clippy/fmt clean.
   - 2026-09-03: **Block-at-a-time execution lands: 17.4 → 30.4M insns/s
     (+75%), i.e. 8.7 → 15.2 in legacy step units — the 15 MIPS goal**.
     Firmware boots in 3.2s wall (was 5.5s), fully deterministic across runs.

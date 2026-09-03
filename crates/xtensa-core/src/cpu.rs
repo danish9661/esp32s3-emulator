@@ -18,60 +18,7 @@
 
 use crate::bus::Bus;
 use crate::exec::{self, Outcome};
-use crate::generated::{
-    Opcode, Opnd, decode_inst, decode_inst16a, decode_inst16b, insn_len, opnds,
-};
-
-impl Cpu {
-    /// Execute a pre-decoded op (for block cache). Like `step` but without fetch/decode/tick/int.
-    pub fn execute_decoded<B: Bus>(
-        &mut self,
-        bus: &mut B,
-        opc: Opcode,
-        opnds: &[Opnd; 8],
-        len: u32,
-    ) -> StepResult {
-        // Window overflow check (same as step)
-        let mut wmask = 0u32;
-        for op in opnds.iter() {
-            if op.is_reg {
-                wmask |= 1u32 << (op.value & 31);
-            }
-        }
-        if wmask != 0 && self.sregs[SR_PS as usize] & (PS_WOE | PS_EXCM) == PS_WOE {
-            let r = 31 - wmask.leading_zeros();
-            if r / 4 > self.window() {
-                let cause = self.window_overflow(self.pc);
-                return StepResult::Exception { cause };
-            }
-        }
-        let pc = self.pc;
-        match exec::execute(self, bus, opc, opnds, len) {
-            Outcome::Seq => {
-                let next_pc = pc.wrapping_add(len);
-                if next_pc == self.sregs[SR_LEND as usize] && self.sregs[SR_LCOUNT as usize] != 0 {
-                    self.sregs[SR_LCOUNT as usize] -= 1;
-                    self.pc = self.sregs[SR_LBEG as usize];
-                } else {
-                    self.pc = next_pc;
-                }
-            }
-            Outcome::Jump(t) => {
-                self.pc = t;
-            }
-            Outcome::Exception(cause) => {
-                return StepResult::Exception { cause };
-            }
-            Outcome::Unimplemented => {
-                return StepResult::Unimplemented("opcode");
-            }
-        }
-        self.sync_windowbase();
-        self.icount += 1;
-        // Note: no check_interrupts here — caller handles bulk tick/int
-        StepResult::Ok
-    }
-}
+use crate::generated::{Opcode, decode_inst, decode_inst16a, decode_inst16b, insn_len, opnds};
 
 /// One decode-cache entry: fetch key (`pc`, `raw`) plus the decoded
 /// `opcode`, its operands, instruction length, and the precomputed
@@ -84,40 +31,6 @@ type DecodeEntry = (
     u32,
     u32,
 );
-
-fn is_branch(opc: Opcode) -> bool {
-    matches!(
-        opc,
-        Opcode::OPCODE_J
-            | Opcode::OPCODE_CALL0
-            | Opcode::OPCODE_CALL4
-            | Opcode::OPCODE_CALL8
-            | Opcode::OPCODE_CALL12
-            | Opcode::OPCODE_CALLX0
-            | Opcode::OPCODE_CALLX4
-            | Opcode::OPCODE_CALLX8
-            | Opcode::OPCODE_CALLX12
-            | Opcode::OPCODE_RET
-            | Opcode::OPCODE_RETW
-            | Opcode::OPCODE_RET_N
-            | Opcode::OPCODE_RFI
-            | Opcode::OPCODE_RFE
-            | Opcode::OPCODE_LOOP
-            | Opcode::OPCODE_LOOPNEZ
-            | Opcode::OPCODE_LOOPGTZ
-            | Opcode::OPCODE_BNE
-            | Opcode::OPCODE_BEQ
-            | Opcode::OPCODE_BLT
-            | Opcode::OPCODE_BLTU
-            | Opcode::OPCODE_BGE
-            | Opcode::OPCODE_BGEU
-            | Opcode::OPCODE_BNEZ
-            | Opcode::OPCODE_BEQZ
-            | Opcode::OPCODE_BNEZ_N
-            | Opcode::OPCODE_BEQZ_N
-            | Opcode::OPCODE_JX
-    )
-}
 
 // Special register numbers (QEMU cpu.h "SR enum").  ESP32-S3 has no NDEPC,
 // so double exceptions reuse EPC1.

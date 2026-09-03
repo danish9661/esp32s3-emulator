@@ -89,11 +89,12 @@ macro_rules! in_range {
 // SRAM window size used in range checks (kept in sync with DRAM_SIZE).
 const SRAM_BASE_RANGE: u32 = DRAM_SIZE;
 
-// Block-boundary cache geometry (see `Soc::fast_tag`): 4096 entries per
-// core, indexed by `(pc >> 1) & mask`. Only flow lengths are cached, so the
-// table is 20 KB total — the decoded ops themselves stay in the Cpu decode
-// cache, which revalidates `raw` on every op.
-const FAST_CACHE_SIZE: usize = 4096;
+// Block-boundary cache geometry (see `Soc::fast_tag`): 2048 entries per
+// core, indexed by `(pc >> 1) & mask` (10 KB per core — L1-resident; no
+// measurable difference vs 4096 on hello-boot, so the smaller table wins).
+// Only flow lengths are cached — the decoded ops themselves stay in the Cpu
+// decode cache, which revalidates `raw` on every op.
+const FAST_CACHE_SIZE: usize = 2048;
 const FAST_TAG_INVALID: u32 = 0xFFFF_FFFF;
 const FAST_MAX_OPS: u8 = 16;
 
@@ -489,11 +490,13 @@ impl Soc {
 
     /// True when UART `n` has undrained console bytes. Cheap field read for
     /// the host console fast path (avoids Vec handoffs when idle).
+    #[inline]
     pub fn uart_tx_pending(&self, n: usize) -> bool {
         self.uarts[n].tx_len() != 0
     }
 
     /// True when the USB-Serial-JTAG controller has undrained TX bytes.
+    #[inline]
     pub fn usb_tx_pending(&self) -> bool {
         self.usb.tx_len() != 0
     }
@@ -782,7 +785,9 @@ impl Soc {
             if self.mcpwm.is_active() {
                 self.mcpwm.tick();
             }
-            self.sdm.tick();
+            if self.sdm.is_active() {
+                self.sdm.tick();
+            }
             if self.lcd_cam.is_active() {
                 self.lcd_cam.tick();
             }
