@@ -126,6 +126,30 @@ Core design:
 - Commit-ready, formatted with `cargo fmt`, clippy-clean.
 
 ## Status log (append, newest last)
+  - 2026-09-03: **Clock-tree assessed: no remodel (documented
+    approximation)**. Follow-up to the TIMG fix: `multi_irq` counts
+    `t0=1006` where silicon-nominal is ~5000, so the time bases were
+    audited with a temporary probe (since removed): across `delay(500)`,
+    global-ticks ≈ systimer-delta ≈ 8.0M while TIMG advanced 1006×100
+    counts — i.e. the model clock is coherent (firmware self-consistent;
+    1007 alarm matches → 1006 ISR counts, no re-fire) but runs systimer
+    and APB domains 1:1 where silicon is ~16:1 (SYSTIMER 16MHz vs APB
+    80MHz). A full remodel (systimer ÷5..÷16, APB ÷3 for a 240MHz CPU)
+    would make delay-heavy boots ~5× longer in host time and churn every
+    step budget/timeout for zero firmware-observable gain: no firmware
+    can read wall time, CCOUNT stays instruction-exact, WDT/UART/RMT
+    margins are huge, and the only cross-domain assert (this sketch)
+    passes with 100× margin. So the model clock stays: 1 global tick per
+    2 instructions for all domains, peripheral dividers below that. The
+    TIMG divider fix itself was still required (it broke match equality
+    entirely, a functional defect — unlike this ratio).
+  - 2026-09-03: **Browser speed measured: ~20-23M insns/s in headless
+    Chrome** (hello sketch to `boot OK`, 13.1M insns; temporary bench page
+    since removed). Node/V8 reference: 21.3M. So the wasm penalty vs native
+    (~30M) is only ~1.3-1.5× — batch size (40k vs 250k/frame) barely matters,
+    i.e. JS↔wasm call overhead is negligible. Caveats: headless (no DOM
+    paint costs), no PGO in wasm builds (native-only), absolutes float with
+    box load; Firefox unmeasured.
   - 2026-09-03: **PGO adopted (+45%, native only)**. `tools/pgo.sh` trains an
     LLVM profile over hello+periph boots and rebuilds
     (`-Cprofile-generate` → `llvm-profdata merge` → `-Cprofile-use`).
