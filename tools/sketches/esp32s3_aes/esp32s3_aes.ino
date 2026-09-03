@@ -60,6 +60,46 @@ void setup() {
     got[128] = 0;
     Serial.println(strcmp(got, want) == 0 ? "AES CBC PASS" : "AES CBC FAIL");
   }
+
+  // AES-128-XTS via the real driver (2 blocks, zero tweak). The esp-idf XTS
+  // path is software over the HW block cipher (no XTS block mode in the
+  // peripheral: esp_aes_crypt_xts calls esp_aes_crypt_ecb per block and
+  // advances the tweak with esp_gf128mul_x_ble, the byte-reversed-α variant
+  // — hence block 1 differs from the BE-α textbook value), so this exercises
+  // the ECB block path with tweak chaining.
+  {
+    const uint8_t key[32] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                             0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+                             0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                             0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f};
+    const uint8_t pt[32] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                            0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+                            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+                            0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00};
+    const uint8_t tweak[16] = {0};
+    uint8_t ct[32];
+    mbedtls_aes_xts_context xctx;
+    mbedtls_aes_xts_init(&xctx);
+    int rc = mbedtls_aes_xts_setkey_enc(&xctx, key, 256);
+    if (rc == 0) {
+      rc = mbedtls_aes_crypt_xts(&xctx, MBEDTLS_AES_ENCRYPT, 32, tweak, pt, ct);
+    }
+    mbedtls_aes_xts_free(&xctx);
+    for (int i = 0; i < 32; i++) {
+      Serial.printf("%02x", ct[i]);
+    }
+    Serial.println();
+    static const char* want =
+        "171c69724dcf733f9aa6317d795153e4"
+        "0f46d50a7bad5aa2a36c3a14bb4617d5";
+    char got[65];
+    for (int i = 0; i < 32; i++) {
+      sprintf(got + 2 * i, "%02x", ct[i]);
+    }
+    got[64] = 0;
+    Serial.println(
+        (rc == 0 && strcmp(got, want) == 0) ? "AES XTS PASS" : "AES XTS FAIL");
+  }
 }
 
 void loop() {}
