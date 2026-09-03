@@ -10,10 +10,14 @@
 // pass with a smaller comparator exercises a different duty.
 
 #define MCPWM 0x6001E000u
+#define MCPWM1 0x6002C000u
 #define GPIO  0x60004000u
 
 static volatile uint32_t* M(uint32_t off) {
   return (volatile uint32_t*)(MCPWM + off);
+}
+static volatile uint32_t* M1(uint32_t off) {
+  return (volatile uint32_t*)(MCPWM1 + off);
 }
 static volatile uint32_t* G(uint32_t off) {
   return (volatile uint32_t*)(GPIO + off);
@@ -54,7 +58,22 @@ void setup() {
   int duty2 = measure_duty(PIN, 4000);
   Serial.printf("MCPWM duty2=%d%%\n", duty2);
 
-  if (duty1 >= 40 && duty1 <= 60 && duty2 >= 15 && duty2 <= 35) {
+  // Pass 3: MCPWM group 1 (base 0x6002C000), same layout: route
+  // PWM1_OUT0A (signal 166) to GPIO3, timer0 up period 100, utez=set,
+  // utea=clear, comparator A = 50 -> ~50% duty.
+  const int PIN1 = 3;
+  *G(0x554 + PIN1 * 4) = 166;
+  *G(0x24) = (1u << PIN1);
+  *M1(0x04) = (100u << 8);
+  *M1(0x08) = (1u << 3) | 2;
+  *M1(0x38) = 0;
+  *M1(0x50) = (2u << 4) | 1;
+  *M1(0x40) = 50;
+  int duty3 = measure_duty(PIN1, 4000);
+  Serial.printf("MCPWM1 duty3=%d%%\n", duty3);
+
+  if (duty1 >= 40 && duty1 <= 60 && duty2 >= 15 && duty2 <= 35
+      && duty3 >= 40 && duty3 <= 60) {
     Serial.println("MCPWM PASS");
   } else {
     Serial.println("MCPWM FAIL");

@@ -22,9 +22,9 @@ use crate::bignum::*;
 /// ECDSA register-block base (`DR_REG_ECDSA_BASE`).
 pub const ECDSA_BASE: u32 = 0x6008_E000;
 
-/// ECDSA interrupt source for the interrupt matrix (esp32s3 interrupts.h
-/// `ETS_ECDSA_INTR_SOURCE` = 97).
-pub const ECDSA_INTR_SOURCE: u32 = 97;
+/// NOTE: the S3 interrupt table has NO ECDSA source (unlike RSA=76) —
+/// ECDSA completion is polled via RESULT, like HMAC/DS. There is no matrix
+/// wiring for this device by design.
 
 /// Max operand size: 256-bit = 8 words (P-192 uses the low 6 words).
 const NW: usize = 8;

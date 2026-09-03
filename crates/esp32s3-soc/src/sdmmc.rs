@@ -46,6 +46,9 @@ use alloc::vec::Vec;
 
 pub const SDMMC_BASE: u32 = 0x6002_8000;
 
+/// SDIO-host interrupt source for the matrix (ETS_SDIO_HOST_INTR_SOURCE).
+pub const SDMMC_INTR_SOURCE: u32 = 30;
+
 // Register offsets (DesignWare MMC).
 pub const CTRL: u32 = 0x00;
 pub const PWREN: u32 = 0x04;
@@ -400,6 +403,13 @@ impl Sdmmc {
     pub fn finish_idmac(&mut self) {
         self.regs[self.idx(IDMAC_RINTSTS)] |= IDMAC_TI;
         self.regs[self.idx(RINTSTS)] |= INT_DATA_OVER;
+    }
+
+    /// Interrupt status for the matrix: the masked view (MINTSTS reads the
+    /// same RINTSTS word; no separate enable mask is modeled, and status
+    /// is write-1-to-clear like silicon).
+    pub fn int_st(&self) -> u32 {
+        self.regs[self.idx(RINTSTS)]
     }
 
     pub fn read32(&mut self, offset: u32) -> u32 {

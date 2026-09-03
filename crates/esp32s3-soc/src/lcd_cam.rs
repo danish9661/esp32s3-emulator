@@ -21,6 +21,9 @@
 
 pub const LCD_CAM_BASE: u32 = 0x6004_1000;
 
+/// LCD_CAM interrupt source for the matrix (ETS_LCD_CAM_INTR_SOURCE = 24).
+pub const LCD_CAM_INTR_SOURCE: u32 = 24;
+
 // LCD_CAM GPIO-matrix signal indices (gpio_sig_map.h).
 const SIG_LCD_CS: u32 = 132;
 const SIG_DATA0: u32 = 133; // .. SIG_DATA15 = 148
@@ -194,6 +197,11 @@ impl LcdCam {
                 self.int_raw |= LCD_TRANS_DONE;
             }
         }
+    }
+
+    /// Interrupt status = RAW & ENA (LC_DMA_INT_ST).
+    pub fn int_st(&self) -> u32 {
+        self.int_raw & self.int_ena
     }
 
     /// Current level (0/1) of an LCD_CAM GPIO-matrix signal index.

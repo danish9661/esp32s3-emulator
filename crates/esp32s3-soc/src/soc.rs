@@ -31,7 +31,7 @@ use crate::intc::Intc;
 use crate::lcd_cam::LcdCam;
 use crate::ledc::Lcdc;
 use crate::lp_uart::LpUart;
-use crate::mcpwm::{MCPWM_BASE, Mcpwm};
+use crate::mcpwm::{MCPWM_BASE, MCPWM1_BASE, Mcpwm};
 use crate::memmap::*;
 use crate::memspi::Memspi;
 use crate::pcnt::{PCNT_BASE, Pcnt};
@@ -195,6 +195,8 @@ pub struct Soc {
     gpio: Gpio,
     ledc: Lcdc,
     mcpwm: Mcpwm,
+    /// MCPWM group 1: independent copy of the group-0 block.
+    mcpwm1: Mcpwm,
     lp_uart: LpUart,
     spi: [Spi; 2],
     /// SPI1 (0x60002000) + SPIMEM0 (0x60003000) flash controllers, sharing
@@ -337,6 +339,7 @@ impl Soc {
             gpio: Gpio::new(),
             ledc: Lcdc::new(),
             mcpwm: Mcpwm::new(),
+            mcpwm1: Mcpwm::new(),
             lp_uart: LpUart::new(),
             spi: [Spi::new(0), Spi::new(1)],
             memspi: [Memspi::new(), Memspi::new()],
@@ -782,8 +785,29 @@ impl Soc {
             if self.rmt.is_active() {
                 self.rmt.tick();
             }
+            // RMT RX sampling: skipped unless a capture is armed/running.
+            // Input levels resolve through the GPIO-matrix input routing
+            // against the pad readback (so TX-driven pads loop back);
+            // unrouted inputs read pull-up high. Pins 32+ are out of the
+            // u32 readback word and also read high (same limit as the GPIO
+            // edge sampler).
+            if self.rmt.rx_pending() {
+                let rb = self.gpio_in_readback();
+                let rmt_rx = |sig: u32| -> u32 {
+                    match self.gpio.in_sel(sig) {
+                        // Pins 32+ are out of the u32 readback word and read
+                        // high (same limit as the GPIO edge sampler).
+                        Some((pin, inv)) if pin < 32 => ((rb >> pin) & 1) ^ (inv as u32),
+                        _ => 1,
+                    }
+                };
+                self.rmt.tick_rx(&rmt_rx);
+            }
             if self.mcpwm.is_active() {
                 self.mcpwm.tick();
+            }
+            if self.mcpwm1.is_active() {
+                self.mcpwm1.tick();
             }
             if self.sdm.is_active() {
                 self.sdm.tick();
@@ -796,6 +820,13 @@ impl Soc {
             }
             if self.i2s[1].is_active() {
                 self.i2s[1].tick();
+            }
+            // GPIO edge/level sampling: skipped unless a pin interrupt is
+            // armed (the common case). Levels come from the pad readback so
+            // peripheral-driven pins (RMT/MCPWM/LEDC...) also fire edges.
+            if self.gpio.irq_armed() {
+                let lv = self.gpio_in_readback();
+                self.gpio.poll_interrupts(lv);
             }
             // PCNT samples its unit/channel signal inputs via the GPIO-matrix
             // input routing (FUNC_IN_SEL_CFG); resolve each signal index to the
@@ -938,6 +969,11 @@ impl Soc {
         } else if (160..=165).contains(&sig) {
             // MCPWM0 operator 0..2 output A/B (PWM0_OUT0A..OUT2B_IDX).
             self.mcpwm.signal_level(sig)
+        } else if (166..=171).contains(&sig) {
+            // MCPWM1 operator 0..2 output A/B (PWM1_OUT0A..OUT2B_IDX).
+            // (Indices overlap MCPWM0's CAPx/SYNCx *input* signals, which
+            // live in the separate input-routing table.)
+            self.mcpwm1.signal_level(sig - 6)
         } else if (93..=100).contains(&sig) {
             // Sigma-Delta channels 0..7 (GPIO_SD0..7_OUT_IDX).
             self.sdm.signal_level(sig)
@@ -1292,6 +1328,14 @@ impl Soc {
                     0
                 } else {
                     self.mcpwm.read32(off)
+                }
+            }
+            MCPWM1_BASE => {
+                if is_write {
+                    self.mcpwm1.write32(off, value);
+                    0
+                } else {
+                    self.mcpwm1.read32(off)
                 }
             }
             // Page 0x6000_8000 holds RTC_CNTL (0x000), RTC_IO (0x400),
@@ -1832,6 +1876,10 @@ impl Soc {
                 src |= 1 << (27 + i);
             }
         }
+        // GPIO edge/level interrupt (ETS_GPIO_INTR_SOURCE = 16).
+        if self.gpio.int_pending() {
+            src |= 1 << crate::gpio::GPIO_INTR_SOURCE;
+        }
         for (g, t) in self.timg.iter().enumerate() {
             let st = t.int_st();
             let base = 50 + g * 3;
@@ -1867,11 +1915,17 @@ impl Soc {
         if self.pcnt.int_st() != 0 {
             src |= 1 << crate::pcnt::PCNT_INTR_SOURCE;
         }
-        if self.gdma.int_pending() {
-            src |= 1 << crate::gdma::GDMA_INTR_SOURCE;
-        }
-        if self.crypto_dma.int_pending() {
-            src |= 1 << crate::gdma::GDMA_INTR_SOURCE;
+        // GDMA channels have per-channel sources (ETS_DMA_IN_CH0..4 =
+        // 66..70, ETS_DMA_OUT_CH0..4 = 71..75). The crypto/shared DMA
+        // instance is unwired: its consumers (AES/SHA drivers) poll, and no
+        // distinct source exists for it.
+        for ch in 0..crate::gdma::NCH {
+            if self.gdma.in_int_st(ch) != 0 {
+                src |= 1 << (crate::gdma::GDMA_IN_INTR_BASE + ch as u32);
+            }
+            if self.gdma.out_int_st(ch) != 0 {
+                src |= 1 << (crate::gdma::GDMA_OUT_INTR_BASE + ch as u32);
+            }
         }
         if self.aes.int_pending() {
             src |= 1 << 77;
@@ -1882,11 +1936,28 @@ impl Soc {
         if self.mcpwm.int_pending() {
             src |= 1 << crate::mcpwm::MCPWM_INTR_SOURCE;
         }
+        if self.mcpwm1.int_pending() {
+            src |= 1 << crate::mcpwm::MCPWM1_INTR_SOURCE;
+        }
         if self.rsa.int_pending() {
             src |= 1 << crate::rsa::RSA_INTR_SOURCE;
         }
-        if self.ecdsa.int_pending() {
-            src |= 1 << crate::ecdsa::ECDSA_INTR_SOURCE;
+        // NOTE: ECDSA has no matrix source on the S3 (polled via RESULT,
+        // like HMAC/DS) — deliberately unwired.
+        if self.lcd_cam.int_st() != 0 {
+            src |= 1 << crate::lcd_cam::LCD_CAM_INTR_SOURCE;
+        }
+        if self.i2s[0].int_st() != 0 {
+            src |= 1 << crate::i2s::I2S0_INTR_SOURCE;
+        }
+        if self.i2s[1].int_st() != 0 {
+            src |= 1 << crate::i2s::I2S1_INTR_SOURCE;
+        }
+        if self.sdmmc.int_st() != 0 {
+            src |= 1 << crate::sdmmc::SDMMC_INTR_SOURCE;
+        }
+        if self.ledc.int_st() != 0 {
+            src |= 1 << crate::ledc::LEDC_INTR_SOURCE;
         }
         if self.usb.int_pending() {
             src |= 1 << USB_SERIAL_JTAG_INTR_SOURCE;

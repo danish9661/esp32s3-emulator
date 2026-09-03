@@ -2578,3 +2578,184 @@ fn ee_extension_traps_unimplemented() {
     );
     assert!(n >= 1, "trap counts the attempted op");
 }
+
+/// RMT waveform edge fires a GPIO interrupt through the full chain: RMT TX
+/// channel 0 drives GPIO2 (matrix signal 81), GPIO2's PIN interrupt
+/// (RISING, enabled) latches STATUS, source 16 (ETS_GPIO_INTR_SOURCE) routes
+/// to CPU line 15, and the level-3 handler counts and clears via STATUS_W1TC.
+#[test]
+fn gpio_rmt_edge_fires_gpio_isr() {
+    use crate::asm::Asm;
+    use esp32s3_soc::memmap::{GPIO_BASE, INT_MATRIX_BASE, IRAM_BASE};
+    use esp32s3_soc::rmt::{RMT_BASE, RMTMEM_BASE};
+
+    const CTR: u32 = 0x3FC8_0300;
+    const STASH: u32 = 0x3FC8_0304;
+    let mut a = Asm::new(IRAM_BASE);
+    let l_ctr = a.offset();
+    a.lit(0);
+    let l_stash = a.offset();
+    a.lit(0);
+    let l_mat = a.offset();
+    a.lit(0);
+    let l_gpio = a.offset();
+    a.lit(0);
+    let l_gfunc = a.offset();
+    a.lit(0);
+    let l_pin2 = a.offset();
+    a.lit(0);
+    let l_rmt = a.offset();
+    a.lit(0);
+    let l_rmtmem = a.offset();
+    a.lit(0);
+    let code_start = a.pc();
+    // GPIO2 <- RMT TX signal 81, output enabled.
+    let p = a.l32r(5);
+    a.patch_l32r(p, IRAM_BASE + l_gfunc as u32);
+    a.movi_n(4, 81);
+    a.s32i(4, 5, 0); // FUNC_OUT_SEL_CFG[2] = 81
+    let p = a.l32r(3);
+    a.patch_l32r(p, IRAM_BASE + l_gpio as u32);
+    a.movi_n(4, 1 << 2);
+    a.s32i(4, 3, 0x24); // GPIO_ENABLE_W1TS bit 2
+    // RMT items: HIGH 2000 / LOW 2000, HIGH 1000 / LOW 1000. Pulses are
+    // deliberately long: the RMT FSM advances 32 duration units per step,
+    // so sub-100-unit pulses would alias past the per-step GPIO sampler.
+    let p = a.l32r(5);
+    a.patch_l32r(p, IRAM_BASE + l_rmtmem as u32);
+    a.li(4, (2000 | (1 << 15) | (2000 << 16)) as i32);
+    a.s32i(4, 5, 0);
+    a.li(4, (1000 | (1 << 15) | (1000 << 16)) as i32);
+    a.s32i(4, 5, 4);
+    let p = a.l32r(5);
+    a.patch_l32r(p, IRAM_BASE + l_rmt as u32);
+    a.movi_n(4, (1 << 0) | (1 << 6));
+    a.s32i(4, 5, 0x20); // chnconf0: tx_start | idle_out_en
+    // GPIO2 PIN interrupt: RISING + enable bit 0.
+    let p = a.l32r(5);
+    a.patch_l32r(p, IRAM_BASE + l_pin2 as u32);
+    a.li(4, ((1 << 7) | (1 << 13)) as i32);
+    a.s32i(4, 5, 0);
+    // Matrix: source 16 (GPIO) -> CPU line 15; INTENABLE; rsil 0.
+    let p = a.l32r(2);
+    a.patch_l32r(p, IRAM_BASE + l_mat as u32);
+    a.movi_n(3, 15);
+    a.s32i(3, 2, 4 * 16);
+    a.li(3, 0x8000);
+    a.wsr(228, 3);
+    a.rsil(4, 0);
+    // Spin until the handler has counted 2 edges, then stash 0xCAFE.
+    let loop_start = a.pc();
+    let p = a.l32r(2);
+    a.patch_l32r(p, IRAM_BASE + l_ctr as u32);
+    a.l32i(3, 2, 0);
+    a.addi(4, 3, -2);
+    a.bnez(4, loop_start);
+    a.li(4, 0xCAFE);
+    let p = a.l32r(5);
+    a.patch_l32r(p, IRAM_BASE + l_stash as u32);
+    a.s32i(4, 5, 0);
+    let done = a.pc();
+    a.j(done);
+    // Patch literals.
+    a.bytes_mut()[l_ctr..l_ctr + 4].copy_from_slice(&CTR.to_le_bytes());
+    a.bytes_mut()[l_stash..l_stash + 4].copy_from_slice(&STASH.to_le_bytes());
+    a.bytes_mut()[l_mat..l_mat + 4].copy_from_slice(&INT_MATRIX_BASE.to_le_bytes());
+    a.bytes_mut()[l_gpio..l_gpio + 4].copy_from_slice(&GPIO_BASE.to_le_bytes());
+    a.bytes_mut()[l_gfunc..l_gfunc + 4].copy_from_slice(&(GPIO_BASE + 0x55C).to_le_bytes());
+    a.bytes_mut()[l_pin2..l_pin2 + 4].copy_from_slice(&(GPIO_BASE + 0x7C).to_le_bytes());
+    a.bytes_mut()[l_rmt..l_rmt + 4].copy_from_slice(&RMT_BASE.to_le_bytes());
+    a.bytes_mut()[l_rmtmem..l_rmtmem + 4].copy_from_slice(&RMTMEM_BASE.to_le_bytes());
+
+    // Level-3 handler at VECBASE + 0x1C0: CTR += 1, clear GPIO STATUS bit 2.
+    let mut h = Asm::new(0x4000_01C0);
+    h.li(6, CTR as i32);
+    h.l32i(7, 6, 0);
+    h.addi(7, 7, 1);
+    h.s32i(7, 6, 0); // CTR += 1
+    h.li(8, GPIO_BASE as i32);
+    h.movi_n(9, 1 << 2);
+    h.s32i(9, 8, 0x4C); // GPIO_STATUS_W1TC bit 2
+    h.rfi(3);
+    assert!(
+        h.bytes().len() <= 0x40,
+        "handler fits the 64-byte vector slot"
+    );
+
+    let mut m = Esp32S3::new();
+    m.load_image(IRAM_BASE, a.bytes());
+    m.load_image(0x4000_01C0, h.bytes());
+    m.cpu[0].pc = code_start;
+    for _ in 0..60000 {
+        if m.cpu[0].pc == done {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.cpu[0].pc, done, "app finished its loop");
+    assert_eq!(m.soc.read32(STASH), 0xCAFE, "stash after 2 GPIO interrupts");
+    assert_eq!(m.soc.read32(CTR), 2, "GPIO handler ran twice");
+    assert_eq!(m.soc.read32(INT_MATRIX_BASE + 4 * 16), 15, "matrix write");
+}
+
+/// RMT TX loopback into RMT RX through a GPIO pad: TX channel 0 drives
+/// GPIO2 (matrix signal 81) while RX channel 4 samples matrix input 81
+/// (routed from the same pad). The received items must match the
+/// transmitted waveform (within the 32-tick sample quantum) and the rx_end
+/// interrupt must latch.
+#[test]
+fn rmt_tx_loopback_into_rx_channel() {
+    use esp32s3_soc::gpio::GPIO_FUNC_IN_SEL_0;
+    use esp32s3_soc::memmap::GPIO_BASE;
+    use esp32s3_soc::rmt::{RMT_BASE, RMTMEM_BASE};
+
+    let mut m = Esp32S3::new();
+    // GPIO2 <- RMT TX ch0 (signal 81), output enabled.
+    m.soc.write32(GPIO_BASE + 0x554 + 2 * 4, 81);
+    m.soc.write32(GPIO_BASE + 0x20, 1 << 2);
+    // RMT RX input 81 <- GPIO2 pad.
+    m.soc.write32(GPIO_BASE + GPIO_FUNC_IN_SEL_0 + 81 * 4, 2);
+    // TX items: HIGH 100 / LOW 100, HIGH 50 / LOW 50.
+    m.soc.write32(RMTMEM_BASE, 100 | (1u32 << 15) | (100 << 16));
+    m.soc
+        .write32(RMTMEM_BASE + 4, 50 | (1u32 << 15) | (50 << 16));
+    // Enable RX channel 4 first (samples the idle-low pad as baseline).
+    m.soc.write32(RMT_BASE + 0x34, 1); // chmconf1[0]: rx_en
+    // Let the receiver baseline a few steps on the idle pad before the
+    // transmitter starts (back-to-back setup would race TX's synchronous
+    // first-pulse level into the baseline, as on silicon).
+    for _ in 0..5 {
+        m.step();
+    }
+    // Start TX (default idle_thres/mem_size/rx_lim on the RX side).
+    m.soc.write32(RMT_BASE + 0x20, (1 << 0) | (1 << 6));
+    for _ in 0..4000 {
+        m.step();
+        if m.soc.read32(RMT_BASE + 0x70) & (1 << 16) != 0 {
+            break;
+        }
+    }
+    assert_ne!(
+        m.soc.read32(RMT_BASE + 0x70) & (1 << 16),
+        0,
+        "rx_end latched after the looped-back transmission"
+    );
+    // Received block (HW ch 4 @ RMTMEM + 0x400): first item holds the
+    // baseline-LOW remnant + the transmitted HIGH-100; levels exact,
+    // widths within two sample quanta.
+    let r0 = m.soc.read32(RMTMEM_BASE + 0x400);
+    assert_eq!((r0 >> 15) & 1, 0, "item0 first half low (baseline)");
+    assert_eq!((r0 >> 31) & 1, 1, "item0 second half high (TX pulse)");
+    assert!((r0 & 0x7FFF) <= 256, "baseline remnant is short");
+    let high = (r0 >> 16) & 0x7FFF;
+    assert!(
+        (36..=200).contains(&high),
+        "captured HIGH duration, got {high}"
+    );
+    let r1 = m.soc.read32(RMTMEM_BASE + 0x404);
+    assert_eq!((r1 >> 15) & 1, 0, "item1 first half low");
+    assert_eq!((r1 >> 31) & 1, 1, "item1 second half high");
+    // INT_CLR clears the RX end flag.
+    m.soc.write32(RMT_BASE + 0x7C, 1 << 16);
+    assert_eq!(m.soc.read32(RMT_BASE + 0x70) & (1 << 16), 0);
+}

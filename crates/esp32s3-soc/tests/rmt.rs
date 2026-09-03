@@ -60,3 +60,91 @@ fn signal_outside_tx_range_is_zero() {
     assert_eq!(r.signal_level(RMT_TX_SIGNAL_BASE - 1), 0);
     assert_eq!(r.signal_level(RMT_TX_SIGNAL_BASE + 4), 0);
 }
+
+// chmconf1[0] @ 0x34 (rx_en = bit 0), chmconf0[0] @ 0x30 (idle_thres [22:8]).
+const CHMCONF1_0: u32 = 0x34;
+const CHMCONF0_0: u32 = 0x30;
+const RX_MEM0: u32 = 0xC00; // RMTMEM block of HW channel 4
+const RX_END_BIT: u32 = 1 << 16;
+const RX_EN: u32 = 1;
+
+use std::cell::Cell;
+
+/// Scripted pad level: `levels[n]` for sample n (then holds the last).
+fn scripted(levels: &[u32]) -> (impl Fn(u32) -> u32 + '_) {
+    let n = Cell::new(0usize);
+    move |_| {
+        let i = n.get().min(levels.len() - 1);
+        n.set(n.get() + 1);
+        levels[i]
+    }
+}
+
+#[test]
+fn rx_captures_edges_and_raises_rx_end() {
+    let mut r = Rmt::new();
+    // Idle timeout after 256 channel ticks (~8 samples).
+    r.write32(CHMCONF0_0, 256 << 8);
+    r.write32(CHMCONF1_0, RX_EN);
+    // low x2, high x6, low x18 with idle timeout 256: pulses 64 / 160 /
+    // 256 (truncated by the timeout). Quantum is 32/step: the baseline
+    // sample counts, so each run measures (samples × 32).
+    let input = scripted(&[0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    for _ in 0..18 {
+        r.tick_rx(&input);
+    }
+    // Item 0: low 64, high 160. Item 1: low 256 (idle-timeout truncation).
+    let w0 = r.read32(RX_MEM0);
+    assert_eq!(w0 & 0x7FFF, 64, "first pulse width");
+    assert_eq!((w0 >> 15) & 1, 0, "first pulse low");
+    assert_eq!((w0 >> 16) & 0x7FFF, 160, "second pulse width");
+    assert_eq!((w0 >> 31) & 1, 1, "second pulse high");
+    let w1 = r.read32(RX_MEM0 + 4);
+    assert_eq!(w1 & 0x7FFF, 256, "third pulse width");
+    assert_eq!((w1 >> 15) & 1, 0, "third pulse low");
+    assert_ne!(r.read32(0x70) & RX_END_BIT, 0, "rx_end latched");
+    assert_eq!(r.int_st() & RX_END_BIT, 0, "masked off without ena");
+    r.write32(0x78, RX_END_BIT); // INT_ENA bit 16
+    assert_ne!(r.int_st() & RX_END_BIT, 0, "rx_end now visible");
+    r.write32(0x7C, RX_END_BIT); // INT_CLR
+    assert_eq!(r.read32(0x70) & RX_END_BIT, 0, "rx_end clears");
+}
+
+#[test]
+fn rx_idle_line_ends_capture_immediately() {
+    let mut r = Rmt::new();
+    r.write32(CHMCONF0_0, 64 << 8);
+    r.write32(CHMCONF1_0, RX_EN);
+    let input = scripted(&[1]);
+    for _ in 0..4 {
+        r.tick_rx(&input);
+    }
+    assert_ne!(r.read32(0x70) & RX_END_BIT, 0, "idle timeout ends capture");
+    assert!(!r.rx_pending(), "channel disarms after end");
+    // The open pulse is flushed like the hardware writer offset advancing
+    // past a partial item: 3 samples x 32 at HIGH.
+    assert_eq!(r.read32(RX_MEM0), 96 | (1 << 15), "partial pulse flushed");
+}
+
+#[test]
+fn rx_filter_absorbs_short_glitch() {
+    let mut r = Rmt::new();
+    // Idle timeout far beyond the script (the capture must survive to the
+    // real edge); only the glitch filter shapes this run.
+    r.write32(CHMCONF0_0, 2048 << 8);
+    // rx_en + filter_en + threshold 64 channel ticks.
+    r.write32(CHMCONF1_0, RX_EN | (1 << 4) | (64 << 5));
+    // HIGH x7, LOW x1 (glitch, 32 < 64), HIGH x7, then LOW x7 (real edge).
+    let input = scripted(&[
+        1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+    for _ in 0..22 {
+        r.tick_rx(&input);
+    }
+    // The glitch must not split the HIGH pulse: the first completed item
+    // is HIGH (long) with an empty second half, not a short LOW item.
+    let w0 = r.read32(RX_MEM0);
+    assert_eq!((w0 >> 15) & 1, 1, "first pulse is the long HIGH");
+    assert!((w0 & 0x7FFF) > 200, "glitch absorbed into HIGH width");
+    assert_eq!((w0 >> 16) & 0x7FFF, 0, "no short LOW half written");
+}

@@ -22,8 +22,13 @@
 
 /// MCPWM group-0 register block base (esp-idf `DR_REG_PWM0_BASE`).
 pub const MCPWM_BASE: u32 = 0x6001_E000;
+/// MCPWM group-1 register block base (esp-idf `DR_REG_PWM1_BASE`): an
+/// independent copy of the group-0 block (3 timers + 3 operators).
+pub const MCPWM1_BASE: u32 = 0x6002_C000;
 /// Peripheral interrupt source (#31 = `ETS_PWM0_INTR_SOURCE`, `interrupts.h`).
 pub const MCPWM_INTR_SOURCE: u32 = 31;
+/// Group-1 interrupt source (`ETS_PWM1_INTR_SOURCE` = 32).
+pub const MCPWM1_INTR_SOURCE: u32 = 32;
 
 // Timer array: 3 timers, 16 B (0x10) stride.
 const NTIMER: usize = 3;

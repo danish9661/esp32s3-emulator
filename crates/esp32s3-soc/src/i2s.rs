@@ -82,6 +82,10 @@ const INT_MASK: u32 = RX_DONE | TX_DONE | RX_HUNG | TX_HUNG;
 
 const FIFO_DEPTH: usize = 16;
 
+/// I2S interrupt sources for the matrix (ETS_I2S0/1_INTR_SOURCE = 25/26).
+pub const I2S0_INTR_SOURCE: u32 = 25;
+pub const I2S1_INTR_SOURCE: u32 = 26;
+
 #[derive(Clone, Copy)]
 pub struct I2s {
     idx: u32,
@@ -449,6 +453,11 @@ impl I2s {
                 }
             }
         }
+    }
+
+    /// Interrupt status = RAW & ENA.
+    pub fn int_st(&self) -> u32 {
+        self.int_raw & self.int_ena
     }
 
     /// Current level (0/1) of an I2S output signal index (see gpio_sig_map.h).

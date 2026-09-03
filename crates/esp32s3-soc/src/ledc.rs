@@ -12,6 +12,9 @@
 //! `duty_reg >> 4`. Output signal `LEDC_CHn` = GPIO-matrix signal 73+n
 //! (`gpio_sig_map.h`); `sig_out_en` (conf0 bit 2) gates the pad.
 
+/// LEDC interrupt source for the matrix (ETS_LEDC_INTR_SOURCE = 35).
+pub const LEDC_INTR_SOURCE: u32 = 35;
+
 const TIMER_COUNT: usize = 4;
 const CHANNEL_COUNT: usize = 8;
 
@@ -157,6 +160,11 @@ impl Lcdc {
         } else {
             self.channel_idle(c)
         }
+    }
+
+    /// Interrupt status = RAW & ENA.
+    pub fn int_st(&self) -> u32 {
+        self.regs[INT_RAW_W] & self.regs[INT_ENA_W]
     }
 
     /// Level for a GPIO-matrix LEDC signal (73..80 → channel 0..7).

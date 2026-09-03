@@ -28,6 +28,34 @@ pub const GPIO_IN: u32 = 0x3C;
 pub const GPIO_STATUS: u32 = 0x44;
 pub const GPIO_STATUS_W1TS: u32 = 0x48;
 pub const GPIO_STATUS_W1TC: u32 = 0x4C;
+/// Second status bank (pins 32..45): mirrors STATUS, cleared the same way.
+/// Offsets from gpio_struct.h member order (status trio, then pcpu_int at
+/// 0x5C, pcpu_int1 at 0x68, then pin[54] at 0x74).
+pub const GPIO_STATUS1: u32 = 0x50;
+pub const GPIO_STATUS1_W1TS: u32 = 0x54;
+pub const GPIO_STATUS1_W1TC: u32 = 0x58;
+/// Per-CPU interrupt status (what the GPIO ISR reads): status bits of
+/// interrupt-enabled pins, low bank then high bank.
+pub const GPIO_PCPU_INT: u32 = 0x5C;
+pub const GPIO_PCPU_INT1: u32 = 0x68;
+
+/// GPIO interrupt source for the matrix (ETS_GPIO_INTR_SOURCE).
+pub const GPIO_INTR_SOURCE: u32 = 16;
+
+// PIN register fields (gpio_struct.h pin[]: int_type[9:7], int_ena[17:13]).
+// The driver enables with BIT(0) (GPIO_LL_INTR_ENA); per-CPU routing goes
+// through the interrupt matrix, not the remaining ena bits.
+const PIN_INT_TYPE_SHIFT: u32 = 7;
+const PIN_INT_TYPE_MASK: u32 = 0x7;
+const PIN_INT_ENA_BIT: u32 = 13;
+
+// int_type values (hal gpio_int_type_t).
+const INT_DISABLE: u32 = 0;
+const INT_RISING: u32 = 1;
+const INT_FALLING: u32 = 2;
+const INT_ANYEDGE: u32 = 3;
+const INT_LOW: u32 = 4;
+const INT_HIGH: u32 = 5;
 
 /// Strap pin encoding for SPI flash boot mode (ESP32S3_STRAP_MODE_FLASH_BOOT
 /// in QEMU esp32s3_gpio.h).
@@ -45,6 +73,10 @@ const REG_COUNT: usize = 0x704 / 4;
 
 pub struct Gpio {
     regs: [u32; REG_COUNT],
+    /// Last sampled pad levels (for edge detection).
+    prev: u64,
+    /// Pins with the interrupt enable bit set (poll + matrix fast path).
+    armed: u64,
 }
 
 impl Gpio {
@@ -61,7 +93,34 @@ impl Gpio {
         }
         regs[(GPIO_STRAP / 4) as usize] = STRAP_FLASH_BOOT;
         regs[(GPIO_IN / 4) as usize] = STRAP_FLASH_BOOT;
-        Self { regs }
+        Self {
+            regs,
+            prev: 0,
+            armed: 0,
+        }
+    }
+
+    /// PIN config word for `i` (int_type/int_ena live here).
+    fn pin_reg(&self, i: usize) -> u32 {
+        self.regs[(GPIO_PIN_0 / 4) as usize + i]
+    }
+
+    /// Refresh the armed bit for pin `i` from its PIN register, seeding the
+    /// edge-detector baseline at the current pad level (like the silicon
+    /// input synchronizer, so enabling on an already-high pin does not
+    /// fire a spurious RISING edge).
+    fn refresh_armed(&mut self, i: usize) {
+        let ena = self.pin_reg(i) & (1 << PIN_INT_ENA_BIT) != 0;
+        if ena {
+            self.armed |= 1u64 << i;
+            if self.pin_level(i as u32) != 0 {
+                self.prev |= 1u64 << i;
+            } else {
+                self.prev &= !(1u64 << i);
+            }
+        } else {
+            self.armed &= !(1u64 << i);
+        }
     }
 
     pub fn read32(&mut self, offset: u32) -> u32 {
@@ -75,6 +134,12 @@ impl Gpio {
             let en = self.regs[(GPIO_ENABLE / 4) as usize] as u64;
             v = (v & !en) | (out & en);
             v as u32
+        } else if offset == GPIO_PCPU_INT {
+            // CPU interrupt status: latched status of enabled pins (low bank).
+            (self.regs[(GPIO_STATUS / 4) as usize] as u64 & self.armed) as u32
+        } else if offset == GPIO_PCPU_INT1 {
+            // High bank (pins 32..45).
+            (self.regs[(GPIO_STATUS1 / 4) as usize] as u64 & (self.armed >> 32)) as u32
         } else {
             self.regs[(offset / 4) as usize]
         }
@@ -96,9 +161,67 @@ impl Gpio {
             GPIO_ENABLE_W1TC => self.regs[(GPIO_ENABLE / 4) as usize] &= !value,
             GPIO_STATUS_W1TS => self.regs[(GPIO_STATUS / 4) as usize] |= value,
             GPIO_STATUS_W1TC => self.regs[(GPIO_STATUS / 4) as usize] &= !value,
+            GPIO_STATUS1_W1TS => self.regs[(GPIO_STATUS1 / 4) as usize] |= value,
+            GPIO_STATUS1_W1TC => self.regs[(GPIO_STATUS1 / 4) as usize] &= !value,
             // OUT/ENABLE/STATUS and all other offsets: plain latch.
-            _ => self.regs[(offset / 4) as usize] = value,
+            _ => {
+                self.regs[(offset / 4) as usize] = value;
+                // A PIN config write may arm/disarm that pin's interrupt.
+                if offset >= GPIO_PIN_0 && offset < GPIO_PIN_0 + 54 * 4 {
+                    self.refresh_armed(((offset - GPIO_PIN_0) / 4) as usize);
+                }
+            }
         }
+    }
+
+    /// Any pin with the interrupt enable bit set (tick fast path).
+    pub fn irq_armed(&self) -> bool {
+        self.armed != 0
+    }
+
+    /// Interrupt source asserted: latched status on an enabled pin.
+    pub fn int_pending(&self) -> bool {
+        let st = self.regs[(GPIO_STATUS / 4) as usize] as u64
+            | ((self.regs[(GPIO_STATUS1 / 4) as usize] as u64) << 32);
+        st & self.armed != 0
+    }
+
+    /// Sample pad `levels` (the readback word: GPIO_OUT loopback overlaid
+    /// with peripheral-driven levels by the SoC) against the previous
+    /// sample and latch STATUS bits per each armed pin's int_type
+    /// (gpio_int_type_t: 1 rising, 2 falling, 3 either edge, 4 low level,
+    /// 5 high level). Level types re-latch while the level holds, so the
+    /// ISR refires after INT_CLR until the condition clears, like silicon.
+    pub fn poll_interrupts(&mut self, levels: u32) {
+        if self.armed == 0 {
+            return;
+        }
+        let cur = levels as u64;
+        let mut armed = self.armed;
+        while armed != 0 {
+            let i = armed.trailing_zeros() as usize;
+            armed &= armed - 1;
+            let ty = (self.pin_reg(i) >> PIN_INT_TYPE_SHIFT) & PIN_INT_TYPE_MASK;
+            let was = (self.prev >> i) & 1 != 0;
+            let is = (cur >> i) & 1 != 0;
+            let fire = match ty {
+                INT_DISABLE => false,
+                INT_RISING => !was && is,
+                INT_FALLING => was && !is,
+                INT_ANYEDGE => was != is,
+                INT_LOW => !is,
+                INT_HIGH => is,
+                _ => false,
+            };
+            if fire {
+                if i < 32 {
+                    self.regs[(GPIO_STATUS / 4) as usize] |= 1u32 << i;
+                } else {
+                    self.regs[(GPIO_STATUS1 / 4) as usize] |= 1u32 << (i - 32);
+                }
+            }
+        }
+        self.prev = cur;
     }
 
     /// Is pin `i`'s output driver enabled (GPIO_ENABLE)?

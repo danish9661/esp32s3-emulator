@@ -126,6 +126,35 @@ Core design:
 - Commit-ready, formatted with `cargo fmt`, clippy-clean.
 
 ## Status log (append, newest last)
+  - 2026-09-03: **RMT RX capture (P5 — item 4)**. `rmt.rs` gains 4 RX
+    channels (HW 4..7): `chmconf1` rx_en edge arms a one-shot capture
+    (mirroring TX_START), sampling matrix input 81+m per tick with the TX
+    quantum so loopback round-trips; edges pack into RMTMEM items,
+    `rx_end` (raw 16+m) fires on idle timeout / rx_lim / full block, with
+    glitch filter, wrap mode, mem_owner hand-off and partial-flush (like
+    the HW writer offset). Validated: 3 unit tests (capture+rx_end+clear,
+    idle finish, filter), machine test TX→pad→RX loopback, and the
+    `esp32s3_rmt` sketch extended (`RX item1 = 160/1`, trailing HIGH
+    truncated at the programmed idle 2000, `RMT RX PASS`). Found en route:
+    silicon reset defaults matter — `idle_thres` resets to 32767, without
+    which a capture never times out (now seeded in `Rmt::new`). Carrier
+    demodulation still unmodeled. 36/36 suites green, clippy/fmt clean.
+  - 2026-09-03: **Interrupt matrix completed: GPIO + missing wirings +
+    MCPWM1**. (1) GPIO edge/level interrupts modeled (`gpio.rs`: PIN
+    int_type/int_ena, STATUS/STATUS1 latch + w1tc, pcpu masking, per-tick
+    sampling on the pad-readback level so peripheral-driven pins fire;
+    source 16). The old sketch passed vacuously via NO_JUMPER — rewritten
+    to RMT-TX-driving-GPIO2 with the real `attachInterrupt` driver path →
+    `GPIO_IRQ PASS count=2` (plus a machine test RMT→pad→ISR and 6 unit
+    tests). Found along the way: RMT TX_START needs auto-clear on
+    completion or re-transmits silently no-op (fixed; single-shot sketches
+    unaffected). (2) Source-number audit vs `interrupts.h` fixed real
+    errors: RSA 95→76, ECDSA unwired (no S3 source exists — polled like
+    HMAC/DS), GDMA 63 (=DCACHE_SYNC0!) → per-channel 66-75; newly wired:
+    LCD_CAM 24, I2S0/1 25/26, SDIO 30, LEDC 35. (3) MCPWM group 1
+    (0x6002C000, source 32, signals 166-171) as a second instance +
+    sketch pass 3 (`MCPWM1 duty3=53%`). 36/36 suites green, clippy/fmt
+    clean (one pre-existing warn).
   - 2026-09-03: **OTA update mechanism validated end-to-end (was
     write-untested)**. The MEMSPI flash-write path (WREN latch, PP/AND,
     SE/BE/CE) existed but had zero coverage through real transactions, so

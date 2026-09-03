@@ -26,8 +26,8 @@ pub const RSA_BASE: u32 = 0x6003_C000;
 const NW: usize = 128;
 
 /// RSA interrupt source for the interrupt matrix (esp32s3 interrupts.h
-/// `ETS_RSA_INTR_SOURCE` = 95).
-pub const RSA_INTR_SOURCE: u32 = 95;
+/// `ETS_RSA_INTR_SOURCE` = 76).
+pub const RSA_INTR_SOURCE: u32 = 76;
 
 pub struct Rsa {
     m: [u32; NW],

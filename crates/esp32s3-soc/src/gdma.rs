@@ -33,9 +33,12 @@ use alloc::vec::Vec;
 /// GDMA register-block base (APB).
 pub const GDMA_BASE: u32 = 0x6004_2000;
 
-/// GDMA interrupt source for the interrupt matrix (esp32s3 interrupts.h
-/// `ETS_GDMA_INTR_SOURCE = 63`).
-pub const GDMA_INTR_SOURCE: u32 = 63;
+/// GDMA per-channel interrupt sources (esp32s3 interrupts.h):
+/// RX channels are `ETS_DMA_IN_CH0..4` (66..70), TX channels
+/// `ETS_DMA_OUT_CH0..4` (71..75). (There is no combined GDMA source; the
+/// old single-source-63 wiring aliased DCACHE_SYNC0 and is removed.)
+pub const GDMA_IN_INTR_BASE: u32 = 66;
+pub const GDMA_OUT_INTR_BASE: u32 = 71;
 
 /// Number of GDMA channel pairs (TX+RX).
 pub const NCH: usize = 5;
@@ -219,12 +222,13 @@ impl Gdma {
         v
     }
 
-    /// Masked OUT interrupt status for a channel.
-    fn out_int_st(&self, ch: usize) -> u32 {
+    /// Masked OUT interrupt status for a channel (matrix source 71+ch).
+    pub fn out_int_st(&self, ch: usize) -> u32 {
         self.out_int_raw[ch] & self.out_int_ena[ch]
     }
 
-    fn in_int_st(&self, ch: usize) -> u32 {
+    /// Masked IN interrupt status for a channel (matrix source 66+ch).
+    pub fn in_int_st(&self, ch: usize) -> u32 {
         self.in_int_raw[ch] & self.in_int_ena[ch]
     }
 
