@@ -355,6 +355,222 @@ fn esp_app_image_multi(entry: u32, segs: &[(u32, &[u8])]) -> Bytes {
     img
 }
 
+/// Drive one MEMSPI USR transaction the way the IDF spi_flash driver does:
+/// WREN latch, then command + plain 24-bit address + optional MOSI data
+/// from W0.., triggered by CMD_USR. `REG_ADDR` takes the plain address
+/// (esp-idf `spimem_flash_ll_set_address`: `dev->addr = addr`); the
+/// model's register decoding pairs with its addr-phase streaming so plain
+/// values land correctly (pinned by `usr_program_writes_flash` and the
+/// SE/BE unit tests — an MSB-first streaming "fix" was tried here and
+/// broke them, proving the pairing).
+fn memspi_usr(m: &mut Esp32S3, cmd: u32, addr: u32, mosi: &[u8], wren_first: bool) {
+    use esp32s3_soc::memmap::SPI1_BASE;
+    use esp32s3_soc::memspi::{
+        CMD_FLASH_WREN, CMD_USR, REG_ADDR, REG_CMD, REG_MOSI_DLEN, REG_USER, REG_USER1, REG_USER2,
+        REG_W0, USER_USR_ADDR, USER_USR_COMMAND, USER_USR_MOSI,
+    };
+    if wren_first {
+        m.soc.write32(SPI1_BASE + REG_CMD, CMD_FLASH_WREN);
+    }
+    let mut user = USER_USR_COMMAND | USER_USR_ADDR;
+    if !mosi.is_empty() {
+        user |= USER_USR_MOSI;
+        m.soc
+            .write32(SPI1_BASE + REG_MOSI_DLEN, mosi.len() as u32 * 8 - 1);
+        for (i, chunk) in mosi.chunks(4).enumerate() {
+            let mut w = [0u8; 4];
+            w[..chunk.len()].copy_from_slice(chunk);
+            m.soc
+                .write32(SPI1_BASE + REG_W0 + i as u32 * 4, u32::from_le_bytes(w));
+        }
+    }
+    m.soc.write32(SPI1_BASE + REG_USER, user);
+    m.soc.write32(SPI1_BASE + REG_USER2, cmd | (7 << 28)); // 8-bit command
+    m.soc.write32(SPI1_BASE + REG_USER1, 23 << 26); // 24-bit address
+    m.soc.write32(SPI1_BASE + REG_ADDR, addr);
+    m.soc.write32(SPI1_BASE + REG_CMD, CMD_USR);
+}
+
+/// NOR flash writes through the emulated SPI controller: sector erase fills
+/// 0xFF, page-program ANDs bits (clears only), exactly like the m25p80 the
+/// model mirrors — the mechanism `esp_ota_write` relies on.
+#[test]
+fn spi_flash_page_program_and_sector_erase_via_memspi() {
+    use esp32s3_soc::memmap::FLASH_DATA_BASE;
+    let mut m = Esp32S3::new();
+    const PAGE: u32 = 0x1_0000;
+    let rd = |m: &mut Esp32S3, off: u32| m.soc.read32(FLASH_DATA_BASE + off);
+    // Erase the scratch sector (erase fills a 4 KB page with 0xFF).
+    memspi_usr(&mut m, 0x20, PAGE, &[], true); // SE
+    assert_eq!(rd(&mut m, PAGE), 0xFFFF_FFFF, "erased word reads all-ones");
+    assert_eq!(
+        rd(&mut m, PAGE + 0xFFC),
+        0xFFFF_FFFF,
+        "erase covers the whole 4 KB sector"
+    );
+    // Program 4 bytes (PP + W0 data).
+    memspi_usr(&mut m, 0x02, PAGE, &0xDEAD_BEEFu32.to_le_bytes(), true); // PP
+    assert_eq!(rd(&mut m, PAGE), 0xDEAD_BEEF, "programmed word reads back");
+    // Programming without erase clears bits but never sets them.
+    memspi_usr(&mut m, 0x02, PAGE, &0xFFFF_FFFFu32.to_le_bytes(), true);
+    assert_eq!(
+        rd(&mut m, PAGE),
+        0xDEAD_BEEF,
+        "PP of all-ones leaves bits unchanged"
+    );
+    memspi_usr(&mut m, 0x02, PAGE, &0x0000_0000u32.to_le_bytes(), true);
+    assert_eq!(rd(&mut m, PAGE), 0x0000_0000, "PP of zeros clears bits");
+}
+
+/// End-to-end OTA update at the mechanism level: boot slot 0, reprogram the
+/// otadata sector through the SPI controller exactly like
+/// `esp_ota_set_boot_partition` does (SE + PP), then reboot from the mutated
+/// flash and land in slot 1. (Slot *selection* alone is covered by
+/// `ota_boot_selects_active_slot`; this covers the *update* path.)
+#[test]
+fn ota_update_reprograms_otadata_and_reboots_into_new_slot() {
+    use crate::asm::Asm;
+    use crate::partition::select_ota_boot_offset;
+    use esp32s3_soc::memmap::{FLASH_DATA_BASE, IRAM_BASE};
+
+    const STASH: u32 = 0x3FC8_0400;
+    const MARK0: u32 = 0x1111_1111;
+    const MARK1: u32 = 0x2222_2222;
+    const OTA0_OFF: u32 = 0x11_0000;
+    const OTA1_OFF: u32 = 0x21_0000;
+    const OTADATA_OFF: u32 = 0xE000;
+    // Minimal app: stash a slot mark, then spin on itself.
+    fn slot_app(mark: u32) -> (Bytes, u32) {
+        let mut a = Asm::new(IRAM_BASE);
+        a.li(4, mark as i32);
+        a.li(5, STASH as i32);
+        a.s32i(4, 5, 0);
+        let here = a.pc();
+        a.j(here);
+        (a.bytes().to_vec(), here)
+    }
+    let (app0, here0) = slot_app(MARK0);
+    let (app1, here1) = slot_app(MARK1);
+    let img0 = esp_app_image(IRAM_BASE, IRAM_BASE, &app0);
+    let img1 = esp_app_image(IRAM_BASE, IRAM_BASE, &app1);
+
+    // Partition table: ota_0 @ 0x110000, ota_1 @ 0x210000, otadata @ 0xE000.
+    let mut flash = std::vec![0xFFu8; 0x300_000];
+    let mut entry = |idx: usize, ty: u8, sub: u8, off: u32, len: u32, label: &[u8; 16]| {
+        let b = 0x8000 + idx * 0x20;
+        flash[b] = 0x50;
+        flash[b + 1] = 0xAA;
+        flash[b + 2] = ty;
+        flash[b + 3] = sub;
+        flash[b + 4..b + 8].copy_from_slice(&off.to_le_bytes());
+        flash[b + 8..b + 12].copy_from_slice(&len.to_le_bytes());
+        flash[b + 16..b + 32].copy_from_slice(label);
+    };
+    entry(
+        0,
+        0x00,
+        0x10,
+        OTA0_OFF,
+        0x100000,
+        b"ota_0\0\0\0\0\0\0\0\0\0\0\0",
+    );
+    entry(
+        1,
+        0x00,
+        0x11,
+        OTA1_OFF,
+        0x100000,
+        b"ota_1\0\0\0\0\0\0\0\0\0\0\0",
+    );
+    entry(
+        2,
+        0x01,
+        0x39,
+        OTADATA_OFF,
+        0x2000,
+        b"otadata\0\0\0\0\0\0\0\0\0",
+    );
+    flash[0x8060] = 0xEB;
+    flash[0x8061] = 0xEB;
+    // otadata: slot 0 valid (seq 1), slot 1 invalid (erased flash reads
+    // 0xFF, whose bit 31 the parser treats as valid — zero it explicitly).
+    flash[OTADATA_OFF as usize..OTADATA_OFF as usize + 4]
+        .copy_from_slice(&0x8000_0001u32.to_le_bytes());
+    flash[OTADATA_OFF as usize + 0x20..OTADATA_OFF as usize + 0x24]
+        .copy_from_slice(&0u32.to_le_bytes());
+    flash[OTA0_OFF as usize..OTA0_OFF as usize + img0.len()].copy_from_slice(&img0);
+    flash[OTA1_OFF as usize..OTA1_OFF as usize + img1.len()].copy_from_slice(&img1);
+    assert_eq!(select_ota_boot_offset(&flash), Some(OTA0_OFF));
+
+    // Boot slot 0 through the real boot path.
+    let mut m = Esp32S3::new();
+    m.boot_from_flash(&flash);
+    for _ in 0..4000 {
+        if m.cpu[0].pc == here0 {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.cpu[0].pc, here0, "slot-0 app reached its self-loop");
+    assert_eq!(m.soc.read32(STASH), MARK0, "slot 0 executed");
+
+    // Firmware-style update: erase the otadata sector, then program both
+    // records (slot 0 invalid, slot 1 sequence 2) through MEMSPI.
+    let mut rec = [0u8; 64];
+    rec[0x20..0x24].copy_from_slice(&0x8000_0002u32.to_le_bytes());
+    memspi_usr(&mut m, 0x20, OTADATA_OFF, &[], true); // SE
+    memspi_usr(&mut m, 0x02, OTADATA_OFF, &rec, true); // PP
+    // Read the mutated sector back through the flash window and splice it
+    // into an image copy (the live backing holds the update; reset() would
+    // reload the pristine image, so reboot from the updated copy instead).
+    let mut img2 = flash.clone();
+    for (i, dst) in img2[OTADATA_OFF as usize..OTADATA_OFF as usize + 0x1000]
+        .chunks_mut(4)
+        .enumerate()
+    {
+        dst.copy_from_slice(
+            &m.soc
+                .read32(FLASH_DATA_BASE + OTADATA_OFF + i as u32 * 4)
+                .to_le_bytes(),
+        );
+    }
+    assert_eq!(
+        u32::from_le_bytes(
+            img2[OTADATA_OFF as usize..OTADATA_OFF as usize + 4]
+                .try_into()
+                .unwrap()
+        ),
+        0,
+        "slot-0 record cleared by the update"
+    );
+    assert_eq!(
+        u32::from_le_bytes(
+            img2[OTADATA_OFF as usize + 0x20..OTADATA_OFF as usize + 0x24]
+                .try_into()
+                .unwrap()
+        ),
+        0x8000_0002,
+        "slot-1 record programmed by the update"
+    );
+    assert_eq!(select_ota_boot_offset(&img2), Some(OTA1_OFF));
+
+    // Reboot from the updated image: slot 1 runs.
+    let mut m1 = Esp32S3::new();
+    m1.boot_from_flash(&img2);
+    for _ in 0..4000 {
+        if m1.cpu[0].pc == here1 {
+            break;
+        }
+        m1.step();
+    }
+    assert_eq!(m1.cpu[0].pc, here1, "slot-1 app reached its self-loop");
+    assert_eq!(
+        m1.soc.read32(STASH),
+        MARK1,
+        "slot 1 executed after OTA switch"
+    );
+}
+
 #[test]
 fn dual_core_release_and_run() {
     use crate::asm::Asm;

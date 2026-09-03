@@ -38,41 +38,43 @@
 //! dummy cycles as bytes).  CS-high after each transaction resets the
 //! stream state but keeps write-enable, exactly like m25p80_cs().
 
-// Register offsets (esp32s3_spi.h REG32 list).
-const REG_CMD: u32 = 0x000;
-const REG_ADDR: u32 = 0x004;
+// Register offsets (esp32s3_spi.h REG32 list). Public: firmware-style
+// flash update flows (esp_ota_write -> PP/SE) are driven through this bus
+// by machine tests exactly like the IDF spi_flash driver drives silicon.
+pub const REG_CMD: u32 = 0x000;
+pub const REG_ADDR: u32 = 0x004;
 const REG_CTRL: u32 = 0x008;
 const REG_CTRL1: u32 = 0x00C;
 const REG_CTRL2: u32 = 0x010;
 const REG_CLOCK: u32 = 0x014;
-const REG_USER: u32 = 0x018;
-const REG_USER1: u32 = 0x01C;
-const REG_USER2: u32 = 0x020;
-const REG_MOSI_DLEN: u32 = 0x024;
+pub const REG_USER: u32 = 0x018;
+pub const REG_USER1: u32 = 0x01C;
+pub const REG_USER2: u32 = 0x020;
+pub const REG_MOSI_DLEN: u32 = 0x024;
 const REG_MISO_DLEN: u32 = 0x028;
 const REG_RD_STATUS: u32 = 0x02C;
 const REG_MISC: u32 = 0x034;
 const REG_CACHE_FCTRL: u32 = 0x03C;
 const REG_FSM: u32 = 0x054;
-const REG_W0: u32 = 0x058;
+pub const REG_W0: u32 = 0x058;
 const REG_W15: u32 = 0x094;
 const REG_SUS_STATUS: u32 = 0x0A4;
 const REG_DDR_CTRL: u32 = 0x0E0;
 const REG_CLOCK_GATE: u32 = 0x0E8;
 
 // USER bits (esp32s3_spi.h SPI_MEM_USER).
-const USER_USR_COMMAND: u32 = 1 << 31;
-const USER_USR_ADDR: u32 = 1 << 30;
+pub const USER_USR_COMMAND: u32 = 1 << 31;
+pub const USER_USR_ADDR: u32 = 1 << 30;
 const USER_USR_DUMMY: u32 = 1 << 29;
 const USER_USR_MISO: u32 = 1 << 28;
-const USER_USR_MOSI: u32 = 1 << 27;
+pub const USER_USR_MOSI: u32 = 1 << 27;
 
 // CMD bits (esp32s3_spi.h SPI_MEM_CMD).  Special-command dispatch mask
 // keeps bits [31:19] (QEMU `command >> 19 << 19`).
-const CMD_USR: u32 = 1 << 18;
+pub const CMD_USR: u32 = 1 << 18;
 const CMD_SPECIAL_MASK: u32 = 0xFFFF_F800;
 const CMD_FLASH_READ: u32 = 1 << 31;
-const CMD_FLASH_WREN: u32 = 1 << 30;
+pub const CMD_FLASH_WREN: u32 = 1 << 30;
 const CMD_FLASH_WRDI: u32 = 1 << 29;
 const CMD_FLASH_RDID: u32 = 1 << 28;
 const CMD_FLASH_RDSR: u32 = 1 << 27;

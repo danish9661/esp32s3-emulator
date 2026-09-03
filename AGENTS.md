@@ -126,6 +126,22 @@ Core design:
 - Commit-ready, formatted with `cargo fmt`, clippy-clean.
 
 ## Status log (append, newest last)
+  - 2026-09-03: **OTA update mechanism validated end-to-end (was
+    write-untested)**. The MEMSPI flash-write path (WREN latch, PP/AND,
+    SE/BE/CE) existed but had zero coverage through real transactions, so
+    two machine tests now drive it exactly like the IDF spi_flash driver:
+    `spi_flash_page_program_and_sector_erase_via_memspi` (SE fills 0xFF,
+    PP AND-semantics incl. no-set-without-erase) and
+    `ota_update_reprograms_otadata_and_reboots_into_new_slot` (boot slot 0
+    → SE+PP the otadata sector via MMIO → read back through the XIP window
+    → reboot lands in slot 1). Register programming verified against the
+    esp-idf v5.3 HAL (`spimem_flash_ll_set_address` stores plain; program
+    path uses length<<24|addr); the needed REG_*/USER_*/CMD_* consts are now
+    pub. CAUTIONARY TALE: an MSB-first addr-streaming "fix" was tried and
+    reverted — it broke `special_be_erases_64k`, proving the model's
+    plain-REG + phase-streaming pairing is self-consistent for the true
+    driver convention (both orders can't be right; the suite decides).
+    35/35 green, clippy/fmt clean.
   - 2026-09-03: **Clock-tree assessed: no remodel (documented
     approximation)**. Follow-up to the TIMG fix: `multi_irq` counts
     `t0=1006` where silicon-nominal is ~5000, so the time bases were

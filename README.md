@@ -191,6 +191,8 @@ on CALL/RETW, matching QEMU's `win_helper.c` behavior.
 | LCD_CAM 8080/6800 | Partial | FIFO + transfer-done functional; RGB FSM not modeled |
 | ULP rv32imc | Functional | C extension supported; compressed decode working |
 | Deep-sleep | Register model | esp-idf driver path hangs; direct-poke validated |
+| SDMMC FAT mount | Block-level only | PIO + IDMAC + simulated card functional; SDIO/ACMD51/CMD6 negotiation for a FAT mount not modeled |
+| Model clock | Approximate | 1 global tick per 2 instructions for all domains (silicon runs SYSTIMER 16MHz vs APB 80MHz); only observable in cross-domain counts, all passing |
 
 ## Performance
 
