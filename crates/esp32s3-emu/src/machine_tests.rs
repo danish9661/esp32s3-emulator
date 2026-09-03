@@ -2331,3 +2331,34 @@ fn gpio_edge_emits_event() {
         "falling edge on pin 2"
     );
 }
+
+/// Unimplemented DSP/TIE extensions trap instead of hanging: executing a
+/// `format_32` word with no execution model returns
+/// `StepResult::Unimplemented` with the pc frozen (the fast-block runner
+/// aborts the block the same way). Dynamic audit over 24 arduino-cli
+/// sketches x 96M instructions each (2026-09-03) shows zero executions,
+/// so the trap path is firmware-invisible today — this test pins it.
+/// (0xEEEEEEEE: low nibble 0xE = 4-byte format; decode lands on an
+/// `OPCODE_EE_*` with no executor, or the EE catch-all.)
+#[test]
+fn ee_extension_traps_unimplemented() {
+    use xtensa_core::StepResult;
+    let mut m = Esp32S3::new();
+    let addr = 0x4000_1000u32;
+    m.load_image(addr, &0xEEEE_EEEEu32.to_le_bytes());
+    m.cpu[0].pc = addr;
+    let r = m.cpu[0].step(&mut m.soc);
+    assert!(
+        matches!(r, StepResult::Unimplemented(_)),
+        "ee word traps, got {r:?}"
+    );
+    assert_eq!(m.cpu[0].pc, addr, "pc frozen on unimplemented trap");
+    // The block runner surfaces the same trap promptly (no silent hang).
+    m.cpu[0].pc = addr;
+    let (br, _, n) = m.step_fast();
+    assert!(
+        matches!(br, StepResult::Unimplemented(_)),
+        "fast block traps, got {br:?}"
+    );
+    assert!(n >= 1, "trap counts the attempted op");
+}

@@ -10,5 +10,8 @@ web/firmware/*.bin
 # arduino-cli in-tree build output
 tools/sketches/*/build/
 
+# PGO raw training profiles (the merged profile IS committed)
+tools/pgo/raw/
+
 # reference materials
 help/

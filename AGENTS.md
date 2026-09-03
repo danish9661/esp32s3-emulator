@@ -126,6 +126,32 @@ Core design:
 - Commit-ready, formatted with `cargo fmt`, clippy-clean.
 
 ## Status log (append, newest last)
+  - 2026-09-03: **PGO adopted (+45%, native only)**. `tools/pgo.sh` trains an
+    LLVM profile over hello+periph boots and rebuilds
+    (`-Cprofile-generate` → `llvm-profdata merge` → `-Cprofile-use`).
+    Interleaved A/B medians, pinned P-cores, 8/8 pairs same direction:
+    29.6 → 43.0M insns/s. `tools/pgo/merged.profdata` (244KB) is committed
+    (like the sketch `*.merged.bin` validation artifacts); raw training
+    profiles are gitignored. Rules: native x86_64 ONLY (profiles don't carry
+    to wasm — browser keeps the default build), requires `llvm-profdata`,
+    retrain after hot-path changes (stale profiles still build/run, just
+    less optimally). Dead ends logged: `target-cpu=native` alone is +2%
+    (noise), and single-shot MIPS on this shared box is meaningless (±30%
+    swings — e.g. identical binary reading 28/29/43) — only interleaved
+    back-to-back ratios count.
+  - 2026-09-03: **ee.* DSP/TIE scoped to loud traps (no silent hangs)**.
+    Dynamic audit (temporary `unimp_audit` example, since removed) over 24
+    arduino-cli sketches × 96M instructions each (~2.3B insns, both cores):
+    **zero** `StepResult::Unimplemented` executions — no in-tree firmware
+    touches TIE/DSP, so full execution modeling would be unvalidatable.
+    Fixed the real hazard instead: an unimplemented op leaves pc frozen, so
+    the old silent skip in `run_flash` would spin forever on encounter.
+    Now `run_flash` halts LOUD on both cores (`UNIMPLEMENTED coreN at pc…
+    <mnemonic>`, decoded via `Opcode::name()`), and machine test
+    `ee_extension_traps_unimplemented` pins the trap (single-step +
+    `step_fast`, pc frozen). The 29 never-decoded `format_32` mnemonics
+    already trap loud via ILLEGAL. Full TIE execution stays out of scope
+    (nothing executes it; Touch/WiFi/BLE exclusions unchanged).
   - 2026-09-03: **Browser bundle rebuilt + revalidated (P6 hygiene)**.
     `web/pkg/` was 13h stale (predating all speed work). Rebuilt via
     wasm-pack 0.14.0; NOTE the out-dir gotcha: `--out-dir web/pkg` resolves

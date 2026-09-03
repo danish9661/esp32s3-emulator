@@ -13,6 +13,31 @@ use esp32s3_emu::Esp32S3;
 use xtensa_core::cpu::SR_EPC1;
 use xtensa_core::{Bus, StepResult};
 
+/// Describe the faulting instruction behind an Unimplemented trap (these
+/// are ee.* DSP/TIE extensions: recognized by the decoder but without an
+/// execution model).
+fn unimp_detail(m: &mut Esp32S3, core: usize) -> String {
+    use xtensa_core::generated::{decode_inst, decode_inst16a, decode_inst16b, insn_len};
+    let pc = m.cpu[core].pc;
+    let raw = m.soc.read32(pc);
+    let b0 = (raw & 0xFF) as u8;
+    let opc = match insn_len(b0) {
+        2 => {
+            let w = raw & 0xFFFF;
+            if b0 & 0xf <= 11 {
+                decode_inst16a(w)
+            } else {
+                decode_inst16b(w)
+            }
+        }
+        _ => decode_inst(raw),
+    };
+    match opc {
+        Some(o) => format!("{} (raw {raw:#010x})", o.name()),
+        None => format!("undecodable (raw {raw:#010x})"),
+    }
+}
+
 fn main() {
     let path = env::args().nth(1).expect("usage: run_flash <flash image>");
     let flash = fs::read(&path).expect("read flash image");
@@ -117,9 +142,22 @@ fn main() {
             );
             break;
         }
-        if let StepResult::Unimplemented(_insn) = r {
-            // Unimplemented TIE/DSP instructions — skip like old code did.
-            // These are ee.* extensions that are never on the boot path.
+        // Unimplemented instructions (ee.* DSP/TIE extensions: decoded but
+        // with no execution model) trap LOUDLY instead of hanging: the pc
+        // is frozen on the faulting op, so ignoring the result would spin
+        // forever. A dynamic audit (2026-09-03: 24 sketches x 96M insns,
+        // both cores) shows zero executions, so this never fires today.
+        if matches!(r, StepResult::Unimplemented(_)) {
+            let pc = m.cpu[0].pc;
+            let detail = unimp_detail(&mut m, 0);
+            println!("\n>> UNIMPLEMENTED core0 at pc {pc:#010x}: {detail}",);
+            break;
+        }
+        if matches!(r1, StepResult::Unimplemented(_)) {
+            let pc = m.cpu[1].pc;
+            let detail = unimp_detail(&mut m, 1);
+            println!("\n>> UNIMPLEMENTED core1 at pc {pc:#010x}: {detail}",);
+            break;
         }
 
         // --- UART output (every step): the drain must stay per-step.

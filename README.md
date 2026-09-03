@@ -214,6 +214,11 @@ The emulator's per-step hot path costs approximately:
   no interrupts are globally enabled and no software bits are set.
 - **Peripheral idle fast paths**: Systimer, TIMG, ADC, SPI all have early-return
   checks when disabled/idle.
+- **Block-at-a-time execution**: `step_fast()` runs cached straight-line
+  blocks (≤16 instructions) per core with interrupts once per block.
+- **PGO (opt-in)**: `tools/pgo.sh` trains an LLVM profile over hello+periph
+  boots and rebuilds — ~1.45× throughput on native x86_64 (native target
+  only, not for wasm builds).
 
 ## Adding / Validating a Peripheral
 
