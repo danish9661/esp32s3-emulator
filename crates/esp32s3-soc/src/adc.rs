@@ -129,6 +129,10 @@ pub struct Adc {
     timer_cycle: u64,
     /// APB alternate-mode phase (work_mode = 2).
     alt_phase: bool,
+    /// Digital-conversion results queued for the GDMA `in` walk
+    /// (`peri_sel` ADC): each timer pass pushes its data_status word here
+    /// (cap 256, oldest dropped). The IN walk drains them to DRAM.
+    dma_queue: alloc::collections::VecDeque<u32>,
 }
 
 impl Adc {
@@ -141,6 +145,7 @@ impl Adc {
             meas_busy: false,
             timer_cycle: 0,
             alt_phase: false,
+            dma_queue: alloc::collections::VecDeque::new(),
         };
         // Reset values from sens_reg.h / apb_saradc_reg.h (idle FSM fields,
         // so firmware that reads config back sees sensible defaults).
@@ -163,6 +168,12 @@ impl Adc {
 
     /// Inject an analog voltage (mV) on `unit` (0 = ADC1, 1 = ADC2)
     /// `channel` (0..=9 on real silicon).  Host frontend API.
+    /// Pop one staged digital-conversion result for the GDMA `in` walk
+    /// (`None` when the queue is empty — reads back zeros on the bus).
+    pub fn dma_pop(&mut self) -> Option<u32> {
+        self.dma_queue.pop_front()
+    }
+
     pub fn inject_voltage(&mut self, unit: usize, channel: usize, milli_volts: u32) {
         if unit < NUM_UNITS && channel < NUM_CHANNELS {
             self.voltages[unit][channel] = milli_volts;
@@ -297,6 +308,12 @@ impl Adc {
                 last ^= 0xFFF;
             }
             self.apb[(DATA_STATUS[unit] / 4) as usize] = last & 0x1FFFF;
+            // Stage for GDMA: the DMA engine moves each conversion result
+            // to DRAM (the IN walk drains this queue).
+            if self.dma_queue.len() >= 256 {
+                self.dma_queue.pop_front();
+            }
+            self.dma_queue.push_back(last & 0x1FFFF);
             self.apb[(APB_INT_RAW / 4) as usize] |= if unit == 0 {
                 APB_ADC1_DONE
             } else {

@@ -236,3 +236,21 @@ fn adc2_oneshot_converts_without_arbiter() {
         "meas2_done_sar set"
     );
 }
+
+/// Digital conversions stage results for the GDMA `in` walk: each timer
+/// pass pushes its data_status word, drained in order via `dma_pop`.
+#[test]
+fn digital_results_stage_for_gdma() {
+    let mut adc = Adc::new();
+    adc.inject_voltage(0, 2, 825);
+    adc.apb_write32(APB_SAR1_PATT_TAB, 2 << 2);
+    // ctrl: clk gated, single mode unit 0, patt_len 0.
+    adc.apb_write32(APB_CTRL, (1 << 6) | (0 << 3) | (0 << 15));
+    adc.apb_write32(APB_CTRL2, (1 << 24) | (1 << 11) | (4 << 12));
+    assert_eq!(adc.dma_pop(), None, "nothing staged yet");
+    adc.tick(5);
+    assert_eq!(adc.dma_pop(), Some(825 * 4095 / 1100));
+    adc.tick(5);
+    assert_eq!(adc.dma_pop(), Some(825 * 4095 / 1100));
+    assert_eq!(adc.dma_pop(), None, "queue drained");
+}

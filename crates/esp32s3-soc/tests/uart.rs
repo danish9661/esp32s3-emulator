@@ -67,3 +67,30 @@ fn tout_idle_with_empty_fifo() {
     u.tick(100_000);
     assert_eq!(u.read32(UART_INT_RAW) & (1 << 8), 0);
 }
+
+/// RXFIFO_FULL is gated on the CONF1 threshold: a 1-byte burst with the
+/// reset threshold (96) does not latch FULL.
+#[test]
+fn full_gated_on_threshold() {
+    let mut u = Uart::new();
+    u.inject_rx(b'Z');
+    assert_eq!(u.read32(UART_INT_RAW) & 1, 0, "below threshold");
+    // Programming the threshold to 1 latches FULL with data pending.
+    u.write32(UART_CONF1, 1);
+    assert_eq!(u.read32(UART_INT_RAW) & 1, 1, "FULL latched");
+    // Draining drops it again (level-style).
+    assert_eq!(u.read32(UART_FIFO), u32::from(b'Z'));
+    assert_eq!(u.read32(UART_INT_RAW) & 1, 0);
+}
+
+/// A burst reaching the programmed threshold latches FULL on arrival.
+#[test]
+fn full_fires_at_threshold() {
+    let mut u = Uart::new();
+    u.write32(UART_CONF1, 3);
+    u.inject_rx(b'a');
+    u.inject_rx(b'b');
+    assert_eq!(u.read32(UART_INT_RAW) & 1, 0);
+    u.inject_rx(b'c');
+    assert_eq!(u.read32(UART_INT_RAW) & 1, 1);
+}

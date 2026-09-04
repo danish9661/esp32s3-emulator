@@ -39,7 +39,7 @@ const REG_COUNT: usize = 0x1000 / 4;
 const LCD_USER: u32 = 0x14;
 const LCD_CMD_BIT: u32 = 1 << 26;
 const CAM_CTRL1: u32 = 0x08;
-const LCD_DATA: u32 = 0x40;
+pub const LCD_DATA: u32 = 0x40;
 const LCD_FIFO_STATUS: u32 = 0x44;
 const CAM_DATA: u32 = 0x48;
 const CAM_FIFO_STATUS: u32 = 0x4C;
@@ -199,6 +199,27 @@ impl LcdCam {
         }
     }
 
+    /// GDMA-fed block transfer (`peri_sel` LCD): stream `words` through the
+    /// TX FIFO, ticking PCLK to drain (the FIFO holds 16 words; transfers
+    /// may be longer), finishing with LCD_TRANS_DONE latched. One
+    /// synchronous DMA-backed 8080 transfer: firmware cannot observe
+    /// mid-transfer states within the GDMA walk's single step, so this is
+    /// observationally identical to an async completion (unlike SPI, where
+    /// the live waveform is the validation target).
+    pub fn dma_transfer(&mut self, words: &[u32]) {
+        self.write32(LCD_USER, LCD_START_BIT);
+        let mut i = 0;
+        while i < words.len() || self.busy {
+            while i < words.len() && self.tx_count < FIFO_DEPTH {
+                self.write32(LCD_DATA, words[i]);
+                i += 1;
+            }
+            // One full PCLK cycle presents a word.
+            self.tick();
+            self.tick();
+        }
+    }
+
     /// Interrupt status = RAW & ENA (LC_DMA_INT_ST).
     pub fn int_st(&self) -> u32 {
         self.int_raw & self.int_ena
@@ -225,6 +246,7 @@ impl LcdCam {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     #[test]
     fn tx_fifo_counts_and_drains_on_start() {
@@ -247,6 +269,21 @@ mod tests {
         // Clear and confirm.
         d.write32(LC_DMA_INT_CLR, LCD_TRANS_DONE);
         assert_eq!(d.read32(LC_DMA_INT_RAW) & LCD_TRANS_DONE, 0, "RAW cleared");
+    }
+
+    /// GDMA-fed transfer longer than the 16-word FIFO completes with
+    /// TRANS_DONE latched and the FIFO drained (PCLK ticks interleave).
+    #[test]
+    fn dma_transfer_streams_past_fifo_depth() {
+        let mut d = LcdCam::new();
+        let words: Vec<u32> = (0..40).collect();
+        d.dma_transfer(&words);
+        assert_eq!(d.read32(LCD_FIFO_STATUS) & 0x7FF, 0, "TX drained");
+        assert_eq!(
+            d.read32(LC_DMA_INT_RAW) & LCD_TRANS_DONE,
+            LCD_TRANS_DONE,
+            "TRANS_DONE latched"
+        );
     }
 
     #[test]

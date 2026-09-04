@@ -834,6 +834,8 @@ fn uart_rx_interrupt_echo() {
     a.patch_l32r(p, IRAM_BASE + l_uart as u32);
     a.movi_n(3, 1);
     a.s32i(3, 2, 0x0C); // INT_ENA bit 0 (RXFIFO_FULL)
+    a.movi_n(3, 1);
+    a.s32i(3, 2, 0x24); // CONF1: rxfifo_full_thrhd = 1 (a 1-byte burst fires)
     a.li(3, 0x8000); // INTENABLE bit 15
     a.wsr(228, 3);
     a.rsil(4, 0);

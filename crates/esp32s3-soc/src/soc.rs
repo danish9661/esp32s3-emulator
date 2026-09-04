@@ -1158,7 +1158,11 @@ impl Soc {
                     // A write that starts an OUT (TX) or IN (RX) channel transfer
                     // triggers the descriptor-walk copy.
                     if let Some((ch, is_out)) = self.gdma.write32(off, value) {
-                        let link_addr = self.gdma.out_link_addr(ch);
+                        let link_addr = if is_out {
+                            self.gdma.out_link_addr(ch)
+                        } else {
+                            self.gdma.in_link_addr(ch)
+                        };
                         let peri = if is_out {
                             self.gdma.out_peri_sel(ch)
                         } else {
@@ -1325,6 +1329,20 @@ impl Soc {
                                     }
                                     self.gdma.set_out_eof_des_addr(ch, desc);
                                     spi_dma_pending = Some(idx);
+                                } else if peri == crate::gdma::GDMA_LCD_PERIPH {
+                                    // LCD_CAM DMA: stream the descriptor's
+                                    // words through the TX FIFO as one
+                                    // synchronous 8080 transfer (word-aligned
+                                    // lengths; a partial tail word is dropped).
+                                    let mut words =
+                                        alloc::vec::Vec::with_capacity((len / 4) as usize);
+                                    let mut k = 0u32;
+                                    while k + 4 <= len {
+                                        words.push(self.read32(buf + k));
+                                        k += 4;
+                                    }
+                                    self.lcd_cam.dma_transfer(&words);
+                                    self.gdma.set_out_eof_des_addr(ch, desc);
                                 }
                             } else {
                                 // IN (RX) channel: copy from the peripheral's data
@@ -1377,6 +1395,17 @@ impl Soc {
                                     let mut k = 0u32;
                                     while k + 4 <= len {
                                         let w = self.spi[idx].dma_rx_word(k);
+                                        self.write32(buf + k, w);
+                                        k += 4;
+                                    }
+                                    self.gdma.raise_in_done(ch);
+                                } else if peri == crate::gdma::GDMA_ADC_PERIPH {
+                                    // ADC digital DMA: drain staged conversion
+                                    // results to DRAM (zeros once the queue
+                                    // runs dry).
+                                    let mut k = 0u32;
+                                    while k + 4 <= len {
+                                        let w = self.adc.dma_pop().unwrap_or(0);
                                         self.write32(buf + k, w);
                                         k += 4;
                                     }

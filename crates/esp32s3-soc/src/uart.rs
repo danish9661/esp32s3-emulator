@@ -9,13 +9,15 @@
 //!   polling TX path never blocks.
 //! - `UART_INT_RAW.TXFIFO_EMPTY` set after each TX (FIFO empty); `INT_CLR`
 //!   write clears the corresponding RAW bit; `INT_ST = RAW & ENA`.
-//! - RX: `inject_rx` pushes a byte into the RX FIFO and latches
-//!   `INT_RXFIFO_FULL`; `UART_FIFO` reads pop one byte (RAW drops when the
-//!   FIFO empties, level-style); `UART_STATUS.rxfifo_cnt` (bits [9:0], the
-//!   S3 layout per uart_struct.h — NOT classic-ESP32 [29:24]) mirrors the
-//!   FIFO length for polling. `INT_RXFIFO_TOUT` fires via `tick` once the
-//!   RX line has been idle for `rx_tout_thrhd` bit-times with data pending
-//!   and `rx_tout_en` set (CONF1 bit 23, MEM_CONF bits [26:17]).
+//! - RX: `inject_rx` pushes a byte into the RX FIFO; `INT_RXFIFO_FULL`
+//!   latches when the count reaches CONF1.rxfifo_full_thrhd (level-style,
+//!   re-armed by lowering the threshold under a pending count);
+//!   `UART_FIFO` reads pop one byte (RAW drops when the FIFO empties);
+//!   `UART_STATUS.rxfifo_cnt` (bits [9:0], the S3 layout per uart_struct.h —
+//!   NOT classic-ESP32 [29:24]) mirrors the FIFO length for polling.
+//!   `INT_RXFIFO_TOUT` fires via `tick` once the RX line has been idle for
+//!   `rx_tout_thrhd` bit-times with data pending and `rx_tout_en` set
+//!   (CONF1 bit 23, MEM_CONF bits [26:17]).
 //! - Remaining registers are latched (writes stored, reads return stored
 //!   value or reset value) so firmware configuration writes are harmless.
 
@@ -59,6 +61,7 @@ const STATUS_MODEM_IDLE: u32 = (1 << 14) | (1 << 15) | (1 << 29);
 
 // UART_CONF1 fields (TRM UART_CONF1_REG @ 0x24).
 const CONF1_RX_TOUT_EN: u32 = 1 << 23;
+const CONF1_FULL_THRHD_MASK: u32 = 0x3FF;
 // UART_MEM_CONF fields (TRM UART_MEM_CONF_REG @ 0x60): rx_tout_thrhd [26:17].
 const MEM_CONF_RX_TOUT_THRHD_SHIFT: u32 = 17;
 const MEM_CONF_RX_TOUT_THRHD_MASK: u32 = 0x3FF;
@@ -96,6 +99,8 @@ impl Uart {
         regs[(UART_INT_RAW / 4) as usize] = INT_TXFIFO_EMPTY | INT_TX_DONE;
         // MEM_CONF reset default carries rx_tout_thrhd = 10 (TRM).
         regs[(UART_MEM_CONF / 4) as usize] = 10 << MEM_CONF_RX_TOUT_THRHD_SHIFT;
+        // CONF1 reset defaults: rxfifo_full_thrhd = txfifo_empty_thrhd = 96.
+        regs[(UART_CONF1 / 4) as usize] = 96 | (96 << 10);
         Self {
             regs,
             tx_out: Vec::new(),
@@ -129,7 +134,13 @@ impl Uart {
             & !STATUS_RXFIFO_CNT_MASK)
             | ((self.rx.len() as u32) & STATUS_RXFIFO_CNT_MASK);
         regs[(UART_RXD_CNT / 4) as usize] = regs[(UART_RXD_CNT / 4) as usize].wrapping_add(1);
-        regs[(UART_INT_RAW / 4) as usize] |= INT_RXFIFO_FULL;
+        // RXFIFO_FULL is level-gated on the CONF1 threshold (TRM: fires when
+        // the FIFO count reaches rxfifo_full_thrhd); short bursts rely on
+        // RXFIFO_TOUT instead.
+        let thrhd = regs[(UART_CONF1 / 4) as usize] & CONF1_FULL_THRHD_MASK;
+        if self.rx.len() as u32 >= thrhd.max(1) {
+            regs[(UART_INT_RAW / 4) as usize] |= INT_RXFIFO_FULL;
+        }
     }
 
     /// APB bit time in model ticks from CLKDIV (≈ clkdiv at 80 MHz APB;
@@ -205,6 +216,15 @@ impl Uart {
             UART_INT_CLR => {
                 // Writing 1 clears the corresponding RAW bit (TRM UART_INT_CLR).
                 self.regs[(UART_INT_RAW / 4) as usize] &= !value;
+            }
+            UART_CONF1 => {
+                self.regs[(UART_CONF1 / 4) as usize] = value;
+                // Lowering the FULL threshold under a pending count latches
+                // FULL (level-style, TRM UART_INT_RAW).
+                let thrhd = value & CONF1_FULL_THRHD_MASK;
+                if self.rx.len() as u32 >= thrhd.max(1) {
+                    self.regs[(UART_INT_RAW / 4) as usize] |= INT_RXFIFO_FULL;
+                }
             }
             // Auto-baud: EN=0 at reset and on write of 0 → clear RXD_CNT.
             UART_AUTOBAUD => {

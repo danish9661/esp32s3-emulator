@@ -64,6 +64,17 @@ pub const GDMA_RMT_PERIPH: u32 = 9;
 pub const GDMA_SPI2_PERIPH: u32 = 0;
 pub const GDMA_SPI3_PERIPH: u32 = 1;
 
+/// LCD_CAM peripheral id for `peri_sel` (`soc/gdma_channel.h`
+/// `SOC_GDMA_TRIG_PERIPH_LCD0` = 5, shared with CAM0). The GDMA `out`
+/// channel streams descriptor words through the LCD TX FIFO as one
+/// synchronous 8080 transfer (see `LcdCam::dma_transfer`).
+pub const GDMA_LCD_PERIPH: u32 = 5;
+
+/// ADC peripheral id for `peri_sel` (`soc/gdma_channel.h`
+/// `SOC_GDMA_TRIG_PERIPH_ADC0` = 8). The GDMA `in` channel drains staged
+/// digital-conversion results (`Adc::dma_pop`) to DRAM.
+pub const GDMA_ADC_PERIPH: u32 = 8;
+
 /// SHA peripheral id for `peri_sel` (`soc/gdma_channel.h`
 /// `SOC_GDMA_TRIG_PERIPH_SHA0`).
 pub const GDMA_SHA_PERIPH: u32 = 7;
