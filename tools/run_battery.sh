@@ -1,0 +1,128 @@
+#!/bin/bash
+# tools/run_battery.sh — end-to-end validation battery for the emulator.
+#
+# For every validation sketch: optionally rebuild it with arduino-cli,
+# run the merged flash image through run_flash (with the sketch's env),
+# and assert its PASS markers (and no FAIL). Exits nonzero if any sketch
+# fails. Sketches with documented out-of-scope gaps are SKIPped with a
+# reason instead of going red.
+#
+# Usage:
+#   tools/run_battery.sh                 # run all (existing .merged.bin)
+#   tools/run_battery.sh --build         # rebuild every sketch first
+#   tools/run_battery.sh --build hello   # rebuild+run only matching sketches
+set -u
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+EMU="$ROOT/target/release/examples/run_flash"
+SK="$ROOT/tools/sketches"
+BUILD=0
+FILTER=()
+for a in "$@"; do
+  case "$a" in
+    --build) BUILD=1 ;;
+    *) FILTER+=("$a") ;;
+  esac
+done
+
+echo "== building run_flash =="
+cargo build --release -p esp32s3-emu --example run_flash 2>&1 | grep -E "^error" -A4 | head -8
+
+# Table: name|env(space-separated K=V)|required markers (; separated)|STEPS.
+# SKIP entries: name|SKIP:reason (not run).
+CASES=(
+"hello||Hello from ESP32-S3!;boot OK|"
+"periph|ADC_INJECT_MV=825|boot OK|"
+"uart_echo|UART_INJECT=hello|[uart1] rx 'h'|"
+"uart_tout|UART_INJECT=Z|UART TOUT OK|"
+"uart_multi||MULTI_UART PASS|"
+"usb_serial||USB TEST|"
+"aes||AES DONE;AES CBC PASS;AES XTS PASS|"
+"aes_poke||AES POKE PASS|"
+"sha||SHA DONE;SHA384 PASS;SHA512 PASS|"
+"spi||SPI DONE|"
+"spi_driver||SPI DRIVER PASS|"
+"spi_dma||SPI DMA MOSI OK;SPI DMA RX OK|"
+"spi_slave|SPI_SLAVE_XCHG=1|SPI SLAVE DONE|"
+"spi_wide||SPI_WIDE PASS|"
+"i2c||I2C DONE|"
+"i2c_poke||I2C POKE PASS|"
+"i2c_slave|I2C_SLAVE_XCHG=1|I2C SLAVE DONE|"
+"i2c_wire|SKIP:Wire driver needs cmd_link ABI (documented limitation)|"
+"rmt||RMT TX done|"
+"rmt_driver||RMT DRIVER PASS|"
+"gpio_interrupt||GPIO_IRQ PASS|"
+"gpio_uart_timer||MULTI_PERIPH PASS|"
+"multi_irq||MULTI_IRQ PASS|"
+"timer_alarm||TIMER_ALARM PASS|"
+"systimer||SYSTIMER PASS|"
+"twai||TWAI LOOPBACK PASS|"
+"twai_driver||TWAI DRIVER LOOPBACK PASS|"
+"mcpwm||MCPWM PASS|"
+"pcnt||PCNT PASS|"
+"ledc||LEDC PASS|"
+"sigmadelta||SIGMADELTA PASS|"
+"efuse||EFUSE DONE|"
+"rng||RNG PASS|"
+"rtcio||RTCIO PASS|"
+"lpi2c||LP I2C POKE PASS|"
+"lpuart||LP UART POKE PASS|"
+"ulp||ULP POKE PASS|"
+"sdmmc||SDMMC PASS|"
+"deepsleep_poke||DEEPSLEEP PASS|"
+"deepsleep|SKIP:esp-idf deep-sleep prep hangs, poke sketch covers|"
+"hmac||HMAC DONE|"
+"ds||DS DONE|"
+"rsa||RSA POKE PASS||esp32s3_rsa/esp32s3_rsa_poke/esp32s3_rsa_poke.merged.bin"
+"ecdsa||ECDSA DONE|"
+"i2s||I2S POKE PASS|"
+"lcd_cam||LCD CAM POKE PASS|"
+"p5_stubs||P5 STUBS POKE PASS|"
+"gdma||GDMA RMT TX done|"
+"full_load||FULL_LOAD PASS|"
+"ota_slot||OTA SLOT TEST PASS|"
+"virtual_demo|SKIP:needs node virtual-device harness, not run_flash|"
+)
+
+pass=0; fail=0; skipped=0
+for c in "${CASES[@]}"; do
+  name="${c%%|*}"; rest="${c#*|}"
+  if [[ ${#FILTER[@]} -gt 0 ]]; then
+    keep=0
+    for f in "${FILTER[@]}"; do [[ "$name" == *"$f"* ]] && keep=1; done
+    [[ $keep == 0 ]] && continue
+  fi
+  if [[ "$rest" == SKIP:* ]]; then
+    reason="${rest#SKIP:}"; reason="${reason%|}"
+    echo "SKIP $name ($reason)"
+    skipped=$((skipped+1)); continue
+  fi
+  IFS='|' read -r envstr markers steps binrel _ <<< "$rest"
+  [[ -z "$steps" ]] && steps=96000000
+  dir="$SK/esp32s3_$name"
+  if [[ -n "$binrel" ]]; then
+    bin="$SK/$binrel"
+  else
+    bin="$dir/esp32s3_$name.merged.bin"
+    [[ -f "$bin" ]] || bin="$dir/esp32s3_$name.ino.merged.bin"
+    if [[ ! -f "$bin" ]]; then
+      bin=$(find "$dir/build" -name "*.merged.bin" 2>/dev/null | head -1)
+    fi
+  fi
+  if [[ $BUILD == 1 ]]; then
+    if ! arduino-cli compile --fqbn esp32:esp32:esp32s3 --build-path "$dir/build" "$dir" >/tmp/battery_build.log 2>&1; then
+      echo "FAIL $name (compile)"; tail -3 /tmp/battery_build.log; fail=$((fail+1)); continue
+    fi
+    cp "$dir/build/esp32s3_$name.ino.merged.bin" "$bin"
+  fi
+  if [[ ! -f "$bin" ]]; then echo "FAIL $name (no binary $bin)"; fail=$((fail+1)); continue; fi
+  log=$(STEPS=$steps env $envstr timeout 300 "$EMU" "$bin" 2>&1 | tr -d '\0')
+  ok=1; why=""
+  for m in ${markers//;/ }; do
+    echo "$log" | grep -aqF "$m" || { ok=0; why="missing [$m]"; }
+  done
+  echo "$log" | grep -aq "FAIL" && { ok=0; why="FAIL in output"; }
+  if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); fi
+done
+echo "== battery: $pass pass, $fail fail, $skipped skipped =="
+[[ $fail == 0 ]]

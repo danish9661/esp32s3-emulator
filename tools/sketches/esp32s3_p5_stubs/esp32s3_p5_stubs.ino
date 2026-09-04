@@ -29,6 +29,20 @@ bool check(const char* name, uint32_t base) {
   return ok;
 }
 
+// I2S0/1 are functional models now (not RegStores): INT_ST (0x10) reads
+// RAW&ENA and the FIFOs pop, so those don't round-trip. Poke two plain
+// config regs instead (TX_CONF 0x24 / RX_CONF 0x20, start bits clear).
+bool check_i2s(const char* name, uint32_t base) {
+  REG_WRITE(base + 0x24, 0x12345678);
+  REG_WRITE(base + 0x20, 0xDEADBEEB);
+  uint32_t a = REG_READ(base + 0x24);
+  uint32_t b = REG_READ(base + 0x20);
+  bool ok = (a == 0x12345678) && (b == 0xDEADBEEB);
+  Serial.print(name);
+  Serial.print(ok ? " OK" : " FAIL");
+  return ok;
+}
+
 void setup() {
   Serial.begin(115200);
   delay(50);
@@ -38,8 +52,8 @@ void setup() {
   all &= check("WCL", WCL_BASE);
   all &= check("PERI_BACKUP", PERI_BACKUP_BASE);
   all &= check("SYSCON", SYSCON_BASE);
-  all &= check("I2S0", I2S0_BASE);
-  all &= check("I2S1", I2S1_BASE);
+  all &= check_i2s("I2S0", I2S0_BASE);
+  all &= check_i2s("I2S1", I2S1_BASE);
   all &= check("ASSIST_DEBUG", ASSIST_DEBUG_BASE);
   all &= check("LCD_CAM", LCD_CAM_BASE);
 

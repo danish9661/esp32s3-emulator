@@ -11,10 +11,11 @@
 //!   write clears the corresponding RAW bit; `INT_ST = RAW & ENA`.
 //! - RX: `inject_rx` pushes a byte into the RX FIFO and latches
 //!   `INT_RXFIFO_FULL`; `UART_FIFO` reads pop one byte (RAW drops when the
-//!   FIFO empties, level-style); `UART_STATUS[29:24]` mirrors the FIFO
-//!   length for polling. `INT_RXFIFO_TOUT` fires via `tick` once the RX line
-//!   has been idle for `rx_tout_thrhd` bit-times with data pending and
-//!   `rx_tout_en` set (CONF1 bit 23, MEM_CONF bits [26:17]).
+//!   FIFO empties, level-style); `UART_STATUS.rxfifo_cnt` (bits [9:0], the
+//!   S3 layout per uart_struct.h — NOT classic-ESP32 [29:24]) mirrors the
+//!   FIFO length for polling. `INT_RXFIFO_TOUT` fires via `tick` once the
+//!   RX line has been idle for `rx_tout_thrhd` bit-times with data pending
+//!   and `rx_tout_en` set (CONF1 bit 23, MEM_CONF bits [26:17]).
 //! - Remaining registers are latched (writes stored, reads return stored
 //!   value or reset value) so firmware configuration writes are harmless.
 
@@ -46,10 +47,15 @@ pub const INT_RXFIFO_OVF: u32 = 1 << 4;
 pub const INT_RXFIFO_TOUT: u32 = 1 << 8;
 pub const INT_TX_DONE: u32 = 1 << 14;
 
-// UART_STATUS fields (TRM UART chapter): FIFO_CNT (RX bytes) = bits
-// [29:24], TXFIFO_CNT = bits [16:13], ST_UTX_OUT = bits [9:8] (idle high).
-const STATUS_FIFO_CNT_MASK: u32 = 0x3F << 24;
-const STATUS_ST_UTX_OUT: u32 = 0x3 << 8;
+// UART_STATUS fields (S3 TRM UART_STATUS_REG @ 0x1C / uart_struct.h —
+// NOTE this is NOT the classic-ESP32 layout: rxfifo_cnt = bits [9:0],
+// txfifo_cnt = bits [25:16]; dsrn/ctsn/rxd/dtrn are modem-line levels).
+// The esp-idf UART HAL reads the RX count with `extui status, 0, 10`, so
+// these low bits must carry the count — a ST_UTX_OUT-style constant here
+// (as on classic ESP32) poisons every length computation with 0x300.
+const STATUS_RXFIFO_CNT_MASK: u32 = 0x3FF;
+// Modem-line idle levels (TRM defaults): ctsn/rxd/dtrn high, dsrn low.
+const STATUS_MODEM_IDLE: u32 = (1 << 14) | (1 << 15) | (1 << 29);
 
 // UART_CONF1 fields (TRM UART_CONF1_REG @ 0x24).
 const CONF1_RX_TOUT_EN: u32 = 1 << 23;
@@ -79,8 +85,8 @@ pub struct Uart {
 impl Uart {
     pub fn new() -> Self {
         let mut regs = [0u32; REG_COUNT];
-        // ST_UTX_OUT = idle high (UART_STATUS[9:8]); TXFIFO_CNT = 0.
-        regs[(UART_STATUS / 4) as usize] = STATUS_ST_UTX_OUT;
+        // Modem lines idle (ctsn/rxd/dtrn high); TXFIFO_CNT = 0.
+        regs[(UART_STATUS / 4) as usize] = STATUS_MODEM_IDLE;
         // TXFIFO_EMPTY/TX_DONE are LEVEL-style latches on real silicon: the
         // FIFO is empty and the transmitter idle from reset, so both RAW
         // bits read 1 until the first byte is written (TRM UART_INT_RAW).
@@ -120,8 +126,8 @@ impl Uart {
         self.tout_idle = 0;
         let regs = &mut self.regs;
         regs[(UART_STATUS / 4) as usize] = (regs[(UART_STATUS / 4) as usize]
-            & !STATUS_FIFO_CNT_MASK)
-            | ((self.rx.len() as u32 & 0x3F) << 24);
+            & !STATUS_RXFIFO_CNT_MASK)
+            | ((self.rx.len() as u32) & STATUS_RXFIFO_CNT_MASK);
         regs[(UART_RXD_CNT / 4) as usize] = regs[(UART_RXD_CNT / 4) as usize].wrapping_add(1);
         regs[(UART_INT_RAW / 4) as usize] |= INT_RXFIFO_FULL;
     }
@@ -172,8 +178,8 @@ impl Uart {
                     return 0;
                 };
                 self.regs[(UART_STATUS / 4) as usize] = (self.regs[(UART_STATUS / 4) as usize]
-                    & !STATUS_FIFO_CNT_MASK)
-                    | ((self.rx.len() as u32 & 0x3F) << 24);
+                    & !STATUS_RXFIFO_CNT_MASK)
+                    | ((self.rx.len() as u32) & STATUS_RXFIFO_CNT_MASK);
                 if self.rx.is_empty() {
                     self.regs[(UART_INT_RAW / 4) as usize] &= !INT_RXFIFO_FULL;
                 }

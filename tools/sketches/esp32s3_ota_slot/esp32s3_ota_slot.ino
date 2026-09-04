@@ -28,7 +28,7 @@ void setup() {
 
   // Try to find OTA partitions
   esp_partition_iterator_t it = esp_partition_find(
-    ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APPOTA_0, NULL);
+    ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
   int slot = 0;
   while (it) {
     const esp_partition_t* p = esp_partition_get(it);
