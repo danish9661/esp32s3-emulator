@@ -2106,3 +2106,67 @@ Core design:
     Validated: 8 aes KATs, driver sketch ECB + `AES CBC PASS`, `AES POKE
     PASS`, SHA/GDMA/RMT-driver regressions green. 36/36 suites, clippy (only
     pre-existing warns)/fmt/wasm32 clean.
+  - 2026-09-04: **Peripheral batch: SHA-384/512, XTS, SPI/I2C slave, GDMA SPI,
+    UART TOUT + ROM call-target audit.**
+    - **SHA-384/512** (`sha.rs`): SHA-512 compression (FIPS 180-4 K table
+      verified against the `sha2` crate constants), 128-byte blocks, 384/512
+      IVs, 12/16-word H readback (each u64 splits hi-half-first, every u32
+      byte-swapped like the 256-bit modes — confirmed by KAT). 4 new KATs
+      (hello + 2-block messages vs hashlib) + sketch extended (`SHA384 PASS`
+      / `SHA512 PASS` via the real `mbedtls_sha512` → `esp_sha_dma` HW path,
+      proven in disassembly). Mode 5 (SHA512_t) stays unmodeled (mbedtls
+      exposes no t-variant).
+    - **AES-XTS decision: no model change.** `esp_aes_crypt_xts` is software
+      over HW ECB (calls `esp_aes_crypt_ecb` per block; tweak via
+      `esp_gf128mul_x_ble`, the byte-reversed-α variant — recovered
+      empirically after the BE-α guess failed block 1). Sketch asserts a
+      2-block vector → `AES XTS PASS`. XTS retired.
+    - **SPI slave** (`spi.rs`): slave_mode bit 26 (from `spi_struct.h`),
+      CMD.usr gated in slave mode, host-driven `slave_inject_write` /
+      `slave_take_read` (shared-buffer semantics: a master-write clobbers the
+      TX preload, so firmware reloads between halves — the first sketch run
+      caught exactly this, harness asserting `[a5, c3]`). Validated end-to-end
+      (`RX=11223300 RXLEN=24 TXLEN=16 DONE`) via new `SPI_SLAVE_XCHG`
+      run_flash markers. Slave DMA + live Q waveform not modeled.
+    - **I2C slave** (`i2c.rs`): slave = CTR.ms_mode clear, SLAVE_ADDR @0x10,
+      SR slave_rw/addressed bits, TRANS_START/DET_START/WM/TRANS_COMPLETE/
+      END_DETECT on inject, TXFIFO_UDF on dry read, addr-match gating,
+      trans_start ignored in slave mode, 7-bit only. Validated end-to-end
+      (`RX=11 22 SR=00040020 SR2=00040022 DONE`) via `I2C_SLAVE_XCHG`.
+    - **GDMA SPI master-DMA** (`spi.rs`/`soc.rs`/`gdma.rs`): peri_sel 0/1,
+      OUT walk stages bytes + one `dma_trigger` per link-start (sized Txn.buf
+      past the 64B data_buf), MISO into non-draining `dma_rx` for the IN walk
+      (start IN after trans_done — documented ordering contract). Machine test
+      + sketch with GPIO logic-analyzer capture → `BITS=32 MOSI=a53cf00f OK`.
+      Found en route: (1) **SPI clock ran 16× fast with pre>0**
+      (`phase=(elapsed%bit_cycles)%period` conflated scales; all prior tests
+      used pre=0 which masked it) — fixed with `low_ticks`, prescaler KAT
+      updated to the TRM reading; (2) a DESC `printf` between GDMA-start and
+      sampling eats the first bits (documented in-sketch); (3) two stale-
+      binary false alarms chased before checking timestamps. Slave-DMA,
+      LCD(5)/ADC(8) GDMA still out of scope.
+    - **UART RXFIFO_TOUT** (`uart.rs`): tout_en (CONF1.23) + tout_thrhd
+      (MEM_CONF[26:17], reset-seeded 10) + CLKDIV-derived bit time, ticked per
+      step (no-op fast path), re-arms while data pending. 4 unit tests +
+      sketch (`UART TOUT BYTE=5a OK` via `UART_INJECT` with a sub-threshold
+      burst). FULL-threshold gating deliberately untouched (no regression
+      risk to the echo path).
+    - **uart_echo pre-existing hang (not mine)**: the `esp32s3_uart_echo`
+      sketch never prints Hello at HEAD either (verified via stash A/B, same
+      spinlock pc 0x4037ae7f) — UART1 *driver* RX path, same family as the
+      Wire `cmd_link` gap; TOUT was validated driver-free per precedent.
+    - **ROM call-target audit (no fills needed)**. Method: temporary
+      `romprobe` census (since removed) of entries into real-ROM
+      [0x40000570, 0x40060000) over hello/periph/aes/twai_driver (173-177
+      distinct targets each). Findings: glue [0x400,0x570) sees only
+      reset/loader/puts entries; live-ROM does everything else — ets_delay_us
+      (direct app calls), cache suspend/resume/enable, spi_flash idle/poll +
+      opiflash family (heaviest hitters, incl. former ".ld gaps" like
+      `esp_rom_opiflash_read_raw`), console (one `ets_printf`-wrapper call +
+      71× direct `uart_tx_one_char@0x40048C30`), newlib (0x4002xxxx),
+      reset-reason (0x57C), install-putc neighborhood (0x5D6C). The 184
+      PROVIDE-without-stub-table "gaps" are executing ROM code, not missing
+      coverage (stub entries past GLUE_END=0x570 are dead reference by
+      design). MMIO default (read 0 / drop writes) means ROM can't panic on
+      unmodeled regs; battery proves its needs are met.
+    - 37/37 suites green, clippy (pre-existing warns only)/fmt/wasm32 clean.

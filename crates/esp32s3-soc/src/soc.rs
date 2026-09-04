@@ -770,6 +770,11 @@ impl Soc {
             self.timg[1].tick(1);
             self.systimer.tick(1);
             self.ledc.tick();
+            // UART RX-timeout counters (no-op unless RX data is pending with
+            // rx_tout_en set).
+            self.uarts[0].tick(1);
+            self.uarts[1].tick(1);
+            self.uarts[2].tick(1);
             self.spi[0].tick(1);
             if let Some(tx) = self.spi[0].take_last_tx() {
                 self.pending_spi_tx[0] = tx;

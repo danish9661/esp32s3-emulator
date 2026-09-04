@@ -12,7 +12,9 @@
 //! - RX: `inject_rx` pushes a byte into the RX FIFO and latches
 //!   `INT_RXFIFO_FULL`; `UART_FIFO` reads pop one byte (RAW drops when the
 //!   FIFO empties, level-style); `UART_STATUS[29:24]` mirrors the FIFO
-//!   length for polling.  (RXFIFO_TOUT / threshold levels not modeled yet.)
+//!   length for polling. `INT_RXFIFO_TOUT` fires via `tick` once the RX line
+//!   has been idle for `rx_tout_thrhd` bit-times with data pending and
+//!   `rx_tout_en` set (CONF1 bit 23, MEM_CONF bits [26:17]).
 //! - Remaining registers are latched (writes stored, reads return stored
 //!   value or reset value) so firmware configuration writes are harmless.
 
@@ -49,6 +51,17 @@ pub const INT_TX_DONE: u32 = 1 << 14;
 const STATUS_FIFO_CNT_MASK: u32 = 0x3F << 24;
 const STATUS_ST_UTX_OUT: u32 = 0x3 << 8;
 
+// UART_CONF1 fields (TRM UART_CONF1_REG @ 0x24).
+const CONF1_RX_TOUT_EN: u32 = 1 << 23;
+// UART_MEM_CONF fields (TRM UART_MEM_CONF_REG @ 0x60): rx_tout_thrhd [26:17].
+const MEM_CONF_RX_TOUT_THRHD_SHIFT: u32 = 17;
+const MEM_CONF_RX_TOUT_THRHD_MASK: u32 = 0x3FF;
+// UART_CLKDIV fields (TRM UART_CLKDIV_REG @ 0x14): clkdiv [11:0] (+frag
+// [23:20]/16); the APB (80 MHz) bit time in model ticks is ~clkdiv.
+const CLKDIV_DIV_MASK: u32 = 0xFFF;
+const CLKDIV_FRAG_SHIFT: u32 = 20;
+const CLKDIV_FRAG_MASK: u32 = 0xF;
+
 const REG_COUNT: usize = 0x80 / 4;
 
 /// One UART instance.
@@ -59,6 +72,8 @@ pub struct Uart {
     tx_out: Vec<u8>,
     /// Received-but-unread bytes (the RX FIFO).
     rx: VecDeque<u8>,
+    /// RX-idle ticks since the last received byte (RXFIFO_TOUT counter).
+    tout_idle: u64,
 }
 
 impl Uart {
@@ -73,10 +88,13 @@ impl Uart {
         // TXFIFO_EMPTY and the ISR fires immediately to drain the driver's
         // TX ringbuffer (uart_tx_all -> xRingbufferSend -> enable -> ISR).
         regs[(UART_INT_RAW / 4) as usize] = INT_TXFIFO_EMPTY | INT_TX_DONE;
+        // MEM_CONF reset default carries rx_tout_thrhd = 10 (TRM).
+        regs[(UART_MEM_CONF / 4) as usize] = 10 << MEM_CONF_RX_TOUT_THRHD_SHIFT;
         Self {
             regs,
             tx_out: Vec::new(),
             rx: VecDeque::new(),
+            tout_idle: 0,
         }
     }
 
@@ -99,12 +117,45 @@ impl Uart {
     /// Push one received byte into the RX FIFO (host console input).
     pub fn inject_rx(&mut self, byte: u8) {
         self.rx.push_back(byte);
+        self.tout_idle = 0;
         let regs = &mut self.regs;
         regs[(UART_STATUS / 4) as usize] = (regs[(UART_STATUS / 4) as usize]
             & !STATUS_FIFO_CNT_MASK)
             | ((self.rx.len() as u32 & 0x3F) << 24);
         regs[(UART_RXD_CNT / 4) as usize] = regs[(UART_RXD_CNT / 4) as usize].wrapping_add(1);
         regs[(UART_INT_RAW / 4) as usize] |= INT_RXFIFO_FULL;
+    }
+
+    /// APB bit time in model ticks from CLKDIV (≈ clkdiv at 80 MHz APB;
+    /// falls back to the 115200-baud divisor when unprogrammed).
+    fn bit_ticks(&self) -> u64 {
+        let clkdiv = self.regs[(UART_CLKDIV / 4) as usize];
+        let div = u64::from(clkdiv & CLKDIV_DIV_MASK)
+            + u64::from((clkdiv >> CLKDIV_FRAG_SHIFT) & CLKDIV_FRAG_MASK) / 16;
+        div.max(1)
+    }
+
+    /// Advance `cycles` ticks; latch INT_RXFIFO_TOUT once the RX line has
+    /// been idle for rx_tout_thrhd bit-times with data pending and
+    /// rx_tout_en set (TRM UART RXFIFO_TOUT). Fast path: nothing pending or
+    /// the timeout disabled.
+    pub fn tick(&mut self, cycles: u64) {
+        if self.rx.is_empty() {
+            return;
+        }
+        if self.regs[(UART_CONF1 / 4) as usize] & CONF1_RX_TOUT_EN == 0 {
+            return;
+        }
+        self.tout_idle += cycles;
+        let thrhd = u64::from(
+            (self.regs[(UART_MEM_CONF / 4) as usize] >> MEM_CONF_RX_TOUT_THRHD_SHIFT)
+                & MEM_CONF_RX_TOUT_THRHD_MASK,
+        );
+        if self.tout_idle >= thrhd.max(1) * self.bit_ticks() {
+            self.regs[(UART_INT_RAW / 4) as usize] |= INT_RXFIFO_TOUT;
+            // Re-arm: with data still pending the timeout recurs each period.
+            self.tout_idle = 0;
+        }
     }
 
     /// Interrupt status = RAW & ENA (TRM UART_INT_ST); the peripheral
