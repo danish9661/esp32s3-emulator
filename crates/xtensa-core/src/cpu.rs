@@ -232,6 +232,11 @@ pub struct Cpu {
     /// APP-CPU fastboot check) — QEMU esp32s3.c uses the same values).
     core_id: usize,
     phys: [u32; 64],
+    /// Single-precision floating-point register file: 16 × 32-bit raw IEEE
+    /// bits (ISA RM 4.3.11.2). NOT windowed — global like the special
+    /// registers (QEMU `f` array). Reset state is undefined on silicon;
+    /// zeroed here.
+    fpregs: [u32; 16],
     sregs: [u32; 256],
     user_sregs: [u32; 256],
     pub(crate) windowbase_next: Option<u32>,
@@ -272,6 +277,7 @@ impl Cpu {
             pc: RESET_VECTOR,
             core_id,
             phys: [0; 64],
+            fpregs: [0; 16],
             sregs: [0; 256],
             user_sregs: [0; 256],
             windowbase_next: None,
@@ -321,6 +327,36 @@ impl Cpu {
     pub fn set_reg(&mut self, n: u32, v: u32) {
         let i = ((self.windowbase() * 4 + n) & 63) as usize;
         self.phys[i] = v;
+    }
+
+    /// Floating-point register fN as f32 (raw bits via u32::from_bits).
+    #[inline]
+    pub fn freg(&self, n: u32) -> f32 {
+        f32::from_bits(self.fpregs[(n & 15) as usize])
+    }
+
+    /// Write floating-point register fN (stored as raw bits).
+    #[inline]
+    pub fn set_freg(&mut self, n: u32, v: f32) {
+        self.fpregs[(n & 15) as usize] = v.to_bits();
+    }
+
+    /// Boolean register bit (ISA RM Boolean Option): the 16 FP-compare
+    /// result bits live in SR_BR (QEMU `br` — compares set/clear one bit).
+    #[inline]
+    pub fn br(&self, b: u32) -> bool {
+        self.sregs[SR_BR as usize] >> (b & 15) & 1 != 0
+    }
+
+    /// Set/clear one boolean bit, preserving the other 15.
+    #[inline]
+    pub fn set_br(&mut self, b: u32, v: bool) {
+        let bit = 1u32 << (b & 15);
+        if v {
+            self.sregs[SR_BR as usize] |= bit;
+        } else {
+            self.sregs[SR_BR as usize] &= !bit;
+        }
     }
 
     #[inline]

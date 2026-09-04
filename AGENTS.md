@@ -2215,3 +2215,101 @@ Core design:
       TMPDIR=~/.tmp works around it).
     - 37/37 suites green, battery 49/0/3, clippy (pre-existing warns only)/
       fmt/wasm32 clean.
+  - 2026-09-04: **PSRAM chip init + small items (MCPWM capture, I2C-10bit,
+    gallery) — MicroPython unblocked past init.**
+    - **PSRAM ID probe (real model gap)**. MicroPython died at `esp_psram`
+      init ("not connected"). Root-caused via the MEMSPI trace ring (+ a new
+      per-transaction MISC field): the ROM issues the 0x9F probe with
+      MISC=0x00 and later pattern traffic (0xF5/0x02/0x03+magic) with
+      MISC=0x01 (CS1), but the model routed everything to the NOR flash
+      (flash ID failed the `KGD==0x5D` check; PP writes even corrupted flash
+      at the test address). Fixed with: (1) CS routing by MISC (CS1-only →
+      PSRAM device with private 8 MB pattern backing — runtime heap uses the
+      cache MMU, never SPI1, so no sharing needed); (2) XIP-gated ID: once
+      cache is enabled the flash is in continuous-read mode and goes silent,
+      so the ambiguous-misc 0x9F probe is answered by PSRAM
+      (`xip` mirrored from cache enables; exact probe shape only, zero impact
+      on validated flash flows); (3) ID bytes `[0D,5D,00]` (byte1=KGD).
+      Caught en route: a `&`/`==` precedence bug that made routing dead code
+      (unit tests now pin it), and my own inverted CS-bit test value. Result:
+      PSRAM errors gone, boot proceeds to VFS + `qstr_hash` before the known
+      window-spill crash. 3 new memspi KATs. Decisive evidence came from the
+      real IDF source (`esp_psram_impl_quad.c`: `PSRAM_KGD==0x5D`,
+      `cs_en_mask` semantics) instead of ROM disassembly.
+    - **MCPWM capture** (`mcpwm.rs`): free-running cap timer + 3 channels
+      (en/edge/prescale/invert per `mcpwm_struct.h`, CAP 166-168/175-177,
+      values/status/INT 27-29), sampled via pad readback (found en route:
+      `pin_level` returns GPIO_OUT for output-enabled pins, hiding
+      peripheral levels — capture uses `gpio_in_readback` like digitalRead).
+      3 unit tests + machine loopback test + sketch (`period=10000` exact).
+    - **I2C 10-bit**: slave match widens with `addr_10bit_en` (master 10-bit
+      is plain WRITE bytes — proven by test); stretch documented unneeded
+      (host-driven exchanges are instant). 2 unit tests.
+    - **Gallery**: refreshed stale `uart_echo` bin (it hung!), +6 entries
+      (aes/sha/spi_dma/mcpwm_cap/twai_driver/ledc) → 19 examples, all 200,
+      API-compat confirmed. eFuse-burn documented as no-op.
+    - Battery 50/0/3, 37/37 suites, clippy (pre-existing warns only)/
+      fmt/wasm32 clean.
+  - 2026-09-05: **sr_of WINDOWBASE/WINDOWSTART gap fixed — MicroPython boots
+    to REPL (user: "run micropython code and see if that works")**.
+    MicroPython v1.29.0 GENERIC_S3 (1.78MB) died at ~7.47M insns (wild sp
+    0x3c16def4 + ret-to-heap inside xthal_window_spill_nw → ILLEGAL at the
+    double vector). Long forensics detour first: a stray 7.44M-step pre-roll
+    loop in a temp probe (since removed) SHIFTED several probe timelines and
+    produced phantom "determinism violations" (solved by a state-hash probe;
+    emulator is deterministic); the underflow/spill machinery itself was
+    PROVEN healthy by tracing (underflow8 handler restores + RFWU retry
+    succeed). ROOT CAUSE (real model bug, same class as the P4 PRID bug):
+    `sr_of()` had no RSR_WINDOWBASE/WINDOWSTART arms → both fell through to
+    `_ => 0` (LBEG!). xthal_window_spill_nw opens with rsr_windowbase/
+    rsr_windowstart to compute its ws rotation; with LBEG (0x4038b3be) instead
+    of wb=15/ws=0xaa80 it computed ws=0x4038 via wsr_windowstart and poisoned
+    every window (traced live: a2=0x4038b3be post-rsr, SAR=31, final
+    wsr=0x4038 reproduced exactly). Fix: 6-line sr_of arms (+rsr_windowbase/
+    windowstart roundtrip unit test, fails-without/passes-with verified).
+    Audit: those were the ONLY two RSR variants missing from sr_of.
+  - 2026-09-05: **LX7 single-precision FPU implemented (P5)**. FPR file
+    (fpregs[16] + freg/set_freg, not windowed) + BR bits (br/set_br, SR_BR)
+    in cpu.rs; exec.rs implements WFR/RFR/MOV/ABS/NEG/ADD/SUB/MUL, fused
+    MADD/MSUB (libm::fmaf, QEMU parity), MKDADJ (=b/a), MKSADJ (=sqrt),
+    FLOAT/UFLOAT (scalbn exact), TRUNC/FLOOR/CEIL/ROUND/UTRUNC with the ISA
+    RM edge rules (NOT Rust `as` casts: TRUNC NaN/+ovf→0x7FFFFFFF,
+    -ovf→0x80000000; UTRUNC NaN/+ovf→0xFFFFFFFF, negative→0x80000000),
+    CONST_S table [0,1,2,0.5] (QEMU), all 7 compares → BR
+    (ordered-false/unordered-true), MOVT/MOVF (BR) + MOVEQZ/NEZ/LTZ/GEZ (AR),
+    LSI/SSI/LSX/SSX + P-variants (split out of the DSP-unimplemented arm;
+    LSI dest = T field, LSX dest = R field per ISA Ch.6), BT/BF now test BR
+    (were always-false/true stubs). Divide/sqrt steps (DIV0/NEXP01/MADDN/
+    ADDEXP/ADDEXPM/DIVN/SQRT0/RECIP0/RSQRT0) are NOPs + ADDEXPM=MOV (QEMU
+    parity, commit f8c6137: sequences collapse via exact MKDADJ/MKSADJ).
+    Needs `libm = 0.2` (no_std, cached offline) for sqrtf/fmaf/scalbnf/
+    floorf/ceilf/roundevenf/truncf. 9 unit tests incl. full libgcc
+    __divsf3/__ieee754_sqrtf sequences (words match real toolchain bytes
+    exactly) over 10 div + 7 sqrt vectors bit-exact vs host f32 ops.
+    Gotchas: RFR/WFR were shadowed by a TLB-no-op arm (all FP reads were 0);
+    hand-asm pitfalls documented in-test (b1=(r<<4)|s; movi b1=0xA0|
+    imm[11:8]; slli sal spans bit20, op2=0 for shifts>16; L32I r=2).
+  - 2026-09-05: **MEMSPI driver-read path fixed (0xEB Quad Read) — new
+    peripheral gap via arduino-cli**. Real IDF `spi_flash_read` issues 0xEB
+    (USER2=0x700000EB, trace-ring proven), but NOR decode lacked 0xEB →
+    every driver read returned zeros (existing tests used low-byte-zero
+    addrs + 0x03/PP/SE only). Also fixed the stacked address bug (swap/shift
+    pairing only worked for low-byte-zero addrs; plain-REG + MSB stream now)
+    and the hardcoded dummy counts (Collect need now per-transaction).
+    New `tools/sketches/esp32s3_flashread` (table/app magic, NVS erased,
+    4KB sector like MP): was all-zeros FAIL → `FLASHREAD PASS` in battery.
+  - 2026-09-05: **MicroPython status: boots to `>>> `, runs Python**.
+    With a vfs partition appended (type DATA sub 0x82 label "vfs" @0x200000
+    + MD5 record digest at record-offset 16, NOT 12 — verified against the
+    pristine table): `Performing initial setup` (littlefs mkfs through OUR
+    PP/SE!), reboot from snapshot → `42` (boot.py print(6*7)), banner,
+    `>>> `; `print("hi")`/`print(1.0)`/`print(10.0)`/`print(len)` all work.
+    KNOWN GAPS (documented, reproduced): float formatting of values needing
+    negative-exponent scaling hangs (`print(0.5)`, `print(1.0/3.0)` —
+    mp_decimal_exp-negative path calling powf/div in a loop with constant
+    args, root cause TBD) and some calls raise garbage `NameError: name ''`
+    (`x=len("hi")`, `x=pow(5.0,1.0)` — same garbage line/name, TBD);
+    interactive stdin unread (USB-CDC + UART0 bytes ignored by REPL).
+    run_flash gains UART0_INJECT/UART0_MARKER (mirrors USB_INJECT).
+    Battery 51/0/3 (+flashread), 37/37 suites, clippy (pre-existing warns
+    only)/fmt/wasm32 clean.

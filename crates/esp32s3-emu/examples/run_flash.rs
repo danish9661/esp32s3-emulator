@@ -58,6 +58,18 @@ fn main() {
     // pushed into UART1 RX as soon as the console shows the RXREADY marker.
     let uart1_inject: Option<Vec<u8>> = env::var("UART_INJECT").ok().map(|s| s.into_bytes());
     let mut uart1_injected = false;
+    // UART0 RX injection (REPL experiment): UART0_INJECT=<text> is pushed
+    // into UART0 RX once the console shows UART0_MARKER (MicroPython's
+    // REPL may listen on UART0 rather than USB-CDC depending on the
+    // board's console configuration).
+    let uart0_inject: Option<Vec<u8>> = env::var("UART0_INJECT")
+        .ok()
+        .map(|s| s.replace("\\n", "\n").replace("\\r", "\r").into_bytes());
+    let uart0_marker: Vec<u8> = env::var("UART0_MARKER")
+        .ok()
+        .map(|s| s.into_bytes())
+        .unwrap_or_else(|| b">>> ".to_vec());
+    let mut uart0_injected = false;
     // USB-Serial-JTAG RX injection (REPL experiment): USB_INJECT=<text> is
     // pushed into the USB CDC RX FIFO once the console shows USB_MARKER
     // (default: the MicroPython post-PSRAM boot line).
@@ -216,6 +228,25 @@ fn main() {
                         String::from_utf8_lossy(bytes)
                     );
                     uart1_injected = true;
+                }
+            }
+        }
+
+        // UART0 RX injection: same pattern with a configurable marker.
+        if !uart0_injected && (!tx.is_empty() || !tx1.is_empty()) {
+            if let Some(bytes) = &uart0_inject {
+                if uart_buf
+                    .windows(uart0_marker.len())
+                    .any(|w| w == uart0_marker.as_slice())
+                {
+                    for &b in bytes {
+                        m.soc.uart_inject_rx(0, b);
+                    }
+                    println!(
+                        "[host] injected {:?} into UART0 RX",
+                        String::from_utf8_lossy(bytes)
+                    );
+                    uart0_injected = true;
                 }
             }
         }

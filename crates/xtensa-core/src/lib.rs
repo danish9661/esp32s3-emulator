@@ -796,6 +796,360 @@ mod cpu_tests {
     }
 
     #[test]
+    fn rsr_windowbase_windowstart_roundtrip() {
+        // `sr_of` needs explicit WINDOWBASE/WINDOWSTART arms: without them
+        // both RSRs fall through to `_ => 0` and read LBEG (SR 0), which
+        // poisons xthal_window_spill_nw's ws computation (MicroPython boot
+        // died at ~7.47M insns with ws=0x4038, wild sp, ret-to-heap).
+        // rsr a2, WINDOWBASE = 0x0003_4820; wsr WINDOWBASE a2 = 0x0013_4820;
+        // rsr a3, WINDOWSTART = 0x0003_4930; wsr WINDOWSTART a3 = 0x0013_4930.
+        let mut prog = Vec::new();
+        let mut a = 0x4000_1000u32;
+        put(&mut prog, &mut a, 0x000C_A022); // movi a2, 12 (fitting wb)
+        put(&mut prog, &mut a, 0x0013_4820); // wsr WINDOWBASE, a2
+        put(&mut prog, &mut a, 0x0003_4830); // rsr a3, WINDOWBASE
+        put(&mut prog, &mut a, 0x00A0_A242); // movi a4, 0x2A0
+        put(&mut prog, &mut a, 0x0013_4940); // wsr WINDOWSTART, a4
+        put(&mut prog, &mut a, 0x0003_4950); // rsr a5, WINDOWSTART
+        let end = a;
+
+        let mut bus = RamBus::load(&prog);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_1000;
+        run(&mut cpu, &mut bus, end);
+        assert_eq!(cpu.reg(3), 12, "rsr.windowbase reads back wsr value");
+        assert_eq!(cpu.reg(5), 0x2A0, "rsr.windowstart reads back wsr value");
+    }
+
+    // Single-precision FPU tests. FP RRR word layout (verified against
+    // real S3 firmware bytes, e.g. wfr f1,a2 = 0xFA1250):
+    //   word = (op2<<20)|(op1<<16)|(r<<12)|(s<<8)|(t<<4)|op0, op0=0.
+    // FP class op1=10 (arith/convert/move), op1=11 (compares/cond moves);
+    // op2 selects the op (ADD=0 SUB=1 MUL=2 MADD=4 MSUB=5 FLOAT=12
+    // UFLOAT=13 UTRUNC=14 ROUND=8 TRUNC=9 FLOOR=10 CEIL=11; two-operand
+    // class op2=15 with t-ext MOV=0 ABS=1 CONST=3 RFR=4 WFR=5 NEG=6;
+    // compares op1=11 op2: UN=1 OEQ=2 UEQ=3 OLT=4 ULT=5 OLE=6 ULE=7).
+    // movi at,imm: (imm[7:0]<<16)|(0xA<<12)|(imm[11:8]<<8)|(at<<4)|2.
+    // slli at,as,n: (sa4<<20)|(1<<16)|(at<<12)|(as<<8)|((sa&15)<<4), sa=(32-n)&31.
+    #[test]
+    fn fpu_moves_and_arith() {
+        let mut prog = Vec::new();
+        let mut a = 0x4000_1000u32;
+        put(&mut prog, &mut a, 0x00F8_A322); // movi a2, 0x3F8
+        put(&mut prog, &mut a, 0x0001_22C0); // slli a2, a2, 20   ; a2 = 1.0
+        put(&mut prog, &mut a, 0x0000_A432); // movi a3, 0x400
+        put(&mut prog, &mut a, 0x0001_33C0); // slli a3, a3, 20   ; a3 = 2.0
+        put(&mut prog, &mut a, 0x00FA_1250); // wfr f1, a2
+        put(&mut prog, &mut a, 0x00FA_2350); // wfr f2, a3
+        put(&mut prog, &mut a, 0x000A_3120); // add.s f3, f1, f2  ; 3.0
+        put(&mut prog, &mut a, 0x00FA_4340); // rfr a4, f3
+        put(&mut prog, &mut a, 0x001A_3120); // sub.s f3, f1, f2  ; -1.0
+        put(&mut prog, &mut a, 0x00FA_5340); // rfr a5, f3
+        put(&mut prog, &mut a, 0x002A_3120); // mul.s f3, f1, f2  ; 2.0
+        put(&mut prog, &mut a, 0x00FA_6340); // rfr a6, f3
+        put(&mut prog, &mut a, 0x00FA_4100); // mov.s f4, f1
+        put(&mut prog, &mut a, 0x00FA_4110); // abs.s f4, f1      ; (f4 = 1.0)
+        put(&mut prog, &mut a, 0x00FA_4160); // neg.s f4, f1      ; f4 = -1.0
+        put(&mut prog, &mut a, 0x00FA_7440); // rfr a7, f4
+        let end = a;
+
+        let mut bus = RamBus::load(&prog);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_1000;
+        run(&mut cpu, &mut bus, end);
+        assert_eq!(cpu.reg(4), 0x4040_0000, "1.0 + 2.0 = 3.0");
+        assert_eq!(cpu.reg(5), 0xBF80_0000, "1.0 - 2.0 = -1.0");
+        assert_eq!(cpu.reg(6), 0x4000_0000, "1.0 * 2.0 = 2.0");
+        assert_eq!(cpu.reg(7), 0xBF80_0000, "neg(1.0) = -1.0");
+    }
+
+    #[test]
+    fn fpu_madd_msub_const() {
+        // MADD_S/MSUB_S are fused (QEMU float32_muladd); CONST_S table =
+        // [0.0, 1.0, 2.0, 0.5], imm = s field (QEMU translate_const_s).
+        let mut prog = Vec::new();
+        let mut a = 0x4000_1000u32;
+        put(&mut prog, &mut a, 0x00FA_1130); // const.s f1, 1      ; 1.0
+        put(&mut prog, &mut a, 0x00FA_2330); // const.s f2, 3      ; 0.5
+        put(&mut prog, &mut a, 0x00FA_3230); // const.s f3, 2      ; 2.0
+        put(&mut prog, &mut a, 0x004A_1230); // madd.s f1, f2, f3  ; 1+0.5*2=2
+        put(&mut prog, &mut a, 0x00FA_4140); // rfr a4, f1
+        put(&mut prog, &mut a, 0x005A_5230); // msub.s f5, f2, f3  ; f5=0: 0-1
+        put(&mut prog, &mut a, 0x00FA_6540); // rfr a6, f5
+        let end = a;
+
+        let mut bus = RamBus::load(&prog);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_1000;
+        run(&mut cpu, &mut bus, end);
+        assert_eq!(cpu.reg(4), 0x4000_0000, "madd(1, 0.5, 2) = 2.0");
+        assert_eq!(cpu.reg(6), 0xBF80_0000, "msub(0, 0.5, 2) = -1.0");
+        assert_eq!(cpu.freg(2).to_bits(), 0x3F00_0000, "const.s 3 = 0.5");
+        assert_eq!(cpu.freg(3).to_bits(), 0x4000_0000, "const.s 2 = 2.0");
+    }
+
+    #[test]
+    fn fpu_converts() {
+        // FLOAT_S/UFLOAT_S/TRUNC_S (+edges per the ISA RM TRUNC.S page:
+        // +ovf/+inf/NaN -> 0x7FFFFFFF, -ovf/-inf -> 0x80000000) and the
+        // UTRUNC_S edges (NaN/+ovf -> 0xFFFFFFFF, negative -> 0x80000000).
+        // trunc.s ar,fs,t: op2=9; utrunc.s: op2=14.
+        let mut prog = Vec::new();
+        let mut a = 0x4000_1000u32;
+        put(&mut prog, &mut a, 0x0005_A022); // movi a2, 5
+        put(&mut prog, &mut a, 0x00CA_1200); // float.s f1, a2, 0  ; 5.0
+        put(&mut prog, &mut a, 0x00FA_7140); // rfr a7, f1
+        put(&mut prog, &mut a, 0x009A_8100); // trunc.s a8, f1, 0  ; 5
+        put(&mut prog, &mut a, 0x00F8_A722); // movi a2, 0x7F8
+        put(&mut prog, &mut a, 0x0001_22C0); // slli a2, a2, 20   ; +inf
+        put(&mut prog, &mut a, 0x00FA_1250); // wfr f1, a2
+        put(&mut prog, &mut a, 0x009A_3100); // trunc.s a3, f1, 0  ; +inf -> MAX
+        put(&mut prog, &mut a, 0x00EA_4100); // utrunc.s a4, f1, 0 ; +inf -> ~0
+        put(&mut prog, &mut a, 0x00FA_1160); // neg.s f1, f1       ; -inf
+        put(&mut prog, &mut a, 0x009A_5100); // trunc.s a5, f1, 0  ; -inf -> MIN
+        put(&mut prog, &mut a, 0x00EA_6100); // utrunc.s a6, f1, 0 ; neg -> 0x80000000
+        let end = a;
+
+        let mut bus = RamBus::load(&prog);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_1000;
+        run(&mut cpu, &mut bus, end);
+        assert_eq!(cpu.reg(7), 0x40A0_0000, "float(5) = 5.0");
+        assert_eq!(cpu.reg(4), 0xFFFF_FFFF, "utrunc(+inf) = ~0");
+        assert_eq!(cpu.reg(8), 5, "trunc(5.0) = 5");
+        assert_eq!(cpu.reg(3), 0x7FFF_FFFF, "trunc(+inf) saturates");
+        assert_eq!(cpu.reg(5), 0x8000_0000, "trunc(-inf) = MIN");
+        assert_eq!(cpu.reg(6), 0x8000_0000, "utrunc(negative) = 0x80000000");
+    }
+
+    #[test]
+    fn fpu_compares_and_cond_moves() {
+        // Compares write BR bit r (QEMU translate_compare_s): ordered ops
+        // false on NaN, unordered ops true, UN tests NaN-ness. MOVT/MOVF
+        // test BR bit t; MOVEQZ tests AR[t] == 0.
+        // oeq.s b2,f1,f2: (2<<20)|(11<<16)|(2<<12)|(1<<8)|(2<<4).
+        // olt.s b3: op2=4; ult.s b4: op2=5; un.s b5: op2=1.
+        // movt.s f3,f1,2: (13<<20)|(11<<16)|(3<<12)|(1<<8)|(2<<4).
+        let mut prog = Vec::new();
+        let mut a = 0x4000_1000u32;
+        put(&mut prog, &mut a, 0x00F8_A322); // movi a2, 0x3F8
+        put(&mut prog, &mut a, 0x0001_22C0); // slli a2, a2, 20   ; 1.0
+        put(&mut prog, &mut a, 0x00FA_1250); // wfr f1, a2
+        put(&mut prog, &mut a, 0x00FA_2250); // wfr f2, a2        ; f2 = 1.0
+        put(&mut prog, &mut a, 0x002B_2120); // oeq.s b2, f1, f2  ; true
+        put(&mut prog, &mut a, 0x004B_3120); // olt.s b3, f1, f2  ; false
+        put(&mut prog, &mut a, 0x00DB_3120); // movt.s f3, f1, 2  ; taken
+        put(&mut prog, &mut a, 0x00FA_6340); // rfr a6, f3
+        put(&mut prog, &mut a, 0x0080_A032); // movi a3, 0x80
+        put(&mut prog, &mut a, 0x0001_3380); // slli a3, a3, 24   ; 0x80000000
+        put(&mut prog, &mut a, 0x0020_2230); // or a2, a2, a3     ; a2 = -1.0 bits
+        put(&mut prog, &mut a, 0x00FA_1250); // wfr f1, a2        ; f1 = -1.0
+        put(&mut prog, &mut a, 0x004B_4120); // olt.s b4, f1, f2  ; -1 < 1 true
+        put(&mut prog, &mut a, 0x001B_5120); // un.s b5, f1, f2   ; false (ordered)
+        let end = a;
+
+        let mut bus = RamBus::load(&prog);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_1000;
+        run(&mut cpu, &mut bus, end);
+        assert!(cpu.br(2), "1.0 == 1.0 sets BR[2]");
+        assert!(!cpu.br(3), "1.0 < 1.0 clears BR[3]");
+        assert!(cpu.br(4), "-1.0 < 1.0 sets BR[4]");
+        assert!(!cpu.br(5), "ordered pair clears UN bit");
+        assert_eq!(cpu.reg(6), 0x3F80_0000, "movt took the move");
+    }
+
+    #[test]
+    fn fpu_load_store_and_branches() {
+        // LSI/SSI round-trip (RRI8 FP class op0=3, r = 0/4 selector;
+        // dest/base/imm = t/s/imm8<<2) and BT/BF on a compare result
+        // (b0=0x76, b1=(bool#<<4)|r with r=0 BF / 1 BT, target=pc+4+imm8).
+        const DATA: u32 = 0x4000_2000;
+        let mut prog = Vec::new();
+        prog.push((DATA, 0x4040_0000)); // 3.0f bits
+        let mut a = 0x4000_1000u32;
+        // a2 = DATA (0x40002000): movi 0x400 + slli 20 -> 0x40000000,
+        // then add low half via overlapping movi/or: 0x2000 =
+        // movi a3,0x20... 0x20 fits: movi a3, 0x20; slli a3, a3, 8? no
+        // slli-by-8: field (32-8)=24 -> 0x180. Simpler: movi a3,0x2000?
+        // 0x2000 > 0x7FF, no. Use: movi a3, 0x20; slli a3, a3, 8.
+        put(&mut prog, &mut a, 0x0000_A422); // movi a2, 0x400
+        put(&mut prog, &mut a, 0x0001_22C0); // slli a2, a2, 20   ; 0x40000000
+        put(&mut prog, &mut a, 0x0020_A032); // movi a3, 0x20
+        put(&mut prog, &mut a, 0x0011_3380); // slli a3, a3, 8    ; 0x2000
+        put(&mut prog, &mut a, 0x0020_2230); // or a2, a2, a3     ; 0x40002000
+        put(&mut prog, &mut a, 0x0000_0213); // lsi f1, a2, 0     ; 3.0
+        put(&mut prog, &mut a, 0x00FA_4140); // rfr a4, f1
+        put(&mut prog, &mut a, 0x0001_4213); // ssi f1, a2, 4     ; MEM[+4] = 3.0
+        put(&mut prog, &mut a, 0x0001_0223); // lsi f2, a2, 4     ; reload
+        put(&mut prog, &mut a, 0x00FA_5240); // rfr a5, f2
+        let end = a;
+
+        let mut bus = RamBus::load(&prog);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_1000;
+        run(&mut cpu, &mut bus, end);
+        assert_eq!(cpu.reg(2), DATA, "address materialized");
+        assert_eq!(cpu.reg(4), 0x4040_0000, "lsi loaded 3.0");
+        assert_eq!(cpu.reg(5), 0x4040_0000, "ssi+lsi round-trip");
+    }
+
+    #[test]
+    fn fpu_bt_bf_condmove() {
+        // BT/BF branch on BR bit s (b0=0x76, b1=(r<<4)|s with r=0 BF /
+        // 1 BT, target = pc+4+sext8); MOVEQZ/MOVNEZ test AR[t].
+        let mut prog = Vec::new();
+        let mut a = 0x4000_1000u32;
+        put(&mut prog, &mut a, 0x00F8_A322); // movi a2, 0x3F8
+        put(&mut prog, &mut a, 0x0001_22C0); // slli a2, a2, 20   ; 1.0
+        put(&mut prog, &mut a, 0x00FA_1250); // wfr f1, a2
+        put(&mut prog, &mut a, 0x00FA_2250); // wfr f2, a2
+        put(&mut prog, &mut a, 0x002B_2120); // oeq.s b2, f1, f2  ; true
+        put(&mut prog, &mut a, 0x0002_1276); // bt 2, +2 -> T1 (T1 = bt_pc+4+2)
+        put(&mut prog, &mut a, 0x0011_A042); // movi a4, 0x11 (skipped)
+        put(&mut prog, &mut a, 0x0022_A052); // T1: movi a5, 0x22
+        put(&mut prog, &mut a, 0x0002_0276); // bf 2, +2 -> T3 (not taken)
+        put(&mut prog, &mut a, 0x0033_A062); // movi a6, 0x33
+        put(&mut prog, &mut a, 0x0044_A072); // T3: movi a7, 0x44
+        put(&mut prog, &mut a, 0x00FA_5230); // const.s f5, 2     ; 2.0
+        put(&mut prog, &mut a, 0x008B_4100); // moveqz.s f4, f1, a0; a0=0: move
+        put(&mut prog, &mut a, 0x009B_5100); // movnez.s f5, f1, a0; no move
+        put(&mut prog, &mut a, 0x00FA_8440); // rfr a8, f4
+        put(&mut prog, &mut a, 0x00FA_9540); // rfr a9, f5
+        let end = a;
+
+        let mut bus = RamBus::load(&prog);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_1000;
+        run(&mut cpu, &mut bus, end);
+        assert_eq!(cpu.reg(4), 0, "bt taken skips the marker");
+        assert_eq!(cpu.reg(5), 0x22, "bt lands on T1");
+        assert_eq!(cpu.reg(6), 0x33, "bf not taken falls through");
+        assert_eq!(cpu.reg(7), 0x44, "reaches T3");
+        assert_eq!(cpu.reg(8), 0x3F80_0000, "moveqz moved (a0 == 0)");
+        assert_eq!(cpu.reg(9), 0x4000_0000, "movnez kept 2.0 (a0 == 0)");
+    }
+
+    #[test]
+    fn fpu_floor_ceil_round_ufloat() {
+        // FLOOR/CEIL/ROUND_S (op2=10/11/8) and UFLOAT_S (op2=13).
+        // 2.5 = 0x40200000 via movi 0x402 + slli 20.
+        let mut prog = Vec::new();
+        let mut a = 0x4000_1000u32;
+        put(&mut prog, &mut a, 0x0002_A432); // movi a3, 0x402
+        put(&mut prog, &mut a, 0x0001_33C0); // slli a3, a3, 20   ; 2.5
+        put(&mut prog, &mut a, 0x00FA_1350); // wfr f1, a3
+        put(&mut prog, &mut a, 0x00AA_9100); // floor.s a9, f1, 0 ; 2
+        put(&mut prog, &mut a, 0x00BA_A100); // ceil.s a10, f1, 0 ; 3
+        put(&mut prog, &mut a, 0x008A_B100); // round.s a11, f1, 0; 2 (ties-even)
+        put(&mut prog, &mut a, 0x0005_A022); // movi a2, 5
+        put(&mut prog, &mut a, 0x00DA_2200); // ufloat.s f2, a2, 0; 5.0
+        put(&mut prog, &mut a, 0x00FA_6240); // rfr a6, f2
+        let end = a;
+
+        let mut bus = RamBus::load(&prog);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_1000;
+        run(&mut cpu, &mut bus, end);
+        assert_eq!(cpu.reg(9), 2, "floor(2.5) = 2");
+        assert_eq!(cpu.reg(10), 3, "ceil(2.5) = 3");
+        assert_eq!(cpu.reg(11), 2, "round(2.5) = 2 ties-even");
+        assert_eq!(cpu.reg(6), 0x40A0_0000, "ufloat(5) = 5.0");
+    }
+
+    // libgcc software-divide/square-root sequences through the FPU.
+    // The divide/square-root step ops (DIV0/NEXP01/MADDN/ADDEXP/ADDEXPM/
+    // DIVN/SQRT0/RECIP0/RSQRT0) are NOPs (QEMU parity, commit f8c6137);
+    // the sequences collapse correctly because MKDADJ/MKSADJ perform the
+    // true divide/sqrt and ADDEXPM moves it to the final register that
+    // DIVN leaves untouched.  Encodings below reproduce real toolchain
+    // bytes exactly (e.g. wfr f1,a2 = 0xFA1250, divn.s f0,f1,f3 =
+    // 0x7A0130, maddn.s f3,f2,f2 = 0x6A3220, all matching disassembled
+    // ESP32-S3 libgcc/firmware).  Expected results are computed by host
+    // f32 division/sqrt (correctly rounded IEEE).
+    //
+    // Machine-generated words (op1=10 arith class op2: ADD=0 MADD=4
+    // MSUB=5 MADDN=6 DIVN=7; op2=15 two-op class t-ext: MOV=0 CONST=3
+    // NEG=6 DIV0=7 SQRT0=9 NEXP01=11 MKSADJ=12 MKDADJ=13 ADDEXP=14
+    // ADDEXPM=15; WFR t=5 RFR t=4; word=(op2<<20)|(op1<<16)|(r<<12)|
+    // (s<<8)|(t<<4); LSI/SSI op0=3 class; l32i/or/movi/slli per the
+    // header notes above fpu_moves_and_arith).
+    #[allow(dead_code)]
+    fn fp_seq_run(x_bits: u32, y_bits: u32, seq: &[u32]) -> u32 {
+        const D0: u32 = 0x4000_2000;
+        let mut prog = alloc::vec![(D0, x_bits), (D0 + 4, y_bits)];
+        let mut a = 0x4000_1000u32;
+        let emit = |w: u32, p: &mut Vec<(u32, u32)>, a: &mut u32| {
+            p.push((*a, w));
+            *a += crate::generated::insn_len((w & 0xff) as u8);
+        };
+        emit(0x0000_A422, &mut prog, &mut a); // movi a2, 0x400
+        emit(0x0001_22C0, &mut prog, &mut a); // slli a2, a2, 20
+        emit(0x0020_A032, &mut prog, &mut a); // movi a3, 0x20
+        emit(0x0011_3380, &mut prog, &mut a); // slli a3, a3, 8
+        emit(0x0020_2230, &mut prog, &mut a); // or a2, a2, a3 -> D0
+        emit(0x0020_4200, &mut prog, &mut a); // or a4, a2, a0 -> base copy
+        emit(0x0000_2422, &mut prog, &mut a); // l32i a2, a4, 0
+        emit(0x0001_2432, &mut prog, &mut a); // l32i a3, a4, 4
+        for w in seq {
+            emit(*w, &mut prog, &mut a);
+        }
+        let mut bus = RamBus::load(&prog);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_1000;
+        run(&mut cpu, &mut bus, a);
+        cpu.reg(4)
+    }
+
+    #[test]
+    fn fpu_libgcc_div_sequence() {
+        // Exact libgcc __divsf3 instruction sequence (wfr/div0/nexp01/
+        // const/maddn/mov/neg/mkdadj/addexpm/addexp/divn/rfr).
+        const SEQ: [u32; 28] = [
+            0x00FA1250, 0x00FA2350, 0x00FA3270, 0x00FA42B0, 0x00FA5130, 0x006A5430, 0x00FA6300,
+            0x00FA7200, 0x00FA21B0, 0x006A6560, 0x00FA5130, 0x00FA0030, 0x00FA8260, 0x006A5460,
+            0x006A0830, 0x00FA71D0, 0x006A6560, 0x006A8400, 0x00FA3130, 0x006A3460, 0x006A0860,
+            0x00FA2260, 0x006A6360, 0x006A2400, 0x00FA07F0, 0x00FA67E0, 0x007A0260, 0x00FA4040,
+        ];
+        for (x, y) in [
+            (1.0f32, 3.0f32),
+            (2.0, 3.0),
+            (7.0, 2.0),
+            (1.0, 10.0),
+            (-1.0, 3.0),
+            (1.0, 0.0),
+            (-1.0, 0.0),
+            (0.0, 5.0),
+            (100.0, 0.25),
+            (0.1, 0.3),
+        ] {
+            let got = fp_seq_run(x.to_bits(), y.to_bits(), &SEQ);
+            assert_eq!(got, (x / y).to_bits(), "{x}/{y}");
+        }
+        // 0/0 is NaN (payload-insensitive).
+        let nan = fp_seq_run(0.0f32.to_bits(), 0.0f32.to_bits(), &SEQ);
+        assert!(f32::from_bits(nan).is_nan(), "0/0 = NaN, got {nan:#x}");
+    }
+
+    #[test]
+    fn fpu_libgcc_sqrt_sequence() {
+        // Exact libgcc __ieee754_sqrtf sequence (second operand ignored).
+        const SEQ: [u32; 31] = [
+            0x00FA1250, 0x00FA2190, 0x00FA3030, 0x006A3220, 0x00FA41B0, 0x00FA0330, 0x00FA40E0,
+            0x006A0340, 0x00FA31B0, 0x00FA5360, 0x006A2020, 0x00FA0030, 0x00FA6030, 0x00FA7030,
+            0x006A0520, 0x006A6240, 0x00FA4330, 0x006A7420, 0x006A3000, 0x006A4620, 0x00FA2760,
+            0x006A0320, 0x006A7470, 0x00FA21C0, 0x00FA11B0, 0x006A1000, 0x00FA3760, 0x00FA02F0,
+            0x00FA32E0, 0x007A0130, 0x00FA4040,
+        ];
+        for x in [2.0f32, 0.25, 1.0, 100.0, 0.0, f32::INFINITY, 0.5] {
+            let got = fp_seq_run(x.to_bits(), 0, &SEQ);
+            assert_eq!(got, x.sqrt().to_bits(), "sqrt({x})");
+        }
+        let nan = fp_seq_run((-1.0f32).to_bits(), 0, &SEQ);
+        assert!(f32::from_bits(nan).is_nan(), "sqrt(-1) = NaN");
+    }
+
+    #[test]
     fn ee_dsp_instruction_is_unimplemented() {
         // An unimplemented TIE/DSP (`ee.*`) instruction must halt the core with
         // StepResult::Unimplemented rather than mis-executing or raising a

@@ -428,8 +428,8 @@ pub(crate) fn execute<B: Bus>(
         ),
         Opcode::OPCODE_BBCI => branch_if(o, 2, (cpu.reg(o[0].value) >> (o[1].value & 31)) & 1 == 0),
         Opcode::OPCODE_BBSI => branch_if(o, 2, (cpu.reg(o[0].value) >> (o[1].value & 31)) & 1 == 1),
-        Opcode::OPCODE_BF => branch_if(o, 1, false),
-        Opcode::OPCODE_BT => branch_if(o, 1, true),
+        Opcode::OPCODE_BF => branch_if(o, 1, !cpu.br(o[0].value)),
+        Opcode::OPCODE_BT => branch_if(o, 1, cpu.br(o[0].value)),
 
         // ------------------------------------------------------------------
         // Jumps and calls.
@@ -1178,11 +1178,11 @@ pub(crate) fn execute<B: Bus>(
         | Opcode::OPCODE_WDTLB
         | Opcode::OPCODE_WITLB
         | Opcode::OPCODE_RER
-        | Opcode::OPCODE_WER
-        | Opcode::OPCODE_RFR
-        | Opcode::OPCODE_WFR => {
+        | Opcode::OPCODE_WER => {
             // System/TLB/cache barrier instructions: no architectural
             // effects in the P1 emulation (QEMU translates most as no-ops).
+            // NOTE: OPCODE_RFR/WFR (FP moves) must NOT be listed here —
+            // they have real behavior in the FPU section below.
             Outcome::Seq
         }
         Opcode::OPCODE_LDDEC => {
@@ -1198,20 +1198,307 @@ pub(crate) fn execute<B: Bus>(
             cpu.set_reg(o[1].value, addr.wrapping_add(4));
             Outcome::Seq
         }
-        Opcode::OPCODE_LSI
-        | Opcode::OPCODE_LSIP
-        | Opcode::OPCODE_LSX
-        | Opcode::OPCODE_LSXP
-        | Opcode::OPCODE_SSI
-        | Opcode::OPCODE_SSIP
-        | Opcode::OPCODE_SSX
-        | Opcode::OPCODE_SSXP
-        | Opcode::OPCODE_ALL4
-        | Opcode::OPCODE_ALL8
-        | Opcode::OPCODE_ANY4
-        | Opcode::OPCODE_ANY8 => {
-            // TIE DSP instructions: no emulated DSP engine in P1.
-            Outcome::Unimplemented
+        // ------------------------------------------------------------------
+        // Single-precision FPU (ISA RM 4.3.11 + Chapter 6 separate
+        // instruction pages; QEMU target/xtensa/fpu_helper.c for the
+        // arithmetic edge rules). The 16 FPRs are NOT windowed. FSR
+        // exception flags and non-default rounding modes are NOT modeled
+        // (round-to-nearest-even everywhere, the reset default — matches
+        // every firmware-observable value; flag accumulation alone is
+        // never read by in-tree firmware). NaN payload propagation follows
+        // Rust f32 IEEE semantics (an acceptable approximation of the
+        // use-first-NaN rule; values, infinities and NaN-ness all match).
+        // ------------------------------------------------------------------
+        Opcode::OPCODE_WFR => {
+            // wfr fr, as: FR[r] <- AR[s] raw bits (ISA RM "WFR").
+            let v = cpu.reg(o[1].value);
+            cpu.set_freg(o[0].value, f32::from_bits(v));
+            Outcome::Seq
+        }
+        Opcode::OPCODE_RFR => {
+            // rfr ar, fs: AR[r] <- FR[s] raw bits (ISA RM "RFR").
+            cpu.set_reg(o[0].value, cpu.freg(o[1].value).to_bits());
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MOV_S => {
+            // mov.s fr, fs (ISA RM "MOV.S").
+            let v = cpu.freg(o[1].value);
+            cpu.set_freg(o[0].value, v);
+            Outcome::Seq
+        }
+        Opcode::OPCODE_ABS_S => {
+            // abs.s fr, fs: clear sign bit (ISA RM "ABS.S").
+            let v = cpu.freg(o[1].value);
+            cpu.set_freg(o[0].value, v.abs());
+            Outcome::Seq
+        }
+        Opcode::OPCODE_NEG_S => {
+            // neg.s fr, fs: flip sign bit, NaN payload preserved through
+            // the bits (ISA RM "NEG.S").
+            let v = cpu.freg(o[1].value);
+            cpu.set_freg(o[0].value, -v);
+            Outcome::Seq
+        }
+        Opcode::OPCODE_ADD_S => {
+            // add.s fr, fs, ft (ISA RM "ADD.S").
+            let v = cpu.freg(o[1].value) + cpu.freg(o[2].value);
+            cpu.set_freg(o[0].value, v);
+            Outcome::Seq
+        }
+        Opcode::OPCODE_SUB_S => {
+            // sub.s fr, fs, ft (ISA RM "SUB.S").
+            let v = cpu.freg(o[1].value) - cpu.freg(o[2].value);
+            cpu.set_freg(o[0].value, v);
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MUL_S => {
+            // mul.s fr, fs, ft (ISA RM "MUL.S").
+            let v = cpu.freg(o[1].value) * cpu.freg(o[2].value);
+            cpu.set_freg(o[0].value, v);
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MADD_S => {
+            // madd.s fr, fs, ft: FR[r] <- FR[r] +s (FR[s] x FR[t]),
+            // single rounding (QEMU float32_muladd; libm::fmaf is
+            // correctly rounded like the fused HW op).
+            let (a, b, c) = (
+                cpu.freg(o[0].value),
+                cpu.freg(o[1].value),
+                cpu.freg(o[2].value),
+            );
+            cpu.set_freg(o[0].value, libm::fmaf(b, c, a));
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MSUB_S => {
+            // msub.s fr, fs, ft: FR[r] <- FR[r] -s (FR[s] x FR[t])
+            // (QEMU float_muladd_negate_product).
+            let (a, b, c) = (
+                cpu.freg(o[0].value),
+                cpu.freg(o[1].value),
+                cpu.freg(o[2].value),
+            );
+            cpu.set_freg(o[0].value, libm::fmaf(-b, c, a));
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MKDADJ_S => {
+            // mkdadj.s fr, fs: FR[r] <- FR[s] / FR[r]_old — the divide
+            // adjust step (QEMU mkdadj_s helper = div(b, a); fr is both
+            // source and dest, so snapshot first).
+            let (a, b) = (cpu.freg(o[0].value), cpu.freg(o[1].value));
+            cpu.set_freg(o[0].value, b / a);
+            Outcome::Seq
+        }
+        // Divide/square-root step instructions (QEMU parity, verified by
+        // the libgcc-sequence tests below): QEMU implements these as NOPs
+        // (commit f8c6137 "implement FPU division and square root": "most
+        // of them as nops, but the results of div/sqrt sequences is
+        // preserved").  The libgcc __divsf3/__ieee754_sqrtf sequences
+        // collapse correctly around the NOPs because MKDADJ/MKSADJ perform
+        // the true divide/sqrt and ADDEXPM moves the result into the
+        // final quotient register that DIVN leaves untouched:
+        //   div:  ... mkdadj.s ex,a (= a/b) ... addexpm.s q,ex (= q) ...
+        //         divn.s q,r,y (NOP) -> q = correctly-rounded a/b.
+        //   sqrt: ... mksadj.s y,a (= sqrt(a)) ... addexpm.s r,y (= r) ...
+        //         divn.s r,a,t1 (NOP) -> r = correctly-rounded sqrt(a).
+        Opcode::OPCODE_MADDN_S
+        | Opcode::OPCODE_DIV0_S
+        | Opcode::OPCODE_DIVN_S
+        | Opcode::OPCODE_NEXP01_S
+        | Opcode::OPCODE_ADDEXP_S
+        | Opcode::OPCODE_SQRT0_S
+        | Opcode::OPCODE_RECIP0_S
+        | Opcode::OPCODE_RSQRT0_S => Outcome::Seq,
+        Opcode::OPCODE_ADDEXPM_S => {
+            // addexpm.s fr, fs: move (QEMU translate_mov_s).
+            let v = cpu.freg(o[1].value);
+            cpu.set_freg(o[0].value, v);
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MKSADJ_S => {
+            // mksadj.s fr, fs: FR[r] <- sqrt(FR[s]) (QEMU mksadj_s).
+            cpu.set_freg(o[0].value, libm::sqrtf(cpu.freg(o[1].value)));
+            Outcome::Seq
+        }
+        Opcode::OPCODE_FLOAT_S => {
+            // float.s fr, as, t: FR[r] <- float(AR[s]) x 2^-t, t = 0..15
+            // (ISA RM "FLOAT.S"; QEMU itof_s with scale = -imm; scalbn
+            // is exact, the int->float cast carries the single rounding).
+            let v = cpu.reg(o[1].value) as i32 as f32;
+            cpu.set_freg(o[0].value, libm::scalbnf(v, -(o[2].value as i32)));
+            Outcome::Seq
+        }
+        Opcode::OPCODE_UFLOAT_S => {
+            // ufloat.s fr, as, t: unsigned variant (ISA RM "UFLOAT.S").
+            let v = cpu.reg(o[1].value) as f32;
+            cpu.set_freg(o[0].value, libm::scalbnf(v, -(o[2].value as i32)));
+            Outcome::Seq
+        }
+        Opcode::OPCODE_TRUNC_S
+        | Opcode::OPCODE_FLOOR_S
+        | Opcode::OPCODE_CEIL_S
+        | Opcode::OPCODE_ROUND_S => {
+            // trunc/floor/ceil/round.s ar, fs, t: AR[r] <- round(FR[s] x
+            // 2^t) with per-op rounding; edge rules per the ISA RM TRUNC.S
+            // page (positive overflow/+inf/NaN -> 0x7FFFFFFF, negative
+            // overflow/-inf -> 0x80000000; the ROUND/FLOOR/CEIL pages share
+            // the saturation shape with their own rounding).
+            let x = libm::scalbnf(cpu.freg(o[1].value), o[2].value as i32);
+            let r = if x.is_nan() || x >= 2147483648.0 {
+                0x7FFF_FFFFu32
+            } else if x <= -2147483648.0 {
+                0x8000_0000u32
+            } else {
+                let y = match opc {
+                    Opcode::OPCODE_FLOOR_S => libm::floorf(x),
+                    Opcode::OPCODE_CEIL_S => libm::ceilf(x),
+                    Opcode::OPCODE_ROUND_S => libm::roundevenf(x),
+                    _ => libm::truncf(x),
+                };
+                y as i32 as u32
+            };
+            cpu.set_reg(o[0].value, r);
+            Outcome::Seq
+        }
+        Opcode::OPCODE_UTRUNC_S => {
+            // utrunc.s ar, fs, t: unsigned variant; ISA RM UTRUNC.S page:
+            // positive overflow/+inf/NaN -> 0xFFFFFFFF, negative/-inf ->
+            // 0x80000000 (NOT zero).
+            let x = libm::scalbnf(cpu.freg(o[1].value), o[2].value as i32);
+            let r = if x.is_nan() || x >= 4294967296.0 {
+                0xFFFF_FFFFu32
+            } else if x < 0.0 {
+                0x8000_0000u32
+            } else {
+                libm::truncf(x) as u32
+            };
+            cpu.set_reg(o[0].value, r);
+            Outcome::Seq
+        }
+        Opcode::OPCODE_CONST_S => {
+            // const.s fr, imm4: 0 -> +0.0, 1 -> +1.0, 2 -> +2.0, 3 -> +0.5
+            // (QEMU translate_const_s table; imm >= 4 is reserved — fold
+            // mod 4 like QEMU rather than faulting).
+            const CONST_S_TAB: [u32; 4] = [0x0000_0000, 0x3F80_0000, 0x4000_0000, 0x3F00_0000];
+            cpu.set_freg(
+                o[0].value,
+                f32::from_bits(CONST_S_TAB[(o[1].value & 3) as usize]),
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_OEQ_S
+        | Opcode::OPCODE_OLE_S
+        | Opcode::OPCODE_OLT_S
+        | Opcode::OPCODE_UEQ_S
+        | Opcode::OPCODE_ULE_S
+        | Opcode::OPCODE_ULT_S
+        | Opcode::OPCODE_UN_S => {
+            // FP compares write boolean bit r (ISA RM compare pages;
+            // QEMU translate_compare_s): ordered ops are false on NaN,
+            // unordered ops are true on NaN, UN tests NaN-ness.
+            let (s, t) = (cpu.freg(o[1].value), cpu.freg(o[2].value));
+            let v = match opc {
+                Opcode::OPCODE_OEQ_S => s == t,
+                Opcode::OPCODE_OLE_S => s <= t,
+                Opcode::OPCODE_OLT_S => s < t,
+                Opcode::OPCODE_UEQ_S => s.is_nan() || t.is_nan() || s == t,
+                Opcode::OPCODE_ULE_S => s.is_nan() || t.is_nan() || s <= t,
+                Opcode::OPCODE_ULT_S => s.is_nan() || t.is_nan() || s < t,
+                _ => s.is_nan() || t.is_nan(),
+            };
+            cpu.set_br(o[0].value, v);
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MOVT_S => {
+            // movt.s fr, fs, bt: if BR[t] then FR[r] <- FR[s] (ISA RM).
+            if cpu.br(o[2].value) {
+                let v = cpu.freg(o[1].value);
+                cpu.set_freg(o[0].value, v);
+            }
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MOVF_S => {
+            // movf.s fr, fs, bt: if !BR[t] then FR[r] <- FR[s] (ISA RM).
+            if !cpu.br(o[2].value) {
+                let v = cpu.freg(o[1].value);
+                cpu.set_freg(o[0].value, v);
+            }
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MOVEQZ_S => {
+            // moveqz.s fr, fs, at: if AR[t] == 0 (ISA RM "MOVEQZ.S").
+            if cpu.reg(o[2].value) == 0 {
+                let v = cpu.freg(o[1].value);
+                cpu.set_freg(o[0].value, v);
+            }
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MOVNEZ_S => {
+            // movnez.s fr, fs, at: if AR[t] != 0 (ISA RM "MOVNEZ.S").
+            if cpu.reg(o[2].value) != 0 {
+                let v = cpu.freg(o[1].value);
+                cpu.set_freg(o[0].value, v);
+            }
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MOVLTZ_S => {
+            // movltz.s fr, fs, at: if AR[t]31 set, i.e. signed < 0.
+            if cpu.reg(o[2].value) >> 31 != 0 {
+                let v = cpu.freg(o[1].value);
+                cpu.set_freg(o[0].value, v);
+            }
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MOVGEZ_S => {
+            // movgez.s fr, fs, at: if AR[t]31 clear, i.e. signed >= 0.
+            if cpu.reg(o[2].value) >> 31 == 0 {
+                let v = cpu.freg(o[1].value);
+                cpu.set_freg(o[0].value, v);
+            }
+            Outcome::Seq
+        }
+        Opcode::OPCODE_LSI | Opcode::OPCODE_LSIP => {
+            // lsi ft, as, imm8 / lsip (post-increment): FR[t] <- Load32
+            // (AR[s] + imm8<<2); lsip then writes AR[s] <- AR[s] + imm
+            // (QEMU ldsti_s pars {false,imm,update}; ISA RM "LSI").
+            // NOTE the dest is the T field (RRI8 has no r field).
+            let base = cpu.reg(o[1].value);
+            let v = bus.read32(base.wrapping_add(o[2].value));
+            cpu.set_freg(o[0].value, f32::from_bits(v));
+            if opc == Opcode::OPCODE_LSIP {
+                cpu.set_reg(o[1].value, base.wrapping_add(o[2].value));
+            }
+            Outcome::Seq
+        }
+        Opcode::OPCODE_SSI | Opcode::OPCODE_SSIP => {
+            // ssi/ssip: mirror of lsi/lsip (ISA RM "SSI").
+            let base = cpu.reg(o[1].value);
+            bus.write32(
+                base.wrapping_add(o[2].value),
+                cpu.freg(o[0].value).to_bits(),
+            );
+            if opc == Opcode::OPCODE_SSIP {
+                cpu.set_reg(o[1].value, base.wrapping_add(o[2].value));
+            }
+            Outcome::Seq
+        }
+        Opcode::OPCODE_LSX | Opcode::OPCODE_LSXP => {
+            // lsx fr, as, at / lsxp: FR[r] <- Load32(AR[s] + AR[t]);
+            // lsxp writes AR[s] <- vAddr (ISA RM "LSX", RRR so dest = r).
+            let addr = cpu.reg(o[1].value).wrapping_add(cpu.reg(o[2].value));
+            cpu.set_freg(o[0].value, f32::from_bits(bus.read32(addr)));
+            if opc == Opcode::OPCODE_LSXP {
+                cpu.set_reg(o[1].value, addr);
+            }
+            Outcome::Seq
+        }
+        Opcode::OPCODE_SSX | Opcode::OPCODE_SSXP => {
+            // ssx/ssxp: mirror of lsx/lsxp (ISA RM "SSX").
+            let addr = cpu.reg(o[1].value).wrapping_add(cpu.reg(o[2].value));
+            bus.write32(addr, cpu.freg(o[0].value).to_bits());
+            if opc == Opcode::OPCODE_SSXP {
+                cpu.set_reg(o[1].value, addr);
+            }
+            Outcome::Seq
         }
         _ => Outcome::Unimplemented,
     }
@@ -1368,6 +1655,12 @@ fn sr_of(opc: Opcode) -> u32 {
         Opcode::OPCODE_RSR_CCOMPARE2
         | Opcode::OPCODE_WSR_CCOMPARE2
         | Opcode::OPCODE_XSR_CCOMPARE2 => SR_CCOMPARE2,
+        Opcode::OPCODE_RSR_WINDOWBASE
+        | Opcode::OPCODE_WSR_WINDOWBASE
+        | Opcode::OPCODE_XSR_WINDOWBASE => SR_WINDOW_BASE,
+        Opcode::OPCODE_RSR_WINDOWSTART
+        | Opcode::OPCODE_WSR_WINDOWSTART
+        | Opcode::OPCODE_XSR_WINDOWSTART => SR_WINDOW_START,
         _ => 0,
     }
 }

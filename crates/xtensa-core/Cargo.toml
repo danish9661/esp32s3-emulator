@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Scalar float math for the LX7 single-precision FPU (sqrt, FMA, scalbn,
+# correctly-rounded conversions): pure Rust, no_std + WASM compatible.
+libm = "0.2"

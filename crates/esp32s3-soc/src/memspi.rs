@@ -117,6 +117,12 @@ const CMD_WRDI: u8 = 0x04;
 const CMD_RDSR: u8 = 0x05;
 const CMD_WREN: u8 = 0x06;
 const CMD_FAST_READ: u8 = 0x0B;
+// Quad-I/O fast read: the ESP-IDF S3 flash driver issues ALL programmed
+// reads (spi_flash_read, partition reads, MicroPython readblocks) as 0xEB
+// with a 24-bit address + dummy cycles (seen on the wire via the tx_trace
+// ring: USER2 = 0x700000EB). The model streams single-bit like the other
+// reads (quad phases are not modeled — only the byte flow matters).
+const CMD_QIOR: u8 = 0xEB;
 const CMD_SE: u8 = 0x20;
 // Winbond 0x35 = RDCR_EQIO: read status register 2 (bit 1 = QE).
 const CMD_RDSR2: u8 = 0x35;
@@ -159,6 +165,12 @@ struct Chip {
     state: ChipState,
     cmd: u8,
     addr: u32,
+    /// Address/dummy bytes the current Collect phase must consume, set per
+    /// transaction by `run_transaction` (which owns the programmed lengths).
+    /// Replaces the old hardcoded counts (FAST_READ assumed 8 dummy bytes
+    /// as BYTES, but the driver programs dummy CYCLES — e.g. 5 for 0xEB —
+    /// so any hardcoded count desyncs the stream and reads return zeros).
+    collect_total: u8,
     write_enable: bool,
     /// Status register 1 (SRWD/BP bits; RDSR reports bit 1 = WEL live).
     status: u8,
@@ -182,7 +194,6 @@ impl Chip {
             }
             ChipState::Collect { need, got } => {
                 self.data[got as usize] = tx;
-                self.addr = (self.addr << 8) | tx as u32;
                 let got = got + 1;
                 if got == need {
                     self.finish_collect(flash);
@@ -258,11 +269,15 @@ impl Chip {
             // (QEMU m25p80 WRSR needed_bytes=2 for MAN_WINBOND; the QE bit
             // lives in data[1]).
             CMD_WRSR if self.write_enable => self.state = ChipState::Collect { need: 2, got: 0 },
-            CMD_READ => self.state = ChipState::Collect { need: 3, got: 0 },
-            // Winbond fast-read: 3 addr bytes + 8 dummy bytes — QEMU models
-            // dummy cycles as BYTES (m25p80 decode_fast_read_cmd).
-            CMD_FAST_READ => self.state = ChipState::Collect { need: 11, got: 0 },
-            CMD_PP | CMD_SE | CMD_BE => self.state = ChipState::Collect { need: 3, got: 0 },
+            // Address-collecting commands consume exactly what the
+            // programmed transaction streams (addr + dummy bytes); the
+            // address itself arrives precomputed (see run_transaction).
+            CMD_READ | CMD_FAST_READ | CMD_QIOR | CMD_PP | CMD_SE | CMD_BE => {
+                self.state = ChipState::Collect {
+                    need: self.collect_total,
+                    got: 0,
+                }
+            }
             CMD_CE | CMD_CE_ALT => {
                 if self.write_enable {
                     flash.fill(0xFF);
@@ -291,7 +306,7 @@ impl Chip {
                 self.write_enable = false;
                 self.state = ChipState::Idle;
             }
-            CMD_READ | CMD_FAST_READ => self.state = ChipState::Read,
+            CMD_READ | CMD_FAST_READ | CMD_QIOR => self.state = ChipState::Read,
             CMD_PP => self.state = ChipState::Program,
             CMD_SE => {
                 if self.write_enable {
@@ -494,11 +509,9 @@ impl Memspi {
         let mut addr_bytes = 0u32;
         let mut dummy_bytes = 0u32;
         if user & USER_USR_ADDR != 0 {
-            addr = self.regs[(REG_ADDR >> 2) as usize].swap_bytes();
+            // Plain address straight from ADDR (see run_transaction).
+            addr = self.regs[(REG_ADDR >> 2) as usize];
             addr_bytes = ((user1 >> 26) + 1) / 8;
-            if (1..=4).contains(&addr_bytes) {
-                addr >>= 32 - addr_bytes * 8;
-            }
             // Dummy cycles only count when the address phase is enabled
             // (QEMU nests the dummy calculation inside the addr branch).
             if user & USER_USR_DUMMY != 0 {
@@ -594,16 +607,12 @@ impl Memspi {
     fn special_command(&mut self, flash: &mut [u8], cmd_reg: u32) {
         let addr_word = self.regs[(REG_ADDR >> 2) as usize];
         let addr_bitlen = ((self.regs[(REG_USER1 >> 2) as usize] >> 26) + 1) / 8;
-        let addr = addr_word.swap_bytes();
-        // 3-byte address, right-aligned (bswap32 >> 8 — for addr_bitlen=23
-        // this drops the legacy length byte in ADDR[31:24]).
-        let addr3 = addr >> 8;
-        let norm = |a: u32| {
-            if (1..=4).contains(&addr_bitlen) {
-                a >> (32 - addr_bitlen * 8)
-            } else {
-                a
-            }
+        // Plain address (see run_transaction); right-align to the
+        // programmed bit length.
+        let addr = if (1..=4).contains(&addr_bitlen) {
+            addr_word & (0xFFFF_FFFFu32 >> (32 - addr_bitlen * 8))
+        } else {
+            addr_word
         };
         match cmd_reg & CMD_SPECIAL_MASK {
             CMD_FLASH_READ => {
@@ -613,7 +622,7 @@ impl Memspi {
                     Txn {
                         cmd: CMD_READ as u32,
                         cmd_bytes: 1,
-                        addr: norm(addr),
+                        addr,
                         addr_bytes: addr_bitlen,
                         dummy_bytes: 0,
                         tx_bytes: 0,
@@ -688,7 +697,7 @@ impl Memspi {
                 },
             ),
             // Legacy page-program: byte count lives in ADDR[31:24], address
-            // bytes are bswap32(ADDR) >> 8 (QEMU's fixed-shift adjustment).
+            // is the plain low 24 bits (see run_transaction).
             CMD_FLASH_PP => {
                 let len = (addr_word >> 24) & 0xFF;
                 self.run_transaction(
@@ -696,7 +705,7 @@ impl Memspi {
                     Txn {
                         cmd: CMD_PP as u32,
                         cmd_bytes: 1,
-                        addr: addr3,
+                        addr: addr_word & 0xFF_FFFF,
                         addr_bytes: 3,
                         dummy_bytes: 0,
                         tx_bytes: len,
@@ -710,7 +719,7 @@ impl Memspi {
                 Txn {
                     cmd: CMD_SE as u32,
                     cmd_bytes: 1,
-                    addr: norm(addr),
+                    addr,
                     addr_bytes: addr_bitlen,
                     dummy_bytes: 0,
                     tx_bytes: 0,
@@ -723,7 +732,7 @@ impl Memspi {
                 Txn {
                     cmd: CMD_BE as u32,
                     cmd_bytes: 1,
-                    addr: norm(addr),
+                    addr,
                     addr_bytes: addr_bitlen,
                     dummy_bytes: 0,
                     tx_bytes: 0,
@@ -802,6 +811,16 @@ impl Memspi {
         } = t;
         let data_start = cmd_bytes + addr_bytes + dummy_bytes;
         let total = data_start + tx_bytes.max(rx_bytes);
+        // The address arrives precomputed from the programmed ADDR register
+        // (plain value, esp-idf `spimem_flash_ll_set_address`: dev->addr =
+        // addr) and the Collect phase only counts bytes — the old code
+        // assembled the address from the stream with a swap/shift pairing
+        // that was only self-consistent for low-byte-zero addresses (all
+        // in-tree tests used sector-aligned ones, e.g. 0x10000), silently
+        // misaddressing reads like the driver's 0x8C80 (fixed here).
+        let mask = (flash.len() - 1) as u32;
+        self.chip.addr = addr & mask;
+        self.chip.collect_total = addr_bytes.saturating_add(dummy_bytes) as u8;
         for i in 0..total {
             let mut txb = 0u8;
             let mut di = usize::MAX;
@@ -976,6 +995,35 @@ mod tests {
         m.write32(&mut f, REG_MISO_DLEN, 31);
         m.write32(&mut f, REG_CMD, CMD_USR);
         assert_eq!(m.read32(REG_W0), 0x00FF_A55A);
+    }
+
+    /// Quad-I/O fast read (0xEB) as programmed by the ESP-IDF S3 flash
+    /// driver (USER2 = cmd | 7<<28, 24-bit addr, dummy cycles, MISO length):
+    /// data streams into W0... The address has a nonzero low byte
+    /// (0x18C80) — the old swap/shift address pairing only worked for
+    /// low-byte-zero addresses, and the missing 0xEB decode returned zeros
+    /// for every driver read (caught by the esp32s3_flashread sketch:
+    /// partition/app reads came back all-zero, hanging MicroPython's
+    /// check_bootsec in its "corrupt" loop).
+    #[test]
+    fn usr_quad_read_streams_flash() {
+        let mut f = flash4m();
+        f[0x18C80] = 0xAA;
+        f[0x18C81] = 0x50;
+        f[0x18C82] = 0x01;
+        f[0x18C83] = 0x02;
+        let mut m = Memspi::new();
+        m.write32(
+            &mut f,
+            REG_USER,
+            USER_USR_COMMAND | USER_USR_ADDR | USER_USR_DUMMY | USER_USR_MISO,
+        );
+        m.write32(&mut f, REG_USER2, (CMD_QIOR as u32) | (7 << 28));
+        m.write32(&mut f, REG_USER1, (23 << 26) | 5);
+        m.write32(&mut f, REG_ADDR, 0x18C80);
+        m.write32(&mut f, REG_MISO_DLEN, 31);
+        m.write32(&mut f, REG_CMD, CMD_USR);
+        assert_eq!(m.read32(REG_W0), 0x0201_50AA);
     }
 
     /// USR page-program (0x02) ANDs MOSI bytes into flash at the address.
