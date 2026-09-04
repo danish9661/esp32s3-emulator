@@ -279,6 +279,54 @@ fn boot_path_loads_app_from_flash() {
     assert_eq!(parse_partition_table(&flash).unwrap().len(), 1);
 }
 
+/// The ROM stub loader skips flash-mapped (XIP) segments instead of
+/// byte-copying them: a 3-segment app (DRAM, XIP @0x42000000, DRAM marker)
+/// must load both DRAM segments. If the skip mis-advances the cursor past
+/// the XIP data, the third header misparses and MARKER never lands.
+#[test]
+fn boot_loader_skips_flash_mapped_segments() {
+    use crate::asm::Asm;
+    use esp32s3_soc::memmap::IRAM_BASE;
+
+    const APP_ENTRY: u32 = IRAM_BASE;
+    const STASH: u32 = 0x3FC8_0500;
+    const MARKER: u32 = 0x3FC8_0504;
+    let mut a = Asm::new(IRAM_BASE);
+    a.li(4, 0x1234);
+    a.li(5, STASH as i32);
+    a.s32i(4, 5, 0);
+    let here = a.pc();
+    a.j(here);
+    let app = a.bytes().to_vec();
+
+    let filler = [0xAAu8; 64];
+    let img = esp_app_image_multi(
+        APP_ENTRY,
+        &[
+            (IRAM_BASE, &app),
+            (0x4200_0000, &filler),
+            (MARKER, &[0x11, 0x22, 0x33, 0x44]),
+        ],
+    );
+    // No partition table: boot falls back to the factory slot at 0x10000.
+    let mut flash = std::vec![0xFFu8; 0x20000 + 1024];
+    flash[0x10000..0x10000 + img.len()].copy_from_slice(&img);
+
+    let mut m = Esp32S3::new();
+    m.boot_from_flash(&flash);
+    for _ in 0..4000 {
+        if m.cpu[0].pc == here {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.cpu[0].pc, here, "app entry ran");
+    assert_eq!(m.soc.read32(STASH), 0x1234);
+    // The third segment header must parse after the skipped XIP data: the
+    // marker payload lands (not XIP filler, not a misparsed header).
+    assert_eq!(m.soc.read32(MARKER), 0x4433_2211);
+}
+
 #[test]
 fn ota_boot_selects_active_slot() {
     use crate::asm::Asm;

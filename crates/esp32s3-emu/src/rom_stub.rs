@@ -499,9 +499,30 @@ pub fn rom_image() -> Vec<u8> {
     a.l32i(6, 5, 0); // load_addr
     a.l32i(7, 5, 4); // data_len
     a.addi(5, 5, 8); // -> segment data
-    // beqz a7, seg_next; seg_next is 6 instructions further on (21 bytes).
-    // (The constant is derived from the fixed 3-byte instruction widths.)
+    // Skip flash-mapped (XIP) segments: map_app_flash_segments pre-maps them
+    // in the cache MMU (the real 2nd-stage bootloader maps instead of
+    // copying), and the copy loop below cannot write the read-only windows —
+    // without the skip a 1 MB .flash.rodata segment costs a million wasted
+    // iterations and trips the harness stuck detector. The loader slot is
+    // nearly full ([0x400, 0x480)), so this is a single lower-bound check:
+    // load >= 0x42000000 (inst window; the 265 KB data-window segment still
+    // copies, ~265k iterations). The two tiny segments above the window
+    // (RTC slow-mem init + 0x600FE000, 88 B combined) are skipped too —
+    // harmless for normal boot (verified: MicroPython reaches its REPL).
+    // Clobbers a8 (a1/SP, a3/count, a4/entry, a5/cursor, a6/a7 preserved
+    // for the copy path; a5 is advanced past skipped data below).
+    // Layout (movi.n 2 B, rest 3 B): bltu falls through to the epilogue,
+    // which presents an empty length so the beqz routes to seg_next.
+    a.movi_n(8, 0x42);
+    a.slli(8, 8, 24); // a8 = 0x42000000
+    let copy_site = a.pc() + 8;
+    a.bltu(6, 8, copy_site); // load < inst base -> copy via beqz below
+    // Skip epilogue: advance past the data, present an empty length.
+    a.add(5, 5, 7); // a5 += data_len -> next header
+    a.movi_n(7, 0);
+    // beqz a7, seg_next (span unchanged: beqz + 18 B copy block = 21).
     a.beqz(7, a.pc() + 21);
+    let seg_next_pc = a.pc() + 18;
     let copy_loop = a.pc();
     a.l8ui(8, 5, 0);
     a.s8i(8, 6, 0);
@@ -509,7 +530,10 @@ pub fn rom_image() -> Vec<u8> {
     a.addi(6, 6, 1);
     a.addi(7, 7, -1);
     a.bnez(7, copy_loop);
-    let _seg_next = a.pc();
+    let seg_next = a.pc();
+    // The hand-computed forward targets above must land exactly here (any
+    // width miscount would corrupt the boot image).
+    debug_assert_eq!(seg_next, seg_next_pc, "loader skip/beqz targets");
     a.addi(3, 3, -1);
     a.bnez(3, seg_loop);
     a.jx(4); // jump to app entry point

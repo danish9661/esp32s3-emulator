@@ -286,6 +286,14 @@ pub struct Soc {
     /// Cleared by `Esp32S3::step` once core 0 leaves the ROM (stub done).
     rom_boot_mode: bool,
 
+    /// Byte length of the app image staged at the loader scratch offset
+    /// (set by `map_app_flash_segments`; defaults to the legacy 384 KB cap).
+    /// Images bigger than 384 KB (e.g. MicroPython, ~1.8 MB) address the
+    /// whole image through the scratch view — reads past a fixed cap alias
+    /// to raw flash at the window offset (zeros/wrong bytes), silently
+    /// dropping later segment headers.
+    loader_scratch_len: u32,
+
     /// Cached interrupt source bitmap, valid only while `src_valid` is true.
     /// Each bit corresponds to an ETS_*_INTR_SOURCE number.  Set by
     /// `int_pending()` on the first call after `tick_timers()` invalidates it.
@@ -382,6 +390,7 @@ impl Soc {
             appcpu_ctrl_a: 0,
             cpu_int_from_cpu: [0, 0],
             rom_boot_mode: false,
+            loader_scratch_len: 0x6_0000,
             cached_src: 0,
             src_valid: false,
             events: Vec::new(),
@@ -443,6 +452,7 @@ impl Soc {
             end += 8 + len;
         }
         // 1. Loader scratch: map every flash page the app image spans.
+        self.loader_scratch_len = (end - base) as u32;
         let scratch_page0 = LOADER_SCRATCH_OFF / CACHE_PAGE_SIZE;
         let fpage0 = (base / CACHE_PAGE_SIZE as usize) as u32;
         let app_pages = (end - base).div_ceil(CACHE_PAGE_SIZE as usize) as u32;
@@ -922,7 +932,7 @@ impl Soc {
             // The loader scratch (host-mapped app image for the ROM stub) is
             // MMU-routed even in ROM-boot mode — the stub reads the image
             // through that mapping (map_app_flash_segments).
-            let scratch_end = LOADER_SCRATCH_OFF + 0x6_0000;
+            let scratch_end = LOADER_SCRATCH_OFF + self.loader_scratch_len;
             if !(off >= LOADER_SCRATCH_OFF && off < scratch_end) {
                 return self.flash_byte(off);
             }

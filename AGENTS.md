@@ -2170,3 +2170,48 @@ Core design:
       design). MMIO default (read 0 / drop writes) means ROM can't panic on
       unmodeled regs; battery proves its needs are met.
     - 37/37 suites green, clippy (pre-existing warns only)/fmt/wasm32 clean.
+  - 2026-09-04: **uart_echo resurrection (real model bug), battery, more
+    completions, MicroPython boot experiment.**
+    - **UART_STATUS S3 layout fix — the echo hang.** The `esp32s3_uart_echo`
+      sketch hung in boot (stale binary) then panicked (fresh binary, Core-1
+      IWDT). Root-caused with a single-step trap + the emulator's own decoder
+      as ground truth (objdump linear sweep desyncs on dense Xtensa): our
+      UART_STATUS used the classic-ESP32 layout (count [29:24], ST_UTX [9:8])
+      but S3 has rxfifo_cnt [9:0], so the driver's `extui(status,0,10)` length
+      read 0x300 (ST_UTX bits) instead of 5 — a 768-iteration copy overflowed
+      the RX buffer, smashed a neighboring mux's FREE cookie, and core1 spun
+      forever acquiring it. Fixed to the `uart_struct.h` layout (+ modem idle
+      levels); echo is now byte-perfect (`h e l l o`, no panic). Lesson: never
+      trust objdump alignment on Xtensa — decode with our own decoder.
+    - **`tools/run_battery.sh`**: builds (optional `--build`) + runs + asserts
+      all 52 validation sketches (per-sketch env/markers/STEPS, SKIP with
+      reason). First green run caught real rot: stale bins (echo, sdmmc),
+      ota_slot source rot vs core 3.3.10 (`APPOTA_0` rename, fixed), p5_stubs
+      I2S offsets vs the functional I2S model (now pokes TX/RX_CONF). Status:
+      **49 pass, 0 fail, 3 skipped** (i2c_wire, deepsleep-driver, virtual_demo
+      needs the node harness).
+    - **Small completions**: UART FULL threshold gating (CONF1 reset 96/96;
+      echo now flows via TOUT, machine test programs thrhd=1), LCD_CAM GDMA-
+      OUT (peri 5, sync-interleaved `dma_transfer` past the 16-word FIFO),
+      ADC digital GDMA-IN (peri 8, staged-sample queue), and a real find:
+      **main-GDMA IN walks used the OUT link address** (crypto engine already
+      did it right) — ADC IN (RX-only, no OUT link) exposed it.
+    - **MicroPython v1.29.0 (GENERIC_S3) boot experiment: boots to the
+      MicroPython task, dies in window spill (fix pending).** Landed en route:
+      loader XIP-skip (MMU-mapped inst segments aren't copied; 13 B single-
+      `bgeu` design to fit [0x400,0x480), + dedicated skip test), scratch
+      sizing fix (`loader_scratch_len` — the 384 KB cap silently dropped
+      later segment headers of 1 MB+ images), STUCK 200 k→1 M (byte-copy
+      loader trips block-granular detection), SYSCALL_CONTINUE + IDLE_STEPS
+      harness knobs, USB_INJECT hook. Current state: loader → IDF init →
+      PSRAM-less continue → VFS complaint → `qstr_hash` executes → wild sp +
+      ret-to-heap inside `xthal_window_spill_nw` under deep interpreter
+      nesting (Arduino's shallow spills never trigger it). Prime suspects:
+      window-state/nesting handling in the spill path (sp-goes-wild observed
+      right after `wsr_windowbase`, but that may be legitimate mid-surgery
+      state). PSRAM chip init (ID probe) is the other known gap for a real
+      REPL (heap now DRAM-only). Tried and dropped: objdump forensics
+      (desync), recursive-stress sketch (arduino-cli broke on full /tmp;
+      TMPDIR=~/.tmp works around it).
+    - 37/37 suites green, battery 49/0/3, clippy (pre-existing warns only)/
+      fmt/wasm32 clean.

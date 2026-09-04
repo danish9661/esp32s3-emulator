@@ -58,6 +58,17 @@ fn main() {
     // pushed into UART1 RX as soon as the console shows the RXREADY marker.
     let uart1_inject: Option<Vec<u8>> = env::var("UART_INJECT").ok().map(|s| s.into_bytes());
     let mut uart1_injected = false;
+    // USB-Serial-JTAG RX injection (REPL experiment): USB_INJECT=<text> is
+    // pushed into the USB CDC RX FIFO once the console shows USB_MARKER
+    // (default: the MicroPython post-PSRAM boot line).
+    let usb_inject: Option<Vec<u8>> = env::var("USB_INJECT")
+        .ok()
+        .map(|s| s.replace("\\n", "\n").replace("\\r", "\r").into_bytes());
+    let usb_marker: Vec<u8> = env::var("USB_MARKER")
+        .ok()
+        .map(|s| s.into_bytes())
+        .unwrap_or_else(|| b"continuing without it".to_vec());
+    let mut usb_injected = false;
 
     // SPI-slave host exchange (slave-sketch support): SPI_SLAVE_XCHG=1 drives
     // both halves when the app prints its markers — a master-write-to-slave
@@ -111,6 +122,12 @@ fn main() {
             if (32..=37).contains(&cause) {
                 continue; // Window overflow/underflow — normal.
             }
+            if cause == 1 && env::var("SYSCALL_CONTINUE").is_ok() {
+                // Let the firmware's own exception vector handle syscalls
+                // (raise_cause already vectored; e.g. MicroPython issues
+                // syscalls its kernel handles).
+                continue;
+            }
             if cause == 0 {
                 // Illegal instruction — likely the ESP-IDF panic `ill`.
                 let epc = m.cpu[0].sreg(SR_EPC1);
@@ -137,6 +154,9 @@ fn main() {
         if let StepResult::Exception { cause } = r1 {
             if cause != 0 && (32..=37).contains(&cause) {
                 continue;
+            }
+            if cause == 1 && env::var("SYSCALL_CONTINUE").is_ok() {
+                continue; // Same as above (core1 syscalls).
             }
             println!(
                 "\n== step {i}: core1 exception(cause={cause}) at pc {:#010x}; EPC1 {:#010x}",
@@ -200,6 +220,25 @@ fn main() {
             }
         }
 
+        // USB-CDC RX injection: same pattern with a configurable marker.
+        if !usb_injected && (!tx.is_empty() || !tx1.is_empty()) {
+            if let Some(bytes) = &usb_inject {
+                if uart_buf
+                    .windows(usb_marker.len())
+                    .any(|w| w == usb_marker.as_slice())
+                {
+                    for &b in bytes {
+                        m.soc.usb_inject_rx(b);
+                    }
+                    println!(
+                        "[host] injected {:?} into USB CDC RX",
+                        String::from_utf8_lossy(bytes)
+                    );
+                    usb_injected = true;
+                }
+            }
+        }
+
         // SPI-slave host exchange: marker-driven, one shot per half.
         if spi_slave_xchg && (!tx.is_empty() || !tx1.is_empty()) {
             if !spi_slave_wrote
@@ -253,9 +292,13 @@ fn main() {
         if pc == last_pc && uart_len == last_uart_len {
             idle_steps += 1;
             stuck += 1;
-            if stuck == 200_000 {
+            // 1M macro-steps: the ROM stub loader copies DRAM segments
+            // byte-wise (~265k iterations for a big .rodata image like
+            // MicroPython's), and block-at-a-time execution samples the
+            // same copy-loop pc every macro-step — 200k tripped mid-copy.
+            if stuck == 1_000_000 {
                 println!(
-                    "\n== STUCK: core0 pc {:#010x} unchanged for 200k steps at step {i} (a0={:#x} a1={:#x} a2={:#x}) ==",
+                    "\n== STUCK: core0 pc {:#010x} unchanged for 1M steps at step {i} (a0={:#x} a1={:#x} a2={:#x}) ==",
                     pc,
                     m.cpu[0].reg(0),
                     m.cpu[0].reg(1),
@@ -266,7 +309,12 @@ fn main() {
             // Early-exit: if both cores are idle (no PC change + no new UART
             // output) for 2M steps, the firmware's setup() has finished and
             // the main loop is spinning — we've seen all the meaningful output.
-            if idle_steps >= 2_000_000 {
+            // IDLE_STEPS overrides (slow boots like MicroPython need more).
+            let idle_limit: usize = env::var("IDLE_STEPS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2_000_000);
+            if idle_steps >= idle_limit {
                 println!("\n== IDLE: no output or PC change for 2M steps at step {i} ==");
                 break;
             }
