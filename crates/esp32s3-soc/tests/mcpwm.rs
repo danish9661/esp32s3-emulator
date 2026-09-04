@@ -3,6 +3,7 @@
 //! and the live timer_status readback.
 
 use esp32s3_soc::mcpwm::*;
+use std::cell::Cell;
 
 const TIMER0_CFG0: u32 = 0x04;
 const TIMER0_CFG1: u32 = 0x08;
@@ -116,4 +117,94 @@ fn prescale_slows_the_counter() {
     }
     // 100 ticks / 10 = 10 counts -> counter = 10 (period 100, no wrap).
     assert_eq!(m.read32(TIMER0_STATUS), 10);
+}
+
+// Capture register offsets (mcpwm_cap_*_reg_t).
+const CAP_TIMER_CFG: u32 = 0xE8;
+const CAP_CHN_CFG0: u32 = 0xF0;
+const CAP_CHN0: u32 = 0xFC;
+const CAP_STATUS: u32 = 0x108;
+const CAP_INT_RAW: u32 = 0x114;
+const CAP_INT_CLR: u32 = 0x11C;
+
+/// Drives channel 0 with a scripted level (Cell for the Fn closure).
+struct Script {
+    levels: Vec<bool>,
+    pos: Cell<usize>,
+}
+
+impl Script {
+    fn input(&self, _sig: u32) -> u32 {
+        let p = self.pos.get().min(self.levels.len() - 1);
+        self.pos.set(p + 1);
+        u32::from(self.levels[p])
+    }
+}
+
+/// A rising edge latches the free-running timer, records posedge status,
+/// and raises the CAP0 interrupt.
+#[test]
+fn capture_posedge_latches_timer_and_raises_int() {
+    let mut m = Mcpwm::new();
+    m.write32(CAP_TIMER_CFG, 1); // timer enable
+    m.write32(CAP_CHN_CFG0, 1 | (2 << 1)); // ch0 en + posedge
+    // idle low, then high: the seed consumes idx0, three setup ticks stay
+    // low, the next tick sees the edge (timer reads 5).
+    let mut s = Script {
+        levels: vec![false, false, false, false, true, true, true],
+        pos: Cell::new(0),
+    };
+    for _ in 0..4 {
+        m.tick_capture(166, &|sig| s.input(sig));
+    }
+    assert_eq!(m.read32(CAP_INT_RAW) & (1 << 27), 0, "no int yet");
+    m.tick_capture(166, &|sig| s.input(sig));
+    assert_eq!(m.read32(CAP_CHN0), 5, "timer latched (5 ticks)");
+    assert_eq!(m.read32(CAP_STATUS) & 1, 0, "posedge status");
+    assert_eq!(m.read32(CAP_INT_RAW) & (1 << 27), 1 << 27, "CAP0 int");
+    m.write32(CAP_INT_CLR, 1 << 27);
+    assert_eq!(m.read32(CAP_INT_RAW) & (1 << 27), 0, "cleared");
+}
+
+/// Prescale divides the input: prescale=1 captures every 2nd edge.
+#[test]
+fn capture_prescale_divides_edges() {
+    let mut m = Mcpwm::new();
+    m.write32(CAP_TIMER_CFG, 1);
+    m.write32(CAP_CHN_CFG0, 1 | (2 << 1) | (1 << 3)); // en + pos + prescale 1
+    // Edges at idx1 (divided out) and idx3 (captured, timer reads 4).
+    let mut s = Script {
+        levels: vec![false, true, false, true, true],
+        pos: Cell::new(0),
+    };
+    for _ in 0..3 {
+        m.tick_capture(166, &|sig| s.input(sig));
+    }
+    assert_eq!(
+        m.read32(CAP_INT_RAW) & (1 << 27),
+        0,
+        "first edge divided out"
+    );
+    m.tick_capture(166, &|sig| s.input(sig));
+    assert_eq!(m.read32(CAP_CHN0), 4, "second edge latched");
+}
+
+/// Negative-edge mode latches with negedge status; disabled channels idle.
+#[test]
+fn capture_negedge_and_disabled_channel() {
+    let mut m = Mcpwm::new();
+    m.write32(CAP_TIMER_CFG, 1);
+    m.write32(CAP_CHN_CFG0, 1 | (1 << 1)); // en + negedge
+    let mut s = Script {
+        levels: vec![true, true, false, false],
+        pos: Cell::new(0),
+    };
+    m.tick_capture(166, &|sig| s.input(sig));
+    m.tick_capture(166, &|sig| s.input(sig));
+    assert_eq!(m.read32(CAP_INT_RAW) & (1 << 27), 0, "no edge yet");
+    m.tick_capture(166, &|sig| s.input(sig));
+    assert_eq!(m.read32(CAP_CHN0), 3, "timer latched");
+    assert_eq!(m.read32(CAP_STATUS) & 1, 1, "negedge status");
+    // Channel 1 (never enabled) stays quiet.
+    assert_eq!(m.read32(CAP_INT_RAW) & (1 << 28), 0);
 }

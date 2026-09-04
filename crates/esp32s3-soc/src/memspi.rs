@@ -5,6 +5,10 @@
 //! chip model mirrors QEMU's `m25p80.c` for a Winbond w25q32 (JEDEC id
 //! 0xEF4016, 4 MB, 64 KB blocks / 4 KB sectors).
 //!
+//! SPI1 also carries the external RAM on CS1 (selected via MISC.cs bits).
+//! The PSRAM device answers the ID probe (density/KGD 0x5D) and init/test
+//! pattern traffic; runtime heap access bypasses SPI1 (cache MMU).
+//!
 //! Modeled:
 //! - Writing CMD.USR (bit 18) executes a **USR transaction** synchronously:
 //!   command bytes from USER2.USR_COMMAND_VALUE/BITLEN, then (if
@@ -38,6 +42,8 @@
 //! dummy cycles as bytes).  CS-high after each transaction resets the
 //! stream state but keeps write-enable, exactly like m25p80_cs().
 
+use alloc::boxed::Box;
+
 // Register offsets (esp32s3_spi.h REG32 list). Public: firmware-style
 // flash update flows (esp_ota_write -> PP/SE) are driven through this bus
 // by machine tests exactly like the IDF spi_flash driver drives silicon.
@@ -68,6 +74,22 @@ pub const USER_USR_ADDR: u32 = 1 << 30;
 const USER_USR_DUMMY: u32 = 1 << 29;
 const USER_USR_MISO: u32 = 1 << 28;
 pub const USER_USR_MOSI: u32 = 1 << 27;
+
+// MISC chip-select bits (spi_mem_struct.h `misc`: cs0_dis bit 0 deselects
+// the SPI flash, cs1_dis bit 1 deselects the external RAM; both share SPI1).
+const MISC_CS0_DIS: u32 = 1 << 0;
+const MISC_CS1_DIS: u32 = 1 << 1;
+
+// PSRAM (Ext_RAM) ID reply bytes, MSB-first on the wire (APM 64 Mb part:
+// mfr 0x0D, density/KGD 0x5D). A 3-byte MISO read lands the KGD byte at ID
+// word bits [15:8], where the esp-idf quad PSRAM probe checks it
+// (`PSRAM_KGD(id) == 0x5D`, esp_psram_impl_quad.c).
+const PSRAM_ID: [u8; 3] = [0x0D, 0x5D, 0x00];
+
+// PSRAM backing for the CS1 device (pattern/test traffic only — runtime
+// heap access goes through the cache MMU's own `psram` array, never SPI1).
+// Sized to the physical part (APM 64 Mb = 8 MB).
+const PSRAM_DEV_SIZE: usize = 0x0080_0000;
 
 // CMD bits (esp32s3_spi.h SPI_MEM_CMD).  Special-command dispatch mask
 // keeps bits [31:19] (QEMU `command >> 19 << 19`).
@@ -333,12 +355,24 @@ pub struct TxRec {
     pub mosi_dlen: u32,
     pub miso_dlen: u32,
     pub w0: u32,
+    /// MISC at transaction time (cs0_dis bit 0 / cs1_dis bit 1 select the
+    /// flash vs PSRAM chip on the shared SPI1 bus).
+    pub misc: u32,
 }
 
 /// ESP32-S3 SPI flash controller (SPI1 @ 0x60002000, SPIMEM0 @ 0x60003000).
 pub struct Memspi {
     regs: [u32; REG_COUNT],
     chip: Chip,
+    /// Set while the attached SPI flash is in continuous-read (XIP) mode.
+    /// Mirrored from the cache enable flags by the SoC (see there): once the
+    /// ROM bootloader enables XIP for cache reads, single-line commands
+    /// like RDID no longer reach the flash — the (also-selected) PSRAM chip
+    /// answers instead. Fresh controllers start non-XIP (pre-bootloader).
+    pub xip: bool,
+    /// PSRAM (Ext_RAM on CS1) backing for init/test-pattern traffic
+    /// (extram_test writes magic via 0x02 and reads it back via 0x03).
+    psram: Box<[u8; PSRAM_DEV_SIZE]>,
     /// Ring of the most recent transactions (host debug tracing).
     pub tx_trace: [TxRec; 16],
     pub tx_head: usize,
@@ -357,6 +391,8 @@ impl Memspi {
         Self {
             regs,
             chip: Chip::default(),
+            xip: false,
+            psram: Box::new([0; PSRAM_DEV_SIZE]),
             tx_trace: [TxRec {
                 cmd_reg: 0,
                 addr: 0,
@@ -366,6 +402,7 @@ impl Memspi {
                 mosi_dlen: 0,
                 miso_dlen: 0,
                 w0: 0,
+                misc: 0,
             }; 16],
             tx_head: 0,
             tx_count: 0,
@@ -382,6 +419,7 @@ impl Memspi {
             mosi_dlen: self.regs[(REG_MOSI_DLEN >> 2) as usize],
             miso_dlen: self.regs[(REG_MISO_DLEN >> 2) as usize],
             w0: self.regs[(REG_W0 >> 2) as usize],
+            misc: self.regs[(REG_MISC >> 2) as usize],
         };
         self.tx_head = (self.tx_head + 1) & 15;
         self.tx_count += 1;
@@ -477,6 +515,25 @@ impl Memspi {
             rx_bytes = ((self.regs[(REG_MISO_DLEN >> 2) as usize] & 0x3FF) + 1) / 8;
         }
 
+        // Chip routing (MISC.cs bits): CS1-only (flash deselected) talks to
+        // the PSRAM device; anything else talks to the NOR flash.
+        let misc = self.regs[(REG_MISC >> 2) as usize];
+        if (misc & (MISC_CS0_DIS | MISC_CS1_DIS)) == MISC_CS0_DIS {
+            self.run_psram_usr(cmd, addr, tx_bytes, rx_bytes);
+            return;
+        }
+        // XIP-silenced flash: once the ROM bootloader enables continuous
+        // reads for cache XIP, a single-line RDID no longer reaches the
+        // flash — the (also-selected) PSRAM chip answers the ID probe
+        // instead. Gated on the exact probe shape so normal flash traffic
+        // (which suspends XIP around programmed I/O) is unaffected.
+        if self.xip && cmd == CMD_JEDEC as u32 && addr_bytes == 0 && tx_bytes == 0 && rx_bytes > 0 {
+            for (i, &b) in PSRAM_ID.iter().enumerate().take(rx_bytes as usize) {
+                self.set_data_byte(i, b);
+            }
+            return;
+        }
+
         self.run_transaction(
             flash,
             Txn {
@@ -490,6 +547,46 @@ impl Memspi {
                 rx: Rxn::Data,
             },
         );
+    }
+
+    /// PSRAM (Ext_RAM, CS1) USR transaction: ID probe, array reads/writes,
+    /// and mode-command absorbs. Addresses are plain (no NOR swap quirk);
+    /// writes overwrite (RAM, not flash-AND). MISO for unrecognized reads
+    /// is zeros (undriven bus).
+    fn run_psram_usr(&mut self, cmd: u32, addr: u32, tx_bytes: u32, rx_bytes: u32) {
+        let ntx = tx_bytes as usize;
+        let nrx = rx_bytes as usize;
+        match cmd as u8 {
+            CMD_JEDEC => {
+                for (i, &b) in PSRAM_ID.iter().enumerate().take(nrx) {
+                    self.set_data_byte(i, b);
+                }
+            }
+            CMD_READ | CMD_FAST_READ | 0xEB => {
+                for i in 0..nrx {
+                    let a = (addr as usize).wrapping_add(i);
+                    self.set_data_byte(i, *self.psram.get(a).unwrap_or(&0));
+                }
+            }
+            CMD_PP | 0x38 => {
+                for i in 0..ntx {
+                    let b = self.data_byte(i);
+                    let a = (addr as usize).wrapping_add(i);
+                    if let Some(slot) = self.psram.get_mut(a) {
+                        *slot = b;
+                    }
+                }
+                for i in 0..nrx {
+                    let a = (addr as usize).wrapping_add(i);
+                    self.set_data_byte(i, *self.psram.get(a).unwrap_or(&0));
+                }
+            }
+            _ => {
+                for i in 0..nrx {
+                    self.set_data_byte(i, 0);
+                }
+            }
+        }
     }
 
     /// Special-command dispatch (QEMU esp32s3_spi_special_command), matched
@@ -774,6 +871,67 @@ mod tests {
         assert_eq!(m.read32(REG_W0), 0x1640EF);
         // CMD always reads 0 (the driver's poll_cmd_done loop exits).
         assert_eq!(m.read32(REG_CMD), 0);
+    }
+
+    /// CS1-selected ID probe answers the PSRAM (not flash) ID, with the
+    /// KGD density byte where the esp-idf quad probe checks it.
+    #[test]
+    fn psram_id_on_cs1() {
+        let mut f = flash4m();
+        let mut m = Memspi::new();
+        m.write32(&mut f, REG_MISC, 0x1); // cs0_dis=1 (flash off), cs1_dis=0 (PSRAM on)
+        m.write32(&mut f, REG_USER, USER_USR_COMMAND | USER_USR_MISO);
+        m.write32(&mut f, REG_USER2, (CMD_JEDEC as u32) | (7 << 28));
+        m.write32(&mut f, REG_MISO_DLEN, 23);
+        m.write32(&mut f, REG_CMD, CMD_USR);
+        assert_eq!((m.read32(REG_W0) >> 8) & 0xFF, 0x5D);
+    }
+
+    /// With XIP active, an ambiguous (both-selected) ID probe is answered
+    /// by the PSRAM (silenced flash); pre-XIP it returns the flash ID.
+    #[test]
+    fn psram_id_when_xip_silences_flash() {
+        let mut f = flash4m();
+        let mut m = Memspi::new();
+        m.write32(&mut f, REG_USER, USER_USR_COMMAND | USER_USR_MISO);
+        m.write32(&mut f, REG_USER2, (CMD_JEDEC as u32) | (7 << 28));
+        m.write32(&mut f, REG_MISO_DLEN, 23);
+        m.write32(&mut f, REG_CMD, CMD_USR);
+        assert_eq!(m.read32(REG_W0), 0x1640EF, "pre-XIP: flash ID");
+        m.xip = true;
+        m.write32(&mut f, REG_CMD, CMD_USR);
+        assert_eq!((m.read32(REG_W0) >> 8) & 0xFF, 0x5D, "XIP: PSRAM ID");
+    }
+
+    /// CS1 pattern traffic round-trips through the PSRAM backing (the
+    /// extram_test write-magic/read-back shape).
+    #[test]
+    fn psram_pattern_round_trip() {
+        let mut f = flash4m();
+        let mut m = Memspi::new();
+        m.write32(&mut f, REG_MISC, 0x1); // cs0_dis=1 (flash off), cs1_dis=0 (PSRAM on)
+        m.write32(
+            &mut f,
+            REG_USER,
+            USER_USR_COMMAND | USER_USR_ADDR | USER_USR_MOSI,
+        );
+        m.write32(&mut f, REG_USER2, (CMD_PP as u32) | (7 << 28));
+        m.write32(&mut f, REG_ADDR, 0x100);
+        m.write32(&mut f, REG_USER1, 23 << 26); // 24-bit address
+        m.write32(&mut f, REG_MOSI_DLEN, 31);
+        m.write32(&mut f, REG_W0, 0x5A6B7C8D);
+        m.write32(&mut f, REG_CMD, CMD_USR);
+        m.write32(
+            &mut f,
+            REG_USER,
+            USER_USR_COMMAND | USER_USR_ADDR | USER_USR_MISO,
+        );
+        m.write32(&mut f, REG_USER2, (CMD_READ as u32) | (7 << 28));
+        m.write32(&mut f, REG_MISO_DLEN, 31);
+        m.write32(&mut f, REG_CMD, CMD_USR);
+        assert_eq!(m.read32(REG_W0), 0x5A6B7C8D);
+        // Flash backing untouched by the CS1 write.
+        assert_eq!(f[0x100], 0);
     }
 
     /// Special-command RDID (CMD bit 28) reads 3 id bytes into W0.

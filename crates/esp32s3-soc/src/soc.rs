@@ -852,6 +852,34 @@ impl Soc {
             if self.mcpwm1.is_active() {
                 self.mcpwm1.tick();
             }
+            // MCPWM capture samples its channel inputs via the GPIO-matrix
+            // input routing (PCNT-style); group 0 listens on 166..168,
+            // group 1 on 175..177 (gpio_sig_map.h PWMx_CAPn_IN_IDX). Levels
+            // come from the pad readback (not pin_level: an output-enabled
+            // peripheral-driven pin reads GPIO_OUT there, not the driven
+            // signal).
+            if self.mcpwm.cap_timer_enabled() {
+                let rb = self.gpio_in_readback();
+                let cap_in = |sig: u32| -> u32 {
+                    match self.gpio.in_sel(sig) {
+                        Some((pin, inv)) if pin < 32 => ((rb >> pin) & 1) ^ (inv as u32),
+                        Some((pin, inv)) => self.gpio.pin_level(pin) ^ (inv as u32),
+                        None => 0,
+                    }
+                };
+                self.mcpwm.tick_capture(166, &cap_in);
+            }
+            if self.mcpwm1.cap_timer_enabled() {
+                let rb = self.gpio_in_readback();
+                let cap_in = |sig: u32| -> u32 {
+                    match self.gpio.in_sel(sig) {
+                        Some((pin, inv)) if pin < 32 => ((rb >> pin) & 1) ^ (inv as u32),
+                        Some((pin, inv)) => self.gpio.pin_level(pin) ^ (inv as u32),
+                        None => 0,
+                    }
+                };
+                self.mcpwm1.tick_capture(175, &cap_in);
+            }
             if self.sdm.is_active() {
                 self.sdm.tick();
             }
@@ -1569,6 +1597,12 @@ impl Soc {
             EXTMEM_BASE => {
                 if is_write {
                     self.cache.write32(off, value);
+                    // Mirror XIP activity into the SPI flash controllers so
+                    // a post-XIP RDID is answered by the PSRAM device (the
+                    // silenced flash cannot reply); see `Memspi::xip`.
+                    let xip = self.cache.xip_active();
+                    self.memspi[0].xip = xip;
+                    self.memspi[1].xip = xip;
                     0
                 } else {
                     self.cache.read32(off)

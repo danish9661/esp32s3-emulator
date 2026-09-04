@@ -61,6 +61,21 @@ const INT_RAW: u32 = 0x114;
 const INT_ST: u32 = 0x118;
 const INT_CLR: u32 = 0x11C;
 
+// Capture submodule (mcpwm_cap_*_reg_t): timer cfg @0xE8, phase @0xEC,
+// channel cfg @0xF0+4n, channel value @0xFC+4n, edge status @0x108.
+const CAP_TIMER_CFG: u32 = 0xE8;
+const CAP_CHN_CFG_BASE: u32 = 0xF0;
+const CAP_CHN_BASE: u32 = 0xFC;
+const CAP_STATUS: u32 = 0x108;
+// CAP_TIMER_CFG bits / cap_chn_cfg fields.
+const CAP_TIMER_EN: u32 = 1 << 0;
+const CAPN_EN: u32 = 1 << 0;
+const CAPN_MODE_SHIFT: u32 = 1; // bit0(1) = negedge, bit1(2) = posedge
+const CAPN_PRESCALE_SHIFT: u32 = 3; // [10:3], divide by prescale+1
+const CAPN_INVERT: u32 = 1 << 11;
+// Capture-channel interrupt bits (INT_ENA/RAW/ST/CLR).
+const CAP_INT_BASE: u32 = 27;
+
 const REG_WORDS: usize = 0x128 / 4;
 
 // timer_cfg0 field positions (mcpwm_timer_cfg0_reg_t).
@@ -99,6 +114,15 @@ pub struct Mcpwm {
     gen_level: [[u32; 2]; NOPER],
     /// Latched interrupt raw bits.
     int_raw: u32,
+    /// Capture-timer free-running counter (APB ticks while enabled).
+    cap_timer: u32,
+    /// Per-channel prescale edge counters.
+    cap_edge_cnt: [u32; 3],
+    /// Previous sampled input level per capture channel.
+    prev_cap: [u32; 3],
+    /// Per-channel first-sample seeding (a channel latches no edge on the
+    /// tick its sampling starts, like the PCNT first-sample gate).
+    cap_init: [bool; 3],
 }
 
 impl Mcpwm {
@@ -110,6 +134,10 @@ impl Mcpwm {
             timer_dir: [0; NTIMER],
             gen_level: [[0; 2]; NOPER],
             int_raw: 0,
+            cap_timer: 0,
+            cap_edge_cnt: [0; 3],
+            prev_cap: [0; 3],
+            cap_init: [false; 3],
         }
     }
 
@@ -242,6 +270,64 @@ impl Mcpwm {
         }
     }
 
+    /// True while the capture timer runs (gates `tick_capture`).
+    pub fn cap_timer_enabled(&self) -> bool {
+        self.regs[CAP_TIMER_CFG as usize / 4] & CAP_TIMER_EN != 0
+    }
+
+    /// Sampled input level of capture channel `n` (post-invert).
+    fn cap_level<F: Fn(u32) -> u32>(&self, cap_base: u32, input: &F, n: usize) -> u32 {
+        let cfg = self.regs[(CAP_CHN_CFG_BASE as usize + 4 * n) / 4];
+        input(cap_base + n as u32) ^ ((cfg & CAPN_INVERT) >> 11)
+    }
+
+    /// Advance the capture submodule by one SoC step: the free-running timer
+    /// plus per-channel edge capture through the GPIO-matrix input routing
+    /// (`input` resolves a capture signal index to its level, PCNT-style).
+    /// On a configured edge (divided by prescale+1) the timer latches into
+    /// CAP_CHN, the edge records in CAP_STATUS, and the CAPn interrupt
+    /// latches. Called regardless of the PWM timers (capture is independent).
+    pub fn tick_capture<F: Fn(u32) -> u32>(&mut self, cap_base: u32, input: &F) {
+        if !self.cap_timer_enabled() {
+            return;
+        }
+        self.cap_timer = self.cap_timer.wrapping_add(1);
+        for n in 0..3 {
+            let cfg = self.regs[(CAP_CHN_CFG_BASE as usize + 4 * n) / 4];
+            if cfg & CAPN_EN == 0 {
+                continue;
+            }
+            if !self.cap_init[n] {
+                self.prev_cap[n] = self.cap_level(cap_base, input, n);
+                self.cap_init[n] = true;
+                continue;
+            }
+            let cur = self.cap_level(cap_base, input, n);
+            let prev = self.prev_cap[n];
+            self.prev_cap[n] = cur;
+            let pos = cur == 1 && prev == 0;
+            let neg = cur == 0 && prev == 1;
+            let mode = (cfg >> CAPN_MODE_SHIFT) & 3;
+            if !(mode & 2 != 0 && pos) && !(mode & 1 != 0 && neg) {
+                continue;
+            }
+            let pre = ((cfg >> CAPN_PRESCALE_SHIFT) & 0xFF) + 1;
+            self.cap_edge_cnt[n] += 1;
+            if self.cap_edge_cnt[n] < pre {
+                continue;
+            }
+            self.cap_edge_cnt[n] = 0;
+            self.regs[(CAP_CHN_BASE as usize + 4 * n) / 4] = self.cap_timer;
+            let st = &mut self.regs[CAP_STATUS as usize / 4];
+            if pos {
+                *st &= !(1 << n);
+            } else {
+                *st |= 1 << n;
+            }
+            self.int_raw |= 1 << (CAP_INT_BASE + n as u32);
+        }
+    }
+
     /// Output level of a GPIO-matrix signal (PWM0 OUT0A..OUT2B = 160..165).
     pub fn signal_level(&self, sig: u32) -> u32 {
         if (PWM0_OUT0A_IDX..=PWM0_OUT2B_IDX).contains(&sig) {
@@ -252,7 +338,8 @@ impl Mcpwm {
         }
     }
 
-    /// Interrupt pending = raw & enabled (no raw bits are generated yet).
+    /// Interrupt pending = raw & enabled (capture channels latch; timer
+    /// event interrupts are not modeled).
     pub fn int_pending(&self) -> bool {
         (self.int_raw & self.regs[INT_ENA as usize / 4]) != 0
     }

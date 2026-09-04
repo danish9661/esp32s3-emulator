@@ -60,6 +60,7 @@ CASES=(
 "twai||TWAI LOOPBACK PASS|"
 "twai_driver||TWAI DRIVER LOOPBACK PASS|"
 "mcpwm||MCPWM PASS|"
+"mcpwm_cap||MCPWM CAP PASS|"
 "pcnt||PCNT PASS|"
 "ledc||LEDC PASS|"
 "sigmadelta||SIGMADELTA PASS|"

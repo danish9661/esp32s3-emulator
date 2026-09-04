@@ -331,3 +331,46 @@ fn slave_take_read_returns_tx_and_underflow_flags() {
     assert!(got2.is_empty());
     assert_eq!(i.int_raw() & (1 << 12), 1 << 12, "txfifo_udf");
 }
+
+/// With addr_10bit_en set, the slave matches the low 10 address bits.
+#[test]
+fn slave_10bit_address_match() {
+    let mut i = I2c::new(0);
+    i.write32(I2C_CTR, 0);
+    i.write32(I2C_SLAVE_ADDR, (1 << 31) | 0x155);
+    assert!(i.is_slave());
+    i.slave_inject_write(0x155, &[0xAA]);
+    assert_eq!(i.read32(I2C_DATA), 0xAA, "10-bit match delivers");
+    assert_eq!(i.read32(I2C_SR) & (1 << 5), 1 << 5, "addressed");
+    // 7-bit alias of the same low bits still matches (mask is 10-bit).
+    i.write32(I2C_INT_CLR, 0xFFFF);
+    // Reset the latched status, then confirm a 7-bit alias mismatch is ignored.
+    i.write32(I2C_FIFO_CONF, (1 << 12) | (1 << 13));
+    i.slave_inject_write(0x55, &[0xBB]);
+    assert_eq!(
+        i.read32(I2C_SR) & (1 << 5),
+        0,
+        "0x55 != 0x155 in 10-bit mode"
+    );
+}
+
+/// Master-side 10-bit addressing is ordinary WRITE bytes (no peripheral
+/// support needed): two address bytes shift out and NACK with no device.
+#[test]
+fn master_10bit_address_as_two_write_bytes() {
+    let mut i = I2c::new(0);
+    // 10-bit addr 0x155 write: header 0b11110_01_0, low byte 0x55.
+    setup_master(&mut i);
+    i.write32(I2C_DATA, 0xF2);
+    i.write32(I2C_DATA, 0x55);
+    i.write32(I2C_COMD, 6 << 11); // RSTART
+    i.write32(I2C_COMD + 4, (1 << 11) | 2); // WRITE, 2 bytes
+    i.write32(I2C_COMD + 8, 2 << 11); // STOP
+    i.write32(I2C_COMD + 12, 4 << 11); // END
+    i.write32(I2C_CTR, (1 << 4) | (1 << 5));
+    for _ in 0..2000 {
+        i.tick(1);
+    }
+    assert_eq!(i.int_raw() & (1 << 10), 1 << 10, "NACKs with no device");
+    assert_eq!(i.int_raw() & (1 << 7), 1 << 7, "completes");
+}

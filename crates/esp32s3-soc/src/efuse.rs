@@ -118,8 +118,10 @@ impl Efuse {
             {
                 self.regs[w] = value;
             }
-            // RD_* data registers are read-only on silicon; PGM registers are not
-            // modeled. Drop all other writes so the modeled MAC is preserved.
+            // RD_* data registers are read-only on silicon; PGM (burn)
+            // registers are not modeled — firmware burn flows
+            // (esp_efuse_batch_write) silently no-op instead of programming
+            // fuses. Drop all other writes so the modeled MAC is preserved.
             _ => {
                 let _ = w;
             }

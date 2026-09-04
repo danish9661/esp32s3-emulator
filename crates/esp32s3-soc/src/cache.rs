@@ -152,6 +152,13 @@ impl Cache {
         }
     }
 
+    /// True once either cache is enabled (firmware cache init). The MSPI
+    /// flash is in continuous-read (XIP) mode from then on: single-line
+    /// commands like RDID no longer reach it (see `Memspi::xip`).
+    pub fn xip_active(&self) -> bool {
+        self.dcache_enable != 0 || self.icache_enable != 0
+    }
+
     /// Cache control register write.
     pub fn write32(&mut self, off: u32, val: u32) {
         let idx = (off >> 2) as usize;

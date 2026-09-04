@@ -2315,6 +2315,42 @@ fn gdma_spi_out_runs_dma_transfer_and_in_returns_rx() {
     );
 }
 
+/// MCPWM capture loopback at the SoC level: timer0 PWM drives GPIO2 via the
+/// output matrix, GPIO2 feeds CAP0 via input selection, and two rising
+/// edges latch timer values ~10000 ticks apart with the CAP0 interrupt.
+#[test]
+fn mcpwm_capture_measures_pwm_period_via_loopback() {
+    use esp32s3_soc::gpio::GPIO_ENABLE_W1TS;
+    use esp32s3_soc::memmap::GPIO_BASE;
+    let mcpwm = 0x6001_E000;
+    let mut m = Esp32S3::new();
+    // GPIO2 <- PWM0_OUT0A (160), output driver on.
+    m.soc.write32(GPIO_BASE + 0x554 + 2 * 4, 160);
+    m.soc.write32(GPIO_BASE + GPIO_ENABLE_W1TS, 1 << 2);
+    // CAP0 input <- GPIO2.
+    m.soc.write32(GPIO_BASE + 0x154 + 166 * 4, 2);
+    // Timer0: period 100, prescale 99, up mode, run.
+    m.soc.write32(mcpwm + 0x04, (100 << 8) | 99);
+    m.soc.write32(mcpwm + 0x08, (1 << 3) | 2);
+    m.soc.write32(mcpwm + 0x40, 50);
+    m.soc.write32(mcpwm + 0x50, (2 << 4) | 1);
+    // Capture timer on, ch0 rising edges.
+    m.soc.write32(mcpwm + 0xE8, 1);
+    m.soc.write32(mcpwm + 0xF0, 1 | (2 << 1));
+    // Run past ~1.5 PWM periods (10000 ticks each): the first rising edge
+    // latches ~10000 (later edges would overwrite, so don't overrun).
+    for _ in 0..15 {
+        m.soc.tick_timers(1000);
+    }
+    assert_eq!(
+        m.soc.read32(mcpwm + 0x114) & (1 << 27),
+        1 << 27,
+        "CAP0 interrupt latched"
+    );
+    let c1 = m.soc.read32(mcpwm + 0xFC);
+    assert!(c1 > 9000 && c1 < 11000, "first capture ~10000, got {c1}");
+}
+
 #[test]
 fn ulp_runs_poked_program_via_bus() {
     use esp32s3_soc::memmap::RTC_SLOW_BASE;

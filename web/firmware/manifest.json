@@ -1,15 +1,78 @@
 [
-  { "name": "hello — Hello from ESP32-S3", "file": "esp32s3_hello.merged.bin" },
-  { "name": "periph — GPIO blink + sensors", "file": "esp32s3_periph.merged.bin" },
-  { "name": "uart_echo — UART loopback", "file": "esp32s3_uart_echo.merged.bin" },
-  { "name": "spi — SPI master transfer", "file": "esp32s3_spi.merged.bin" },
-  { "name": "i2c — I2C bus scan", "file": "esp32s3_i2c.merged.bin" },
-  { "name": "uart_multi — UART0/1/2 TX", "file": "esp32s3_uart_multi.merged.bin" },
-  { "name": "gpio_interrupt — GPIO edge IRQ", "file": "esp32s3_gpio_interrupt.merged.bin" },
-  { "name": "timer_alarm — TIMG0 alarm IRQ", "file": "esp32s3_timer_alarm.merged.bin" },
-  { "name": "spi_wide — SPI 8/16/32-bit", "file": "esp32s3_spi_wide.merged.bin" },
-  { "name": "multi_irq — timer+UART+GPIO IRQs", "file": "esp32s3_multi_irq.merged.bin" },
-  { "name": "multi_periph — timer UART GPIO together", "file": "esp32s3_gpio_uart_timer.merged.bin" },
-  { "name": "virtual_demo — I2C/SPI virtual devices", "file": "esp32s3_virtual_demo.merged.bin" },
-  { "name": "full_load — FreeRTOS dual-core stress test", "file": "esp32s3_full_load.merged.bin" }
+  {
+    "name": "hello \u2014 Hello from ESP32-S3",
+    "file": "esp32s3_hello.merged.bin"
+  },
+  {
+    "name": "periph \u2014 GPIO blink + sensors",
+    "file": "esp32s3_periph.merged.bin"
+  },
+  {
+    "name": "uart_echo \u2014 UART loopback",
+    "file": "esp32s3_uart_echo.merged.bin"
+  },
+  {
+    "name": "spi \u2014 SPI master transfer",
+    "file": "esp32s3_spi.merged.bin"
+  },
+  {
+    "name": "i2c \u2014 I2C bus scan",
+    "file": "esp32s3_i2c.merged.bin"
+  },
+  {
+    "name": "uart_multi \u2014 UART0/1/2 TX",
+    "file": "esp32s3_uart_multi.merged.bin"
+  },
+  {
+    "name": "gpio_interrupt \u2014 GPIO edge IRQ",
+    "file": "esp32s3_gpio_interrupt.merged.bin"
+  },
+  {
+    "name": "timer_alarm \u2014 TIMG0 alarm IRQ",
+    "file": "esp32s3_timer_alarm.merged.bin"
+  },
+  {
+    "name": "spi_wide \u2014 SPI 8/16/32-bit",
+    "file": "esp32s3_spi_wide.merged.bin"
+  },
+  {
+    "name": "multi_irq \u2014 timer+UART+GPIO IRQs",
+    "file": "esp32s3_multi_irq.merged.bin"
+  },
+  {
+    "name": "multi_periph \u2014 timer UART GPIO together",
+    "file": "esp32s3_gpio_uart_timer.merged.bin"
+  },
+  {
+    "name": "virtual_demo \u2014 I2C/SPI virtual devices",
+    "file": "esp32s3_virtual_demo.merged.bin"
+  },
+  {
+    "name": "full_load \u2014 FreeRTOS dual-core stress test",
+    "file": "esp32s3_full_load.merged.bin"
+  },
+  {
+    "name": "aes \u2014 AES-ECB/CBC/XTS via mbedTLS",
+    "file": "esp32s3_aes.merged.bin"
+  },
+  {
+    "name": "sha \u2014 SHA-256/384/512 digests",
+    "file": "esp32s3_sha.merged.bin"
+  },
+  {
+    "name": "spi_dma \u2014 GDMA-fed SPI waveform",
+    "file": "esp32s3_spi_dma.merged.bin"
+  },
+  {
+    "name": "mcpwm_cap \u2014 PWM capture loopback",
+    "file": "esp32s3_mcpwm_cap.merged.bin"
+  },
+  {
+    "name": "twai_driver \u2014 CAN loopback (driver)",
+    "file": "esp32s3_twai_driver.merged.bin"
+  },
+  {
+    "name": "ledc \u2014 LEDC PWM driver",
+    "file": "esp32s3_ledc.merged.bin"
+  }
 ]

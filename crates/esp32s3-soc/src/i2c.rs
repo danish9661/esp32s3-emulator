@@ -43,8 +43,10 @@
 //! TRANS_COMPLETE + END_DETECT), `slave_take_read` emulates a
 //! master-read-from-slave (TX FIFO bytes out, slave_rw=1, TRANS_START +
 //! TXFIFO_WM + TRANS_COMPLETE, TXFIFO_UDF when the TX FIFO is empty).
-//! 7-bit addressing only; 10-bit (addr_10bit_en) and clock stretching are
-//! not modeled.
+//! Slave addressing is 7-bit, widening to 10-bit when addr_10bit_en is set
+//! (master-side 10-bit needs no support: both address bytes are ordinary
+//! WRITE bytes); clock stretching is not modeled (host-driven exchanges
+//! complete instantly, so the slave never holds SCL).
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -79,6 +81,8 @@ const CTR_MS_MODE: u32 = 1 << 4;
 // SLAVE_ADDR bits (TRM I2C_SLAVE_ADDR @ 0x10).
 pub const I2C_SLAVE_ADDR: u32 = 0x10;
 const SLAVE_ADDR_MASK: u32 = 0x7F;
+const SLAVE_ADDR_10BIT_MASK: u32 = 0x3FF;
+const SLAVE_ADDR_10BIT_EN: u32 = 1 << 31;
 // SR bits (TRM I2C_SR).
 const SR_RESP_REC: u32 = 1 << 0;
 const SR_SLAVE_RW: u32 = 1 << 1;
@@ -216,9 +220,22 @@ impl I2c {
         self.regs[(I2C_CTR / 4) as usize] & CTR_MS_MODE == 0
     }
 
-    /// Configured 7-bit slave address (SLAVE_ADDR[6:0]).
+    /// Configured slave address: 10-bit (SLAVE_ADDR[9:0]) when addr_10bit_en
+    /// is set, else 7-bit (SLAVE_ADDR[6:0]). Master-side 10-bit addressing
+    /// needs no peripheral support (both address bytes travel as ordinary
+    /// WRITE bytes); only the slave match widens.
     fn slave_addr(&self) -> u32 {
         self.regs[(I2C_SLAVE_ADDR / 4) as usize] & SLAVE_ADDR_MASK
+    }
+
+    /// True when `addr` (7- or 10-bit) matches the configured slave address.
+    fn slave_addr_match(&self, addr: u32) -> bool {
+        if self.regs[(I2C_SLAVE_ADDR / 4) as usize] & SLAVE_ADDR_10BIT_EN != 0 {
+            addr & SLAVE_ADDR_10BIT_MASK
+                == self.regs[(I2C_SLAVE_ADDR / 4) as usize] & SLAVE_ADDR_10BIT_MASK
+        } else {
+            addr & SLAVE_ADDR_MASK == self.slave_addr()
+        }
     }
 
     /// Push one byte into the RX FIFO (drops when full, like real HW).
@@ -235,7 +252,7 @@ impl I2c {
     /// TRANS_COMPLETE + END_DETECT. A mismatched address is ignored (the
     /// slave NACKs it on real HW). Only acts in slave mode.
     pub fn slave_inject_write(&mut self, addr7: u32, bytes: &[u8]) {
-        if !self.is_slave() || addr7 & SLAVE_ADDR_MASK != self.slave_addr() {
+        if !self.is_slave() || !self.slave_addr_match(addr7) {
             return;
         }
         for &b in bytes {
@@ -256,7 +273,7 @@ impl I2c {
     /// raise TRANS_START + TXFIFO_WM + TRANS_COMPLETE (plus TXFIFO_UDF when
     /// the TX FIFO runs dry). Only acts in slave mode.
     pub fn slave_take_read(&mut self, addr7: u32, n: usize) -> Vec<u8> {
-        if !self.is_slave() || addr7 & SLAVE_ADDR_MASK != self.slave_addr() {
+        if !self.is_slave() || !self.slave_addr_match(addr7) {
             return Vec::new();
         }
         let mut out = Vec::new();
