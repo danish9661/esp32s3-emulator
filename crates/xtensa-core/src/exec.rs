@@ -157,14 +157,13 @@ pub(crate) fn execute<B: Bus>(
             Outcome::Seq
         }
         Opcode::OPCODE_MOVF | Opcode::OPCODE_MOVT => {
-            // movf/movt at, as, bt: move if bit bt of register bt is
-            // clear/set (QEMU translate_movp: arg[2] is reg bt, imm = bt).
-            let t = o[2].value;
-            let bit = (cpu.reg(t) >> t) & 1;
+            // movf/movt at, as, bt: move if BR[bt] is clear/set (ISA RM
+            // "MOVF/MOVT"; QEMU translate_movp tests the FP boolean bit,
+            // not an AR bit).
             let cond = if opc == Opcode::OPCODE_MOVF {
-                bit == 0
+                !cpu.br(o[2].value)
             } else {
-                bit != 0
+                cpu.br(o[2].value)
             };
             if cond {
                 cpu.set_reg(o[0].value, cpu.reg(o[1].value));

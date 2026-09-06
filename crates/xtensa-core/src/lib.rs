@@ -1031,6 +1031,43 @@ mod cpu_tests {
     }
 
     #[test]
+    fn fpu_ar_movf_movt_test_br_bits() {
+        // AR MOVF/MOVT move on BR[bt] clear/set (ISA RM Boolean Option),
+        // NOT on an AR bit. BR2=1 (oeq.s true) with a2 bit2=0, BR3=0
+        // (olt.s false) with a3 bit3=1, so any AR-bit reading fails.
+        // Encodings: FP compare op0=0 op1=11 op2=2/4 (r=BR bit, s/t=FR);
+        // AR movf/movt op0=0 op1=3 op2=12/13 (r=dest, s=src, t=bit).
+        let mut prog = Vec::new();
+        let mut a = 0x4000_1000u32;
+        put(&mut prog, &mut a, 0x00F8_A322); // movi a2, 0x3F8
+        put(&mut prog, &mut a, 0x0001_22C0); // slli a2, a2, 20   ; 1.0 (bit2=0)
+        put(&mut prog, &mut a, 0x00FA_1250); // wfr f1, a2
+        put(&mut prog, &mut a, 0x00FA_2250); // wfr f2, a2
+        put(&mut prog, &mut a, 0x002B_2120); // oeq.s b2, f1, f2  ; BR2=1
+        put(&mut prog, &mut a, 0x004B_3120); // olt.s b3, f1, f2  ; BR3=0
+        put(&mut prog, &mut a, 0x0008_A032); // movi a3, 8        ; bit3=1
+        put(&mut prog, &mut a, 0x0055_A052); // movi a5, 0x55
+        put(&mut prog, &mut a, 0x00AA_A062); // movi a6, 0xAA
+        put(&mut prog, &mut a, 0x00BB_A072); // movi a7, 0xBB
+        put(&mut prog, &mut a, 0x00DD_A082); // movi a8, 0xDD
+        put(&mut prog, &mut a, 0x00CC_A092); // movi a9, 0xCC
+        put(&mut prog, &mut a, 0x00C3_6520); // movf a6, a5, 2    ; skip
+        put(&mut prog, &mut a, 0x00D3_7520); // movt a7, a5, 2    ; move
+        put(&mut prog, &mut a, 0x00C3_8530); // movf a8, a5, 3    ; move
+        put(&mut prog, &mut a, 0x00D3_9530); // movt a9, a5, 3    ; skip
+        let end = a;
+
+        let mut bus = RamBus::load(&prog);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_1000;
+        run(&mut cpu, &mut bus, end);
+        assert_eq!(cpu.reg(6), 0xAA, "movf skips on BR2=1");
+        assert_eq!(cpu.reg(7), 0x55, "movt takes on BR2=1");
+        assert_eq!(cpu.reg(8), 0x55, "movf takes on BR3=0");
+        assert_eq!(cpu.reg(9), 0xCC, "movt skips on BR3=0");
+    }
+
+    #[test]
     fn fpu_floor_ceil_round_ufloat() {
         // FLOOR/CEIL/ROUND_S (op2=10/11/8) and UFLOAT_S (op2=13).
         // 2.5 = 0x40200000 via movi 0x402 + slli 20.

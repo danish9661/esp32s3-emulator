@@ -949,6 +949,21 @@ impl Soc {
         }
     }
 
+    /// TEMPORARY PROBE (remove): raw flash backing for snapshots.
+    pub fn flash_backing(&self) -> &[u8] {
+        &self.flash[..]
+    }
+
+    /// TEMPORARY PROBE (remove): raw PSRAM backing for aliasing scans.
+    pub fn psram_backing(&self) -> &[u8] {
+        &self.psram[..]
+    }
+
+    /// TEMPORARY PROBE (remove): raw PSRAM backing, mutable.
+    pub fn psram_backing_mut(&mut self) -> &mut [u8] {
+        &mut self.psram[..]
+    }
+
     /// Byte read through a cache window (data or instruction), translated by
     /// the cache MMU to flash (read-only) or PSRAM (read-write) backing.
     fn cache_read8(&self, addr: u32) -> u8 {
@@ -2342,11 +2357,20 @@ impl Bus for Soc {
     fn write16(&mut self, addr: u32, val: u32) {
         // RAM regions: byte-lane merge. MMIO: APB registers are 32-bit;
         // a sub-word write is approximated as a full-word store.
+        // Cache windows: byte-lane merge like RAM — a widened write32 would
+        // zero-clobber the adjacent halfword on MMU-mapped PSRAM pages
+        // (real S16I semantics; broke MicroPython's u16 qstr table which is
+        // written in hash order).
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE)
             || in_range!(addr, IRAM_BASE, IRAM_WINDOW_SIZE)
         {
             self.ram_write8(addr, val as u8);
             self.ram_write8(addr + 1, (val >> 8) as u8);
+        } else if in_range!(addr, FLASH_DATA_BASE, FLASH_WINDOW_SIZE)
+            || in_range!(addr, FLASH_INST_BASE, FLASH_WINDOW_SIZE)
+        {
+            self.cache_write8(addr, val as u8);
+            self.cache_write8(addr + 1, (val >> 8) as u8);
         } else {
             self.write32(addr, val);
         }

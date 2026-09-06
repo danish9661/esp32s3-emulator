@@ -2313,3 +2313,40 @@ Core design:
     run_flash gains UART0_INJECT/UART0_MARKER (mirrors USB_INJECT).
     Battery 51/0/3 (+flashread), 37/37 suites, clippy (pre-existing warns
     only)/fmt/wasm32 clean.
+  - 2026-09-06: **Soc::write16 widening bug fixed — MicroPython
+    NameError/TypeError family resolved**. `Soc::write16` routed cache-window
+    (PSRAM heap) halfword stores through `write32` (full 4-byte store),
+    zero-clobbering the adjacent halfword. MicroPython's emit qstr_table
+    (u16 array, written in map-hash order) lost exactly the entries whose
+    neighbors were written later (table[1]=module, table[4]=print → 0),
+    producing `NameError: name ''`, `TypeError` (print resolving to a
+    global's value), empty `File ""`, `line 2029180`, and
+    second-string-prints-empty. Root-caused via heap forensics (PSRAM dumps
+    + MMU translation + mpy-cross ground-truth bytecode + write-watch +
+    single-step pc): pool verified perfect (a=1663, b=1664, djb2-checked),
+    bytecode verified exact, emit map verified exact
+    (file=0,mod=1,a=2,b=3,print=4,y=5), then watched the table fill (all six
+    correct) followed by u32-pair overwrites from the same populate loop.
+    AA2 survived by monotonic slot order. Fix: cache-window arm in write16
+    does two cache_write8s (MMIO still widened). Validated: full
+    former-failure family now passes (two1 prints a/b, 2long prints ab/cd,
+    usedef raises correct `File "boot.py", line 2... name 'x'`), regression
+    machine test `psram_write16_preserves_adjacent_halfword`
+    (fails-without/passes-with verified), plus ROM memcpy/memset matrix
+    tests kept. 37 suites green, battery 51/0/3, clippy pre-existing warns
+    only, fmt clean. REMAINING MP GAPS: float-format hang (`print(0.5)`,
+    `__divsf3` loop, still hangs at 200M steps) and REPL stdin unread.
+  - 2026-09-06: **AR MOVF/MOVT tested BR bits, not AR bits — MicroPython
+    float-format hang resolved**. `print(0.5)` hung (core1 cycling, core0 in
+    idle): MP's `formatfloat` exponent loop uses HW-FPU `ole_s` + AR `movf`
+    for step selection, but our AR `MOVF/MOVT` tested bit bt of AR[bt]
+    (pre-FPU stub semantics) instead of `BR[bt]`, so the loop never
+    converged (a3 crept +0x200/cycle). The `.S` variants were already
+    correct; BT/BF were already on BR. Fix is 6 lines in `exec.rs`
+    (`cpu.br(o[2])`); new unit test `fpu_ar_movf_movt_test_br_bits`
+    (fails-without verified; also documents the true RRR field order
+    r=[15:12], s=[11:8], t=[7:4] after a swapped-field false start).
+    Validated: `print(0.5)`→`0.5`, `print(1.0/3.0)`→`0.33333334`,
+    `print(3.14)`/`print(1e10)`/`print(-2.5)`/`print(0.1+0.2)`→`0.3` all
+    correct. 37 suites green, battery 51/0/3, clippy pre-existing warns
+    only, fmt clean. REMAINING MP GAP: REPL stdin unread.

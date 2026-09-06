@@ -1323,6 +1323,7 @@ fn adc1_oneshot_reads_injected_voltage() {
     a.s32i(4, 3, 0); // stash the raw result
     let halt = a.pc();
     a.j(halt);
+
     a.bytes_mut()[l_sens..l_sens + 4].copy_from_slice(&SENS_BASE.to_le_bytes());
     a.bytes_mut()[l_stash..l_stash + 4].copy_from_slice(&STASH.to_le_bytes());
 
@@ -1675,7 +1676,7 @@ fn rom_qsort_sorts_via_windowed_comparator() {
     const CODE: u32 = IRAM_BASE + 0x9000;
     const ARR: u32 = CODE + 0x200;
     let mut a = Asm::new(CODE);
-    a.li(1, 0x3FC8_9000); // SP (clear of the ROM layout struct)
+    a.li(1, 0x3FCB_0000); // SP (clear of code/SRC/DST)
     a.li(3, 0x40000); // PS.WOE
     a.wsr(xtensa_core::cpu::SR_PS, 3);
     a.li(10, ARR as i32); // callee a2 = base (callx8: caller a10..a13)
@@ -2907,4 +2908,238 @@ fn rmt_tx_loopback_into_rx_channel() {
     // INT_CLR clears the RX end flag.
     m.soc.write32(RMT_BASE + 0x7C, 1 << 16);
     assert_eq!(m.soc.read32(RMT_BASE + 0x70) & (1 << 16), 0);
+}
+
+#[test]
+fn rom_memcpy_matrix_lengths_and_alignments() {
+    // ROM newlib memcpy (0x40056F44) over length x src/dst misalignment:
+    // MicroPython's qstr interning (and heap churn generally) copies tiny
+    // strings to chunk addresses whose alignment varies with content, so a
+    // length/alignment-sensitive memcpy bug would manifest as
+    // content-dependent corruption.  Each combo gets a fresh DST slot;
+    // SRC holds a fixed pseudo-random pattern; sentinels guard both.
+    use crate::asm::Asm;
+    use crate::rom_stub;
+    const CODE: u32 = IRAM_BASE + 0x9000;
+    const SRC: u32 = 0x3FC8_1000;
+    // DST must not alias the test code itself: CODE lives at IRAM
+    // 0x40379000+ (= sram 0x9000+, i.e. DRAM 0x3FC89000+), so DST slots
+    // (320 x 128 B) go to 0x3FCA0000, clear of code/SRC/stack.
+    const DST: u32 = 0x3FCA_0000;
+    const MEMCPY: u32 = 0x4005_6F44;
+    const LENS: [u32; 20] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 15, 16, 17, 24, 31, 32, 33, 48, 64,
+    ];
+    let mut combos = alloc::vec::Vec::new();
+    for &len in &LENS {
+        for sm in 0..4u32 {
+            for dm in 0..4u32 {
+                combos.push((len, sm, dm));
+            }
+        }
+    }
+    let mut a = Asm::new(CODE);
+    a.li(1, 0x3FC8_9000); // SP
+    a.li(3, 0x40000); // PS.WOE
+    a.wsr(xtensa_core::cpu::SR_PS, 3);
+    for (i, &(len, sm, dm)) in combos.iter().enumerate() {
+        let dst = DST + i as u32 * 128;
+        a.li(10, (dst + dm) as i32); // callee a2 = dst
+        a.li(11, (SRC + sm) as i32); // callee a3 = src
+        a.li(12, len as i32); // callee a4 = len
+        a.li(8, MEMCPY as i32);
+        a.callx8(8);
+    }
+    let halt = a.pc();
+    a.j(halt);
+    let mut m = Esp32S3::new();
+    let rom = rom_stub::rom_image();
+    m.load_image(rom_stub::ROM_BASE, &rom);
+    m.load_rom_data();
+    m.load_image(CODE, &a.bytes());
+    // SRC pattern + DST sentinels, host-side (pattern is a pure
+    // function of the absolute source address, mirrored in the assert).
+    let pat = |a: u32| (a.wrapping_mul(0x9E3779B9).wrapping_add(a >> 3) & 0xFF) as u8;
+    for i in 0..256u32 {
+        m.soc.write8(SRC + i, pat(SRC + i) as u32);
+    }
+    for i in 0..(combos.len() as u32 * 128) {
+        m.soc.write8(DST + i, 0xCC);
+    }
+    m.cpu[0].pc = CODE;
+    for _ in 0..2_000_000 {
+        if m.cpu[0].pc == halt {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.cpu[0].pc, halt, "memcpy matrix must halt cleanly");
+    for (i, &(len, sm, dm)) in combos.iter().enumerate() {
+        let dst = DST + i as u32 * 128;
+        for k in 0..len {
+            let want = pat(SRC + sm + k);
+            let got = m.soc.read8(dst + dm + k) as u8;
+            assert_eq!(
+                got, want,
+                "combo {i} len={len} src_mis={sm} dst_mis={dm} byte {k}"
+            );
+        }
+        // Sentinels around the written span must be intact.
+        if dm > 0 {
+            assert_eq!(
+                m.soc.read8(dst) as u8,
+                0xCC,
+                "combo {i} leading sentinel intact"
+            );
+        }
+        let tail = dst + dm + len;
+        let slot_end = dst + 128;
+        if tail < slot_end {
+            assert_eq!(
+                m.soc.read8(tail) as u8,
+                0xCC,
+                "combo {i} trailing sentinel intact"
+            );
+        }
+    }
+}
+
+#[test]
+fn rom_memset_matrix_lengths_and_alignments() {
+    // ROM newlib memset (0x400570C8) over length x misalignment, same
+    // rationale as the memcpy matrix above (heap/pool zeroing paths).
+    // Layout keeps code/stack/data disjoint (see memcpy test).
+    use crate::asm::Asm;
+    use crate::rom_stub;
+    const CODE: u32 = IRAM_BASE + 0x9000;
+    const DST: u32 = 0x3FCA_0000;
+    const MEMSET: u32 = 0x4005_70C8;
+    const LENS: [u32; 12] = [0, 1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 33];
+    let mut combos = alloc::vec::Vec::new();
+    for &len in &LENS {
+        for dm in 0..4u32 {
+            combos.push((len, dm));
+        }
+    }
+    let mut a = Asm::new(CODE);
+    a.li(1, 0x3FCB_0000); // SP (clear of code/data)
+    a.li(3, 0x40000); // PS.WOE
+    a.wsr(xtensa_core::cpu::SR_PS, 3);
+    for (i, &(len, dm)) in combos.iter().enumerate() {
+        let dst = DST + i as u32 * 64;
+        a.li(10, (dst + dm) as i32); // callee a2 = dst
+        a.li(11, 0x5A); // callee a3 = value
+        a.li(12, len as i32); // callee a4 = len
+        a.li(8, MEMSET as i32);
+        a.callx8(8);
+    }
+    let halt = a.pc();
+    a.j(halt);
+    let mut m = Esp32S3::new();
+    let rom = rom_stub::rom_image();
+    m.load_image(rom_stub::ROM_BASE, &rom);
+    m.load_rom_data();
+    m.load_image(CODE, &a.bytes());
+    for i in 0..(combos.len() as u32 * 64) {
+        m.soc.write8(DST + i, 0xCC);
+    }
+    m.cpu[0].pc = CODE;
+    for _ in 0..2_000_000 {
+        if m.cpu[0].pc == halt {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.cpu[0].pc, halt, "memset matrix must halt cleanly");
+    for (i, &(len, dm)) in combos.iter().enumerate() {
+        let dst = DST + i as u32 * 64;
+        for k in 0..len {
+            assert_eq!(
+                m.soc.read8(dst + dm + k) as u8,
+                0x5A,
+                "combo {i} len={len} mis={dm} byte {k}"
+            );
+        }
+        if dm > 0 {
+            assert_eq!(m.soc.read8(dst) as u8, 0xCC, "combo {i} leading sentinel");
+        }
+        let tail = dst + dm + len;
+        if tail < dst + 64 {
+            assert_eq!(m.soc.read8(tail) as u8, 0xCC, "combo {i} trailing sentinel");
+        }
+    }
+}
+
+#[test]
+fn psram_write16_preserves_adjacent_halfword() {
+    // Regression: Soc::write16 widened cache-window stores to write32,
+    // zero-clobbering the neighbor halfword on MMU-mapped PSRAM pages.
+    // That broke MicroPython's u16 qstr table (written in hash order, so a
+    // later pair-store cleared already-written entries -> NameError '').
+    // Firmware maps vpage 1 -> PSRAM page 1, writes 6 halfwords in the
+    // non-monotonic order the MP compiler used, and stashes all six.
+    use crate::asm::Asm;
+    use esp32s3_soc::memmap::{CACHE_PAGE_SIZE, FLASH_DATA_BASE, MMU_TABLE_BASE};
+    const STASH: u32 = 0x3FC8_0200;
+    let mut a = Asm::new(IRAM_BASE);
+    let l_tab = a.offset();
+    a.lit(0);
+    let l_win = a.offset();
+    a.lit(0);
+    let l_stash = a.offset();
+    a.lit(0);
+    let code_start = a.pc();
+    let p = a.l32r(2); // MMU_TABLE_BASE
+    a.patch_l32r(p, IRAM_BASE + l_tab as u32);
+    let p = a.l32r(3); // FLASH_DATA_BASE + 1 * CACHE_PAGE_SIZE
+    a.patch_l32r(p, IRAM_BASE + l_win as u32);
+    let p = a.l32r(5); // STASH
+    a.patch_l32r(p, IRAM_BASE + l_stash as u32);
+    a.li(6, 0x8001); // PSRAM page 1 entry
+    a.s32i(6, 2, 1 * 4); // mmu[1]
+    // Non-monotonic u16 writes: +8, +2, +4, +10, +0, +6 (MP emit order).
+    a.li(6, 0x007B);
+    a.s16i(6, 3, 8);
+    a.li(6, 0x0007);
+    a.s16i(6, 3, 2);
+    a.li(6, 0x067F);
+    a.s16i(6, 3, 4);
+    a.li(6, 0x067B);
+    a.s16i(6, 3, 10);
+    a.li(6, 0x0586);
+    a.s16i(6, 3, 0);
+    a.li(6, 0x0680);
+    a.s16i(6, 3, 6);
+    a.l16ui(6, 3, 0);
+    a.s32i(6, 5, 0);
+    a.l16ui(6, 3, 2);
+    a.s32i(6, 5, 4);
+    a.l16ui(6, 3, 4);
+    a.s32i(6, 5, 8);
+    a.l16ui(6, 3, 6);
+    a.s32i(6, 5, 12);
+    a.l16ui(6, 3, 8);
+    a.s32i(6, 5, 16);
+    a.l16ui(6, 3, 10);
+    a.s32i(6, 5, 20);
+    let halt = a.pc();
+    a.j(halt);
+    a.bytes_mut()[l_tab..l_tab + 4].copy_from_slice(&MMU_TABLE_BASE.to_le_bytes());
+    a.bytes_mut()[l_win..l_win + 4]
+        .copy_from_slice(&(FLASH_DATA_BASE + CACHE_PAGE_SIZE).to_le_bytes());
+    a.bytes_mut()[l_stash..l_stash + 4].copy_from_slice(&STASH.to_le_bytes());
+    let mut m = Esp32S3::new();
+    m.load_image(IRAM_BASE, a.bytes());
+    m.cpu[0].pc = code_start;
+    for _ in 0..2000 {
+        if m.cpu[0].pc == halt {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.cpu[0].pc, halt, "must halt");
+    let want = [0x0586u32, 0x0007, 0x067F, 0x0680, 0x007B, 0x067B];
+    for (i, &w) in want.iter().enumerate() {
+        assert_eq!(m.soc.read32(STASH + i as u32 * 4), w, "halfword {i}");
+    }
 }
