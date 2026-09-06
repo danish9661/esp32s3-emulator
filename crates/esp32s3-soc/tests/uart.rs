@@ -94,3 +94,20 @@ fn full_fires_at_threshold() {
     u.inject_rx(b'c');
     assert_eq!(u.read32(UART_INT_RAW) & 1, 1);
 }
+
+/// RX FIFO caps at the 128-byte hardware depth: longer bursts drop the
+/// excess (overrun) instead of reporting a count the REPL ISR would copy
+/// past its 128B stack buffer (150B bursts crashed MicroPython).
+#[test]
+fn rx_fifo_caps_at_hardware_depth() {
+    let mut u = Uart::new();
+    for _ in 0..200 {
+        u.inject_rx(b'A');
+    }
+    let status = u.read32(UART_STATUS);
+    assert_eq!(status & 0x3FF, 128, "count saturates at depth");
+    for _ in 0..128 {
+        assert_eq!(u.read32(UART_FIFO) as u8, b'A');
+    }
+    assert_eq!(u.read32(UART_FIFO), 0, "overrun bytes were dropped");
+}

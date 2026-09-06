@@ -16,7 +16,7 @@
 
 static int poll_done() {
   for (uint32_t t = 0; t < 20000000; t++) {
-    if (SPI_INT_RAW & 1) {
+    if (SPI_INT_RAW & (1 << 12)) {
       return 1;
     }
   }
@@ -27,7 +27,7 @@ void setup() {
   Serial.begin(115200);
   SPI_SLAVE_REG = (1 << 26);  // slave_mode (spi_struct.h `slave`)
   SPI_W0 = 0xA5C30000;        // TX preload for the master-read half
-  SPI_INT_CLR = 1;
+  SPI_INT_CLR = (1 << 12);
   Serial.println("SPI SLAVE READY");
   if (!poll_done()) {
     Serial.println("SPI SLAVE TIMEOUT");
@@ -35,7 +35,7 @@ void setup() {
   }
   Serial.printf("SPI SLAVE RX=%08x\n", SPI_W0);
   Serial.printf("SPI SLAVE RXLEN=%u\n", SPI_SLAVE1_REG & 0x3FFFF);
-  SPI_INT_CLR = 1;
+  SPI_INT_CLR = (1 << 12);
   // Reload the TX buffer: the master-write captured into the shared data
   // buffer, so the master-read half shifts out whatever is preloaded now.
   SPI_W0 = 0xA5C30000;

@@ -126,7 +126,15 @@ impl Uart {
     }
 
     /// Push one received byte into the RX FIFO (host console input).
+    /// Caps at the 128-byte hardware depth (`SOC_UART_FIFO_LEN`): the REPL
+    /// ISR reads `rxfifo_cnt` bytes into a fixed 128B stack buffer, so the
+    /// count must never exceed depth — a 150B burst smashed the ISR stack
+    /// (input text landed in a length field -> runaway copy -> Guru).
+    /// Real silicon drops overrun bytes the same way.
     pub fn inject_rx(&mut self, byte: u8) {
+        if self.rx.len() >= 128 {
+            return;
+        }
         self.rx.push_back(byte);
         self.tout_idle = 0;
         let regs = &mut self.regs;
@@ -177,8 +185,23 @@ impl Uart {
 
     /// Interrupt status = RAW & ENA (TRM UART_INT_ST); the peripheral
     /// interrupt line into the matrix asserts while this is non-zero.
+    /// `TXFIFO_EMPTY` is overlaid level-style: it reads 1 while the TX
+    /// FIFO sits below the CONF1 empty threshold (our TX drains instantly
+    /// so it is always empty). Real silicon re-asserts it after an INT_CLR
+    /// while the FIFO is empty; without this the IDF TX pump ISR never
+    /// fires after driver init clears the reset latch and ringbuffered
+    /// bytes (e.g. MicroPython `UART.write`) never reach the FIFO.
+    pub fn int_raw_live(&self) -> u32 {
+        let mut v = self.regs[(UART_INT_RAW / 4) as usize];
+        let thrhd = (self.regs[(UART_CONF1 / 4) as usize] >> 10) & 0x3FF;
+        if thrhd != 0 {
+            v |= INT_TXFIFO_EMPTY;
+        }
+        v
+    }
+
     pub fn int_st(&self) -> u32 {
-        self.regs[(UART_INT_RAW / 4) as usize] & self.regs[(UART_INT_ENA / 4) as usize]
+        self.int_raw_live() & self.regs[(UART_INT_ENA / 4) as usize]
     }
 
     pub fn read32(&mut self, offset: u32) -> u32 {
@@ -198,6 +221,8 @@ impl Uart {
             }
             // Interrupt status = RAW & ENA (TRM UART_INT_ST).
             UART_INT_ST => self.int_st(),
+            // RAW shows the live level for TXFIFO_EMPTY (see int_raw_live).
+            UART_INT_RAW => self.int_raw_live(),
             _ => self.regs[(offset / 4) as usize],
         }
     }

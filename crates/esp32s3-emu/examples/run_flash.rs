@@ -134,6 +134,13 @@ fn main() {
             if (32..=37).contains(&cause) {
                 continue; // Window overflow/underflow — normal.
             }
+            if cause == 5 {
+                // ALLOCA (movsp stack-guard spill request) — normal,
+                // firmware-handled VM event like window spills: the
+                // handler spills windows and resumes past the movsp.
+                // Aborting here killed healthy MicroPython REPL runs.
+                continue;
+            }
             if cause == 1 && env::var("SYSCALL_CONTINUE").is_ok() {
                 // Let the firmware's own exception vector handle syscalls
                 // (raise_cause already vectored; e.g. MicroPython issues
@@ -166,6 +173,9 @@ fn main() {
         if let StepResult::Exception { cause } = r1 {
             if cause != 0 && (32..=37).contains(&cause) {
                 continue;
+            }
+            if cause == 5 {
+                continue; // ALLOCA spill request (see core0 arm).
             }
             if cause == 1 && env::var("SYSCALL_CONTINUE").is_ok() {
                 continue; // Same as above (core1 syscalls).

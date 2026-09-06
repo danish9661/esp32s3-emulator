@@ -2360,3 +2360,49 @@ Core design:
     un-consumed by REPL (this build's stdin is the UART REPL path). All
     MicroPython gaps closed: REPL boots, runs code, floats format, stdin
     interactive. 37 suites green, battery 51/0/3 (unchanged, no code edit).
+  - 2026-09-06: **IDF SPI driver path validated; UART TXEMPTY level +
+    RX depth cap; ALLOCA continue (MP machine protocols)**. Three real
+    model defects + one harness bug, all via MP `machine` REPL validation
+    (Pin OUT drive/readback both directions; UART construct with real
+    115211 divisor + `write` TX; SPI `read` via `spi_device_transmit`;
+    I2C `scan()`→`[]` + `writeto`→`OSError ENODEV`):
+    (1) SPI `trans_done` is bit **12** of the DMA_INT block (verified in
+    `spi_struct.h`; the bit-0 model hung real `spi_device_transmit`:
+    setup ran, USR never set). Also implemented DMA_INT_SET (0x44) so
+    `spi_hal_init`'s forced-done kick lands. New `esp32s3_spidev` sketch
+    (IDF init+add+transmit, `SPIDEV PASS`) in battery (52/0/3); slave/DMA
+    sketches updated to bit 12. Cautionary tale: an idle-always-set
+    overlay was tried first and stormed the ISR (interrupt-WDT panic) —
+    the latch + SET semantics are load-bearing.
+    (2) UART TXFIFO_EMPTY is level-style (re-asserts while FIFO empty):
+    after init cleared the latch the TX-pump ISR never fired, stranding
+    driver-ringbuffered TX (`u.write` returned 2, bytes never sent).
+    INT_RAW/ST now overlay the live level.
+    (3) UART RX caps at 128B HW depth: longer bursts reported counts the
+    REPL ISR copies past its 128B stack buffer (150B burst smashed it,
+    input text landed in a length field → Guru).
+    (4) Harness: run_flash continues on ALLOCA (movsp spill request,
+    verified vs QEMU `win_helper.c` identical; aborting it killed healthy
+    REPL runs and masqueraded as an `import I2C` hang). Two red herrings
+    retired along the way: `$(...)` strips trailing newlines (fake
+    "stuck" REPL lines) and the MP task idles while blocked (not spinning).
+    37 suites green, battery 52/0/3, clippy pre-existing warns only.
+  - 2026-09-06: **I2C Wire driver limitation RETIRED (was a wrong
+    expectation, not a model gap)**. Arduino `Wire` scan printed
+    `other=119` instead of `nack=119`; prior notes blamed the esp-idf
+    driver's `cmd_link` ABI (no such struct exists in v5.3 — verdict lives
+    in `i2c_master_bus_t.status`/`event`). Root-caused with IDF
+    release/v5.3 source: Arduino 3.3.10 Wire uses the NG driver
+    (`esp32-hal-i2c-ng.c` → `i2c_master_transmit`), whose NACK path sets
+    `status=ACK_ERROR` and returns `ESP_ERR_INVALID_STATE` (0x103) via
+    `s_i2c_transaction_start` (`status != DONE`), which Wire maps to 4
+    ("other") — identical on silicon (verified ISR priority NACK-first,
+    our 0x488 drives it; ENA mask includes NACK; bits verified vs
+    `i2c_ll.h`). The `esp32s3_i2c_wire` sketch now asserts the CORRECT
+    behavior (`found=0`, all 119 error quickly, none hang) and is back in
+    the battery. Cautionary tales: (1) a scratch sketch calling legacy
+    symbols directly linked BOTH drivers and hit the link-time
+    `CONFLICT` abort — use HAL wrappers only; (2) stale `build/` dirs
+    silently mix core versions — `rm -rf build` before bisecting;
+    (3) leftover harness FIFO reads (my I2C trace) eat firmware bytes —
+    broke `i2c_poke` until removed. Battery 53/0/2.

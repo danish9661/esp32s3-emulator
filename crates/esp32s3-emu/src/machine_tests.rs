@@ -2291,8 +2291,8 @@ fn gdma_spi_out_runs_dma_transfer_and_in_returns_rx() {
         "CMD.usr clears"
     );
     assert_eq!(
-        m.soc.read32(SPI2_BASE + SPI_INT_RAW) & 1,
-        1,
+        m.soc.read32(SPI2_BASE + SPI_INT_RAW) & (1 << 12),
+        1 << 12,
         "SPI trans_done latched"
     );
     assert_eq!(

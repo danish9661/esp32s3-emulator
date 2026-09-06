@@ -18,8 +18,8 @@
 //! The module clock gate (CLK_GATE.clk_en) must be set for the clock to
 //! run, exactly like real hardware (IDF spi_ll_enable_clock).
 //!
-//! Interrupts: transaction completion latches INT_RAW.trans_done (bit 0,
-//! TRM SPI_SLV_INT_RAW); INT_STATUS = INT_RAW & INT_ENA. The matrix + CPU
+//! Interrupts: transaction completion latches INT_RAW.trans_done (bit 12,
+//! TRM SPI_DMA_INT_RAW; the classic-ESP32 bit-0 layout does NOT apply);
 //! delivery is wired in soc.rs int_pending.  Not modeled: DMA slave mode,
 //! quad/octal, segments, the CMD.update latch (values are used as written
 //! — functionally equivalent once firmware follows the IDF update sequence).
@@ -92,12 +92,19 @@ const SLAVE1_DATA_BITLEN_MASK: u32 = (1 << 18) - 1;
 const CTRL_D_POL: u32 = 1 << 20;
 // CLK_GATE bits (TRM SPI_CLK_GATE).
 const CLK_GATE_CLK_EN: u32 = 1 << 0;
-// Interrupt registers (TRM SPI_SLV_INT_*): trans_done = bit 0.
+// Interrupt registers (TRM SPI_DMA_INT_*, NOT the classic-ESP32 SLV layout):
+// trans_done = bit 12 (verified against esp32s3 spi_struct.h
+// `dma_int_raw.trans_done`; the old bit-0 model hung the real IDF
+// `spi_device_transmit`, which enables/waits on bit 12).
 pub const SPI_INT_ENA: u32 = 0x34;
 pub const SPI_INT_CLR: u32 = 0x38;
 pub const SPI_INT_RAW: u32 = 0x3C;
 pub const SPI_INT_ST: u32 = 0x40;
-const INT_TRANS_DONE: u32 = 1 << 0;
+/// Software-set register: writing a bit ORs it into INT_RAW (TRM
+/// SPI_DMA_INT_SET; `spi_hal_init` forces trans_done this way so the
+/// first queued transfer can kick the ISR via `esp_intr_enable`).
+pub const SPI_INT_SET: u32 = 0x44;
+const INT_TRANS_DONE: u32 = 1 << 12;
 
 const REG_COUNT: usize = 0xF4 / 4;
 const DATA_WORDS: usize = 16;
@@ -649,6 +656,11 @@ impl Spi {
 
     /// Interrupt status: INT_RAW & INT_ENA (TRM SPI_SLV_INT_STATUS). The
     /// driver ISR reads this to identify the cause before clearing INT_CLR.
+    /// NOTE: `trans_done` is a pure latch (set on completion and by the
+    /// INT_SET register at `spi_hal_init`; cleared by INT_CLR / at the next
+    /// transaction start). It must NOT read back as set merely when idle:
+    /// an idle-always-set overlay storms the ISR (proven: interrupt-WDT
+    /// panic) because the ISR's own CLR is immediately re-asserted.
     pub fn int_st(&self) -> u32 {
         let raw = self.regs[(SPI_INT_RAW / 4) as usize];
         let ena = self.regs[(SPI_INT_ENA / 4) as usize];
@@ -674,6 +686,11 @@ impl Spi {
                 SPI_INT_CLR => {
                     // Clearing the status clears the matching RAW bits.
                     self.regs[(SPI_INT_RAW / 4) as usize] &= !value;
+                }
+                SPI_INT_SET => {
+                    // Software-set: ORs into RAW (TRM SPI_DMA_INT_SET).
+                    self.regs[(SPI_INT_RAW / 4) as usize] |= value;
+                    self.regs[(SPI_INT_SET / 4) as usize] = value;
                 }
                 _ => {
                     self.regs[(offset / 4) as usize] = value;

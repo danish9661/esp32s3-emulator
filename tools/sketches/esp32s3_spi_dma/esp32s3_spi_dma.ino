@@ -108,10 +108,11 @@ void setup() {
   Serial.println(
       (nbits == 32 && got == 0xA53CF00F) ? "SPI DMA MOSI OK" : "SPI DMA MOSI FAIL");
 
-  // trans_done must have latched by now (CS released at transfer end).
+  // trans_done (bit 12 of the S3 DMA_INT block) must have latched by
+  // now (CS released at transfer end).
   uint32_t done = 0;
   for (uint32_t t = 0; t < 2000000; t++) {
-    if (*S(0x3C) & 1u) {
+    if (*S(0x3C) & (1u << 12)) {
       done = 1;
       break;
     }
