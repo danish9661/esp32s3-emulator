@@ -2350,3 +2350,13 @@ Core design:
     `print(3.14)`/`print(1e10)`/`print(-2.5)`/`print(0.1+0.2)`→`0.3` all
     correct. 37 suites green, battery 51/0/3, clippy pre-existing warns
     only, fmt clean. REMAINING MP GAP: REPL stdin unread.
+  - 2026-09-06: **REPL stdin resolved — no model fix needed (MP listens on
+    UART0, not USB-CDC)**. `UART0_INJECT='print(6*7)\n'` at the `>>> `
+    marker → `>>> print(6*7)\r\n42\r\n>>> `; multi-line
+    `x=6*7\nprint(x)\nprint(1/0)\n` → state persists (`42`), correct
+    `File "<stdin>", line 1 ... ZeroDivisionError: divide by zero`, back to
+    `>>> `. Earlier "ignored" verdict predated the write16/movf fixes (the
+    UART RX ringbuf path was likely collateral). USB-CDC inject still
+    un-consumed by REPL (this build's stdin is the UART REPL path). All
+    MicroPython gaps closed: REPL boots, runs code, floats format, stdin
+    interactive. 37 suites green, battery 51/0/3 (unchanged, no code edit).
