@@ -98,16 +98,14 @@ impl Default for Rtc {
             sleep_req: false,
             sleep_target: 0,
             wakeup_cause: 0,
-            // Reset causes report UNKNOWN (0) on normal boot — NOT the
-            // silicon-accurate POWERON (1): seeding 0x41 hangs every boot
-            // in `spi_flash_disable_interrupts_caches_and_other_cpu`
-            // (0x403757C5: polls the core1-stall ack byte after
-            // `esp_ipc_call_nonblocking`). That POWERON-only path (RF-cal
-            // flash save during startup) needs early-boot IPC preemption
-            // of core 1, which the model doesn't deliver before core 1
-            // installs its handler. DEEPSLEEP (5) is set on wake — the
-            // value firmware actually gates on (validated WOKE/PASS).
-            reset_state: 0,
+            // Silicon-accurate POWERON causes (verified live-ROM decode:
+            // `esp_rom_get_reset_reason` returns RESET_STATE PROCPU/APPCPU).
+            // POWERON boots take ~3x the instructions (~34M vs ~13M for
+            // hello): core 0 waits in the flash-stall handshake while core 1
+            // finishes its own POWERON init (RF-cal/BBPLL), then boot
+            // completes normally — an early 20-30M STEP budget misread this
+            // wait as a hang. Size validation budgets accordingly.
+            reset_state: RESET_CAUSE_POWERON | (RESET_CAUSE_POWERON << 6),
             regs: [0u32; 0x400 / 4],
             ulp: crate::ulp::Ulp::default(),
         }

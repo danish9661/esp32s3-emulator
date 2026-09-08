@@ -116,13 +116,43 @@ const SCR_BYTES: [u8; 8] = [0x02, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 // byte-flip the version reads 1 and function-group-1 reports SDR25 (func 1)
 // supported and not busy (sd_protocol_defs.h SD_SFUNC_*).
 const SWITCH_RAW: [u32; 16] = [
-    0, 0, 0, 0x0000_0200, 0x0000_0100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0,
+    0,
+    0,
+    0x0000_0200,
+    0x0000_0100,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
 ];
 // SD Status (ACMD13, 64 bytes): DAT_BUS_WIDTH=4-bit, AU_SIZE=1MB,
 // ERASE_SIZE/TIMEOUT/OFFSET nonzero, DISCARD supported. `sdmmc_decode_ssr`
 // never fails, so these are informational + erase-timeout inputs only.
 const SSR_RAW: [u32; 16] = [
-    0x0000_0080, 0, 0x0000_0700, 0x0000_2908, 0, 0, 0x0000_0002, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x0000_0080,
+    0,
+    0x0000_0700,
+    0x0000_2908,
+    0,
+    0,
+    0x0000_0002,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
 ];
 // CSD v2.0 (R2 words low -> high = RESP0..RESP3): STRUCTURE=1 (v2.0),
 // TAAC=0x0E, TRAN_SPEED=0x5A (50 MHz — the post-HS-switch re-read requires
@@ -652,7 +682,15 @@ mod tests {
     }
 
     /// `issue` plus an R2 (136-bit long response) flag.
-    fn issue_long(d: &mut Sdmmc, index: u8, arg: u32, resp: bool, long: bool, data: bool, rw: bool) {
+    fn issue_long(
+        d: &mut Sdmmc,
+        index: u8,
+        arg: u32,
+        resp: bool,
+        long: bool,
+        data: bool,
+        rw: bool,
+    ) {
         let mut cmd = (index as u32) | CMD_START;
         if resp {
             cmd |= CMD_RESPONSE_EXPECT;
@@ -779,7 +817,10 @@ mod tests {
         assert_eq!(d.storage[510], 0x55);
         assert_eq!(d.storage[511], 0xAA);
         assert_eq!(d.storage[0x1C2], 0x06);
-        assert_eq!(u32::from_le_bytes(d.storage[0x1C6..0x1CA].try_into().unwrap()), 64);
+        assert_eq!(
+            u32::from_le_bytes(d.storage[0x1C6..0x1CA].try_into().unwrap()),
+            64
+        );
         assert_eq!(
             u32::from_le_bytes(d.storage[0x1CA..0x1CE].try_into().unwrap()),
             STORAGE_BLOCKS as u32 - 64

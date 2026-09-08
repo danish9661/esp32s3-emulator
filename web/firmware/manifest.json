@@ -74,5 +74,13 @@
   {
     "name": "ledc \u2014 LEDC PWM driver",
     "file": "esp32s3_ledc.merged.bin"
+  },
+  {
+    "name": "deepsleep \u2014 timer wakeup + reboot",
+    "file": "esp32s3_deepsleep.merged.bin"
+  },
+  {
+    "name": "sdfat \u2014 SDMMC FAT mount + R/W",
+    "file": "esp32s3_sdfat.merged.bin"
   }
 ]

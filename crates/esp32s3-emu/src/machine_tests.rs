@@ -2064,13 +2064,13 @@ fn deep_sleep_poke_wakes_with_timer_cause() {
     assert_eq!(m.soc.read32(WAKEUP_CAUSE) & timer_cause, timer_cause);
 }
 
-/// `RTC_CNTL_RESET_STATE_REG` (+0x38) reports UNKNOWN (0) on normal boot and
+/// `RTC_CNTL_RESET_STATE_REG` (+0x38) reports POWERON (1) on normal boot and
 /// DEEPSLEEP (5) after a deep-sleep wake — the live ROM's
 /// `esp_rom_get_reset_reason` returns these fields directly, and
 /// `esp_sleep_get_wakeup_cause` gates on PRO == 5 (see the
 /// `esp32s3_deepsleep` driver sketch: WOKE/PASS requires it).
 #[test]
-fn rtc_reset_cause_unknown_then_deepsleep_after_wake() {
+fn rtc_reset_cause_poweron_then_deepsleep_after_wake() {
     use esp32s3_soc::rtc::{
         RESET_CAUSE_DEEPSLEEP, RESET_STATE_OFF, RTC_CNTL_BASE, SLEEP_EN_BIT, SLP_TIMER0_OFF,
         SLP_TIMER1_OFF, STATE0_OFF,
@@ -2078,10 +2078,9 @@ fn rtc_reset_cause_unknown_then_deepsleep_after_wake() {
     const RESET_STATE: u32 = RTC_CNTL_BASE + RESET_STATE_OFF;
 
     let mut m = Esp32S3::new();
-    // Normal boot: UNKNOWN approximation (silicon says POWERON, but seeding
-    // that hangs startup in a POWERON-only flash/RF-cal path).
-    assert_eq!(m.soc.read32(RESET_STATE) & 0x3F, 0, "PRO cause");
-    assert_eq!((m.soc.read32(RESET_STATE) >> 6) & 0x3F, 0, "APP cause");
+    // Normal boot: silicon-accurate POWERON.
+    assert_eq!(m.soc.read32(RESET_STATE) & 0x3F, 1, "PRO cause");
+    assert_eq!((m.soc.read32(RESET_STATE) >> 6) & 0x3F, 1, "APP cause");
 
     // Poke a sleep + wake like `deep_sleep_poke_wakes_with_timer_cause`.
     m.soc.write32(RTC_CNTL_BASE + SLP_TIMER0_OFF, 0x100);

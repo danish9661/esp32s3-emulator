@@ -2446,3 +2446,41 @@ Core design:
     0x600C0038/3C) were needed just to reach the sleep call.
     37 suites green (69 emu incl. new test), clippy pre-existing warns
     only, fmt clean.
+  - 2026-09-08: **SDMMC FAT filesystem mount validated end-to-end (P5
+    residual retired)**. `tools/sketches/esp32s3_sdfat` drives the REAL
+    Arduino `SD_MMC` stack (`sdmmc_host` + `sdmmc_card_init` + FATFS):
+    `SD BEGIN OK` / `SIZE MB=4` / `TYPE=3` (SDHC) / root listing /
+    `HELLO.TXT` read → `SD FAT READ PASS` + write/read-back →
+    `SD FAT WRITE PASS` → `SD DONE`. Battery entry (60M STEPS).
+    Model fixes in `sdmmc.rs` (all verified against IDF release/v5.3
+    source): live R1 status (APP_CMD bit 5 for the CMD55 handshake,
+    READY_FOR_DATA + CURRENT_STATE — constant 0 hung every data wait);
+    CMD5 raises RTO **with** CMD_DONE (real HW reports both; the driver
+    relies on CMD_DONE to leave SENDING_CMD — without it the expected RTO
+    errors as a transaction timeout); CMD6 64B SWITCH_FUNC status (SDR25
+    supported, not busy, ver 1); ACMD13 64B SSR; SCR bus-widths 1+4 bit;
+    CSD v2.0 rebuilt (C_SIZE=7 → 8192 sectors = 4 MB, TRAN_SPEED 50 MHz
+    for the post-HS-switch re-read check, CCC SWITCH bit); CTRL reset
+    bits self-clear (`sdmmc_host_reset` polls them); IDMAC enable is BMOD
+    bit 7, not bit 0 (machine test + poke sketch updated to true
+    semantics); storage enlarged 512KB → 4MB with an in-code FAT16
+    preformat (MBR + BPB + 2 FATs + root dir + `HELLO.TXT`). Cautionary
+    tales: (1) the generic S3 board has NO default SDMMC pins — the sketch
+    must `setPins` or `begin` fails silently at `perimanClearPinBus`;
+    (2) MBR LBA-start is at 0x1C6 and count at 0x1CA (I had them swapped —
+    FATFS then sees zero partitions and fails with no further reads);
+    (3) `memdump`/`livedecode` argv quirk + run_flash early-exit make
+    cross-harness state comparisons invalid — verify within one harness.
+    37 suites green, battery 55/0/1 (only `virtual_demo` skipped).
+  - 2026-09-08: **POWERON reset cause adopted (was UNKNOWN approximation,
+    was misdiagnosed as a hang)**. `Rtc::reset_state` now seeds
+    POWERON/POWERON (0x41); normal boots report the silicon-accurate cause
+    through the live ROM's `esp_rom_get_reset_reason`. The "deadlock" was a
+    STEP-budget artifact: POWERON boots take ~34M insns vs ~13M (core 0
+    waits in the flash-stall handshake while core 1 finishes its POWERON
+    RF-cal/BBPLL init, then boot completes normally — `Hello` + `boot
+    OK`), and the 20-30M budgets expired mid-wait. Forensics that proved
+    it: both handshake bytes reach 1, both cores cycle (not stuck), 100M
+    budget boots clean and deterministically. Cost: validation budgets
+    grew (`deepsleep` 20M→50M, `full_load` →150M); battery stays 55/0/1.
+    New test renamed to `rtc_reset_cause_poweron_then_deepsleep_after_wake`.

@@ -75,7 +75,7 @@ CASES=(
 "sdmmc||SDMMC PASS|"
 "sdfat||SD BEGIN OK;SD FAT READ PASS;SD FAT WRITE PASS;SD DONE|60000000"
 "deepsleep_poke||DEEPSLEEP PASS|"
-"deepsleep||DEEPSLEEP START;DEEPSLEEP WOKE;DEEPSLEEP PASS|20000000"
+"deepsleep||DEEPSLEEP START;DEEPSLEEP WOKE;DEEPSLEEP PASS|50000000"
 "hmac||HMAC DONE|"
 "ds||DS DONE|"
 "rsa||RSA POKE PASS||esp32s3_rsa/esp32s3_rsa_poke/esp32s3_rsa_poke.merged.bin"
@@ -84,7 +84,7 @@ CASES=(
 "lcd_cam||LCD CAM POKE PASS;LCD GDMA PASS|"
 "p5_stubs||P5 STUBS POKE PASS|"
 "gdma||GDMA RMT TX done|"
-"full_load||FULL_LOAD PASS|"
+"full_load||FULL_LOAD PASS|150000000"
 "ota_slot||OTA SLOT TEST PASS|"
 "virtual_demo|SKIP:needs node virtual-device harness, not run_flash|"
 )
