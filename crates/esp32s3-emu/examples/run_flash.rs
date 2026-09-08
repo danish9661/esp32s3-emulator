@@ -128,7 +128,6 @@ fn main() {
         executed += n as u64;
         i += 1;
         let pc = m.cpu[0].pc;
-
         // --- Exception handling ---
         if let StepResult::Exception { cause } = r {
             if (32..=37).contains(&cause) {
@@ -329,6 +328,12 @@ fn main() {
         }
 
         // --- Stall / idle detection ---
+        // (Skipped while fast-forwarding deep sleep: the CPUs are halted by
+        // design for the whole sleep, however long the ULP program runs.)
+        if m.is_asleep() {
+            idle_steps = 0;
+            stuck = 0;
+        }
         let uart_len = uart_buf.len();
         if pc == last_pc && uart_len == last_uart_len {
             idle_steps += 1;

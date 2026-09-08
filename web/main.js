@@ -1,6 +1,6 @@
 import init, { Emulator } from './pkg/wasm_bridge.js';
 import { PeripheralBridge } from './emu_api.js';
-import { VirtualI2CSensor, VirtualSpiAdc } from './virtual_devices.js';
+import { VirtualI2CSensor, VirtualSpiAdc, VirtualCamera } from './virtual_devices.js';
 
 const NUM_PINS = 40;
 
@@ -247,6 +247,7 @@ let emu = null;
 let bridge = null;
 let vdevSensor = null;
 let vdevAdc = null;
+let vdevCam = null;
 let flashBytes = null;
 let timer = null;
 let totalSteps = 0;
@@ -291,6 +292,11 @@ async function loadFlash(bytes) {
     bridge.i2c.onRead((chan) => vdevSensor.handleRead(chan));
     bridge.i2c.onWrite((chan, byte) => vdevSensor.handleWrite(chan, byte));
     bridge.spi.onTransfer((chan, tx) => vdevAdc.handleTransfer(chan, tx));
+    // Demo camera frame (two captures' worth, like the harness pre-primes).
+    vdevCam = new VirtualCamera([0x01020304, 0x11223344, 0xa5a5a5a5, 0xdeadbeef, 0x12345678, 0x00000000, 0xffffffff, 0x5a5a5a5a]);
+    vdevCam.onActivity = (t) => appendVdev(t);
+    emu.cam_inject_frame(vdevCam.takeFrame());
+    emu.cam_inject_frame(vdevCam.takeFrame());
     if (els.vdev) els.vdev.textContent = '';
     vdevLineCount = 0;
     appendVdev('Virtual devices attached: I2C sensor @0x42, SPI ADC');

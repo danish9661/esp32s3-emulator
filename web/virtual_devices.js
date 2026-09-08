@@ -60,3 +60,26 @@ export class VirtualSpiAdc {
     return new Uint8Array(tx.length).fill(this.value);
   }
 }
+
+export class VirtualCamera {
+  // words: array of u32 frame words the sensor streams on CAM_START.
+  constructor(words = []) {
+    this.words = [...words];
+    this.framesProvided = 0; // frames handed out via takeFrame()
+    this.onActivity = null;
+  }
+
+  // Return one frame as little-endian bytes and log it (firmware→device
+  // direction is implicit: each CAM_START capture consumes one frame).
+  takeFrame() {
+    const bytes = new Uint8Array(this.words.length * 4);
+    const view = new DataView(bytes.buffer);
+    this.words.forEach((w, i) => view.setUint32(i * 4, w >>> 0, true));
+    this.framesProvided += 1;
+    if (this.onActivity) {
+      const head = this.words.slice(0, 2).map((w) => '0x' + (w >>> 0).toString(16).padStart(8, '0')).join(',');
+      this.onActivity(`CAM frame #${this.framesProvided}: ${this.words.length} words [${head},...] (device→firmware)`);
+    }
+    return bytes;
+  }
+}

@@ -56,6 +56,25 @@ pub const RESET_CAUSE_POWERON: u32 = 1;
 /// Deep-sleep-wake reset-cause code (`esp_sleep_get_wakeup_cause` gate).
 pub const RESET_CAUSE_DEEPSLEEP: u32 = 5;
 
+// Wakeup-source registers (rtc_cntl_reg.h; trigger enable bits from
+// soc/rtc.h: TRIG_EN bit N == wakeup-cause bit N).
+pub const WAKEUP_STATE_OFF: u32 = 0x3C; // WAKEUP_ENA bitmap [31:15]
+pub const EXT_CONF_OFF: u32 = 0x64; // EXT_WAKEUP_CONF: EXT1_LV[31], EXT0_LV[30]
+pub const EXT1_SEL_OFF: u32 = 0xE0; // EXT_WAKEUP1: STATUS_CLR[22], SEL[21:0]
+pub const EXT1_STATUS_OFF: u32 = 0xE4; // EXT_WAKEUP1_STATUS (triggered pads)
+/// Wakeup-enable bit for cause bit N (WAKEUP_STATE field starts at bit 15).
+pub const fn wakeup_ena(n: u32) -> u32 {
+    1 << (15 + n)
+}
+// Wakeup-cause bits (match TRIG_EN + `esp_sleep_get_wakeup_cause` decode,
+// verified against the linked driver's disassembly: bit 9 (FSM ULP) and
+// bit 11 (COCPU/RISCV ULP) both return ULP).
+pub const CAUSE_EXT0: u32 = 1 << 0;
+pub const CAUSE_EXT1: u32 = 1 << 1;
+pub const CAUSE_TIMER: u32 = 1 << 3;
+pub const CAUSE_ULP: u32 = 1 << 9;
+pub const CAUSE_COCPU: u32 = 1 << 11;
+
 // RC_SLOW nominal frequency (TRM §27): 32.5 kHz; CPU clock 240 MHz.
 const SLOW_CLK_DIV: u64 = 240_000_000 / 32_500;
 
@@ -75,11 +94,17 @@ pub struct Rtc {
     sleep_target: u64,
     /// RTC_CNTL_SLP_WAKEUP_CAUSE_REG mirror (set by the emulator on wake).
     wakeup_cause: u32,
+    /// EXT_WAKEUP1_STATUS mirror (triggering RTC pads, set on EXT1 wake).
+    ext1_status: u32,
     /// RTC_CNTL_RESET_STATE_REG mirror (reset causes for PRO/APPCPU).
-    /// Seeded UNKNOWN (0) — see Default; the machine sets DEEPSLEEP on
+    /// Seeded POWERON/POWERON like silicon; the machine sets DEEPSLEEP on
     /// wake. Real hardware is read-only; firmware writes fall into the
     /// generic `regs` store and do not disturb this mirror.
     reset_state: u32,
+    /// SLP_TIMER0/1 have been programmed since reset (timer-armed
+    /// heuristic: the direct-poke sleep flow programs them without touching
+    /// WAKEUP_ENA, while no-timer flows never write them).
+    slp_timer_written: bool,
     /// Generic backing store for the full RTC_CNTL page (0x000..0x400).  Most
     /// registers are simple stores; the special-cased ones below override this.
     regs: [u32; 0x400 / 4],
@@ -98,6 +123,7 @@ impl Default for Rtc {
             sleep_req: false,
             sleep_target: 0,
             wakeup_cause: 0,
+            ext1_status: 0,
             // Silicon-accurate POWERON causes (verified live-ROM decode:
             // `esp_rom_get_reset_reason` returns RESET_STATE PROCPU/APPCPU).
             // POWERON boots take ~3x the instructions (~34M vs ~13M for
@@ -106,6 +132,7 @@ impl Default for Rtc {
             // completes normally — an early 20-30M STEP budget misread this
             // wait as a hang. Size validation budgets accordingly.
             reset_state: RESET_CAUSE_POWERON | (RESET_CAUSE_POWERON << 6),
+            slp_timer_written: false,
             regs: [0u32; 0x400 / 4],
             ulp: crate::ulp::Ulp::default(),
         }
@@ -146,6 +173,32 @@ impl Rtc {
         self.wakeup_cause = bits;
     }
 
+    /// Record the EXT1 triggering pads for `esp_sleep_get_ext1_wakeup_status`.
+    pub fn set_ext1_status(&mut self, pads: u32) {
+        self.ext1_status = pads & 0x3FFFFF;
+    }
+
+    /// Whether the sleep timer was programmed since reset (timer-armed
+    /// heuristic for flows that never touch WAKEUP_ENA).
+    pub fn slp_timer_written(&self) -> bool {
+        self.slp_timer_written
+    }
+
+    /// Raw WAKEUP_STATE (enable bitmap) register value.
+    pub fn wakeup_state(&self) -> u32 {
+        self.regs[(WAKEUP_STATE_OFF / 4) as usize]
+    }
+
+    /// Raw EXT_WAKEUP_CONF register value (EXT1_LV[31], EXT0_LV[30]).
+    pub fn ext_conf(&self) -> u32 {
+        self.regs[(EXT_CONF_OFF / 4) as usize]
+    }
+
+    /// Raw EXT_WAKEUP1 SEL mask (RTC pads [21:0]).
+    pub fn ext1_sel(&self) -> u32 {
+        self.regs[(EXT1_SEL_OFF / 4) as usize] & 0x3FFFFF
+    }
+
     /// Record the reset causes read back by the live ROM's
     /// `esp_rom_get_reset_reason` (called by the machine on wake).
     pub fn set_reset_cause(&mut self, pro: u32, app: u32) {
@@ -160,6 +213,7 @@ impl Rtc {
             SLP_TIMER1_OFF => self.slp_timer1,
             SLP_WAKEUP_CAUSE_OFF => self.wakeup_cause,
             RESET_STATE_OFF => self.reset_state,
+            EXT1_STATUS_OFF => self.ext1_status,
             // ULP-RISC-V block lives at offset 0x100..0x200 of this page.
             o if (ULP_OFF_START..ULP_OFF_END).contains(&o) => self.ulp.read32(RTC_CNTL_BASE + o),
             o => self.regs[o as usize / 4],
@@ -171,9 +225,22 @@ impl Rtc {
             TIME_UPDATE_OFF if value & TIME_UPDATE_BIT != 0 => {
                 self.latched = self.count;
             }
-            SLP_TIMER0_OFF => self.slp_timer0 = value,
-            SLP_TIMER1_OFF => self.slp_timer1 = value,
+            SLP_TIMER0_OFF => {
+                self.slp_timer0 = value;
+                self.slp_timer_written = true;
+            }
+            SLP_TIMER1_OFF => {
+                self.slp_timer1 = value;
+                self.slp_timer_written = true;
+            }
             SLP_WAKEUP_CAUSE_OFF => self.wakeup_cause = value,
+            EXT1_SEL_OFF => {
+                // SEL[21:0] persist; STATUS_CLR[22] (WO) clears the status.
+                self.regs[EXT1_SEL_OFF as usize / 4] = value & 0x3F_FFFF;
+                if value & (1 << 22) != 0 {
+                    self.ext1_status = 0;
+                }
+            }
             STATE0_OFF if value & SLEEP_EN_BIT != 0 => {
                 // Legacy S3 deep-sleep trigger.  Capture the period the
                 // firmware already programmed into SLP_TIMER0/1.

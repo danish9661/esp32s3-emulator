@@ -2106,6 +2106,58 @@ fn rtc_reset_cause_poweron_then_deepsleep_after_wake() {
     );
 }
 
+/// EXT0 deep-sleep wake: with WAKEUP_ENA EXT0 armed, EXT0 pin = RTC pad 4
+/// at HIGH level and GPIO4 driven HIGH, `SLEEP_EN` must reboot immediately
+/// with the EXT0 cause bit (no timer involved).
+#[test]
+fn deep_sleep_ext0_wakes_with_ext0_cause() {
+    use esp32s3_soc::gpio::{GPIO_ENABLE_W1TS, GPIO_OUT_W1TS};
+    use esp32s3_soc::memmap::GPIO_BASE;
+    use esp32s3_soc::rtc::{
+        EXT_CONF_OFF, RTC_CNTL_BASE, SLEEP_EN_BIT, SLP_WAKEUP_CAUSE_OFF, STATE0_OFF,
+        WAKEUP_STATE_OFF,
+    };
+    let mut m = Esp32S3::new();
+    // Drive GPIO4 HIGH from GPIO_OUT (loopback-readable).
+    m.soc.write32(GPIO_BASE + GPIO_ENABLE_W1TS, 1 << 4);
+    m.soc.write32(GPIO_BASE + GPIO_OUT_W1TS, 1 << 4);
+    // Arm EXT0 (ENA bit 15), level HIGH (EXT_CONF bit 30), RTC pad 4.
+    m.soc.write32(RTC_CNTL_BASE + WAKEUP_STATE_OFF, 1 << 15);
+    m.soc.write32(RTC_CNTL_BASE + EXT_CONF_OFF, 1 << 30);
+    m.soc.write32(0x6000_84DC, 4 << 27); // RTC_IO EXT_WAKEUP0_SEL
+    // Sleep: no timer programmed, so only the EXT0 level can wake.
+    let prev = m.soc.read32(RTC_CNTL_BASE + STATE0_OFF);
+    m.soc
+        .write32(RTC_CNTL_BASE + STATE0_OFF, prev | SLEEP_EN_BIT);
+    for _ in 0..200_000 {
+        m.step();
+        if m.soc.read32(RTC_CNTL_BASE + SLP_WAKEUP_CAUSE_OFF) & 1 != 0 {
+            break;
+        }
+    }
+    assert_eq!(
+        m.soc.read32(RTC_CNTL_BASE + SLP_WAKEUP_CAUSE_OFF) & 1,
+        1,
+        "EXT0 cause after level wake"
+    );
+    // EXT0 with the pin LOW must not wake (level mismatch).
+    let mut m = Esp32S3::new();
+    m.soc.write32(GPIO_BASE + GPIO_ENABLE_W1TS, 1 << 4);
+    m.soc.write32(RTC_CNTL_BASE + WAKEUP_STATE_OFF, 1 << 15);
+    m.soc.write32(RTC_CNTL_BASE + EXT_CONF_OFF, 1 << 30); // want HIGH
+    m.soc.write32(0x6000_84DC, 4 << 27);
+    m.soc.write32(RTC_CNTL_BASE + STATE0_OFF, SLEEP_EN_BIT);
+    for _ in 0..50_000 {
+        m.step();
+    }
+    assert_eq!(
+        m.soc.read32(RTC_CNTL_BASE + SLP_WAKEUP_CAUSE_OFF),
+        0,
+        "no wake while level unmet (still asleep)"
+    );
+    assert!(m.is_asleep(), "machine still fast-forwarding sleep");
+}
+
 /// `RTC_CNTL_SLP_WAKEUP_CAUSE` (0x130, inside the ULP sub-region) must be served
 /// by RTC_CNTL, not the ULP block, so the wakeup cause survives a deep-sleep.
 #[test]
@@ -2149,6 +2201,48 @@ fn p5_stub_peripherals_round_trip() {
         // A second, distinct offset also round-trips.
         m.soc.write32(*base + 0x24, 0xDEAD_BEEF);
         assert_eq!(m.soc.read32(*base + 0x24), 0xDEAD_BEEF, "{} off 0x24", name);
+    }
+}
+
+/// LCD_CAM camera capture delivers a host-staged frame: VSYNC interrupt +
+/// FIFO words in order + START self-clear, with the VSYNC input level
+/// visible on a pad routed to CAM_V_SYNC (sensor loopback).
+#[test]
+fn lcd_cam_capture_delivers_injected_frame() {
+    use esp32s3_soc::gpio::GPIO_FUNC_IN_SEL_0;
+    use esp32s3_soc::lcd_cam::LCD_CAM_BASE;
+    use esp32s3_soc::memmap::GPIO_BASE;
+    let cam_ctrl1 = LCD_CAM_BASE + 0x08;
+    let cam_data = LCD_CAM_BASE + 0x48;
+    let cam_fifo_status = LCD_CAM_BASE + 0x4C;
+    let lc_int_raw = LCD_CAM_BASE + 0x68;
+
+    let mut m = Esp32S3::new();
+    // CAM_V_SYNC (152) -> GPIO7 pad (input routing only; pad is sensor-driven).
+    m.soc.write32(GPIO_BASE + GPIO_FUNC_IN_SEL_0 + 152 * 4, 7);
+    // Stage 4 words (LE bytes) and start the capture.
+    let mut bytes = [0u8; 16];
+    for (i, w) in [0x0102_0304u32, 0xA5A5_A5A5, 0xDEAD_BEEF, 0x1234_5678]
+        .iter()
+        .enumerate()
+    {
+        bytes[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    m.soc.cam_inject_frame(&bytes);
+    m.soc.write32(cam_ctrl1, 1 << 29); // CAM_START
+    // Sample mid-stream (2 of 4 words): VSYNC asserted + pad loopback live.
+    m.soc.tick_timers(2);
+    assert_eq!(m.soc.read32(lc_int_raw) & (1 << 2), 1 << 2, "VSYNC latched");
+    assert_eq!(
+        (m.soc.gpio_in_readback() >> 7) & 1,
+        1,
+        "VSYNC visible on routed pad"
+    );
+    m.soc.tick_timers(8);
+    assert_eq!(m.soc.read32(cam_fifo_status) & 0x7FF, 4, "frame arrived");
+    assert_eq!(m.soc.read32(cam_ctrl1) & (1 << 29), 0, "START self-cleared");
+    for w in [0x0102_0304u32, 0xA5A5_A5A5, 0xDEAD_BEEF, 0x1234_5678] {
+        assert_eq!(m.soc.read32(cam_data), w, "frame word");
     }
 }
 

@@ -140,4 +140,11 @@ impl Emulator {
     pub fn i2c_inject_rx(&mut self, chan: u32, bytes: &[u8]) {
         self.inner.soc.i2c_inject_rx(chan as usize, bytes);
     }
+
+    /// Stage one camera frame (bytes, packed LE into words) for LCD_CAM
+    /// capture. One frame per call; each `CAM_START` capture consumes the
+    /// next staged frame.
+    pub fn cam_inject_frame(&mut self, bytes: &[u8]) {
+        self.inner.soc.cam_inject_frame(bytes);
+    }
 }

@@ -42,6 +42,7 @@ const REG_COUNT: usize = (ULP_OFF_END - ULP_OFF_START) as usize / 4;
 
 /// The ULP-RISC-V core: register file + control, plus the surrounding register
 /// store (control/status/reg slots).
+#[derive(Clone)]
 pub struct Ulp {
     regs: [u32; REG_COUNT],
     x: [u32; 32],

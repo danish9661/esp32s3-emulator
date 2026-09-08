@@ -74,7 +74,10 @@ impl Esp32S3 {
         // Deep-sleep fast-forward: while asleep the CPU is halted.  Count down
         // the captured sleep period then wake (reboot with the timer cause).
         if self.asleep {
-            if self.sleep_remaining == 0 {
+            // A watched ULP halting mid-sleep wakes immediately (ULP cause).
+            if self.soc.sleep_ulp_fired() {
+                self.wake();
+            } else if self.sleep_remaining == 0 {
                 self.wake();
             } else {
                 self.sleep_remaining -= 1;
@@ -125,7 +128,12 @@ impl Esp32S3 {
                 return (StepResult::Ok, StepResult::Ok, 0);
             }
             if self.asleep {
-                if self.sleep_remaining == 0 {
+                // Peripherals (notably the ULP coprocessor and RTC clock)
+                // keep running in deep sleep; tick before checking events.
+                self.soc.tick_timers(1);
+                if self.soc.sleep_ulp_fired() {
+                    self.wake();
+                } else if self.sleep_remaining == 0 {
                     self.wake();
                 } else {
                     self.sleep_remaining -= 1;
@@ -149,7 +157,11 @@ impl Esp32S3 {
         // Deep-sleep plumbing mirrors `step` (per macro-step; entry mid-block
         // takes effect here, ≤16 instructions late).
         if self.asleep {
-            if self.sleep_remaining == 0 {
+            // Peripherals keep running in deep sleep (see above).
+            self.soc.tick_timers(1);
+            if self.soc.sleep_ulp_fired() {
+                self.wake();
+            } else if self.sleep_remaining == 0 {
                 self.wake();
             } else {
                 self.sleep_remaining -= 1;
@@ -283,11 +295,25 @@ impl Esp32S3 {
         }
     }
 
-    /// Reboot after a deep-sleep period, recording a timer wakeup cause so
-    /// `esp_sleep_get_wakeup_cause()` returns `ESP_SLEEP_WAKEUP_TIMER`.
+    /// Reboot after a deep-sleep period, recording the evaluated wakeup
+    /// cause (timer / EXT0 / EXT1 / ULP) so `esp_sleep_get_wakeup_cause()`
+    /// returns it, plus the EXT1 triggering pads. RTC slow/fast memory and
+    /// ULP state are retained across the reboot, like silicon.
     fn wake(&mut self) {
+        let cause = self.soc.take_sleep_cause();
+        let ext1 = self.soc.take_sleep_ext1();
+        let retain = self.soc.snapshot_rtc();
+        let cause = if cause == 0 {
+            // Should not happen (consume always stashes something), but keep
+            // the old timer default rather than reporting UNDEFINED.
+            esp32s3_soc::rtc::CAUSE_TIMER
+        } else {
+            cause
+        };
         self.reset();
-        self.soc.set_sleep_wakeup_cause(1 << 3); // RTC_TIMER_TRIG_EN
+        self.soc.set_sleep_wakeup_cause(cause);
+        self.soc.set_ext1_status(ext1);
+        self.soc.restore_rtc(retain);
         // Deep-sleep reset reason: `esp_sleep_get_wakeup_cause` only reads
         // the wakeup-cause register when the PRO reason is DEEPSLEEP (5).
         self.soc.set_reset_cause(

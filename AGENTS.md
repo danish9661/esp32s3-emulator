@@ -2514,3 +2514,54 @@ Core design:
     never fired (`lastWrite=null`), i.e. it validated only half the bus.
     Battery now **56/0/0**. Touch/WiFi/BLE/`ee.*` remain excluded per
     directive; no other SKIPs remain.
+  - 2026-09-08: **LCD_CAM camera capture validated (P5 residual retired)**.
+    `LcdCam` gains a real RX path: `cam_inject_frame` stages host frames
+    (one per call, queued); `CAM_START` (CTRL1.29, verified in
+    lcd_cam_reg.h — the old "no data source" comment is gone) arms a
+    VSYNC-wait that opens on staged data (`CAM_VSYNC_INT`), streams one
+    word/tick into the RX FIFO with RX-full backpressure, raises
+    `CAM_HS_INT` every `LINE_INT_NUM+1` words, truncates at
+    `REC_DATA_BYTELEN+1` bytes (GDMA-eof semantics), honors `CAM_CTRL`
+    byte-swap, self-clears START at end-of-frame, and resets via
+    `CAM_RESET`/`CAM_AFIFO_RESET`. While capturing (TX idle) the CAM input
+    levels (VSYNC/PCLK/DATA) show through `cam_input_level`, overlaid onto
+    input-routed pads in `gpio_in_readback` (sensor loopback, gated on
+    capturing). 7 unit tests + machine test (injected frame + VSYNC pad).
+    Validated end-to-end: new `esp32s3_camcap` sketch (plain + byte-swapped
+    captures, VSYNC/HS asserts → `CAMCAP PASS`) driven by new
+    `tools/camcap_harness.mjs` (pre-primes 2 frames via a new
+    `VirtualCamera` JS device + `cam_inject_frame` wasm export, asserts all
+    16 word lines + both round PASSes; negative control fails, exit 1) as a
+    battery `NODE:` entry; browser `main.js` pre-primes the demo frame and
+    the gallery gains the sketch. NOT modeled (documented): GDMA-RX
+    transport (no validatable driver offline), `CAM_STOP_EN`, clock-divider
+    timing, 2BYTE packing. Battery 57/0/0.
+  - 2026-09-09: **Deep-sleep wake sources EXT0/EXT1/ULP validated (P5)**.
+    New sketches `esp32s3_deepsleep_ext0/ext1/ulp` drive the real esp-idf
+    sleep driver (`esp_sleep_enable_ext0/ext1/ulp_wakeup` +
+    `esp_deep_sleep_start`) → `WOKE`/`PASS` each (battery 50M/50M/80M).
+    Model work (`rtc.rs`/`soc.rs`/`machine.rs`): WAKEUP_STATE enable bitmap
+    decoded (TRIG_EN bit N == cause bit N, verified: EXT0-only programs
+    ENA=0x8000); EXT0 = RTC_IO EXT_WAKEUP0_SEL pad at EXT_WAKEUP_CONF level
+    (pad↔GPIO identity, verified SEL=4 for GPIO4); EXT1 = SEL mask at LV
+    (ANY_HIGH vs ALL_LOW unified mode per `rtc_cntl_ll.h` — no separate mode
+    register exists on S3); EXT1_STATUS (0xE4) reports triggering pads for
+    `esp_sleep_get_ext1_wakeup_status` (STATUS_CLR via 0xE0.22); timer-armed
+    = ENA bit or SLP_TIMER-written (keeps the direct-poke flow working);
+    RISCV ULP arms COCPU/FSM bits (observed ENA bit 24 = trigger 9;
+    linked `esp_sleep_get_wakeup_cause` maps cause 9 AND 11 → ULP) with
+    halt-edge detection during the fast-forward (ULP keeps ticking while
+    CPUs halt — `step_fast` now ticks in the asleep branches); wake applies
+    the stashed cause/status instead of hardcoded TIMER; RTC slow/fast +
+    ULP state retained across the wake reboot (silicon retention; proves
+    the ULP store via post-wake REG0 readback). Cautionary tales: (1) the
+    "WDT reboot loop" was my own instrumentation lying — wake() wipes the
+    Soc, erasing probe state; machine-level snapshot proved sleeps were
+    fine and only the cause was missing; (2) hand-assembled ULP branches
+    (`bnez` off-by-N, `lui` nibble slip) fail silently — assemble ULP
+    programs with riscv32-esp-elf-as and check objdump (words in-sketch);
+    (3) `memdump`/`livedecode` argv quirk + run_flash early-exit make
+    cross-harness comparisons invalid; (4) S3 EXT1 has no mode register
+    (classic-ESP32 assumption) — LV bit IS the mode. NOT modeled: GPIO
+    wakeup (light-sleep-only per soc/rtc.h), ULP TRAP trigger, CAM_STOP_EN
+    equivalents. Battery 59/0/0 (3 new entries).

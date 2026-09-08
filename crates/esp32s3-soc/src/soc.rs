@@ -80,6 +80,15 @@ pub const EVT_I2C_WRITE: u8 = 3;
 pub const EVT_I2C_READ: u8 = 4;
 pub const EVT_I2C_STOP: u8 = 5;
 
+/// RTC-retained state (slow/fast memory + ULP core) snapshotted before a
+/// deep-sleep reboot and restored after (silicon retention behavior).
+#[derive(Clone)]
+pub struct RtcRetain {
+    slow: alloc::boxed::Box<[u8; RTC_SLOW_SIZE as usize]>,
+    fast: alloc::boxed::Box<[u8; RTC_FAST_SIZE as usize]>,
+    ulp: crate::ulp::Ulp,
+}
+
 macro_rules! in_range {
     ($addr:expr, $base:expr, $size:expr) => {
         ($addr).wrapping_sub($base) < ($size)
@@ -228,6 +237,13 @@ pub struct Soc {
     rtc: Rtc,
     rtc_i2c: RtcI2c,
     rtc_io: RtcIo,
+    /// Deep-sleep wake cause evaluated at sleep entry (applied on wake).
+    sleep_cause: u32,
+    /// EXT1 triggering pads evaluated at sleep entry.
+    sleep_ext1: u32,
+    /// Watched ULP cause bits (ULP and/or COCPU): set when armed and the
+    /// ULP is running at sleep entry; latched into the cause on its halt.
+    sleep_ulp_watch: u32,
     rng: Rng,
     sdmmc: Sdmmc,
     sdm: Sdm,
@@ -378,6 +394,9 @@ impl Soc {
             rtc: Rtc::new(),
             rtc_i2c: RtcI2c::new(),
             rtc_io: RtcIo::new(),
+            sleep_cause: 0,
+            sleep_ext1: 0,
+            sleep_ulp_watch: 0,
             rng: Rng::new(),
             sdmmc: Sdmmc::new(),
             sdm: Sdm::new(),
@@ -755,6 +774,20 @@ impl Soc {
         self.i2c[chan].inject_rx(bytes);
     }
 
+    /// Stage one camera frame for LCD_CAM capture: `bytes` are packed
+    /// little-endian into words (one frame per call; frames queue and each
+    /// `CAM_START` capture consumes the next). A virtual camera device
+    /// supplies the sensor stream the RX FIFO would otherwise lack.
+    pub fn cam_inject_frame(&mut self, bytes: &[u8]) {
+        let mut words = alloc::vec::Vec::with_capacity(bytes.len().div_ceil(4));
+        for chunk in bytes.chunks(4) {
+            let mut w = [0u8; 4];
+            w[..chunk.len()].copy_from_slice(chunk);
+            words.push(u32::from_le_bytes(w));
+        }
+        self.lcd_cam.cam_inject_frame(&words);
+    }
+
     /// Host-driven I2C slave master-write: if `addr7` matches, capture
     /// `bytes` into the slave's RX FIFO on `chan` (0=I2CEXT0, 1=I2CEXT1),
     /// latching the slave status and completion interrupts. Only acts in
@@ -1062,6 +1095,24 @@ impl Soc {
                 v |= 1 << i;
             } else {
                 v &= !(1 << i);
+            }
+        }
+        // Camera sensor loopback: while a capture runs, pads whose input
+        // routing selects a CAM signal read the sensor-driven level (like a
+        // real sensor driving the pad). Gated on capturing (cold otherwise).
+        if self.lcd_cam.cam_driving() {
+            for sig in [149, 150, 151, 152] {
+                // Pins 32+ are out of the u32 readback word (same limit as
+                // the RMT sampler above).
+                if let Some((pin, inv)) = self.gpio.in_sel(sig) {
+                    if pin < 32 {
+                        if self.lcd_cam.cam_input_level(sig) ^ (inv as u32) != 0 {
+                            v |= 1 << pin;
+                        } else {
+                            v &= !(1 << pin);
+                        }
+                    }
+                }
             }
         }
         v
@@ -2000,8 +2051,106 @@ impl Soc {
     /// True if firmware requested a deep-sleep (wrote `RTC_CNTL_SLEEP_EN`).
     /// Returns the captured sleep duration (slow-clock ticks) and clears the
     /// flag. The machine consumes this each step to fast-forward the sleep.
+    ///
+    /// Wake-source evaluation happens here (all state is visible: RTC
+    /// registers, GPIO levels, ULP run state): EXT0/EXT1 level triggers met
+    /// at entry set their cause bits immediately; the timer runs its
+    /// programmed period; a running ULP with wakeup armed is watched for
+    /// its halt edge during the fast-forward (`sleep_ulp_fired`). The
+    /// computed cause + EXT1 status are stashed for `wake()` (which reboots
+    /// before applying them). With no timer and no immediate trigger the
+    /// budget is unbounded — the sleep ends on a watched event.
     pub fn consume_sleep_request(&mut self) -> Option<u64> {
-        self.rtc.consume_sleep_request()
+        let target = self.rtc.consume_sleep_request()?;
+        let ena = self.rtc.wakeup_state();
+        let timer_armed = ena & crate::rtc::wakeup_ena(3) != 0 || self.rtc.slp_timer_written();
+        let mut cause = 0;
+        let mut ext1 = 0;
+        let pads = self.gpio_in_readback();
+        let pad_level = |rtc_pad: u32| -> u32 {
+            // S3 RTC pads 0..21 map 1:1 to GPIO0..21 (verified: EXT0 SEL reads
+            // back the programmed GPIO number; sketches use low pins).
+            if rtc_pad < 22 {
+                (pads >> rtc_pad) & 1
+            } else {
+                0
+            }
+        };
+        // EXT0: single RTC pad at the programmed level.
+        if ena & crate::rtc::wakeup_ena(0) != 0 {
+            let sel = (self.rtc_io.read32(0x4DC) >> 27) & 0x1F;
+            let lv = (self.rtc.ext_conf() >> 30) & 1;
+            if pad_level(sel) == lv {
+                cause |= crate::rtc::CAUSE_EXT0;
+            }
+        }
+        // EXT1: RTC-pad mask at the programmed level (ANY_HIGH when LV=1,
+        // ALL_LOW when LV=0 — unified trigger mode, rtc_cntl_ll.h).
+        if ena & crate::rtc::wakeup_ena(1) != 0 {
+            let mask = self.rtc.ext1_sel();
+            let lv = (self.rtc.ext_conf() >> 31) & 1;
+            let mut trig = 0u32;
+            for pad in 0..22 {
+                if mask & (1 << pad) != 0 && pad_level(pad) == lv {
+                    trig |= 1 << pad;
+                }
+            }
+            let fired = if lv == 1 {
+                trig != 0
+            } else {
+                mask != 0 && trig == (mask & 0x3F_FFFF)
+            };
+            if fired {
+                cause |= crate::rtc::CAUSE_EXT1;
+                ext1 = trig;
+            }
+        }
+        if timer_armed {
+            cause |= crate::rtc::CAUSE_TIMER;
+        }
+        // ULP halt edge is watched during the fast-forward (the ULP keeps
+        // ticking while the CPUs halt); nothing to set yet. Either ULP
+        // trigger (FSM bit 9, COCPU bit 11) arms the watch when the ULP is
+        // running; the matching cause bit latches on its halt.
+        self.sleep_ulp_watch = 0;
+        if self.ulp.is_running() {
+            if ena & crate::rtc::wakeup_ena(9) != 0 {
+                self.sleep_ulp_watch |= crate::rtc::CAUSE_ULP;
+            }
+            if ena & crate::rtc::wakeup_ena(11) != 0 {
+                self.sleep_ulp_watch |= crate::rtc::CAUSE_COCPU;
+            }
+        }
+        self.sleep_cause = cause;
+        self.sleep_ext1 = ext1;
+        if timer_armed {
+            Some(target)
+        } else if cause != 0 {
+            Some(1) // immediate trigger: wake on the next step
+        } else {
+            Some(u64::MAX) // ULP edge or nothing: fast-forward until an event
+        }
+    }
+
+    /// Wake cause stashed at sleep entry (applied by the machine on wake).
+    pub fn take_sleep_cause(&mut self) -> u32 {
+        core::mem::take(&mut self.sleep_cause)
+    }
+
+    /// EXT1 triggering pads stashed at sleep entry.
+    pub fn take_sleep_ext1(&mut self) -> u32 {
+        core::mem::take(&mut self.sleep_ext1)
+    }
+
+    /// True once when a watched ULP halts mid-sleep (latches the ULP cause).
+    /// Call each fast-forward step; edge-triggered (no repeat wakeups).
+    pub fn sleep_ulp_fired(&mut self) -> bool {
+        if self.sleep_ulp_watch != 0 && !self.ulp.is_running() {
+            self.sleep_cause |= core::mem::take(&mut self.sleep_ulp_watch);
+            true
+        } else {
+            false
+        }
     }
 
     /// Debug accessor: has the firmware requested a deep-sleep (pending consume)?
@@ -2019,6 +2168,29 @@ impl Soc {
     /// `esp_rom_get_reset_reason` (machine writes this on wake).
     pub fn set_reset_cause(&mut self, pro: u32, app: u32) {
         self.rtc.set_reset_cause(pro, app);
+    }
+
+    /// Record the EXT1 triggering pads for `esp_sleep_get_ext1_wakeup_status`.
+    pub fn set_ext1_status(&mut self, pads: u32) {
+        self.rtc.set_ext1_status(pads);
+    }
+
+    /// Snapshot of RTC-retained state across a deep-sleep reboot (silicon
+    /// keeps RTC slow/fast memory + ULP state over sleep; only the causes
+    /// are refreshed on wake).
+    pub fn snapshot_rtc(&self) -> RtcRetain {
+        RtcRetain {
+            slow: self.rtc_slow.clone(),
+            fast: self.rtc_fast.clone(),
+            ulp: self.ulp.clone(),
+        }
+    }
+
+    /// Restore RTC-retained state after a deep-sleep reboot.
+    pub fn restore_rtc(&mut self, s: RtcRetain) {
+        self.rtc_slow = s.slow;
+        self.rtc_fast = s.fast;
+        self.ulp = s.ulp;
     }
 
     /// Debug accessor for the AES interrupt raw&enabled state (validation harness).

@@ -11,13 +11,31 @@
 //! one `LCD_PCLK` (sig 154) cycle, toggling PCLK and asserting `LCD_CS` (sig
 //! 132, active low) and `LCD_DC` (sig 153, from `LCD_USER` bit 26) for the
 //! duration. When the FIFO empties `LCD_TRANS_DONE` (bit 1 of the
-//! `LC_DMA_INT_*` block at 0x64/0x68/0x6C/0x70) is raised. The camera (RX)
-//! path mirrors this with `CAM_DATA` (0x48) / `CAM_FIFO_STATUS` (0x4C) and
-//! `CAM_START` (bit 29 of `CAM_CTRL1` 0x08) but has no data source, so its
-//! FIFO stays empty.
+//! `LC_DMA_INT_*` block at 0x64/0x68/0x6C/0x70) is raised.
+//!
+//! The camera (RX) path captures a host-staged frame: `cam_inject_frame`
+//! stages one frame (list of words, e.g. from a virtual camera device); a
+//! `CAM_START` write (bit 29 of `CAM_CTRL1` 0x08, verified in lcd_cam_reg.h)
+//! arms/starts capture. With no staged data the controller waits (models the
+//! VSYNC wait for a real sensor); once data is present it asserts VSYNC
+//! (`CAM_VSYNC_INT`, bit 2) and shifts one word per tick into the RX FIFO
+//! (read via `CAM_DATA` 0x48 / `CAM_FIFO_STATUS` 0x4C). Every
+//! `LINE_INT_NUM+1` (`CAM_CTRL1` [21:16]) words raise `CAM_HS_INT` (bit 3,
+//! "received-lines" semantics); a nonzero `REC_DATA_BYTELEN` (`CAM_CTRL1`
+//! [15:0]) ends capture after that many bytes + 1 (GDMA-eof semantics).
+//! When the frame is consumed the capture ends and `CAM_START` self-clears.
+//! A full RX FIFO stalls the stream (flow control); firmware draining
+//! resumes it. `CAM_CTRL` bit 5 (`CAM_BYTE_ORDER`) byte-swaps each word.
+//! `CAM_RESET` (CTRL1.30) / `CAM_AFIFO_RESET` (CTRL1.31) clear RX state.
+//!
+//! NOT modeled: GDMA-RX transport (CPU `CAM_DATA` polling only — no
+//! validatable driver exists offline), `CAM_STOP_EN`, clock-divider timing
+//! (one word per tick), 2BYTE packing (injected words already are units).
 //!
 //! The presented signals are observable on GPIO pins whose `FUNC_OUT_SEL` is
-//! routed to the corresponding LCD_CAM signal index (see `signal_level`).
+//! routed to the corresponding LCD_CAM signal index (see `signal_level`);
+//! during RX capture (TX idle) the CAM input levels (VSYNC/PCLK/DATA) show
+//! instead so a sensor-driven pad reads back like silicon.
 
 pub const LCD_CAM_BASE: u32 = 0x6004_1000;
 
@@ -50,7 +68,11 @@ const LC_DMA_INT_CLR: u32 = 0x70;
 
 const LCD_START_BIT: u32 = 1 << 27;
 const LCD_RESET_BIT: u32 = 1 << 28;
-const CAM_RESET_BIT: u32 = 1 << 30;
+const CAM_START_BIT: u32 = 1 << 29; // CAM_CTRL1: camera module start
+const CAM_RESET_BIT: u32 = 1 << 30; // CAM_CTRL1: camera module reset
+const CAM_AFIFO_RESET_BIT: u32 = 1 << 31; // CAM_CTRL1: async RX FIFO reset
+const CAM_CTRL: u32 = 0x04;
+const CAM_BYTE_ORDER_BIT: u32 = 1 << 5; // CAM_CTRL: swap bytes per word
 
 const LCD_TRANS_DONE: u32 = 1 << 1;
 const CAM_VSYNC_INT: u32 = 1 << 2;
@@ -73,6 +95,18 @@ pub struct LcdCam {
     cur_word: u32,
     pclk: u32,
     dc: u32,
+    // Camera-capture input state.
+    capturing: bool, // CAM_START latched (armed or streaming)
+    streaming: bool, // frame data present (VSYNC asserted)
+    staged: alloc::collections::VecDeque<alloc::vec::Vec<u32>>, // host frames
+    cur_frame: alloc::vec::Vec<u32>, // frame being streamed
+    cur_pos: usize,  // next word index in cur_frame
+    line_pos: usize, // words since last HSYNC
+    byte_count: u32, // bytes streamed (for REC_DATA_BYTELEN)
+    cam_pclk: u32,
+    cam_vsync: u32,
+    cam_hsync: u32,
+    cam_word: u32, // current input word (DATA_IN level source)
 }
 
 impl LcdCam {
@@ -90,7 +124,29 @@ impl LcdCam {
             cur_word: 0,
             pclk: 0,
             dc: 0,
+            capturing: false,
+            streaming: false,
+            staged: alloc::collections::VecDeque::new(),
+            cur_frame: alloc::vec::Vec::new(),
+            cur_pos: 0,
+            line_pos: 0,
+            byte_count: 0,
+            cam_pclk: 0,
+            cam_vsync: 0,
+            cam_hsync: 0,
+            cam_word: 0,
         }
+    }
+
+    /// Stage one camera frame (words) from the host (virtual camera device).
+    /// Frames queue; each `CAM_START` capture consumes the next one.
+    pub fn cam_inject_frame(&mut self, words: &[u32]) {
+        self.staged.push_back(words.into());
+    }
+
+    /// True while a camera capture is armed or streaming (for tick gating).
+    pub fn cam_active(&self) -> bool {
+        self.capturing
     }
 
     fn idx(off: u32) -> usize {
@@ -162,8 +218,18 @@ impl LcdCam {
                 self.regs[Self::idx(o)] = value;
                 if value & CAM_RESET_BIT != 0 {
                     self.rx_count = 0;
+                    self.end_capture();
                 }
-                // CAM_START has no data source modeled; RX FIFO stays empty.
+                if value & CAM_AFIFO_RESET_BIT != 0 {
+                    // Async FIFO reset: drop received (not yet read) words.
+                    self.rx_count = 0;
+                }
+                if value & CAM_START_BIT != 0 {
+                    // Arm (or restart) a capture; streams once framedata is
+                    // staged (VSYNC wait for a real sensor).
+                    self.capturing = true;
+                    self.streaming = false;
+                }
             }
             _ => {
                 self.regs[Self::idx(o)] = value;
@@ -173,29 +239,103 @@ impl LcdCam {
 
     /// Advance the parallel transfer by one emulator step (one PCLK half-cycle).
     /// True mid-transfer. The SoC skips `tick()` otherwise — `tick`
-    /// returns immediately when `!busy`, so gating is behavior-preserving.
+    /// returns immediately when idle, so gating is behavior-preserving.
     pub fn is_active(&self) -> bool {
-        self.busy
+        self.busy || self.capturing
+    }
+
+    /// Latch a capture shut: VSYNC off, START self-cleared (lets firmware
+    /// poll START as a busy flag, like SPI's self-clearing usr bit).
+    fn end_capture(&mut self) {
+        self.capturing = false;
+        self.streaming = false;
+        self.cam_vsync = 0;
+        self.cam_hsync = 0;
+        self.regs[Self::idx(CAM_CTRL1)] &= !CAM_START_BIT;
+    }
+
+    fn line_int_num(&self) -> usize {
+        ((self.regs[Self::idx(CAM_CTRL1)] >> 16) & 0x3F) as usize
+    }
+
+    fn rec_bytelen(&self) -> u32 {
+        self.regs[Self::idx(CAM_CTRL1)] & 0xFFFF
+    }
+
+    fn byte_swap(&self) -> bool {
+        self.regs[Self::idx(CAM_CTRL)] & CAM_BYTE_ORDER_BIT != 0
     }
 
     pub fn tick(&mut self) {
-        if !self.busy {
+        if self.busy {
+            self.pclk ^= 1;
+            if self.pclk == 1 {
+                // Rising PCLK edge: present the next TX FIFO word.
+                if self.tx_count > 0 {
+                    self.cur_word = self.tx_fifo[0];
+                    for i in 1..self.tx_count {
+                        self.tx_fifo[i - 1] = self.tx_fifo[i];
+                    }
+                    self.tx_count -= 1;
+                } else {
+                    // FIFO drained: finish the transfer.
+                    self.busy = false;
+                    self.int_raw |= LCD_TRANS_DONE;
+                }
+            }
+        }
+        if self.capturing {
+            self.tick_cam();
+        }
+    }
+
+    /// One camera-capture step: open the frame (VSYNC), shift a word per
+    /// tick unless the RX FIFO is full (flow control), HSYNC per line,
+    /// REC_DATA_BYTELEN truncation, end-of-frame shutdown.
+    fn tick_cam(&mut self) {
+        if !self.streaming {
+            // VSYNC wait: begin once a staged frame exists.
+            if let Some(frame) = self.staged.pop_front() {
+                self.cur_frame = frame;
+                self.cur_pos = 0;
+                self.line_pos = 0;
+                self.byte_count = 0;
+                self.streaming = true;
+                self.cam_vsync = 1;
+                self.int_raw |= CAM_VSYNC_INT;
+            } else {
+                return;
+            }
+        }
+        self.cam_pclk ^= 1;
+        if self.rx_count >= FIFO_DEPTH {
+            return; // backpressure: firmware must drain CAM_DATA first
+        }
+        let limit = self.rec_bytelen();
+        if limit != 0 && self.byte_count >= limit + 1 {
+            self.end_capture();
             return;
         }
-        self.pclk ^= 1;
-        if self.pclk == 1 {
-            // Rising PCLK edge: present the next TX FIFO word.
-            if self.tx_count > 0 {
-                self.cur_word = self.tx_fifo[0];
-                for i in 1..self.tx_count {
-                    self.tx_fifo[i - 1] = self.tx_fifo[i];
-                }
-                self.tx_count -= 1;
-            } else {
-                // FIFO drained: finish the transfer.
-                self.busy = false;
-                self.int_raw |= LCD_TRANS_DONE;
-            }
+        if self.cur_pos >= self.cur_frame.len() {
+            self.end_capture();
+            return;
+        }
+        let mut w = self.cur_frame[self.cur_pos];
+        if self.byte_swap() {
+            w = w.swap_bytes();
+        }
+        self.cur_pos += 1;
+        self.byte_count += 4;
+        self.rx_fifo[self.rx_count] = w;
+        self.rx_count += 1;
+        self.cam_word = w;
+        self.line_pos += 1;
+        if self.line_pos > self.line_int_num() {
+            self.line_pos = 0;
+            self.cam_hsync = 1;
+            self.int_raw |= CAM_HS_INT;
+        } else {
+            self.cam_hsync = 0;
         }
     }
 
@@ -225,21 +365,57 @@ impl LcdCam {
         self.int_raw & self.int_ena
     }
 
-    /// Current level (0/1) of an LCD_CAM GPIO-matrix signal index.
+    /// Current level (0/1) of an LCD_CAM GPIO-matrix signal index. While a
+    /// TX transfer runs the LCD output view wins; while an RX capture runs
+    /// (TX idle) the camera input view shows (a sensor-driven pad reads
+    /// back through `cam_input_level`); idle reads CS high, rest low.
     pub fn signal_level(&self, sig: u32) -> u32 {
-        if sig == SIG_LCD_CS {
-            if self.busy { 0 } else { 1 }
-        } else if (SIG_DATA0..=SIG_DATA0 + 15).contains(&sig) {
-            (self.cur_word >> (sig - SIG_DATA0)) & 1
-        } else if sig == SIG_LCD_PCLK || sig == SIG_CAM_PCLK {
-            self.pclk
-        } else if sig == SIG_LCD_DC {
-            self.dc
-        } else if sig == SIG_H_ENABLE || sig == SIG_H_SYNC || sig == SIG_V_SYNC {
-            if self.busy { 1 } else { 0 }
+        if self.busy {
+            if sig == SIG_LCD_CS {
+                0
+            } else if (SIG_DATA0..=SIG_DATA0 + 15).contains(&sig) {
+                (self.cur_word >> (sig - SIG_DATA0)) & 1
+            } else if sig == SIG_LCD_PCLK || sig == SIG_CAM_PCLK {
+                self.pclk
+            } else if sig == SIG_LCD_DC {
+                self.dc
+            } else if sig == SIG_H_ENABLE || sig == SIG_H_SYNC || sig == SIG_V_SYNC {
+                1
+            } else {
+                0
+            }
+        } else if self.capturing {
+            self.cam_input_level(sig)
+        } else if sig == SIG_LCD_CS {
+            1
         } else {
             0
         }
+    }
+
+    /// Camera (sensor-driven) input level for a matrix signal index: VSYNC
+    /// high mid-frame, HSYNC pulsed per line, PCLK toggling, DATA = the
+    /// current input word. Consulted for pads whose input routing selects a
+    /// CAM signal (149..152, 133..148) while a capture runs.
+    pub fn cam_input_level(&self, sig: u32) -> u32 {
+        if sig == SIG_V_SYNC {
+            self.cam_vsync
+        } else if sig == SIG_H_SYNC {
+            self.cam_hsync
+        } else if sig == SIG_H_ENABLE {
+            u32::from(self.streaming)
+        } else if sig == SIG_CAM_PCLK {
+            self.cam_pclk
+        } else if (SIG_DATA0..=SIG_DATA0 + 15).contains(&sig) {
+            (self.cam_word >> (sig - SIG_DATA0)) & 1
+        } else {
+            0
+        }
+    }
+
+    /// True while camera inputs are driven (for input-overlay gating).
+    pub fn cam_driving(&self) -> bool {
+        self.capturing
     }
 }
 
@@ -308,5 +484,125 @@ mod tests {
         d.write32(0x24, 0x1234_5678);
         assert_eq!(d.read32(0x10), 0xABCD_0000);
         assert_eq!(d.read32(0x24), 0x1234_5678);
+    }
+
+    const CAM_START: u32 = 1 << 29;
+    const CAM_RESET: u32 = 1 << 30;
+    const CAM_AFIFO_RESET: u32 = 1 << 31;
+
+    /// START with nothing staged arms the capture (VSYNC wait): no VSYNC,
+    /// no FIFO data, still capturing.
+    #[test]
+    fn cam_start_without_frame_waits_for_vsync() {
+        let mut d = LcdCam::new();
+        d.write32(CAM_CTRL1, CAM_START);
+        assert!(d.cam_active(), "armed");
+        for _ in 0..8 {
+            d.tick();
+        }
+        assert_eq!(d.read32(CAM_FIFO_STATUS) & 0x7FF, 0, "no data yet");
+        assert_eq!(d.read32(LC_DMA_INT_RAW) & CAM_VSYNC_INT, 0, "no VSYNC yet");
+        assert!(d.cam_active(), "still armed");
+    }
+
+    /// START with a staged frame streams it: VSYNC + FIFO words in order +
+    /// HSYNC per LINE_INT_NUM+1 + START self-clear at end.
+    #[test]
+    fn cam_capture_streams_staged_frame() {
+        let mut d = LcdCam::new();
+        // One line of 4 words (LINE_INT_NUM = 3).
+        d.write32(CAM_CTRL1, (3 << 16) | CAM_START);
+        d.cam_inject_frame(&[0x0102_0304, 0x1111_1111, 0x2222_2222, 0x3333_3333]);
+        for _ in 0..8 {
+            d.tick();
+        }
+        assert_eq!(d.read32(CAM_FIFO_STATUS) & 0x7FF, 4, "frame arrived");
+        assert_eq!(d.read32(LC_DMA_INT_RAW) & CAM_VSYNC_INT, CAM_VSYNC_INT);
+        assert_eq!(d.read32(LC_DMA_INT_RAW) & CAM_HS_INT, CAM_HS_INT);
+        assert_eq!(d.read32(CAM_CTRL1) & CAM_START, 0, "START self-cleared");
+        assert!(!d.cam_active(), "capture ended");
+        assert_eq!(d.read32(CAM_DATA), 0x0102_0304);
+        assert_eq!(d.read32(CAM_DATA), 0x1111_1111);
+        assert_eq!(d.read32(CAM_DATA), 0x2222_2222);
+        assert_eq!(d.read32(CAM_DATA), 0x3333_3333);
+        assert_eq!(d.read32(CAM_DATA), 0, "FIFO empty reads 0");
+    }
+
+    /// A full RX FIFO stalls the stream (flow control); draining resumes it.
+    #[test]
+    fn cam_backpressure_stalls_until_drained() {
+        let mut d = LcdCam::new();
+        d.write32(CAM_CTRL1, CAM_START);
+        let frame: Vec<u32> = (0..20).collect();
+        d.cam_inject_frame(&frame);
+        for _ in 0..64 {
+            d.tick();
+        }
+        assert_eq!(d.read32(CAM_FIFO_STATUS) & 0x7FF, 16, "FIFO full, stalled");
+        assert!(d.cam_active(), "still capturing (4 words pending)");
+        for i in 0..16u32 {
+            assert_eq!(d.read32(CAM_DATA), i);
+        }
+        for _ in 0..16 {
+            d.tick();
+        }
+        for i in 16..20u32 {
+            assert_eq!(d.read32(CAM_DATA), i);
+        }
+        assert!(!d.cam_active(), "drained to end");
+    }
+
+    /// REC_DATA_BYTELEN truncates the capture (GDMA-eof semantics: N+1 bytes).
+    #[test]
+    fn cam_rec_bytelen_truncates_capture() {
+        let mut d = LcdCam::new();
+        d.write32(CAM_CTRL1, 15 | CAM_START); // 16 bytes = 4 words
+        d.cam_inject_frame(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        for _ in 0..32 {
+            d.tick();
+        }
+        assert_eq!(d.read32(CAM_FIFO_STATUS) & 0x7FF, 4, "truncated to 4");
+        assert!(!d.cam_active(), "capture ended at the limit");
+        assert_eq!(d.read32(CAM_DATA), 1);
+    }
+
+    /// CAM_CTRL bit 5 byte-swaps each received word.
+    #[test]
+    fn cam_byte_order_swaps_words() {
+        let mut d = LcdCam::new();
+        d.write32(CAM_CTRL, 1 << 5);
+        d.write32(CAM_CTRL1, CAM_START);
+        d.cam_inject_frame(&[0x0102_0304]);
+        for _ in 0..4 {
+            d.tick();
+        }
+        assert_eq!(d.read32(CAM_DATA), 0x0403_0201);
+    }
+
+    /// AFIFO reset drops received words; START stays armed for a retry.
+    #[test]
+    fn cam_afifo_reset_drops_fifo() {
+        let mut d = LcdCam::new();
+        d.write32(CAM_CTRL1, CAM_START);
+        d.cam_inject_frame(&[0xAA, 0xBB]);
+        for _ in 0..8 {
+            d.tick();
+        }
+        assert_eq!(d.read32(CAM_FIFO_STATUS) & 0x7FF, 2);
+        d.write32(CAM_CTRL1, CAM_AFIFO_RESET | CAM_START);
+        assert_eq!(d.read32(CAM_FIFO_STATUS) & 0x7FF, 0, "FIFO dropped");
+    }
+
+    /// VSYNC input level is observable while streaming (sensor loopback).
+    #[test]
+    fn cam_vsync_visible_during_capture() {
+        let mut d = LcdCam::new();
+        assert_eq!(d.cam_input_level(SIG_V_SYNC), 0, "idle low");
+        d.write32(CAM_CTRL1, CAM_START);
+        d.cam_inject_frame(&[0x0000_0010, 0x0000_0010, 0x0000_0010, 0x0000_0010]);
+        d.tick();
+        assert_eq!(d.cam_input_level(SIG_V_SYNC), 1, "VSYNC mid-frame");
+        assert_eq!(d.cam_input_level(SIG_DATA0 + 4), 1, "data bit 4");
+        assert_eq!(d.cam_input_level(SIG_DATA0), 0, "data bit 0");
     }
 }
