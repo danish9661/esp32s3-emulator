@@ -2484,3 +2484,33 @@ Core design:
     budget boots clean and deterministically. Cost: validation budgets
     grew (`deepsleep` 20M→50M, `full_load` →150M); battery stays 55/0/1.
     New test renamed to `rtc_reset_cause_poweron_then_deepsleep_after_wake`.
+  - 2026-09-08: **PGO retrained + script fixed for registry deps (PGO)**.
+    The retrain failed two ways, both path-handling: (1) relative
+    `tools/pgo/merged.profdata` in RUSTFLAGS no longer resolves — `libm`
+    0.2 (FPU, registry dep) compiles with rustc CWD outside the workspace;
+    (2) switching to `$PWD`-absolute broke differently — RUSTFLAGS is
+    whitespace-split and the workspace path contains a space. `tools/pgo.sh`
+    now stages through space-free `${TMPDIR:-/tmp}/esp32s3-pgo` (generate +
+    train + merge + use) while the committed artifact stays
+    `tools/pgo/merged.profdata` (349KB, retrained over the slower POWERON
+    hello boot + periph). Fresh PGO binary: 53.0 MIPS on hello boot
+    (vs 43.0M at adoption; absolutes float with box load).
+    Remaining P5 work: none — every modeled peripheral is validated
+    (I2C Wire limitation retired as correct-silicon behavior; Touch
+    excluded per user directive). Only `virtual_demo` is battery-SKIPped.
+  - 2026-09-08: **virtual_demo battery-SKIP retired (0 skips)**. New
+    committed harness `tools/virtual_demo_harness.mjs` drives the SAME
+    `VirtualI2CSensor`/`VirtualSpiAdc` + `PeripheralBridge` the browser
+    uses against a nodejs-target wasm build (rebuilt into gitignored
+    `tools/.virtual_demo_pkg/` only when Rust sources are newer),
+    mirroring `web/main.js` tick (pre-prime + step + dispatch) over the
+    `esp32s3_virtual_demo` sketch. Asserts beyond UART: `lastWrite==0x99`
+    and `mosi==[0x55]` (firmware→JS both buses) + `0x57`/`0xAA` readbacks
+    + `VIRTUAL DEMO PASS` → `VIRTUAL DEMO HARNESS PASS` (negative control:
+    hello image fails all five checks, exit 1). `run_battery.sh` gains a
+    `NODE:` entry convention (node instead of run_flash, same marker
+    discipline). Cautionary tale: the first harness draft never called
+    `bridge.dispatch()` — reads passed via pre-prime but write callbacks
+    never fired (`lastWrite=null`), i.e. it validated only half the bus.
+    Battery now **56/0/0**. Touch/WiFi/BLE/`ee.*` remain excluded per
+    directive; no other SKIPs remain.

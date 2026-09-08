@@ -30,6 +30,9 @@ cargo build --release -p esp32s3-emu --example run_flash 2>&1 | grep -E "^error"
 
 # Table: name|env(space-separated K=V)|required markers (; separated)|STEPS.
 # SKIP entries: name|SKIP:reason (not run).
+# NODE entries: name|NODE:path/to/harness.mjs|markers| — run under node
+#   instead of run_flash (for harnesses like the virtual-device demo that
+#   need JS-side devices); the sketch .merged.bin is passed as argv[1].
 CASES=(
 "hello||Hello from ESP32-S3!;boot OK|"
 "periph|ADC_INJECT_MV=825|boot OK|"
@@ -86,7 +89,7 @@ CASES=(
 "gdma||GDMA RMT TX done|"
 "full_load||FULL_LOAD PASS|150000000"
 "ota_slot||OTA SLOT TEST PASS|"
-"virtual_demo|SKIP:needs node virtual-device harness, not run_flash|"
+"virtual_demo|NODE:tools/virtual_demo_harness.mjs|VIRTUAL DEMO HARNESS PASS|"
 )
 
 pass=0; fail=0; skipped=0
@@ -105,6 +108,33 @@ for c in "${CASES[@]}"; do
   IFS='|' read -r envstr markers steps binrel _ <<< "$rest"
   [[ -z "$steps" ]] && steps=96000000
   dir="$SK/esp32s3_$name"
+  if [[ "$envstr" == NODE:* ]]; then
+    # Node-driven harness (not run_flash): resolve the sketch binary the
+    # same way, optionally rebuild it, then run the harness with the bin
+    # path as argv[1] and check its output markers like any other entry.
+    bin="$dir/esp32s3_$name.merged.bin"
+    [[ -f "$bin" ]] || bin="$dir/esp32s3_$name.ino.merged.bin"
+    if [[ ! -f "$bin" ]]; then
+      bin=$(find "$dir/build" -name "*.merged.bin" 2>/dev/null | head -1)
+    fi
+    if [[ $BUILD == 1 ]]; then
+      if ! arduino-cli compile --fqbn esp32:esp32:esp32s3 --build-path "$dir/build" "$dir" >/tmp/battery_build.log 2>&1; then
+        echo "FAIL $name (compile)"; tail -3 /tmp/battery_build.log; fail=$((fail+1)); continue
+      fi
+      cp "$dir/build/esp32s3_$name.ino.merged.bin" "$dir/esp32s3_$name.merged.bin"
+      bin="$dir/esp32s3_$name.merged.bin"
+    fi
+    if [[ ! -f "$bin" ]]; then echo "FAIL $name (no binary $bin)"; fail=$((fail+1)); continue; fi
+    if ! command -v node >/dev/null 2>&1; then echo "FAIL $name (node missing)"; fail=$((fail+1)); continue; fi
+    log=$(timeout 600 node "$ROOT/${envstr#NODE:}" "$bin" 2>&1 | tr -d '\0')
+    ok=1; why=""
+    for m in ${markers//;/ }; do
+      echo "$log" | grep -aqF "$m" || { ok=0; why="missing [$m]"; }
+    done
+    echo "$log" | grep -aq "HARNESS FAIL" && { ok=0; why="harness reported FAIL"; }
+    if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); fi
+    continue
+  fi
   if [[ -n "$binrel" ]]; then
     bin="$SK/$binrel"
   else
