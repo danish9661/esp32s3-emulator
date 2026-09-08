@@ -1938,7 +1938,8 @@ fn sdmmc_registers_round_trip() {
     m.soc.write32(SDMMC_BASE + 0x00, 0x000F_0001); // CTRL
     m.soc.write32(SDMMC_BASE + 0x2C, 0x0020_0000); // CMD (no start bit -> stores)
     m.soc.write32(SDMMC_BASE + 0x30, 0xCAFE_BEEF); // RESP0
-    assert_eq!(m.soc.read32(SDMMC_BASE + 0x00), 0x000F_0001);
+    // CTRL bit 0 (controller_reset) self-clears like silicon.
+    assert_eq!(m.soc.read32(SDMMC_BASE + 0x00), 0x000F_0000);
     assert_eq!(m.soc.read32(SDMMC_BASE + 0x2C), 0x0020_0000);
     assert_eq!(m.soc.read32(SDMMC_BASE + 0x30), 0xCAFE_BEEF);
 }
@@ -2061,6 +2062,49 @@ fn deep_sleep_poke_wakes_with_timer_cause() {
     }
     assert!(woke, "machine did not wake from deep-sleep");
     assert_eq!(m.soc.read32(WAKEUP_CAUSE) & timer_cause, timer_cause);
+}
+
+/// `RTC_CNTL_RESET_STATE_REG` (+0x38) reports UNKNOWN (0) on normal boot and
+/// DEEPSLEEP (5) after a deep-sleep wake — the live ROM's
+/// `esp_rom_get_reset_reason` returns these fields directly, and
+/// `esp_sleep_get_wakeup_cause` gates on PRO == 5 (see the
+/// `esp32s3_deepsleep` driver sketch: WOKE/PASS requires it).
+#[test]
+fn rtc_reset_cause_unknown_then_deepsleep_after_wake() {
+    use esp32s3_soc::rtc::{
+        RESET_CAUSE_DEEPSLEEP, RESET_STATE_OFF, RTC_CNTL_BASE, SLEEP_EN_BIT, SLP_TIMER0_OFF,
+        SLP_TIMER1_OFF, STATE0_OFF,
+    };
+    const RESET_STATE: u32 = RTC_CNTL_BASE + RESET_STATE_OFF;
+
+    let mut m = Esp32S3::new();
+    // Normal boot: UNKNOWN approximation (silicon says POWERON, but seeding
+    // that hangs startup in a POWERON-only flash/RF-cal path).
+    assert_eq!(m.soc.read32(RESET_STATE) & 0x3F, 0, "PRO cause");
+    assert_eq!((m.soc.read32(RESET_STATE) >> 6) & 0x3F, 0, "APP cause");
+
+    // Poke a sleep + wake like `deep_sleep_poke_wakes_with_timer_cause`.
+    m.soc.write32(RTC_CNTL_BASE + SLP_TIMER0_OFF, 0x100);
+    m.soc.write32(RTC_CNTL_BASE + SLP_TIMER1_OFF, 0);
+    let prev = m.soc.read32(RTC_CNTL_BASE + STATE0_OFF);
+    m.soc
+        .write32(RTC_CNTL_BASE + STATE0_OFF, prev | SLEEP_EN_BIT);
+    for _ in 0..200_000 {
+        m.step();
+        if m.soc.read32(RESET_STATE) & 0x3F == RESET_CAUSE_DEEPSLEEP {
+            break;
+        }
+    }
+    assert_eq!(
+        m.soc.read32(RESET_STATE) & 0x3F,
+        RESET_CAUSE_DEEPSLEEP,
+        "PRO cause"
+    );
+    assert_eq!(
+        (m.soc.read32(RESET_STATE) >> 6) & 0x3F,
+        RESET_CAUSE_DEEPSLEEP,
+        "APP cause"
+    );
 }
 
 /// `RTC_CNTL_SLP_WAKEUP_CAUSE` (0x130, inside the ULP sub-region) must be served
@@ -2632,8 +2676,8 @@ fn sdmmc_idmac_walks_descriptors() {
     m.soc.write32(desc_w + 8, buf_w);
     m.soc.write32(desc_w + 12, 0);
 
-    // Enable IDMAC and point it at the descriptor.
-    m.soc.write32(sd + IDMAC_CTRL, 1);
+    // Enable IDMAC (BMOD.DE, bit 7) and point it at the descriptor.
+    m.soc.write32(sd + IDMAC_CTRL, 1 << 7);
     m.soc.write32(sd + IDMAC_DBADDR, desc_w);
     m.soc.write32(sd + BLKSIZ, 512);
     m.soc.write32(sd + BYTCNT, 512);
@@ -2672,6 +2716,59 @@ fn sdmmc_idmac_walks_descriptors() {
         }
     }
     assert_eq!(mismatch, 0, "IDMAC read-back matches IDMAC write");
+}
+
+/// FATFS-visible bytes arrive intact through the IDMAC path: MBR (LBA 0)
+/// carries the 0x55AA signature + FAT16 partition, and the volume boot
+/// sector (LBA 64) carries the BPB signature + "FAT16" type + HELLO.TXT's
+/// first cluster content at LBA 168.
+#[test]
+fn sdmmc_idmac_reads_fat_boot_sectors() {
+    use esp32s3_soc::sdmmc::{
+        BLKSIZ, BYTCNT, CMD, CMDARG, IDMAC_CTRL, IDMAC_DBADDR, RINTSTS, SDMMC_BASE,
+    };
+
+    let mut m = Esp32S3::new();
+    let sd = SDMMC_BASE;
+    let desc = 0x3FCE_4000;
+    let buf = 0x3FCE_5000;
+
+    let read_lba = |m: &mut Esp32S3, lba: u32| {
+        m.soc.write32(desc, (1 << 31) | (1 << 1) | (1 << 2));
+        m.soc.write32(desc + 4, 512);
+        m.soc.write32(desc + 8, buf);
+        m.soc.write32(desc + 12, 0);
+        m.soc.write32(sd + IDMAC_CTRL, 1 << 7);
+        m.soc.write32(sd + IDMAC_DBADDR, desc);
+        m.soc.write32(sd + BLKSIZ, 512);
+        m.soc.write32(sd + BYTCNT, 512);
+        m.soc.write32(sd + CMDARG, lba);
+        m.soc
+            .write32(sd + CMD, 17 | (1 << 6) | (1 << 9) | (1 << 31));
+        assert!(
+            m.soc.read32(sd + RINTSTS) & (1 << 3) != 0,
+            "DATA_OVER for LBA {lba}"
+        );
+    };
+
+    // MBR.
+    read_lba(&mut m, 0);
+    assert_eq!(m.soc.read8(buf + 0x1C2), 0x06, "partition type FAT16");
+    assert_eq!(m.soc.read8(buf + 510), 0x55, "MBR signature lo");
+    assert_eq!(m.soc.read8(buf + 511), 0xAA, "MBR signature hi");
+    // Boot sector.
+    read_lba(&mut m, 64);
+    assert_eq!(m.soc.read8(buf), 0xEB, "jump boot");
+    assert_eq!(m.soc.read8(buf + 510), 0x55, "BPB signature lo");
+    assert_eq!(m.soc.read8(buf + 511), 0xAA, "BPB signature hi");
+    for (i, b) in b"FAT16   ".iter().enumerate() {
+        assert_eq!(m.soc.read8(buf + 54 + i as u32), *b as u32, "fs type");
+    }
+    // HELLO.TXT data cluster.
+    read_lba(&mut m, 168);
+    for (i, b) in b"Hello from SDMMC!\n".iter().enumerate() {
+        assert_eq!(m.soc.read8(buf + i as u32), *b as u32, "file byte {i}");
+    }
 }
 
 /// GPIO output edges are reported to the host via `drain_events` as

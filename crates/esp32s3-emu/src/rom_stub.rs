@@ -609,6 +609,10 @@ pub fn rom_image() -> Vec<u8> {
             a.retw();
         }),
         // rtc_get_reset_reason -> POWERON_RESET (1)
+        // NOTE: past GLUE_END this assembly is dead reference (discarded by
+        // the splice) — the live bytes are the REAL ROM, which reads the
+        // RTC reset-cause hardware. Deep-sleep wake needs DEEPSLEEP (5)
+        // there: modeled in the RTC reset-cause register, not here.
         (0x4000_057C, |a| {
             a.entry(1, 0);
             a.movi(2, 1);

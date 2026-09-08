@@ -81,14 +81,20 @@ pub const I2C0_BASE: u32 = 0x6001_3000;
 /// I2C1 (I2C EXT1), 0x14000 apart from I2C0.
 pub const I2C1_BASE: u32 = 0x6002_7000;
 
-/// RTC fast memory (32 KB on the S3 — NOT the classic ESP32's 8 KB: the
-/// boot ROM keeps its read-only tables at 0x3FF18C00+ (esp-rom-elfs
-/// esp32s3_rev0_rom.elf .rodata sections), so the data window must cover
-/// 0x3FF18000-0x3FF20000).
-pub const RTC_FAST_BASE: u32 = 0x600F_8000;
-/// RTC fast memory — data-space alias (TRM: RTC fast memory data).
-pub const RTC_FAST_DATA_BASE: u32 = 0x3FF1_8000;
-pub const RTC_FAST_SIZE: u32 = 0x0000_8000;
+/// RTC fast memory: 8 KB executable, `rtc_iram_seg @ 0x600FE000`
+/// (esp32s3 memory.ld; `SOC_RTC_IRAM_LOW/HIGH` in soc.h). Both the
+/// instruction and data views are that same address on S3 (unlike the
+/// classic ESP32's separate 0x3FF80000 data alias).
+pub const RTC_FAST_BASE: u32 = 0x600F_E000;
+pub const RTC_FAST_SIZE: u32 = 0x0000_2000;
+/// ROM constant tables (`esp32s3.rom.ld`: `.rodata @ 0x3FF18C00`,
+/// `ets_rom_layout_p = 0x3FF1FFFC`). A SEPARATE memory from RTC fast —
+/// aliasing them into one array let `load_rom_data` stomp the app's RTC
+/// segment (e.g. IPC/sleep helpers at 0x600FE000) with ROM bytes.
+/// `ets_rom_layout_p` itself is written host-side at boot (the word the
+/// app's heap init dereferences).
+pub const ROM_DATA_BASE: u32 = 0x3FF1_8000;
+pub const ROM_DATA_SIZE: u32 = 0x0000_8000;
 
 /// USB-Serial-JTAG controller (0x60038000) — the boot ROM's console output
 /// goes through its TX FIFO (uart_tx_one_char @ 0x40048C30 writes

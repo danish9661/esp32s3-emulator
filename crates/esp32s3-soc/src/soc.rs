@@ -184,6 +184,7 @@ pub struct Soc {
     psram: Box<[u8; PSRAM_SIZE as usize]>,
     rtc_slow: Box<[u8; RTC_SLOW_SIZE as usize]>,
     rtc_fast: Box<[u8; RTC_FAST_SIZE as usize]>,
+    rom_data: Box<[u8; ROM_DATA_SIZE as usize]>,
     /// USB-Serial-JTAG (CDC-ACM console) controller. The boot ROM's console
     /// (uart_tx_one_char @ 0x40048C30) writes chars to the USB_SERIAL_JTAG FIFO
     /// (0x60038000), NOT UART0 — the S3's ROM messages come out of the USB-CDC
@@ -268,14 +269,15 @@ pub struct Soc {
     /// modeled (dropped writes, reads 0).
     appcpu_ctrl_a: u32,
 
-    /// SYSTEM.CPU_INT_FROM_CPU_0/1 (0x600C0030/0x600C0034): the cross-core
-    /// interrupt registers.  Writing bit 0 to +0x30 asserts the CROSS_CORE0
-    /// interrupt source (48) on core 0's matrix; +0x34 asserts CROSS_CORE1
-    /// (49) on core 1's.  This is how the FreeRTOS SMP scheduler forces a
-    /// yield on the peer/self core (`esp_crosscore_int_send` at 0x40375EF8
-    /// in the app, ROM's ets_ipc_*); the ISR clears it by writing 0 back.
-    /// Level-style sticky bit per core (bit 0 = asserted).
-    cpu_int_from_cpu: [u32; 2],
+    /// SYSTEM.CPU_INT_FROM_CPU_0..3 (0x600C0030/4/8/C): cross-core
+    /// interrupt registers.  +0x30 asserts FROM_CPU_INTR0 (source 79, used
+    /// by FreeRTOS SMP for yields) on core 0's matrix; +0x34 asserts
+    /// FROM_CPU_INTR1 (source 80) on core 1's.  +0x38/+0x3C assert
+    /// FROM_CPU_INTR2/3 (sources 81/82, used by `esp_ipc_isr` for the
+    /// stall/mute handshake, e.g. deep-sleep entry) on core 0/1's matrix.
+    /// The ISR clears its bit by writing 0 back.  Level-style sticky bit
+    /// per core (bit 0 = asserted).
+    cpu_int_from_cpu: [u32; 4],
 
     /// ROM-boot phase: while set, cache-window reads bypass the MMU and map
     /// 1:1 to raw flash. The real ROM bootloader reads flash via SPI with the
@@ -341,6 +343,7 @@ impl Soc {
             psram: Box::new([0; PSRAM_SIZE as usize]),
             rtc_slow: Box::new([0; RTC_SLOW_SIZE as usize]),
             rtc_fast: Box::new([0; RTC_FAST_SIZE as usize]),
+            rom_data: Box::new([0; ROM_DATA_SIZE as usize]),
             uarts: [Uart::new(), Uart::new(), Uart::new()],
             usb: UsbSerialJtag::new(),
             ulp: Ulp::new(),
@@ -388,7 +391,7 @@ impl Soc {
             assist_debug: RegStore::new(0x1000),
             lcd_cam: LcdCam::new(),
             appcpu_ctrl_a: 0,
-            cpu_int_from_cpu: [0, 0],
+            cpu_int_from_cpu: [0, 0, 0, 0],
             rom_boot_mode: false,
             loader_scratch_len: 0x6_0000,
             cached_src: 0,
@@ -480,6 +483,27 @@ impl Soc {
                 for i in 0..pages {
                     self.cache
                         .mmu_write32(((vpage0 + i) & 0x1FF) * 4, (fpage0 + i) & 0x3FFF);
+                }
+            } else if in_range!(load, RTC_SLOW_BASE, RTC_SLOW_SIZE) {
+                // RTC slow-memory segment (e.g. ULP init data): the ROM stub
+                // loader skips every load >= 0x42000000, so preload host-side.
+                let src_end = (data + len).min(FLASH_SIZE as usize);
+                let room = (RTC_SLOW_SIZE - (load - RTC_SLOW_BASE)) as usize;
+                let n = (src_end - data).min(room);
+                for i in 0..n {
+                    let b = self.flash[data + i];
+                    self.rtc_slow[(load - RTC_SLOW_BASE) as usize + i] = b;
+                }
+            } else if in_range!(load, RTC_FAST_BASE, RTC_FAST_SIZE) {
+                // RTC fast-memory segment (linker rtc_iram_seg @ 0x600FE000:
+                // IPC/sleep helpers core 1 executes). Skipped by the stub
+                // loader like the slow segment above — preload host-side.
+                let src_end = (data + len).min(FLASH_SIZE as usize);
+                let room = (RTC_FAST_SIZE - (load - RTC_FAST_BASE)) as usize;
+                let n = (src_end - data).min(room);
+                for i in 0..n {
+                    let b = self.flash[data + i];
+                    self.rtc_fast[(load - RTC_FAST_BASE) as usize + i] = b;
                 }
             }
             pos = data + len;
@@ -1894,12 +1918,14 @@ impl Soc {
                     } else {
                         self.appcpu_ctrl_a
                     }
-                } else if off == 0x030 || off == 0x034 {
-                    // Cross-core interrupt: write 1 asserts the CROSS_CORE0
-                    // (core 0) / CROSS_CORE1 (core 1) source; the ISR writes
-                    // 0 to deassert (esp_crosscore_isr clears its own core's
-                    // reg).  TRM SYSTEM_CPU_INT_FROM_CPU_0/1.
-                    let idx = if off == 0x030 { 0 } else { 1 };
+                } else if off == 0x030 || off == 0x034 || off == 0x038 || off == 0x03C {
+                    // Cross-core interrupt: write 1 asserts the FROM_CPU
+                    // source for the target core (+0x30/+0x38 -> core 0 as
+                    // sources 79/81; +0x34/+0x3C -> core 1 as sources
+                    // 80/82); the ISR writes 0 to deassert (esp_crosscore_isr
+                    // clears its own core's reg, esp_ipc_isr_handler clears
+                    // FROM_CPU_2/3).  TRM SYSTEM_CPU_INT_FROM_CPU_*.
+                    let idx = ((off - 0x030) / 4) as usize;
                     if is_write {
                         self.cpu_int_from_cpu[idx] = value & 1;
                         0
@@ -1987,6 +2013,12 @@ impl Soc {
     /// after a deep-sleep reboot (machine writes this on wake).
     pub fn set_sleep_wakeup_cause(&mut self, bits: u32) {
         self.rtc.set_wakeup_cause(bits);
+    }
+
+    /// Record the reset causes read by the live ROM's
+    /// `esp_rom_get_reset_reason` (machine writes this on wake).
+    pub fn set_reset_cause(&mut self, pro: u32, app: u32) {
+        self.rtc.set_reset_cause(pro, app);
     }
 
     /// Debug accessor for the AES interrupt raw&enabled state (validation harness).
@@ -2169,10 +2201,16 @@ impl Bus for Soc {
         };
 
         // Cross-core: SYSTEM.CPU_INT_FROM_CPU_0/1 assert FROM_CPU_INTR0/1
-        // = sources 79/80.  This is per-cpu so it must not be cached.
+        // = sources 79/80 (FreeRTOS yields); _2/3 assert FROM_CPU_INTR2/3
+        // = sources 81/82 (esp_ipc_isr stall/mute handshake).  Regs are
+        // per-target-core (+0x30/+0x38 -> core 0, +0x34/+0x3C -> core 1).
+        // This is per-cpu so it must not be cached.
         let mut final_src = src;
         if self.cpu_int_from_cpu[cpu] & 1 != 0 {
             final_src |= 1 << (79 + cpu);
+        }
+        if self.cpu_int_from_cpu[2 + cpu] & 1 != 0 {
+            final_src |= 1 << (81 + cpu);
         }
         self.intc.pending_lines(cpu, final_src)
     }
@@ -2192,18 +2230,12 @@ impl Bus for Soc {
             self.cache_read8(addr) as u32
         } else if in_range!(addr, RTC_SLOW_BASE, RTC_SLOW_SIZE) {
             self.rtc_slow[(addr - RTC_SLOW_BASE) as usize] as u32
-        } else if in_range!(addr, RTC_FAST_BASE, RTC_FAST_SIZE)
-            || in_range!(addr, RTC_FAST_DATA_BASE, RTC_FAST_SIZE)
-        {
-            // RTC_FAST_DATA_BASE (0x3FF18000) sits BELOW RTC_FAST_BASE (0x600F8000);
-            // select by comparing against the higher base so the 0x600F8000 window
-            // does not alias into the 0x3FF18000 window (TRM RTC_FAST_MEM).
-            let base = if addr < RTC_FAST_BASE {
-                RTC_FAST_DATA_BASE
-            } else {
-                RTC_FAST_BASE
-            };
-            self.rtc_fast[(addr - base) as usize] as u32
+        } else if in_range!(addr, RTC_FAST_BASE, RTC_FAST_SIZE) {
+            self.rtc_fast[(addr - RTC_FAST_BASE) as usize] as u32
+        } else if in_range!(addr, ROM_DATA_BASE, ROM_DATA_SIZE) {
+            // ROM constant tables (NOT RTC fast — separate memory; aliasing
+            // them let load_rom_data stomp the app's RTC segment).
+            self.rom_data[(addr - ROM_DATA_BASE) as usize] as u32
         } else if in_range!(addr, APB_START, APB_END) {
             (self.mmio32(addr, false, 0) >> ((addr & 3) * 8)) & 0xFF
         } else {
@@ -2299,20 +2331,22 @@ impl Bus for Soc {
                 self.rtc_slow[o + 3],
             ]);
         }
-        if in_range!(addr, RTC_FAST_BASE, RTC_FAST_SIZE)
-            || in_range!(addr, RTC_FAST_DATA_BASE, RTC_FAST_SIZE)
-        {
-            let base = if addr < RTC_FAST_BASE {
-                RTC_FAST_DATA_BASE
-            } else {
-                RTC_FAST_BASE
-            };
-            let o = (addr - base) as usize;
+        if in_range!(addr, RTC_FAST_BASE, RTC_FAST_SIZE) {
+            let o = (addr - RTC_FAST_BASE) as usize;
             return u32::from_le_bytes([
                 self.rtc_fast[o],
                 self.rtc_fast[o + 1],
                 self.rtc_fast[o + 2],
                 self.rtc_fast[o + 3],
+            ]);
+        }
+        if in_range!(addr, ROM_DATA_BASE, ROM_DATA_SIZE) {
+            let o = (addr - ROM_DATA_BASE) as usize;
+            return u32::from_le_bytes([
+                self.rom_data[o],
+                self.rom_data[o + 1],
+                self.rom_data[o + 2],
+                self.rom_data[o + 3],
             ]);
         }
         if in_range!(addr, APB_START, APB_END) {
@@ -2337,18 +2371,10 @@ impl Bus for Soc {
             self.cache_write8(addr, val as u8);
         } else if in_range!(addr, RTC_SLOW_BASE, RTC_SLOW_SIZE) {
             self.rtc_slow[(addr - RTC_SLOW_BASE) as usize] = val as u8;
-        } else if in_range!(addr, RTC_FAST_BASE, RTC_FAST_SIZE)
-            || in_range!(addr, RTC_FAST_DATA_BASE, RTC_FAST_SIZE)
-        {
-            // RTC_FAST_DATA_BASE (0x3FF18000) sits BELOW RTC_FAST_BASE (0x600F8000);
-            // select by comparing against the higher base so the 0x600F8000 window
-            // does not alias into the 0x3FF18000 window (TRM RTC_FAST_MEM).
-            let base = if addr < RTC_FAST_BASE {
-                RTC_FAST_DATA_BASE
-            } else {
-                RTC_FAST_BASE
-            };
-            self.rtc_fast[(addr - base) as usize] = val as u8;
+        } else if in_range!(addr, RTC_FAST_BASE, RTC_FAST_SIZE) {
+            self.rtc_fast[(addr - RTC_FAST_BASE) as usize] = val as u8;
+        } else if in_range!(addr, ROM_DATA_BASE, ROM_DATA_SIZE) {
+            self.rom_data[(addr - ROM_DATA_BASE) as usize] = val as u8;
         } else if in_range!(addr, APB_START, APB_END) {
             self.mmio32(addr, true, val);
         }
@@ -2371,6 +2397,15 @@ impl Bus for Soc {
         {
             self.cache_write8(addr, val as u8);
             self.cache_write8(addr + 1, (val >> 8) as u8);
+        } else if in_range!(addr, RTC_SLOW_BASE, RTC_SLOW_SIZE)
+            || in_range!(addr, RTC_FAST_BASE, RTC_FAST_SIZE)
+            || in_range!(addr, ROM_DATA_BASE, ROM_DATA_SIZE)
+        {
+            // RTC memories: byte-lane merge like RAM — falling through to
+            // write32 would zero-clobber the adjacent halfword (same bug
+            // class as the MicroPython PSRAM write16 widening).
+            self.write8(addr, val);
+            self.write8(addr + 1, val >> 8);
         } else {
             self.write32(addr, val);
         }
@@ -2420,18 +2455,30 @@ impl Bus for Soc {
                 self.cache_write8(addr + i as u32, b);
             }
         } else if in_range!(addr, RTC_SLOW_BASE, RTC_SLOW_SIZE) {
-            let o = (addr - RTC_SLOW_BASE) as usize;
-            self.rtc_slow[o..o + 4].copy_from_slice(&bytes);
-        } else if in_range!(addr, RTC_FAST_BASE, RTC_FAST_SIZE)
-            || in_range!(addr, RTC_FAST_DATA_BASE, RTC_FAST_SIZE)
-        {
-            let base = if addr < RTC_FAST_BASE {
-                RTC_FAST_DATA_BASE
-            } else {
-                RTC_FAST_BASE
-            };
-            let o = (addr - base) as usize;
-            self.rtc_fast[o..o + 4].copy_from_slice(&bytes);
+            // Byte-by-byte: a widened 4-byte copy would clobber neighbors on
+            // sub-word stores and panic at the array tail (o+4 > len).
+            for (i, b) in bytes.into_iter().enumerate() {
+                let o = (addr - RTC_SLOW_BASE) as usize + i;
+                if o < self.rtc_slow.len() {
+                    self.rtc_slow[o] = b;
+                }
+            }
+        } else if in_range!(addr, RTC_FAST_BASE, RTC_FAST_SIZE) {
+            // Byte-by-byte: a widened 4-byte copy would clobber neighbors on
+            // sub-word stores and panic at the array tail (o+4 > len).
+            for (i, b) in bytes.into_iter().enumerate() {
+                let o = (addr - RTC_FAST_BASE) as usize + i;
+                if o < self.rtc_fast.len() {
+                    self.rtc_fast[o] = b;
+                }
+            }
+        } else if in_range!(addr, ROM_DATA_BASE, ROM_DATA_SIZE) {
+            for (i, b) in bytes.into_iter().enumerate() {
+                let o = (addr - ROM_DATA_BASE) as usize + i;
+                if o < self.rom_data.len() {
+                    self.rom_data[o] = b;
+                }
+            }
         } else if in_range!(addr, APB_START, APB_END) {
             self.mmio32(addr, true, val);
         }

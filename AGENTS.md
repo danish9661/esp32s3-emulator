@@ -2406,3 +2406,43 @@ Core design:
     silently mix core versions — `rm -rf build` before bisecting;
     (3) leftover harness FIFO reads (my I2C trace) eat firmware bytes —
     broke `i2c_poke` until removed. Battery 53/0/2.
+  - 2026-09-07: **esp-idf deep-sleep driver path VALIDATED (was SKIP)**.
+    `esp32s3_deepsleep` (`esp_sleep_enable_timer_wakeup` +
+    `esp_deep_sleep_start`) now runs `DEEPSLEEP START` → (sleep
+    fast-forward + reboot) → `DEEPSLEEP WOKE` / `DEEPSLEEP PASS`, un-SKIPped
+    in `run_battery.sh` (STEPS 20M). Battery now **54/0/1** (only
+    `virtual_demo` skipped). Three stacked model defects fixed:
+    (1) **RTC image segments never loaded**: the ROM stub loader skips every
+    `load >= 0x42000000` (XIP), which also skips the linker's `rtc_iram_seg`
+    (`0x600FE000`, 8KB per memory.ld + `SOC_RTC_IRAM_LOW/HIGH` in soc.h —
+    the IPC/sleep helpers core 1 executes). Preloaded host-side in
+    `map_app_flash_segments` (slow → `rtc_slow`, fast → `rtc_fast`).
+    (2) **RTC-fast vs ROM-data aliasing**: the model aliased `0x600F8000`
+    (32KB) and `0x3FF18000` into ONE array, so `load_rom_data`'s 32KB ROM
+    blob stomped the RTC code with ASCII rodata. Split per the real map:
+    `RTC_FAST_BASE = 0x600FE000` (8KB, instruction AND data view — S3 has
+    no separate data alias) + new `ROM_DATA_BASE = 0x3FF18000` (32KB,
+    `esp32s3.rom.ld` tables + `ets_rom_layout_p = 0x3FF1FFFC`) with its own
+    `rom_data` backing; `read8/16/32` + `write8/16/32` routed accordingly.
+    (3) **Reset-cause gate**: `esp_sleep_get_wakeup_cause` calls the LIVE
+    ROM's `esp_rom_get_reset_reason` (0x4000057C — past GLUE_END, so the
+    0x57C stub assembly is dead reference!) which returns
+    `RTC_CNTL_RESET_STATE_REG` (0x60008038: PROCPU [5:0], APPCPU [11:6],
+    verified vs `rtc_cntl_reg.h` + live-ROM decode `l32r/extui`), and only
+    reads the wakeup register when reason == 5 (DEEPSLEEP). `Rtc` now
+    mirrors the register (seeded UNKNOWN/0, set to 5/5 in `wake()` via
+    `Soc::set_reset_cause`); new test
+    `rtc_reset_cause_unknown_then_deepsleep_after_wake`. APPROXIMATIONS
+    DOCUMENTED: normal boots report UNKNOWN not POWERON — seeding 0x41
+    hangs every boot in `spi_flash_disable_interrupts_caches_and_other_cpu`
+    (0x403757C5 core1-stall-ack poll: a POWERON-only RF-cal flash-save
+    path needing early-boot IPC preemption of core 1); `write16/32` RTC
+    arms are byte-wise (same widening class as the PSRAM bug). Cautionary
+    tales: (1) `memdump`/`livedecode` take addrs at argv[3+] (`skip(3)`)
+    and IGNORE the `STEPS` env (argv[2] or default 30M) — phantom
+    "already ASCII at 0 steps" readings; (2) objdump annotates the
+    `__call_*` wrapper table with the WRAPPER addr, decode the literal for
+    the real body; (3) FROM_CPU_INTR2/3 = sources 81/82 (regs
+    0x600C0038/3C) were needed just to reach the sleep call.
+    37 suites green (69 emu incl. new test), clippy pre-existing warns
+    only, fmt clean.

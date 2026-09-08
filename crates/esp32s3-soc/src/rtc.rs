@@ -45,6 +45,16 @@ pub const SLP_TIMER1_OFF: u32 = 0x08;
 pub const STATE0_OFF: u32 = 0x18;
 pub const SLEEP_EN_BIT: u32 = 1 << 31;
 pub const SLP_WAKEUP_CAUSE_OFF: u32 = 0x130;
+// Reset-cause register (rtc_cntl_reg.h RTC_CNTL_RESET_STATE_REG @ +0x38):
+// PROCPU cause [5:0], APPCPU cause [11:6]. The live ROM's
+// `esp_rom_get_reset_reason` (0x4000057C) returns these fields directly
+// (extui 0,6 / extui 6,6), and `esp_sleep_get_wakeup_cause` only reads the
+// wakeup-cause register when the PRO reason is DEEPSLEEP (5).
+pub const RESET_STATE_OFF: u32 = 0x38;
+/// Power-on reset-cause code (what silicon reports after power-up).
+pub const RESET_CAUSE_POWERON: u32 = 1;
+/// Deep-sleep-wake reset-cause code (`esp_sleep_get_wakeup_cause` gate).
+pub const RESET_CAUSE_DEEPSLEEP: u32 = 5;
 
 // RC_SLOW nominal frequency (TRM §27): 32.5 kHz; CPU clock 240 MHz.
 const SLOW_CLK_DIV: u64 = 240_000_000 / 32_500;
@@ -65,6 +75,11 @@ pub struct Rtc {
     sleep_target: u64,
     /// RTC_CNTL_SLP_WAKEUP_CAUSE_REG mirror (set by the emulator on wake).
     wakeup_cause: u32,
+    /// RTC_CNTL_RESET_STATE_REG mirror (reset causes for PRO/APPCPU).
+    /// Seeded UNKNOWN (0) — see Default; the machine sets DEEPSLEEP on
+    /// wake. Real hardware is read-only; firmware writes fall into the
+    /// generic `regs` store and do not disturb this mirror.
+    reset_state: u32,
     /// Generic backing store for the full RTC_CNTL page (0x000..0x400).  Most
     /// registers are simple stores; the special-cased ones below override this.
     regs: [u32; 0x400 / 4],
@@ -83,6 +98,16 @@ impl Default for Rtc {
             sleep_req: false,
             sleep_target: 0,
             wakeup_cause: 0,
+            // Reset causes report UNKNOWN (0) on normal boot — NOT the
+            // silicon-accurate POWERON (1): seeding 0x41 hangs every boot
+            // in `spi_flash_disable_interrupts_caches_and_other_cpu`
+            // (0x403757C5: polls the core1-stall ack byte after
+            // `esp_ipc_call_nonblocking`). That POWERON-only path (RF-cal
+            // flash save during startup) needs early-boot IPC preemption
+            // of core 1, which the model doesn't deliver before core 1
+            // installs its handler. DEEPSLEEP (5) is set on wake — the
+            // value firmware actually gates on (validated WOKE/PASS).
+            reset_state: 0,
             regs: [0u32; 0x400 / 4],
             ulp: crate::ulp::Ulp::default(),
         }
@@ -123,6 +148,12 @@ impl Rtc {
         self.wakeup_cause = bits;
     }
 
+    /// Record the reset causes read back by the live ROM's
+    /// `esp_rom_get_reset_reason` (called by the machine on wake).
+    pub fn set_reset_cause(&mut self, pro: u32, app: u32) {
+        self.reset_state = (pro & 0x3F) | ((app & 0x3F) << 6);
+    }
+
     pub fn read32(&mut self, offset: u32) -> u32 {
         match offset {
             TIME_VALUE_LO_OFF => self.latched as u32,
@@ -130,6 +161,7 @@ impl Rtc {
             SLP_TIMER0_OFF => self.slp_timer0,
             SLP_TIMER1_OFF => self.slp_timer1,
             SLP_WAKEUP_CAUSE_OFF => self.wakeup_cause,
+            RESET_STATE_OFF => self.reset_state,
             // ULP-RISC-V block lives at offset 0x100..0x200 of this page.
             o if (ULP_OFF_START..ULP_OFF_END).contains(&o) => self.ulp.read32(RTC_CNTL_BASE + o),
             o => self.regs[o as usize / 4],

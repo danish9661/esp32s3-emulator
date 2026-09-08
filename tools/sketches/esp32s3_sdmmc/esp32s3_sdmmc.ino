@@ -50,17 +50,16 @@ void setup() {
   // SELECT/DESELECT
   issue(7, rca, CMD_RESP_EXPECT);
 
-  // READ_SINGLE_BLOCK: data_expect, read direction.
+  // READ_SINGLE_BLOCK LBA 0 = MBR (FAT16 preformatted): check the
+  // partition-type word (bytes 0x1C0..0x1C3 = 00 00 06 00) and the
+  // 0x55AA signature word (bytes 508..511 = 00 00 55 AA).
   *reg_bytcnt = 512;
   issue(17, 0, CMD_RESP_EXPECT | CMD_DATA_EXPECT);
   uint32_t bad = 0;
   for (int i = 0; i < 128; i++) {
     uint32_t w = *reg_fifo;
-    uint32_t exp = (((4 * i) & 0xFF)) |
-                   (((4 * i + 1) & 0xFF) << 8) |
-                   (((4 * i + 2) & 0xFF) << 16) |
-                   (((4 * i + 3) & 0xFF) << 24);
-    if (w != exp) bad++;
+    if (i == 112 && w != 0x00060000u) bad++;
+    if (i == 127 && w != 0xAA550000u) bad++;
   }
 
   // WRITE_BLOCK: data_expect, write direction, then read back.

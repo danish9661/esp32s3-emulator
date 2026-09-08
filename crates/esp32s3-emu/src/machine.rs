@@ -8,7 +8,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use esp32s3_soc::Soc;
 use esp32s3_soc::memmap::{
-    DRAM_BASE, IRAM_BASE, IROM_BASE, IROM_SIZE, RTC_FAST_DATA_BASE, RTC_FAST_SIZE, SRAM_BYTES,
+    DRAM_BASE, IRAM_BASE, IROM_BASE, IROM_SIZE, ROM_DATA_BASE, ROM_DATA_SIZE, RTC_FAST_BASE,
+    RTC_FAST_SIZE, RTC_SLOW_BASE, RTC_SLOW_SIZE, SRAM_BYTES,
 };
 use xtensa_core::{Bus, Cpu, StepResult};
 
@@ -287,17 +288,26 @@ impl Esp32S3 {
     fn wake(&mut self) {
         self.reset();
         self.soc.set_sleep_wakeup_cause(1 << 3); // RTC_TIMER_TRIG_EN
+        // Deep-sleep reset reason: `esp_sleep_get_wakeup_cause` only reads
+        // the wakeup-cause register when the PRO reason is DEEPSLEEP (5).
+        self.soc.set_reset_cause(
+            esp32s3_soc::rtc::RESET_CAUSE_DEEPSLEEP,
+            esp32s3_soc::rtc::RESET_CAUSE_DEEPSLEEP,
+        );
         self.asleep = false;
         self.sleep_remaining = 0;
     }
 
-    /// Load a raw firmware image at `addr` (DRAM, IRAM or IROM window).
+    /// Load a raw firmware image at `addr` (DRAM, IRAM, RTC, ROM-data or
+    /// IROM window).
     pub fn load_image(&mut self, addr: u32, bytes: &[u8]) {
         for (i, b) in bytes.iter().enumerate() {
             let a = addr + i as u32;
             if (DRAM_BASE..DRAM_BASE + SRAM_BYTES as u32).contains(&a)
                 || (IRAM_BASE..IRAM_BASE + SRAM_BYTES as u32).contains(&a)
-                || (RTC_FAST_DATA_BASE..RTC_FAST_DATA_BASE + RTC_FAST_SIZE).contains(&a)
+                || (ROM_DATA_BASE..ROM_DATA_BASE + ROM_DATA_SIZE).contains(&a)
+                || (RTC_FAST_BASE..RTC_FAST_BASE + RTC_FAST_SIZE).contains(&a)
+                || (RTC_SLOW_BASE..RTC_SLOW_BASE + RTC_SLOW_SIZE).contains(&a)
             {
                 self.soc.write8(a, *b as u32);
             } else if (IROM_BASE..IROM_BASE + IROM_SIZE).contains(&a) {
