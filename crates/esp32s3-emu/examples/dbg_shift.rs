@@ -31,7 +31,7 @@ fn main() {
     let mut m = Esp32S3::new();
     let rom = rom_stub::rom_image();
     m.load_image(rom_stub::ROM_BASE, &rom);
-    m.load_image(CODE, &a.bytes());
+    m.load_image(CODE, a.bytes());
     m.cpu[0].pc = CODE;
     for i in 0..1000 {
         let pc = m.cpu[0].pc;

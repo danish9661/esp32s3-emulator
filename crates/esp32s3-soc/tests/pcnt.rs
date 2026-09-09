@@ -10,7 +10,7 @@ fn configure_inc_on_pos() -> Pcnt {
     let mut p = Pcnt::new();
     // unit0 ch0: increment on positive edge, disable on negative edge; control
     // mode KEEP (no modification) on both high/low control levels.
-    let conf0 = (1 << 18) | (0 << 16);
+    let conf0 = 1 << 18;
     p.write32(0x00, conf0); // CONF0(0)
     p.write32(0x04, 0); // CONF1(0) thresholds unused
     p.write32(0x08, 0x0000_FFFF); // CONF2 h_lim=0xFFFF, l_lim=0 (no clamp)
@@ -43,7 +43,7 @@ fn counts_rising_edges_on_ch0() {
 fn counts_falling_edges_on_ch0() {
     let mut p = Pcnt::new();
     // decrement on negative edge, disable on positive edge.
-    let conf0 = (0 << 18) | (2 << 16);
+    let conf0 = 2 << 16;
     p.write32(0x00, conf0);
     p.write32(0x08, 0xFFFF_0000); // l_lim = -1 (0xFFFF), so it can go negative
     p.write32(0x60, 0);

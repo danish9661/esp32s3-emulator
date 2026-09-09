@@ -167,7 +167,7 @@ impl Gpio {
             _ => {
                 self.regs[(offset / 4) as usize] = value;
                 // A PIN config write may arm/disarm that pin's interrupt.
-                if offset >= GPIO_PIN_0 && offset < GPIO_PIN_0 + 54 * 4 {
+                if (GPIO_PIN_0..GPIO_PIN_0 + 54 * 4).contains(&offset) {
                     self.refresh_armed(((offset - GPIO_PIN_0) / 4) as usize);
                 }
             }

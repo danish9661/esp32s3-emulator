@@ -71,8 +71,8 @@ const RX_EN: u32 = 1;
 use std::cell::Cell;
 
 /// Scripted pad level: `levels[n]` for sample n (then holds the last).
-fn scripted(levels: &[u32]) -> (impl Fn(u32) -> u32 + '_) {
-    let n = Cell::new(0usize);
+fn scripted(levels: &[u32]) -> impl Fn(u32) -> u32 + '_ {
+    let n = Cell::new(0);
     move |_| {
         let i = n.get().min(levels.len() - 1);
         n.set(n.get() + 1);

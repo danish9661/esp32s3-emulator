@@ -30,13 +30,14 @@ bool check(const char* name, uint32_t base) {
 }
 
 // I2S0/1 are functional models now (not RegStores): INT_ST (0x10) reads
-// RAW&ENA and the FIFOs pop, so those don't round-trip. Poke two plain
-// config regs instead (TX_CONF 0x24 / RX_CONF 0x20, start bits clear).
+// RAW&ENA, the FIFOs pop, and TX/RX_CONF (0x24/0x20) self-clear
+// reset/start/update bits, so none round-trip. Poke two plain config regs
+// instead (CONF1 0x28/0x2C, plain field stores).
 bool check_i2s(const char* name, uint32_t base) {
-  REG_WRITE(base + 0x24, 0x12345678);
-  REG_WRITE(base + 0x20, 0xDEADBEEB);
-  uint32_t a = REG_READ(base + 0x24);
-  uint32_t b = REG_READ(base + 0x20);
+  REG_WRITE(base + 0x2C, 0x12345678);
+  REG_WRITE(base + 0x28, 0xDEADBEEB);
+  uint32_t a = REG_READ(base + 0x2C);
+  uint32_t b = REG_READ(base + 0x28);
   bool ok = (a == 0x12345678) && (b == 0xDEADBEEB);
   Serial.print(name);
   Serial.print(ok ? " OK" : " FAIL");

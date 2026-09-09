@@ -75,13 +75,7 @@ impl Esp32S3 {
         // the captured sleep period then wake (reboot with the timer cause).
         if self.asleep {
             // A watched ULP halting mid-sleep wakes immediately (ULP cause).
-            if self.soc.sleep_ulp_fired() {
-                self.wake();
-            } else if self.sleep_remaining == 0 {
-                self.wake();
-            } else {
-                self.sleep_remaining -= 1;
-            }
+            self.sleep_tick();
             return StepResult::Ok;
         }
         // Firmware requested a deep-sleep this step: enter it and skip the CPU.
@@ -131,13 +125,7 @@ impl Esp32S3 {
                 // Peripherals (notably the ULP coprocessor and RTC clock)
                 // keep running in deep sleep; tick before checking events.
                 self.soc.tick_timers(1);
-                if self.soc.sleep_ulp_fired() {
-                    self.wake();
-                } else if self.sleep_remaining == 0 {
-                    self.wake();
-                } else {
-                    self.sleep_remaining -= 1;
-                }
+                self.sleep_tick();
                 return (StepResult::Ok, StepResult::Ok, 0);
             }
             if let Some(ticks) = self.soc.consume_sleep_request() {
@@ -159,13 +147,7 @@ impl Esp32S3 {
         if self.asleep {
             // Peripherals keep running in deep sleep (see above).
             self.soc.tick_timers(1);
-            if self.soc.sleep_ulp_fired() {
-                self.wake();
-            } else if self.sleep_remaining == 0 {
-                self.wake();
-            } else {
-                self.sleep_remaining -= 1;
-            }
+            self.sleep_tick();
             return (StepResult::Ok, StepResult::Ok, 0);
         }
         if let Some(ticks) = self.soc.consume_sleep_request() {
@@ -289,6 +271,16 @@ impl Esp32S3 {
     /// manually (e.g. `run_flash`).
     pub fn tick_sleep_one(&mut self) {
         if self.sleep_remaining == 0 {
+            self.wake();
+        } else {
+            self.sleep_remaining -= 1;
+        }
+    }
+
+    /// Advance one deep-sleep tick: a watched ULP halting mid-sleep or the
+    /// captured period running out wakes (reboots with the stashed cause).
+    fn sleep_tick(&mut self) {
+        if self.soc.sleep_ulp_fired() || self.sleep_remaining == 0 {
             self.wake();
         } else {
             self.sleep_remaining -= 1;

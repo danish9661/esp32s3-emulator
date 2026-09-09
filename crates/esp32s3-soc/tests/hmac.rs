@@ -77,14 +77,14 @@ fn run(efuse: &mut Efuse, key_id: usize, key_word: u32, msg: &[u8]) -> [u8; 32] 
 fn hex_eq(d: &[u8; 32], hex: &str) -> bool {
     let mut want = [0u8; 32];
     let mut ok = hex.len() == 64;
-    for i in 0..32usize {
+    for (i, w) in want.iter_mut().enumerate() {
         if !ok {
             break;
         }
         let hi = (hex.as_bytes()[i * 2] as char).to_digit(16);
         let lo = (hex.as_bytes()[i * 2 + 1] as char).to_digit(16);
         match (hi, lo) {
-            (Some(h), Some(l)) => want[i] = (h * 16 + l) as u8,
+            (Some(h), Some(l)) => *w = (h * 16 + l) as u8,
             _ => ok = false,
         }
     }

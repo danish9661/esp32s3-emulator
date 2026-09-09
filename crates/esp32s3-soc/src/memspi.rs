@@ -1129,7 +1129,6 @@ mod tests {
     /// QEMU reset defaults are readable back.
     #[test]
     fn reset_defaults() {
-        let mut f = flash4m();
         let m = Memspi::new();
         assert_eq!(m.read32(REG_CTRL1), 0x3FF << 2);
         assert_eq!(m.read32(REG_CLOCK), 0x0003_0103);

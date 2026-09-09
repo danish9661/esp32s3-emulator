@@ -108,7 +108,7 @@ fn fade_down_saturates_at_zero() {
     l.write32(CH0_DUTY, 0x20); // 32
     l.write32(CH0_CONF0, 4);
     // scale 1, cycle 1, num 4, dec, start: 32 - 64 would underflow.
-    l.write32(0x0C, 1 | (1 << 10) | (4 << 20) | (0 << 30) | (1 << 31));
+    l.write32(0x0C, 1 | (1 << 10) | (4 << 20) | (1 << 31));
     for _ in 0..8 {
         l.tick();
     }

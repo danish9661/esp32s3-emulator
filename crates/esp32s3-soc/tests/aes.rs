@@ -36,8 +36,8 @@ fn run_ecb(key: &[u8], pt: &[u8; 16], decrypt: bool) -> [u32; 4] {
     }
     a.write32(AES_TRIGGER, 1);
     let mut out = [0u32; 4];
-    for i in 0..4 {
-        out[i] = a.read32(AES_TEXT_OUT_BASE + (i as u32) * 4);
+    for (slot, w) in out.iter_mut().enumerate() {
+        *w = a.read32(AES_TEXT_OUT_BASE + (slot as u32) * 4);
     }
     out
 }
@@ -110,7 +110,6 @@ fn aes256_ecb_encrypt_fips_vector() {
 
 #[test]
 fn aes_state_reads_done_after_transform() {
-    let key = [0u8; 16];
     let mut a = Aes::new();
     for i in 0..4 {
         a.write32((i as u32) * 4, 0);

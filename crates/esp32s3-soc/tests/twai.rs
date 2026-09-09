@@ -6,7 +6,6 @@ use esp32s3_soc::twai::*;
 const MODE: u32 = 0x00;
 const CMD: u32 = 0x04;
 const STATUS: u32 = 0x08;
-const IR: u32 = 0x0C;
 const IER: u32 = 0x10;
 
 #[test]
@@ -66,8 +65,8 @@ fn self_test_loopback_receives_transmitted_frame() {
     assert_ne!(st & (1 << 0), 0, "rbs: frame in RX buffer");
     // Read back the RX buffer and compare to what was transmitted.
     let mut rx = [0u8; 13];
-    for i in 0..13 {
-        rx[i] = t.read32(0x40 + (i as u32) * 4) as u8;
+    for (slot, b) in rx.iter_mut().enumerate() {
+        *b = t.read32(0x40 + (slot as u32) * 4) as u8;
     }
     assert_eq!(rx, tx, "looped-back frame must equal transmitted frame");
 }

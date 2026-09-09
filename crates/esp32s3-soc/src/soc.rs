@@ -1119,13 +1119,13 @@ impl Soc {
             for sig in [149, 150, 151, 152] {
                 // Pins 32+ are out of the u32 readback word (same limit as
                 // the RMT sampler above).
-                if let Some((pin, inv)) = self.gpio.in_sel(sig) {
-                    if pin < 32 {
-                        if self.lcd_cam.cam_input_level(sig) ^ (inv as u32) != 0 {
-                            v |= 1 << pin;
-                        } else {
-                            v &= !(1 << pin);
-                        }
+                if let Some((pin, inv)) = self.gpio.in_sel(sig)
+                    && pin < 32
+                {
+                    if self.lcd_cam.cam_input_level(sig) ^ (inv as u32) != 0 {
+                        v |= 1 << pin;
+                    } else {
+                        v &= !(1 << pin);
                     }
                 }
             }

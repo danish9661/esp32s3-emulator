@@ -373,7 +373,7 @@ fn ota_boot_selects_active_slot() {
     flash[0xe020..0xe024].copy_from_slice(&0x8000_0001u32.to_le_bytes());
 
     assert_eq!(select_ota_boot_offset(&flash), Some(0x200000));
-    flash[0x200000 as usize..0x200000 as usize + img.len()].copy_from_slice(&img);
+    flash[0x200000_usize..0x200000_usize + img.len()].copy_from_slice(&img);
 
     let mut m = Esp32S3::new();
     m.boot_from_flash(&flash);
@@ -1648,7 +1648,7 @@ fn ets_printf_mailbox_formats_and_prints() {
     let rom = rom_stub::rom_image();
     m.load_image(rom_stub::ROM_BASE, &rom);
     m.load_rom_data();
-    m.load_image(CODE, &a.bytes());
+    m.load_image(CODE, a.bytes());
     m.load_image(FMT, b"%s core %d val=0x%02x!\0");
     m.load_image(S1, b"s1\0");
     m.cpu[0].pc = CODE;
@@ -1700,7 +1700,7 @@ fn rom_qsort_sorts_via_windowed_comparator() {
     let mut m = Esp32S3::new();
     let rom = rom_stub::rom_image();
     m.load_image(rom_stub::ROM_BASE, &rom);
-    m.load_image(CODE, &a.bytes());
+    m.load_image(CODE, a.bytes());
     let arr: [i32; 6] = [9, 7, 5, 6, 8, 4];
     m.load_image(ARR, &arr.map(|v| v.to_le_bytes()).concat());
     m.cpu[0].pc = CODE;
@@ -1748,7 +1748,7 @@ fn rom_qsort_sorts_size8_entries() {
     let mut m = Esp32S3::new();
     let rom = rom_stub::rom_image();
     m.load_image(rom_stub::ROM_BASE, &rom);
-    m.load_image(CODE, &a.bytes());
+    m.load_image(CODE, a.bytes());
     let arr: [i32; 12] = [9, 90, 7, 70, 5, 50, 6, 60, 8, 80, 4, 40];
     m.load_image(ARR, &arr.map(|v| v.to_le_bytes()).concat());
     m.cpu[0].pc = CODE;
@@ -1875,14 +1875,14 @@ fn rtc_io_registers_round_trip_and_w1ts_w1tc() {
     let mut m = Esp32S3::new();
 
     // `out` register round-trips.
-    m.soc.write32(RTC_IO_BASE + 0x00, 0x55);
-    assert_eq!(m.soc.read32(RTC_IO_BASE + 0x00), 0x55);
+    m.soc.write32(RTC_IO_BASE, 0x55);
+    assert_eq!(m.soc.read32(RTC_IO_BASE), 0x55);
 
     // `out_w1ts` sets bits, `out_w1tc` clears bits (real silicon semantics).
     m.soc.write32(RTC_IO_BASE + 0x04, 0xAA);
-    assert_eq!(m.soc.read32(RTC_IO_BASE + 0x00), 0xFF);
+    assert_eq!(m.soc.read32(RTC_IO_BASE), 0xFF);
     m.soc.write32(RTC_IO_BASE + 0x08, 0x0F);
-    assert_eq!(m.soc.read32(RTC_IO_BASE + 0x00), 0xF0);
+    assert_eq!(m.soc.read32(RTC_IO_BASE), 0xF0);
 
     // `enable` w1ts/w1tc.
     m.soc.write32(RTC_IO_BASE + 0x0C, 0x1);
@@ -1922,10 +1922,10 @@ fn ulp_registers_round_trip() {
 
     let mut m = Esp32S3::new();
     // ULP-RISC-V block is at page 0x6000_8000 + 0x100.
-    m.soc.write32(ULP_BASE + 0x00, 0xDEAD_BEEF); // core
+    m.soc.write32(ULP_BASE, 0xDEAD_BEEF); // core
     m.soc.write32(ULP_BASE + 0x04, 0x1234_5678); // ocp
     m.soc.write32(ULP_BASE + 0x0C, 0xAB); // general reg 0
-    assert_eq!(m.soc.read32(ULP_BASE + 0x00), 0xDEAD_BEEF);
+    assert_eq!(m.soc.read32(ULP_BASE), 0xDEAD_BEEF);
     assert_eq!(m.soc.read32(ULP_BASE + 0x04), 0x1234_5678);
     assert_eq!(m.soc.read32(ULP_BASE + 0x0C), 0xAB);
 }
@@ -1935,11 +1935,11 @@ fn sdmmc_registers_round_trip() {
     use esp32s3_soc::sdmmc::SDMMC_BASE;
 
     let mut m = Esp32S3::new();
-    m.soc.write32(SDMMC_BASE + 0x00, 0x000F_0001); // CTRL
+    m.soc.write32(SDMMC_BASE, 0x000F_0001); // CTRL
     m.soc.write32(SDMMC_BASE + 0x2C, 0x0020_0000); // CMD (no start bit -> stores)
     m.soc.write32(SDMMC_BASE + 0x30, 0xCAFE_BEEF); // RESP0
     // CTRL bit 0 (controller_reset) self-clears like silicon.
-    assert_eq!(m.soc.read32(SDMMC_BASE + 0x00), 0x000F_0000);
+    assert_eq!(m.soc.read32(SDMMC_BASE), 0x000F_0000);
     assert_eq!(m.soc.read32(SDMMC_BASE + 0x2C), 0x0020_0000);
     assert_eq!(m.soc.read32(SDMMC_BASE + 0x30), 0xCAFE_BEEF);
 }
@@ -1950,10 +1950,10 @@ fn rtc_i2c_registers_round_trip() {
 
     let mut m = Esp32S3::new();
     // RTC_I2C (LP/I2C) block at 0x6000_8C00.
-    m.soc.write32(RTC_I2C_BASE + 0x00, 0x0000_0032); // I2C_SCL_LOW
+    m.soc.write32(RTC_I2C_BASE, 0x0000_0032); // I2C_SCL_LOW
     m.soc.write32(RTC_I2C_BASE + 0x04, 0x0000_0064); // I2C_SCL_HIGH
     m.soc.write32(RTC_I2C_BASE + 0x0C, 0x00FF_00AA); // I2C_CTRL
-    assert_eq!(m.soc.read32(RTC_I2C_BASE + 0x00), 0x0000_0032);
+    assert_eq!(m.soc.read32(RTC_I2C_BASE), 0x0000_0032);
     assert_eq!(m.soc.read32(RTC_I2C_BASE + 0x04), 0x0000_0064);
     assert_eq!(m.soc.read32(RTC_I2C_BASE + 0x0C), 0x00FF_00AA);
 }
@@ -1964,10 +1964,10 @@ fn lp_uart_registers_round_trip() {
 
     let mut m = Esp32S3::new();
     // LP_UART block at 0x6002_5400 (shares the GPSPI3 page).
-    m.soc.write32(LP_UART_BASE + 0x00, 0x0000_00AB); // FIFO
+    m.soc.write32(LP_UART_BASE, 0x0000_00AB); // FIFO
     m.soc.write32(LP_UART_BASE + 0x14, 0x00AA_00BB); // CLKDIV
     m.soc.write32(LP_UART_BASE + 0x20, 0x1234_5678); // CONF0
-    assert_eq!(m.soc.read32(LP_UART_BASE + 0x00), 0x0000_00AB);
+    assert_eq!(m.soc.read32(LP_UART_BASE), 0x0000_00AB);
     assert_eq!(m.soc.read32(LP_UART_BASE + 0x14), 0x00AA_00BB);
     assert_eq!(m.soc.read32(LP_UART_BASE + 0x20), 0x1234_5678);
 }
@@ -1984,14 +1984,14 @@ fn twai_loopback_transmits_and_receives() {
     let b = TWAI_BASE;
 
     // Enter reset mode so the acceptance filter is writable.
-    m.soc.write32(b + 0x00, 1);
+    m.soc.write32(b, 1);
     // Acceptance filter: code 0, mask 0xFFFFFFFF (all don't-care) -> accept all.
     for off in [0x40u32, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C] {
         m.soc
             .write32(b + off, if off < 0x50 { 0 } else { 0xFFFF_FFFF });
     }
     // Leave reset, enter self-test mode (stm = bit 2) -> TX loops back to RX.
-    m.soc.write32(b + 0x00, 1 << 2);
+    m.soc.write32(b, 1 << 2);
 
     // Load a 13-byte frame: DLC=8 standard data frame, ID 0x123, payload 0x13..0x1C.
     let tx: [u32; 13] = [
@@ -2973,9 +2973,9 @@ fn gpio_rmt_edge_fires_gpio_isr() {
     // so sub-100-unit pulses would alias past the per-step GPIO sampler.
     let p = a.l32r(5);
     a.patch_l32r(p, IRAM_BASE + l_rmtmem as u32);
-    a.li(4, (2000 | (1 << 15) | (2000 << 16)) as i32);
+    a.li(4, 2000 | (1 << 15) | (2000 << 16));
     a.s32i(4, 5, 0);
-    a.li(4, (1000 | (1 << 15) | (1000 << 16)) as i32);
+    a.li(4, 1000 | (1 << 15) | (1000 << 16));
     a.s32i(4, 5, 4);
     let p = a.l32r(5);
     a.patch_l32r(p, IRAM_BASE + l_rmt as u32);
@@ -2984,7 +2984,7 @@ fn gpio_rmt_edge_fires_gpio_isr() {
     // GPIO2 PIN interrupt: RISING + enable bit 0.
     let p = a.l32r(5);
     a.patch_l32r(p, IRAM_BASE + l_pin2 as u32);
-    a.li(4, ((1 << 7) | (1 << 13)) as i32);
+    a.li(4, (1 << 7) | (1 << 13));
     a.s32i(4, 5, 0);
     // Matrix: source 16 (GPIO) -> CPU line 15; INTENABLE; rsil 0.
     let p = a.l32r(2);
@@ -3156,7 +3156,7 @@ fn rom_memcpy_matrix_lengths_and_alignments() {
     let rom = rom_stub::rom_image();
     m.load_image(rom_stub::ROM_BASE, &rom);
     m.load_rom_data();
-    m.load_image(CODE, &a.bytes());
+    m.load_image(CODE, a.bytes());
     // SRC pattern + DST sentinels, host-side (pattern is a pure
     // function of the absolute source address, mirrored in the assert).
     let pat = |a: u32| (a.wrapping_mul(0x9E3779B9).wrapping_add(a >> 3) & 0xFF) as u8;
@@ -3239,7 +3239,7 @@ fn rom_memset_matrix_lengths_and_alignments() {
     let rom = rom_stub::rom_image();
     m.load_image(rom_stub::ROM_BASE, &rom);
     m.load_rom_data();
-    m.load_image(CODE, &a.bytes());
+    m.load_image(CODE, a.bytes());
     for i in 0..(combos.len() as u32 * 64) {
         m.soc.write8(DST + i, 0xCC);
     }
@@ -3296,7 +3296,7 @@ fn psram_write16_preserves_adjacent_halfword() {
     let p = a.l32r(5); // STASH
     a.patch_l32r(p, IRAM_BASE + l_stash as u32);
     a.li(6, 0x8001); // PSRAM page 1 entry
-    a.s32i(6, 2, 1 * 4); // mmu[1]
+    a.s32i(6, 2, 4); // mmu[1]
     // Non-monotonic u16 writes: +8, +2, +4, +10, +0, +6 (MP emit order).
     a.li(6, 0x007B);
     a.s16i(6, 3, 8);

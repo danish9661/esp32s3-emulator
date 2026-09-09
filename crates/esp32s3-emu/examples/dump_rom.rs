@@ -14,7 +14,7 @@ fn main() {
         };
         let name = match xtensa_core::generated::decode_inst(raw) {
             Some(o) => format!("{o:?}"),
-            None => format!("??"),
+            None => "??".to_string(),
         };
         println!("{a:#06x}: {raw:#010x} {name}");
         a += len;

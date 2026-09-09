@@ -5,9 +5,9 @@ use esp32s3_soc::ulp::ULP_BASE;
 #[test]
 fn core_register_round_trips() {
     let mut d = esp32s3_soc::ulp::Ulp::new();
-    d.write32(ULP_BASE + 0x00, 0xDEAD_BEEF); // core
+    d.write32(ULP_BASE, 0xDEAD_BEEF); // core
     d.write32(ULP_BASE + 0x04, 0x1234_5678); // ocp
-    assert_eq!(d.read32(ULP_BASE + 0x00), 0xDEAD_BEEF);
+    assert_eq!(d.read32(ULP_BASE), 0xDEAD_BEEF);
     assert_eq!(d.read32(ULP_BASE + 0x04), 0x1234_5678);
 }
 

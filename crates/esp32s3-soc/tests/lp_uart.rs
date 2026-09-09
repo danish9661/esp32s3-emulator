@@ -5,9 +5,9 @@ use esp32s3_soc::lp_uart::{LP_UART_BASE, LpUart};
 #[test]
 fn fifo_and_conf_registers_round_trip() {
     let mut d = LpUart::new();
-    d.write32(LP_UART_BASE + 0x00, 0x0000_00AB); // FIFO
+    d.write32(LP_UART_BASE, 0x0000_00AB); // FIFO
     d.write32(LP_UART_BASE + 0x20, 0x1234_5678); // CONF0
-    assert_eq!(d.read32(LP_UART_BASE + 0x00), 0x0000_00AB);
+    assert_eq!(d.read32(LP_UART_BASE), 0x0000_00AB);
     assert_eq!(d.read32(LP_UART_BASE + 0x20), 0x1234_5678);
 }
 

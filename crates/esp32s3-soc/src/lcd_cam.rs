@@ -312,7 +312,7 @@ impl LcdCam {
             return; // backpressure: firmware must drain CAM_DATA first
         }
         let limit = self.rec_bytelen();
-        if limit != 0 && self.byte_count >= limit + 1 {
+        if limit != 0 && self.byte_count > limit {
             self.end_capture();
             return;
         }
@@ -487,7 +487,7 @@ mod tests {
     }
 
     const CAM_START: u32 = 1 << 29;
-    const CAM_RESET: u32 = 1 << 30;
+    const _CAM_RESET: u32 = 1 << 30;
     const CAM_AFIFO_RESET: u32 = 1 << 31;
 
     /// START with nothing staged arms the capture (VSYNC wait): no VSYNC,

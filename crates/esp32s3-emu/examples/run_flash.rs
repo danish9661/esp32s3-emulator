@@ -47,11 +47,11 @@ fn main() {
 
     // ADC injection for sketches doing analogRead: ADC_INJECT_MV=<mv>
     // applies the voltage to ADC1 channel 3 (GPIO4).
-    if let Ok(mv) = env::var("ADC_INJECT_MV") {
-        if let Ok(mv) = mv.parse::<u32>() {
-            m.soc.adc_inject_voltage(0, 3, mv);
-            println!("[host] injected {mv} mV on ADC1_CH3 (GPIO4)");
-        }
+    if let Ok(mv) = env::var("ADC_INJECT_MV")
+        && let Ok(mv) = mv.parse::<u32>()
+    {
+        m.soc.adc_inject_voltage(0, 3, mv);
+        println!("[host] injected {mv} mV on ADC1_CH3 (GPIO4)");
     }
 
     // UART1 RX injection (echo-sketch support): UART_INJECT=<text> is
@@ -226,57 +226,55 @@ fn main() {
         // the host payload into UART1 RX (the echo sketch reads it back).
         // Gated on new bytes: the buffer only changes when a drain above
         // appended, so scanning every step is wasted O(buffer) work.
-        if !uart1_injected && (!tx.is_empty() || !tx1.is_empty()) {
-            if let Some(bytes) = &uart1_inject {
-                if uart_buf.windows(b"RXREADY".len()).any(|w| w == b"RXREADY") {
-                    for &b in bytes {
-                        m.soc.uart_inject_rx(1, b);
-                    }
-                    println!(
-                        "[host] injected {:?} into UART1 RX",
-                        String::from_utf8_lossy(bytes)
-                    );
-                    uart1_injected = true;
-                }
+        if !uart1_injected
+            && (!tx.is_empty() || !tx1.is_empty())
+            && let Some(bytes) = &uart1_inject
+            && uart_buf.windows(b"RXREADY".len()).any(|w| w == b"RXREADY")
+        {
+            for &b in bytes {
+                m.soc.uart_inject_rx(1, b);
             }
+            println!(
+                "[host] injected {:?} into UART1 RX",
+                String::from_utf8_lossy(bytes)
+            );
+            uart1_injected = true;
         }
 
         // UART0 RX injection: same pattern with a configurable marker.
-        if !uart0_injected && (!tx.is_empty() || !tx1.is_empty()) {
-            if let Some(bytes) = &uart0_inject {
-                if uart_buf
-                    .windows(uart0_marker.len())
-                    .any(|w| w == uart0_marker.as_slice())
-                {
-                    for &b in bytes {
-                        m.soc.uart_inject_rx(0, b);
-                    }
-                    println!(
-                        "[host] injected {:?} into UART0 RX",
-                        String::from_utf8_lossy(bytes)
-                    );
-                    uart0_injected = true;
-                }
+        if !uart0_injected
+            && (!tx.is_empty() || !tx1.is_empty())
+            && let Some(bytes) = &uart0_inject
+            && uart_buf
+                .windows(uart0_marker.len())
+                .any(|w| w == uart0_marker.as_slice())
+        {
+            for &b in bytes {
+                m.soc.uart_inject_rx(0, b);
             }
+            println!(
+                "[host] injected {:?} into UART0 RX",
+                String::from_utf8_lossy(bytes)
+            );
+            uart0_injected = true;
         }
 
         // USB-CDC RX injection: same pattern with a configurable marker.
-        if !usb_injected && (!tx.is_empty() || !tx1.is_empty()) {
-            if let Some(bytes) = &usb_inject {
-                if uart_buf
-                    .windows(usb_marker.len())
-                    .any(|w| w == usb_marker.as_slice())
-                {
-                    for &b in bytes {
-                        m.soc.usb_inject_rx(b);
-                    }
-                    println!(
-                        "[host] injected {:?} into USB CDC RX",
-                        String::from_utf8_lossy(bytes)
-                    );
-                    usb_injected = true;
-                }
+        if !usb_injected
+            && (!tx.is_empty() || !tx1.is_empty())
+            && let Some(bytes) = &usb_inject
+            && uart_buf
+                .windows(usb_marker.len())
+                .any(|w| w == usb_marker.as_slice())
+        {
+            for &b in bytes {
+                m.soc.usb_inject_rx(b);
             }
+            println!(
+                "[host] injected {:?} into USB CDC RX",
+                String::from_utf8_lossy(bytes)
+            );
+            usb_injected = true;
         }
 
         // SPI-slave host exchange: marker-driven, one shot per half.

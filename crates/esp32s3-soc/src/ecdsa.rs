@@ -25,7 +25,6 @@ pub const ECDSA_BASE: u32 = 0x6008_E000;
 /// NOTE: the S3 interrupt table has NO ECDSA source (unlike RSA=76) —
 /// ECDSA completion is polled via RESULT, like HMAC/DS. There is no matrix
 /// wiring for this device by design.
-
 /// Max operand size: 256-bit = 8 words (P-192 uses the low 6 words).
 const NW: usize = 8;
 
@@ -395,15 +394,15 @@ mod tests {
 
     fn read_block(e: &Ecdsa, block: usize) -> Vec<u32> {
         let mut v = vec![0u32; NW];
-        for i in 0..NW {
-            v[i] = e.read32(0x80 + ((block * NW + i) * 4) as u32);
+        for (i, w) in v.iter_mut().enumerate().take(NW) {
+            *w = e.read32(0x80 + ((block * NW + i) * 4) as u32);
         }
         v
     }
 
     const CONF_SIGN_P256: u32 = (1 << 0) | (1 << 2) | (1 << 3);
-    const CONF_VERIFY_P256: u32 = (0 << 0) | (1 << 2);
-    const CONF_SIGN_P192: u32 = (1 << 0) | (0 << 2) | (1 << 3);
+    const CONF_VERIFY_P256: u32 = 1 << 2;
+    const CONF_SIGN_P192: u32 = (1 << 0) | (1 << 3);
 
     #[test]
     fn p256_sign_kat_matches_independent_implementation() {
@@ -472,7 +471,7 @@ mod tests {
         e.write32(0x04, 1); // sign
         assert_eq!(e.read32(0x18), 1);
 
-        e.write32(0x00, (0 << 0) | (0 << 2)); // verify P-192
+        e.write32(0x00, 0); // verify P-192 (mode 0)
         e.write32(0x04, 1);
         assert_eq!(e.read32(0x18), 1, "valid P-192 signature must verify");
     }

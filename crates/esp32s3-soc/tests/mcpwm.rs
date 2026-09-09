@@ -150,7 +150,7 @@ fn capture_posedge_latches_timer_and_raises_int() {
     m.write32(CAP_CHN_CFG0, 1 | (2 << 1)); // ch0 en + posedge
     // idle low, then high: the seed consumes idx0, three setup ticks stay
     // low, the next tick sees the edge (timer reads 5).
-    let mut s = Script {
+    let s = Script {
         levels: vec![false, false, false, false, true, true, true],
         pos: Cell::new(0),
     };
@@ -173,7 +173,7 @@ fn capture_prescale_divides_edges() {
     m.write32(CAP_TIMER_CFG, 1);
     m.write32(CAP_CHN_CFG0, 1 | (2 << 1) | (1 << 3)); // en + pos + prescale 1
     // Edges at idx1 (divided out) and idx3 (captured, timer reads 4).
-    let mut s = Script {
+    let s = Script {
         levels: vec![false, true, false, true, true],
         pos: Cell::new(0),
     };
@@ -195,7 +195,7 @@ fn capture_negedge_and_disabled_channel() {
     let mut m = Mcpwm::new();
     m.write32(CAP_TIMER_CFG, 1);
     m.write32(CAP_CHN_CFG0, 1 | (1 << 1)); // en + negedge
-    let mut s = Script {
+    let s = Script {
         levels: vec![true, true, false, false],
         pos: Cell::new(0),
     };

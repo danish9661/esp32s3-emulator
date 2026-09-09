@@ -2616,3 +2616,25 @@ Core design:
     gpio nits, example/test casts — none from current work), fixing those is
     separate tech debt. Full local battery not run (subsets only); shards
     carry 300-min step timeouts (i2s_driver alone needs ~10 min).
+  - 2026-09-09: **Full local battery green 61/0/0** (all 4 shards,
+    post-CI-commit validation). One real rot find: `esp32s3_p5_stubs`
+    poked I2S TX/RX_CONF (0x24/0x20) whose reset bits are
+    write-side-effectful under the functional I2S model (same staleness
+    class as the `p5_stub_peripherals_round_trip` machine test) → now pokes
+    plain CONF1 (0x28/0x2C) like the machine test. Also fixed along the way:
+    3 stale GDMA-base sketches from the single-controller change
+    (`lcd_cam`, `spi_dma`, `adc_dma`: 0x60042000 → 0x6003F000).
+  - 2026-09-09: **Clippy tech debt retired: `cargo clippy --workspace
+    --all-targets -- -D warnings` green** (was red on ~70 pre-existing
+    warnings), so the `rust` CI job gates again. Mechanical,
+    behavior-preserving throughout: `machine.rs` triplicated deep-sleep
+    tick folded into `sleep_tick()` (caught a self-recursion slip live —
+    the helper's own body got replaced too, hanging the sleep tests until
+    fixed and verified 0.05s); `BASE + 0x00`/`(0 << n)`/`0 | x` identity
+    ops, same-type casts, needless borrows/refs/parens/muts, `format!("??")`,
+    range-loop indexing, dead consts/vars/imports across soc tests,
+    machine_tests, and debug examples; run_flash injection nests merged via
+    let-chains. One real hygiene catch: a `pin >= 32` shift-overflow the
+    naive collapse would have introduced in the CAM loopback (kept the guard
+    via let-chain). Full workspace 37/37 green, fmt/wasm32 clean, battery
+    smoke (hello/periph/uart_echo/adc_dma) green.

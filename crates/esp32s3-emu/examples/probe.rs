@@ -1,5 +1,4 @@
 use esp32s3_emu::Esp32S3;
-use xtensa_core::Bus;
 
 fn main() {
     let img = std::fs::read("tools/sketches/esp32s3_hello/esp32s3_hello.merged.bin").unwrap();
@@ -7,15 +6,13 @@ fn main() {
     m.boot_from_flash(&img);
     let mut released = 0u64;
     let mut ring: Vec<u32> = Vec::with_capacity(256);
-    let mut jumped = false;
     for i in 0..80_000_000u64 {
         m.step();
         if ring.len() == 256 {
             ring.remove(0);
         }
         ring.push(m.cpu[0].pc);
-        if m.cpu[0].pc == 0x4037_4300 && !jumped {
-            jumped = true;
+        if m.cpu[0].pc == 0x4037_4300 {
             println!("FIRST kernel vector at step {i}");
             println!("prev 256: {:x?}", ring.as_slice());
             println!(

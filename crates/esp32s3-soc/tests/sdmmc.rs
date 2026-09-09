@@ -5,8 +5,8 @@ use esp32s3_soc::sdmmc::SDMMC_BASE;
 #[test]
 fn ctrl_register_round_trips() {
     let mut d = esp32s3_soc::sdmmc::Sdmmc::new();
-    d.write32(SDMMC_BASE + 0x00, 0x000F_0001); // CTRL
-    assert_eq!(d.read32(SDMMC_BASE + 0x00), 0x000F_0001);
+    d.write32(SDMMC_BASE, 0x000F_0001); // CTRL
+    assert_eq!(d.read32(SDMMC_BASE), 0x000F_0001);
 }
 
 #[test]

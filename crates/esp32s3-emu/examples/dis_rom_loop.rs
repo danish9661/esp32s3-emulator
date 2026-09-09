@@ -11,7 +11,7 @@ fn main() {
         let raw = u32::from_le_bytes([rom[a], rom[a + 1], rom[a + 2], rom[a + 3]]);
         let name = match xtensa_core::generated::decode_inst(raw) {
             Some(o) => format!("{o:?}"),
-            None => format!("??"),
+            None => "??".to_string(),
         };
         let mut extra = String::new();
         if name == "OPCODE_ENTRY" {

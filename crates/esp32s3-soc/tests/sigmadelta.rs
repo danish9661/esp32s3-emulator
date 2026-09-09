@@ -38,7 +38,7 @@ fn channel_duty_25_percent_is_quarter_high() {
 #[test]
 fn prescale_slows_the_period_by_prescale_plus_one() {
     let mut s = Sdm::new();
-    s.write32(0, 0 | (7 << 8)); // duty=0 (50%), prescale=7 -> period 256*8
+    s.write32(0, 7 << 8); // duty=0 (50%), prescale=7 -> period 256*8
     // Over one period (2048 ticks) exactly half (1024) are high.
     assert_eq!(high_fraction(&mut s, 0, 2048), 1024);
 }

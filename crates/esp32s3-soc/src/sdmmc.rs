@@ -863,7 +863,7 @@ mod tests {
         issue(&mut d, 24, 0, true, true, true); // WRITE_BLOCK
         // Write a recognizable pattern.
         for i in 0..128u32 {
-            d.write32(FIFO, i as u32 * 0x0101_0101);
+            d.write32(FIFO, i * 0x0101_0101);
         }
         assert!(d.read32(RINTSTS) & INT_DATA_OVER != 0);
         // Now read it back.
@@ -872,7 +872,7 @@ mod tests {
         let mut mismatch = 0;
         for i in 0..128u32 {
             let w = d.read32(FIFO);
-            if w != i as u32 * 0x0101_0101 {
+            if w != i * 0x0101_0101 {
                 mismatch += 1;
             }
         }
