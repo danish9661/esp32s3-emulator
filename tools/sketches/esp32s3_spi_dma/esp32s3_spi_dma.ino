@@ -10,7 +10,7 @@
 
 #define GPIO 0x60004000u
 #define SPI2 0x60024000u
-#define GDMA 0x60042000u
+#define GDMA 0x6003F000u // single GDMA controller (DR_REG_GDMA_BASE)
 #define G(x) ((volatile uint32_t*)(GPIO + (x)))
 #define S(x) ((volatile uint32_t*)(SPI2 + (x)))
 #define D(x) ((volatile uint32_t*)(GDMA + (x)))

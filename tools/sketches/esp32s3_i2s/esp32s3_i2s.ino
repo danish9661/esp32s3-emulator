@@ -30,7 +30,7 @@
 #define TX_DONE      (1u << 1)
 #define RX_DONE      (1u << 0)
 
-#define GDMA_BASE 0x60042000
+#define GDMA_BASE 0x6003F000
 #define GDMA_OUT_PERI_SEL0 (GDMA_BASE + 0xA8)
 #define GDMA_OUT_LINK0     (GDMA_BASE + 0x80)
 

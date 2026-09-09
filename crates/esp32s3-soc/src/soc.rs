@@ -89,6 +89,18 @@ pub struct RtcRetain {
     ulp: crate::ulp::Ulp,
 }
 
+/// I2S GDMA streaming cursor: the esp-idf I2S driver streams multi-hundred-
+/// byte frames through a 16-word TX/RX FIFO, so descriptors are consumed
+/// gradually as FIFO space/data allow (not dumped synchronously). One pass
+/// per link-start; stops at unowned/null/eof descriptors like the sync walk.
+#[derive(Clone, Copy, Default)]
+struct I2sDma {
+    active: bool,
+    ch: usize, // GDMA channel pair carrying this port's link
+    desc: u32, // current descriptor address (0 = none)
+    off: u32,  // bytes already moved in the current descriptor
+}
+
 macro_rules! in_range {
     ($addr:expr, $base:expr, $size:expr) => {
         ($addr).wrapping_sub($base) < ($size)
@@ -218,12 +230,6 @@ pub struct Soc {
     adc: Adc,
     pcnt: Pcnt,
     gdma: Gdma,
-    /// Crypto/shared GDMA (`DR_REG_GDMA_BASE = 0x6003F000`): the dedicated DMA
-    /// controller the esp-idf crypto drivers (AES, SHA) feed through
-    /// `esp_crypto_shared_gdma`. AES routes its plaintext `out` link here and
-    /// the ciphertext `in` link back to DRAM (the GENERAL GDMA at 0x60042000
-    /// is a different controller used by SPI/RMT/etc).
-    crypto_dma: Gdma,
     efuse: Efuse,
     sha: Sha,
     aes: Aes,
@@ -244,6 +250,9 @@ pub struct Soc {
     /// Watched ULP cause bits (ULP and/or COCPU): set when armed and the
     /// ULP is running at sleep entry; latched into the cause on its halt.
     sleep_ulp_watch: u32,
+    /// I2S GDMA streaming cursors (OUT = TX, IN = RX) per I2S port.
+    i2s_dma_out: [I2sDma; 2],
+    i2s_dma_in: [I2sDma; 2],
     rng: Rng,
     sdmmc: Sdmmc,
     sdm: Sdm,
@@ -376,11 +385,6 @@ impl Soc {
             adc: Adc::new(),
             pcnt: Pcnt::new(),
             gdma: Gdma::default(),
-            crypto_dma: {
-                let mut g = Gdma::default();
-                g.ignore_ena = true;
-                g
-            },
             efuse: Efuse::new(),
             sha: Sha::new(),
             aes: Aes::new(),
@@ -397,6 +401,8 @@ impl Soc {
             sleep_cause: 0,
             sleep_ext1: 0,
             sleep_ulp_watch: 0,
+            i2s_dma_out: [I2sDma::default(); 2],
+            i2s_dma_in: [I2sDma::default(); 2],
             rng: Rng::new(),
             sdmmc: Sdmmc::new(),
             sdm: Sdm::new(),
@@ -949,6 +955,15 @@ impl Soc {
             if self.i2s[1].is_active() {
                 self.i2s[1].tick();
             }
+            // I2S GDMA streaming pump: trickle words between owned DMA
+            // descriptors and the TX/RX FIFOs as space/data allow (the
+            // esp-idf driver streams multi-hundred-byte frames through a
+            // 16-word FIFO; a synchronous dump would overflow it). Gated on
+            // any armed link (cold otherwise).
+            if self.i2s_dma_out.iter().any(|d| d.active) || self.i2s_dma_in.iter().any(|d| d.active)
+            {
+                self.poll_i2s_dma();
+            }
             // GPIO edge/level sampling: skipped unless a pin interrupt is
             // armed (the common case). Levels come from the pad readback so
             // peripheral-driven pins (RMT/MCPWM/LEDC...) also fire edges.
@@ -1305,256 +1320,284 @@ impl Soc {
                         // (all descriptors staged first); see below.
                         let mut spi_dma_pending: Option<usize> = None;
                         let mut desc = link_addr;
-                        loop {
-                            let dw0 = self.read32(desc);
-                            let buf = self.read32(desc + 4);
-                            let next = self.read32(desc + 8);
-                            let len = (dw0 >> 12) & 0xFFF;
-                            let eof = (dw0 >> 30) & 1;
-                            let owner = (dw0 >> 31) & 1;
-                            if owner == 0 {
-                                break;
+                        // I2S GDMA streams through the per-tick pump (its
+                        // frames dwarf the 16-word FIFO); arm the cursor and
+                        // skip the synchronous walk. All other peripherals
+                        // keep the immediate walk below.
+                        if is_out
+                            && (peri == crate::gdma::GDMA_I2S0_PERIPH
+                                || peri == crate::gdma::GDMA_I2S1_PERIPH)
+                        {
+                            let p = (peri - crate::gdma::GDMA_I2S0_PERIPH) as usize;
+                            self.i2s_dma_out[p] = I2sDma {
+                                active: true,
+                                ch,
+                                desc: link_addr,
+                                off: 0,
+                            };
+                            self.i2s[p].set_tx_dma_pending(true);
+                        } else if !is_out
+                            && (peri == crate::gdma::GDMA_I2S0_PERIPH
+                                || peri == crate::gdma::GDMA_I2S1_PERIPH)
+                        {
+                            let p = (peri - crate::gdma::GDMA_I2S0_PERIPH) as usize;
+                            self.i2s_dma_in[p] = I2sDma {
+                                active: true,
+                                ch,
+                                desc: link_addr,
+                                off: 0,
+                            };
+                        } else {
+                            loop {
+                                let dw0 = self.read32(desc);
+                                let buf = self.read32(desc + 4);
+                                let next = self.read32(desc + 8);
+                                let len = (dw0 >> 12) & 0xFFF;
+                                let eof = (dw0 >> 30) & 1;
+                                let owner = (dw0 >> 31) & 1;
+                                if owner == 0 {
+                                    break;
+                                }
+                                if is_out {
+                                    if peri == crate::gdma::GDMA_RMT_PERIPH {
+                                        let dst = crate::rmt::RMTMEM_BASE + (ch as u32) * 0x100;
+                                        // Copy in 32-bit words. RMT items are
+                                        // word-aligned and the item buffer length is a
+                                        // multiple of 4; a byte-wise copy would clobber
+                                        // whole words because RMTMEM writes via
+                                        // write32 store the full word (see Rmt::write32).
+                                        let mut k = 0u32;
+                                        while k + 4 <= len {
+                                            let w = self.read32(buf + k);
+                                            self.write32(dst + k, w);
+                                            k += 4;
+                                        }
+                                        self.gdma.set_out_eof_des_addr(ch, desc);
+                                    } else if peri == crate::gdma::GDMA_SHA_PERIPH {
+                                        // SHA: copy the descriptor's message bytes into
+                                        // the SHA engine's message buffer (reconstructed
+                                        // LSB-first per 32-bit word, the byte order the
+                                        // SHA engine consumes). The driver passes an
+                                        // already-padded, complete 64-byte block.
+                                        let mut k = 0u32;
+                                        while k + 4 <= len {
+                                            let w = self.read32(buf + k);
+                                            self.sha.feed_byte((w & 0xFF) as u8);
+                                            self.sha.feed_byte(((w >> 8) & 0xFF) as u8);
+                                            self.sha.feed_byte(((w >> 16) & 0xFF) as u8);
+                                            self.sha.feed_byte(((w >> 24) & 0xFF) as u8);
+                                            k += 4;
+                                        }
+                                        self.gdma.set_out_eof_des_addr(ch, desc);
+                                    } else if peri == crate::gdma::GDMA_AES_PERIPH {
+                                        // AES: copy the descriptor's plaintext into the
+                                        // AES TEXT_IN buffer (LSB-first per word), then
+                                        // run the transform. In DMA mode the engine
+                                        // auto-pushes the ciphertext to the paired GDMA
+                                        // `in` channel, so walk that channel's
+                                        // descriptors and copy TEXT_OUT -> DRAM here.
+                                        let mut k = 0u32;
+                                        while k + 4 <= len {
+                                            let w = self.read32(buf + k);
+                                            self.aes.feed_text_in_byte((w & 0xFF) as u8);
+                                            self.aes.feed_text_in_byte(((w >> 8) & 0xFF) as u8);
+                                            self.aes.feed_text_in_byte(((w >> 16) & 0xFF) as u8);
+                                            self.aes.feed_text_in_byte(((w >> 24) & 0xFF) as u8);
+                                            k += 4;
+                                        }
+                                        self.aes.transform();
+                                        self.gdma.set_out_eof_des_addr(ch, desc);
+                                        // Auto-push ciphertext through the AES RX
+                                        // channel. The esp-idf AES driver allocates a
+                                        // SEPARATE GDMA channel for the ciphertext `in`
+                                        // link (crypto_shared_gdma_new_channel is called
+                                        // twice: TX then RX), so the RX channel index is
+                                        // not the same as this TX channel. Find the
+                                        // channel whose `in` block is wired to AES and
+                                        // copy TEXT_OUT -> its descriptor buffers.
+                                        for rx in 0..crate::gdma::NCH {
+                                            if self.gdma.in_peri_sel(rx)
+                                                == crate::gdma::GDMA_AES_PERIPH
+                                            {
+                                                let mut idesc = self.gdma.in_link_addr(rx);
+                                                loop {
+                                                    let dw0 = self.read32(idesc);
+                                                    let ibuf = self.read32(idesc + 4);
+                                                    let inext = self.read32(idesc + 8);
+                                                    let ilen = (dw0 >> 12) & 0xFFF;
+                                                    let ieof = (dw0 >> 30) & 1;
+                                                    let iowner = (dw0 >> 31) & 1;
+                                                    if iowner == 0 {
+                                                        break;
+                                                    }
+                                                    let mut k = 0u32;
+                                                    while k + 4 <= ilen {
+                                                        let w = self.aes.out_word_at(k);
+                                                        self.write32(ibuf + k, w);
+                                                        k += 4;
+                                                    }
+                                                    // DMA hands the descriptor back: clear owner
+                                                    // (the driver polls owner / reads length/suc_eof).
+                                                    self.write32(idesc, dw0 & !(1u32 << 31));
+                                                    if inext == 0 || ieof == 1 {
+                                                        break;
+                                                    }
+                                                    idesc = inext;
+                                                }
+                                                self.gdma.raise_in_done(rx);
+                                                break;
+                                            }
+                                        }
+                                    } else if peri == crate::gdma::GDMA_SPI2_PERIPH
+                                        || peri == crate::gdma::GDMA_SPI3_PERIPH
+                                    {
+                                        // SPI master DMA: stage the descriptor's
+                                        // bytes (address order) for one DMA-backed
+                                        // transfer, triggered after the walk (see
+                                        // below) so multi-descriptor chains send
+                                        // once. The transfer runs like a USR op
+                                        // (waveform + trans_done); start the IN
+                                        // link after trans_done latches.
+                                        let idx = if peri == crate::gdma::GDMA_SPI2_PERIPH {
+                                            0
+                                        } else {
+                                            1
+                                        };
+                                        let mut k = 0u32;
+                                        while k + 4 <= len {
+                                            let w = self.read32(buf + k);
+                                            self.spi[idx].spi_dma_feed(&w.to_le_bytes());
+                                            k += 4;
+                                        }
+                                        if k < len {
+                                            let w = self.read32(buf + k);
+                                            let tail = &w.to_le_bytes()[..(len - k) as usize];
+                                            self.spi[idx].spi_dma_feed(tail);
+                                        }
+                                        self.gdma.set_out_eof_des_addr(ch, desc);
+                                        spi_dma_pending = Some(idx);
+                                    } else if peri == crate::gdma::GDMA_LCD_PERIPH {
+                                        // LCD_CAM DMA: stream the descriptor's
+                                        // words through the TX FIFO as one
+                                        // synchronous 8080 transfer (word-aligned
+                                        // lengths; a partial tail word is dropped).
+                                        let mut words =
+                                            alloc::vec::Vec::with_capacity((len / 4) as usize);
+                                        let mut k = 0u32;
+                                        while k + 4 <= len {
+                                            words.push(self.read32(buf + k));
+                                            k += 4;
+                                        }
+                                        self.lcd_cam.dma_transfer(&words);
+                                        self.gdma.set_out_eof_des_addr(ch, desc);
+                                    }
+                                } else {
+                                    // IN (RX) channel: copy from the peripheral's data
+                                    // registers into the descriptor's DRAM buffer.
+                                    if peri == crate::gdma::GDMA_AES_PERIPH {
+                                        // AES ciphertext out -> DRAM.
+                                        let mut k = 0u32;
+                                        while k + 4 <= len {
+                                            let w = self.aes.out_word_at(k);
+                                            self.write32(buf + k, w);
+                                            k += 4;
+                                        }
+                                        // The AES engine has already transformed the
+                                        // block (the TX `out` write fed plaintext and
+                                        // ran the cipher); raise the RX done so the
+                                        // driver's completion ISR fires regardless of
+                                        // whether the RX link was started before or
+                                        // after the TX link.
+                                        self.gdma.enable_in_int_all(ch);
+                                        self.gdma.raise_in_done(ch);
+                                    } else if peri == crate::gdma::GDMA_SPI2_PERIPH
+                                        || peri == crate::gdma::GDMA_SPI3_PERIPH
+                                    {
+                                        // SPI RX: copy the last DMA transfer's
+                                        // captured bytes into the descriptor's DRAM
+                                        // buffer (zeros beyond the capture; start
+                                        // this link after trans_done latches).
+                                        let idx = if peri == crate::gdma::GDMA_SPI2_PERIPH {
+                                            0
+                                        } else {
+                                            1
+                                        };
+                                        let mut k = 0u32;
+                                        while k + 4 <= len {
+                                            let w = self.spi[idx].dma_rx_word(k);
+                                            self.write32(buf + k, w);
+                                            k += 4;
+                                        }
+                                        self.gdma.raise_in_done(ch);
+                                    } else if peri == crate::gdma::GDMA_ADC_PERIPH {
+                                        // ADC digital DMA: drain staged conversion
+                                        // results to DRAM (zeros once the queue
+                                        // runs dry).
+                                        let mut k = 0u32;
+                                        while k + 4 <= len {
+                                            let w = self.adc.dma_pop().unwrap_or(0);
+                                            self.write32(buf + k, w);
+                                            k += 4;
+                                        }
+                                        self.gdma.raise_in_done(ch);
+                                    }
+                                }
+                                // DMA hands the descriptor back: clear owner.
+                                self.write32(desc, dw0 & !(1u32 << 31));
+                                if next == 0 || eof == 1 {
+                                    break;
+                                }
+                                desc = next;
+                            }
+                            if let Some(idx) = spi_dma_pending {
+                                // One DMA-backed SPI transfer per OUT-link start.
+                                self.spi[idx].dma_trigger();
                             }
                             if is_out {
-                                if peri == crate::gdma::GDMA_RMT_PERIPH {
-                                    let dst = crate::rmt::RMTMEM_BASE + (ch as u32) * 0x100;
-                                    // Copy in 32-bit words. RMT items are
-                                    // word-aligned and the item buffer length is a
-                                    // multiple of 4; a byte-wise copy would clobber
-                                    // whole words because RMTMEM writes via
-                                    // write32 store the full word (see Rmt::write32).
-                                    let mut k = 0u32;
-                                    while k + 4 <= len {
-                                        let w = self.read32(buf + k);
-                                        self.write32(dst + k, w);
-                                        k += 4;
-                                    }
-                                    self.gdma.set_out_eof_des_addr(ch, desc);
-                                } else if peri == crate::gdma::GDMA_SHA_PERIPH {
-                                    // SHA: copy the descriptor's message bytes into
-                                    // the SHA engine's message buffer (reconstructed
-                                    // LSB-first per 32-bit word, the byte order the
-                                    // SHA engine consumes). The driver passes an
-                                    // already-padded, complete 64-byte block.
-                                    let mut k = 0u32;
-                                    while k + 4 <= len {
-                                        let w = self.read32(buf + k);
-                                        self.sha.feed_byte((w & 0xFF) as u8);
-                                        self.sha.feed_byte(((w >> 8) & 0xFF) as u8);
-                                        self.sha.feed_byte(((w >> 16) & 0xFF) as u8);
-                                        self.sha.feed_byte(((w >> 24) & 0xFF) as u8);
-                                        k += 4;
-                                    }
-                                    self.gdma.set_out_eof_des_addr(ch, desc);
-                                } else if peri == crate::gdma::GDMA_AES_PERIPH {
-                                    // AES: copy the descriptor's plaintext into the
-                                    // AES TEXT_IN buffer (LSB-first per word), then
-                                    // run the transform. In DMA mode the engine
-                                    // auto-pushes the ciphertext to the paired GDMA
-                                    // `in` channel, so walk that channel's
-                                    // descriptors and copy TEXT_OUT -> DRAM here.
-                                    let mut k = 0u32;
-                                    while k + 4 <= len {
-                                        let w = self.read32(buf + k);
-                                        self.aes.feed_text_in_byte((w & 0xFF) as u8);
-                                        self.aes.feed_text_in_byte(((w >> 8) & 0xFF) as u8);
-                                        self.aes.feed_text_in_byte(((w >> 16) & 0xFF) as u8);
-                                        self.aes.feed_text_in_byte(((w >> 24) & 0xFF) as u8);
-                                        k += 4;
-                                    }
-                                    self.aes.transform();
-                                    self.gdma.set_out_eof_des_addr(ch, desc);
-                                    // Auto-push ciphertext through the AES RX
-                                    // channel. The esp-idf AES driver allocates a
-                                    // SEPARATE GDMA channel for the ciphertext `in`
-                                    // link (crypto_shared_gdma_new_channel is called
-                                    // twice: TX then RX), so the RX channel index is
-                                    // not the same as this TX channel. Find the
-                                    // channel whose `in` block is wired to AES and
-                                    // copy TEXT_OUT -> its descriptor buffers.
-                                    for rx in 0..crate::gdma::NCH {
-                                        if self.gdma.in_peri_sel(rx) == crate::gdma::GDMA_AES_PERIPH
-                                        {
-                                            let mut idesc = self.gdma.in_link_addr(rx);
-                                            loop {
-                                                let dw0 = self.read32(idesc);
-                                                let ibuf = self.read32(idesc + 4);
-                                                let inext = self.read32(idesc + 8);
-                                                let ilen = (dw0 >> 12) & 0xFFF;
-                                                let ieof = (dw0 >> 30) & 1;
-                                                let iowner = (dw0 >> 31) & 1;
-                                                if iowner == 0 {
-                                                    break;
-                                                }
-                                                let mut k = 0u32;
-                                                while k + 4 <= ilen {
-                                                    let w = self.aes.out_word_at(k);
-                                                    self.write32(ibuf + k, w);
-                                                    k += 4;
-                                                }
-                                                // DMA hands the descriptor back: clear owner
-                                                // (the driver polls owner / reads length/suc_eof).
-                                                self.write32(idesc, dw0 & !(1u32 << 31));
-                                                if inext == 0 || ieof == 1 {
-                                                    break;
-                                                }
-                                                idesc = inext;
-                                            }
-                                            self.gdma.raise_in_done(rx);
-                                            break;
-                                        }
-                                    }
-                                } else if peri == crate::gdma::GDMA_I2S0_PERIPH {
-                                    // I2S0 TX: copy the descriptor's words into the
-                                    // I2S0 TX FIFO register (each 32-bit write is
-                                    // one FIFO push).
-                                    let mut k = 0u32;
-                                    while k + 4 <= len {
-                                        let w = self.read32(buf + k);
-                                        self.write32(
-                                            crate::memmap::I2S0_BASE + crate::i2s::FIFO,
-                                            w,
-                                        );
-                                        k += 4;
-                                    }
-                                    self.gdma.set_out_eof_des_addr(ch, desc);
-                                } else if peri == crate::gdma::GDMA_I2S1_PERIPH {
-                                    let mut k = 0u32;
-                                    while k + 4 <= len {
-                                        let w = self.read32(buf + k);
-                                        self.write32(
-                                            crate::memmap::I2S1_BASE + crate::i2s::FIFO,
-                                            w,
-                                        );
-                                        k += 4;
-                                    }
-                                    self.gdma.set_out_eof_des_addr(ch, desc);
-                                } else if peri == crate::gdma::GDMA_SPI2_PERIPH
-                                    || peri == crate::gdma::GDMA_SPI3_PERIPH
-                                {
-                                    // SPI master DMA: stage the descriptor's
-                                    // bytes (address order) for one DMA-backed
-                                    // transfer, triggered after the walk (see
-                                    // below) so multi-descriptor chains send
-                                    // once. The transfer runs like a USR op
-                                    // (waveform + trans_done); start the IN
-                                    // link after trans_done latches.
-                                    let idx = if peri == crate::gdma::GDMA_SPI2_PERIPH {
-                                        0
-                                    } else {
-                                        1
-                                    };
-                                    let mut k = 0u32;
-                                    while k + 4 <= len {
-                                        let w = self.read32(buf + k);
-                                        self.spi[idx].spi_dma_feed(&w.to_le_bytes());
-                                        k += 4;
-                                    }
-                                    if k < len {
-                                        let w = self.read32(buf + k);
-                                        let tail = &w.to_le_bytes()[..(len - k) as usize];
-                                        self.spi[idx].spi_dma_feed(tail);
-                                    }
-                                    self.gdma.set_out_eof_des_addr(ch, desc);
-                                    spi_dma_pending = Some(idx);
-                                } else if peri == crate::gdma::GDMA_LCD_PERIPH {
-                                    // LCD_CAM DMA: stream the descriptor's
-                                    // words through the TX FIFO as one
-                                    // synchronous 8080 transfer (word-aligned
-                                    // lengths; a partial tail word is dropped).
-                                    let mut words =
-                                        alloc::vec::Vec::with_capacity((len / 4) as usize);
-                                    let mut k = 0u32;
-                                    while k + 4 <= len {
-                                        words.push(self.read32(buf + k));
-                                        k += 4;
-                                    }
-                                    self.lcd_cam.dma_transfer(&words);
-                                    self.gdma.set_out_eof_des_addr(ch, desc);
-                                }
+                                self.gdma.raise_out_done(ch);
                             } else {
-                                // IN (RX) channel: copy from the peripheral's data
-                                // registers into the descriptor's DRAM buffer.
-                                if peri == crate::gdma::GDMA_AES_PERIPH {
-                                    // AES ciphertext out -> DRAM.
-                                    let mut k = 0u32;
-                                    while k + 4 <= len {
-                                        let w = self.aes.out_word_at(k);
-                                        self.write32(buf + k, w);
-                                        k += 4;
-                                    }
-                                    // The AES engine has already transformed the
-                                    // block (the TX `out` write fed plaintext and
-                                    // ran the cipher); raise the RX done so the
-                                    // driver's completion ISR fires regardless of
-                                    // whether the RX link was started before or
-                                    // after the TX link.
-                                    self.gdma.raise_in_done(ch);
-                                } else if peri == crate::gdma::GDMA_I2S0_PERIPH
-                                    || peri == crate::gdma::GDMA_I2S1_PERIPH
-                                {
-                                    // I2S RX: copy words out of the I2S RX FIFO
-                                    // register into the descriptor's DRAM buffer
-                                    // (each read pops one FIFO word).
-                                    let fifo = if peri == crate::gdma::GDMA_I2S0_PERIPH {
-                                        crate::memmap::I2S0_BASE + crate::i2s::FIFO
-                                    } else {
-                                        crate::memmap::I2S1_BASE + crate::i2s::FIFO
-                                    };
-                                    let mut k = 0u32;
-                                    while k + 4 <= len {
-                                        let w = self.read32(fifo);
-                                        self.write32(buf + k, w);
-                                        k += 4;
-                                    }
-                                    self.gdma.raise_in_done(ch);
-                                } else if peri == crate::gdma::GDMA_SPI2_PERIPH
-                                    || peri == crate::gdma::GDMA_SPI3_PERIPH
-                                {
-                                    // SPI RX: copy the last DMA transfer's
-                                    // captured bytes into the descriptor's DRAM
-                                    // buffer (zeros beyond the capture; start
-                                    // this link after trans_done latches).
-                                    let idx = if peri == crate::gdma::GDMA_SPI2_PERIPH {
-                                        0
-                                    } else {
-                                        1
-                                    };
-                                    let mut k = 0u32;
-                                    while k + 4 <= len {
-                                        let w = self.spi[idx].dma_rx_word(k);
-                                        self.write32(buf + k, w);
-                                        k += 4;
-                                    }
-                                    self.gdma.raise_in_done(ch);
-                                } else if peri == crate::gdma::GDMA_ADC_PERIPH {
-                                    // ADC digital DMA: drain staged conversion
-                                    // results to DRAM (zeros once the queue
-                                    // runs dry).
-                                    let mut k = 0u32;
-                                    while k + 4 <= len {
-                                        let w = self.adc.dma_pop().unwrap_or(0);
-                                        self.write32(buf + k, w);
-                                        k += 4;
-                                    }
-                                    self.gdma.raise_in_done(ch);
-                                }
+                                self.gdma.raise_in_done(ch);
                             }
-                            // DMA hands the descriptor back: clear owner.
-                            self.write32(desc, dw0 & !(1u32 << 31));
-                            if next == 0 || eof == 1 {
-                                break;
+                        } // end non-I2S synchronous walk
+                    } else if off < 5 * 0xC0 {
+                        // Retroactive I2S pump arm: the esp-idf I2S driver
+                        // programs the link (with START) BEFORE peri_sel, so
+                        // the start write above falls into the synchronous
+                        // walk with a non-I2S peri and arms nothing; the
+                        // transfer would then never stream (observed: the IN
+                        // link holds START pre-burst yet the pump stays idle
+                        // until a later rewrite). On silicon order is
+                        // irrelevant, so arm here when peri_sel lands on an
+                        // I2S peri while its link is already started (and no
+                        // cursor is active). Spurious re-arms are harmless:
+                        // completed descriptors read owner=0 and the cursor
+                        // deactivates on the next pump pass.
+                        let ch = (off / 0xC0) as usize;
+                        let rem = off % 0xC0;
+                        let i2s_peri = |v: u32| {
+                            v == crate::gdma::GDMA_I2S0_PERIPH || v == crate::gdma::GDMA_I2S1_PERIPH
+                        };
+                        if rem == 0xA8 && i2s_peri(value) && self.gdma.out_link_started(ch) {
+                            let p = (value - crate::gdma::GDMA_I2S0_PERIPH) as usize;
+                            if !self.i2s_dma_out[p].active {
+                                self.i2s_dma_out[p] = I2sDma {
+                                    active: true,
+                                    ch,
+                                    desc: self.gdma.out_link_addr(ch),
+                                    off: 0,
+                                };
+                                self.i2s[p].set_tx_dma_pending(true);
                             }
-                            desc = next;
-                        }
-                        if let Some(idx) = spi_dma_pending {
-                            // One DMA-backed SPI transfer per OUT-link start.
-                            self.spi[idx].dma_trigger();
-                        }
-                        if is_out {
-                            self.gdma.raise_out_done(ch);
-                        } else {
-                            self.gdma.raise_in_done(ch);
+                        } else if rem == 0x48 && i2s_peri(value) && self.gdma.in_link_started(ch) {
+                            let p = (value - crate::gdma::GDMA_I2S0_PERIPH) as usize;
+                            if !self.i2s_dma_in[p].active {
+                                self.i2s_dma_in[p] = I2sDma {
+                                    active: true,
+                                    ch,
+                                    desc: self.gdma.in_link_addr(ch),
+                                    off: 0,
+                                };
+                            }
                         }
                     }
                     0
@@ -1837,123 +1880,6 @@ impl Soc {
                     self.rng.read32(off)
                 }
             }
-            // Crypto/shared GDMA (`DR_REG_GDMA_BASE = 0x6003F000`): dedicated DMA
-            // for the crypto engines (AES, SHA). Mirrors the general GDMA arm but
-            // routes to AES/SHA. AES is the default (the crypto DMA is
-            // crypto-dedicated, so the exact peri_sel value is irrelevant).
-            0x6003_F000 => {
-                if is_write {
-                    if let Some((ch, is_out)) = self.crypto_dma.write32(off, value) {
-                        let link_addr = if is_out {
-                            self.crypto_dma.out_link_addr(ch)
-                        } else {
-                            self.crypto_dma.in_link_addr(ch)
-                        };
-                        let peri = if is_out {
-                            self.crypto_dma.out_peri_sel(ch)
-                        } else {
-                            self.crypto_dma.in_peri_sel(ch)
-                        };
-                        let mut desc = link_addr;
-                        loop {
-                            let dw0 = self.read32(desc);
-                            let buf = self.read32(desc + 4);
-                            let next = self.read32(desc + 8);
-                            let len = (dw0 >> 12) & 0xFFF;
-                            let eof = (dw0 >> 30) & 1;
-                            let owner = (dw0 >> 31) & 1;
-                            if owner == 0 {
-                                break;
-                            }
-                            if is_out {
-                                if peri == crate::gdma::GDMA_SHA_PERIPH {
-                                    let mut k = 0u32;
-                                    while k + 4 <= len {
-                                        let w = self.read32(buf + k);
-                                        self.sha.feed_byte((w & 0xFF) as u8);
-                                        self.sha.feed_byte(((w >> 8) & 0xFF) as u8);
-                                        self.sha.feed_byte(((w >> 16) & 0xFF) as u8);
-                                        self.sha.feed_byte(((w >> 24) & 0xFF) as u8);
-                                        k += 4;
-                                    }
-                                    self.crypto_dma.set_out_eof_des_addr(ch, desc);
-                                } else {
-                                    // AES (default): feed plaintext, transform,
-                                    // then auto-push ciphertext through the RX link.
-                                    let mut k = 0u32;
-                                    while k + 4 <= len {
-                                        let w = self.read32(buf + k);
-                                        self.aes.feed_text_in_byte((w & 0xFF) as u8);
-                                        self.aes.feed_text_in_byte(((w >> 8) & 0xFF) as u8);
-                                        self.aes.feed_text_in_byte(((w >> 16) & 0xFF) as u8);
-                                        self.aes.feed_text_in_byte(((w >> 24) & 0xFF) as u8);
-                                        k += 4;
-                                    }
-                                    self.aes.transform();
-                                    self.crypto_dma.set_out_eof_des_addr(ch, desc);
-                                    for rx in 0..crate::gdma::NCH {
-                                        if self.crypto_dma.in_peri_sel(rx) == peri {
-                                            let mut idesc = self.crypto_dma.in_link_addr(rx);
-                                            loop {
-                                                let idw0 = self.read32(idesc);
-                                                let ibuf = self.read32(idesc + 4);
-                                                let inext = self.read32(idesc + 8);
-                                                let ilen = (idw0 >> 12) & 0xFFF;
-                                                let ieof = (idw0 >> 30) & 1;
-                                                let iowner = (idw0 >> 31) & 1;
-                                                if iowner == 0 {
-                                                    break;
-                                                }
-                                                let mut k = 0u32;
-                                                while k + 4 <= ilen {
-                                                    let w = self.aes.out_word_at(k);
-                                                    self.write32(ibuf + k, w);
-                                                    k += 4;
-                                                }
-                                                // DMA hands the descriptor back: clear owner
-                                                // (the driver polls owner / reads length/suc_eof).
-                                                self.write32(idesc, idw0 & !(1u32 << 31));
-                                                if inext == 0 || ieof == 1 {
-                                                    break;
-                                                }
-                                                idesc = inext;
-                                            }
-                                            self.crypto_dma.raise_in_done(rx);
-                                            break;
-                                        }
-                                    }
-                                }
-                            } else {
-                                // IN (RX) channel: copy ciphertext to DRAM.
-                                if peri != crate::gdma::GDMA_SHA_PERIPH {
-                                    let mut k = 0u32;
-                                    while k + 4 <= len {
-                                        let w = self.aes.out_word_at(k);
-                                        self.write32(buf + k, w);
-                                        k += 4;
-                                    }
-                                    self.crypto_dma.enable_in_int_all(ch);
-                                    self.crypto_dma.raise_in_done(ch);
-                                }
-                            }
-                            // DMA hands the descriptor back: clear owner.
-                            self.write32(desc, dw0 & !(1u32 << 31));
-                            if next == 0 || eof == 1 {
-                                break;
-                            }
-                            desc = next;
-                        }
-                        if is_out {
-                            self.crypto_dma.raise_out_done(ch);
-                        } else {
-                            self.crypto_dma.raise_in_done(ch);
-                        }
-                    }
-                    0
-                } else {
-                    self.crypto_dma.read32(off)
-                }
-            }
             // SYSTEM peripheral (0x600C0000): only APPCPU_CTRL_A @ +0x04 is
             // modeled — the APP-CPU release register (the ROM's
             // ets_set_appcpu_boot_addr stores the core-1 entry here and the
@@ -2158,6 +2084,114 @@ impl Soc {
         self.rtc.sleep_req()
     }
 
+    /// I2S GDMA streaming pump: move words between owned descriptors and
+    /// the TX/RX FIFOs as space/data allow, raising the per-descriptor EOF
+    /// event (address + done interrupt) as their lengths fill. Called once
+    /// per `tick_timers` while any I2S link is armed.
+    fn poll_i2s_dma(&mut self) {
+        for port in 0..2 {
+            // OUT (TX): DRAM -> TX FIFO.
+            if self.i2s_dma_out[port].active {
+                for _ in 0..8 {
+                    let (desc, off) = {
+                        let s = &self.i2s_dma_out[port];
+                        (s.desc, s.off)
+                    };
+                    if desc == 0 {
+                        self.i2s_dma_out[port].active = false;
+                        break;
+                    }
+                    let dw0 = self.read32(desc);
+                    let len = (dw0 >> 12) & 0xFFF;
+                    let owner = (dw0 >> 31) & 1;
+                    if owner == 0 {
+                        self.i2s_dma_out[port].active = false;
+                        break;
+                    }
+                    let buf = self.read32(desc + 4);
+                    let next = self.read32(desc + 8);
+                    let mut off = off;
+                    while self.i2s[port].tx_space() > 0 && off + 4 <= len {
+                        let w = self.read32(buf + off);
+                        self.i2s[port].tx_push(w);
+                        off += 4;
+                    }
+                    self.i2s_dma_out[port].off = off;
+                    if off + 4 > len {
+                        let ch = self.i2s_dma_out[port].ch;
+                        // Per-descriptor EOF event (the IDF TX callback
+                        // recycles the buffer into the free queue on each
+                        // one). EOF does NOT stop the stream: GDMA keeps
+                        // walking while descriptors are owned (the S3 TX
+                        // channel streams continuously once enabled, repeating
+                        // auto-cleared silence when idle); only owner=0 or a
+                        // null next parks the cursor. (An earlier revision
+                        // stopped at eof and cleared owner, which truncated
+                        // every multi-descriptor IDF transfer after its first
+                        // buffer.)
+                        self.gdma.set_out_eof_des_addr(ch, desc);
+                        self.gdma.raise_out_done(ch);
+                        if next == 0 || owner == 0 {
+                            self.i2s_dma_out[port].active = false;
+                            break;
+                        }
+                        self.i2s_dma_out[port].desc = next;
+                        self.i2s_dma_out[port].off = 0;
+                    } else {
+                        break; // FIFO full; resume next tick
+                    }
+                }
+            }
+            // IN (RX): RX FIFO -> DRAM.
+            if self.i2s_dma_in[port].active {
+                for _ in 0..8 {
+                    let (desc, off) = {
+                        let s = &self.i2s_dma_in[port];
+                        (s.desc, s.off)
+                    };
+                    if desc == 0 {
+                        self.i2s_dma_in[port].active = false;
+                        break;
+                    }
+                    let dw0 = self.read32(desc);
+                    let len = (dw0 >> 12) & 0xFFF;
+                    let owner = (dw0 >> 31) & 1;
+                    if owner == 0 {
+                        self.i2s_dma_in[port].active = false;
+                        break;
+                    }
+                    let buf = self.read32(desc + 4);
+                    let next = self.read32(desc + 8);
+                    let mut off = off;
+                    while self.i2s[port].rx_ready() > 0 && off + 4 <= len {
+                        let w = self.i2s[port].rx_pop();
+                        self.write32(buf + off, w);
+                        off += 4;
+                    }
+                    self.i2s_dma_in[port].off = off;
+                    if off + 4 > len {
+                        let ch = self.i2s_dma_in[port].ch;
+                        // Per-descriptor EOF event (see OUT above): EOF does
+                        // not stop the stream; only owner=0 or null next
+                        // parks the cursor (an overrun then just keeps
+                        // overwriting, like silicon).
+                        self.gdma.set_in_eof_des_addr(ch, desc);
+                        self.gdma.raise_in_done(ch);
+                        if next == 0 || owner == 0 {
+                            self.i2s_dma_in[port].active = false;
+                            break;
+                        }
+                        self.i2s_dma_in[port].desc = next;
+                        self.i2s_dma_in[port].off = 0;
+                    } else {
+                        break; // FIFO drained; resume next tick
+                    }
+                }
+            }
+            self.i2s[port].set_tx_dma_pending(self.i2s_dma_out[port].active);
+        }
+    }
+
     /// Record the wakeup-cause bits read by `esp_sleep_get_wakeup_cause`
     /// after a deep-sleep reboot (machine writes this on wake).
     pub fn set_sleep_wakeup_cause(&mut self, bits: u32) {
@@ -2203,6 +2237,21 @@ impl Soc {
         self.gdma.int_pending()
     }
 
+    /// TEMP I2S-driver probe (remove): completed-walk counters.
+    pub fn gdma_dbg_walks(&self) -> (u64, u64) {
+        (self.gdma.dbg_walks_out, self.gdma.dbg_walks_in)
+    }
+
+    /// TEMP I2S-driver probe (remove): recent I2S CONF writes.
+    pub fn i2s_conf_writes(&self, idx: usize) -> alloc::vec::Vec<(u32, u32)> {
+        self.i2s[idx].dbg_writes.clone()
+    }
+
+    /// TEMP I2S-driver probe (remove): recent raw GDMA writes.
+    pub fn gdma_debug_log(&self) -> alloc::vec::Vec<(u32, u32)> {
+        self.gdma.debug_log()
+    }
+
     /// Debug accessor for the I2C interrupt status (INT_RAW & INT_ENA).
     pub fn i2c_int_st(&self, n: usize) -> u32 {
         self.i2c[n].int_st()
@@ -2236,11 +2285,6 @@ impl Soc {
     /// Debug: recent raw GDMA writes (validation harness).
     pub fn gdma_log(&self) -> Vec<(u32, u32)> {
         self.gdma.debug_log()
-    }
-
-    /// Debug: raw crypto-DMA register writes (validation harness).
-    pub fn crypto_dma_debug_log(&self) -> Vec<(u32, u32)> {
-        self.crypto_dma.debug_log()
     }
 
     /// Scan all peripheral interrupt status registers and build the source
@@ -2303,9 +2347,8 @@ impl Soc {
             src |= 1 << crate::pcnt::PCNT_INTR_SOURCE;
         }
         // GDMA channels have per-channel sources (ETS_DMA_IN_CH0..4 =
-        // 66..70, ETS_DMA_OUT_CH0..4 = 71..75). The crypto/shared DMA
-        // instance is unwired: its consumers (AES/SHA drivers) poll, and no
-        // distinct source exists for it.
+        // 66..70, ETS_DMA_OUT_CH0..4 = 71..75) on the single shared
+        // controller (all peripherals incl. AES/SHA allocate channels here).
         for ch in 0..crate::gdma::NCH {
             if self.gdma.in_int_st(ch) != 0 {
                 src |= 1 << (crate::gdma::GDMA_IN_INTR_BASE + ch as u32);

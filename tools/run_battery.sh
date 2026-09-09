@@ -11,6 +11,7 @@
 #   tools/run_battery.sh                 # run all (existing .merged.bin)
 #   tools/run_battery.sh --build         # rebuild every sketch first
 #   tools/run_battery.sh --build hello   # rebuild+run only matching sketches
+#   tools/run_battery.sh --shard 0/4     # run only shard 0 of 4 (for CI fan-out)
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -18,12 +19,27 @@ EMU="$ROOT/target/release/examples/run_flash"
 SK="$ROOT/tools/sketches"
 BUILD=0
 FILTER=()
-for a in "$@"; do
-  case "$a" in
-    --build) BUILD=1 ;;
-    *) FILTER+=("$a") ;;
+SHARD_IDX=-1
+SHARD_N=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --build) BUILD=1; shift ;;
+    --shard=*) spec="${1#--shard=}"; shift ;;
+    --shard)
+      [[ $# -ge 2 ]] || { echo "usage: --shard K/N (e.g. --shard 0/4)" >&2; exit 2; }
+      spec="$2"; shift 2 ;;
+    *) FILTER+=("$1"); shift ;;
   esac
 done
+if [[ -n "${spec:-}" ]]; then
+  if [[ ! "$spec" =~ ^[0-9]+/[0-9]+$ ]]; then
+    echo "bad --shard spec '$spec' (want K/N)" >&2; exit 2
+  fi
+  SHARD_IDX="${spec%%/*}"; SHARD_N="${spec##*/}"
+  if [[ $SHARD_N -lt 1 || $SHARD_IDX -ge $SHARD_N ]]; then
+    echo "bad --shard spec '$spec' (want 0 <= K < N)" >&2; exit 2
+  fi
+fi
 
 echo "== building run_flash =="
 cargo build --release -p esp32s3-emu --example run_flash 2>&1 | grep -E "^error" -A4 | head -8
@@ -87,6 +103,7 @@ CASES=(
 "rsa||RSA POKE PASS||esp32s3_rsa/esp32s3_rsa_poke/esp32s3_rsa_poke.merged.bin"
 "ecdsa||ECDSA DONE|"
 "i2s||I2S POKE PASS|"
+"i2s_driver||I2S DRIVER LOOPBACK PASS|300000000"
 "lcd_cam||LCD CAM POKE PASS;LCD GDMA PASS|"
 "p5_stubs||P5 STUBS POKE PASS|"
 "gdma||GDMA RMT TX done|"
@@ -97,8 +114,13 @@ CASES=(
 )
 
 pass=0; fail=0; skipped=0
+idx=0
 for c in "${CASES[@]}"; do
   name="${c%%|*}"; rest="${c#*|}"
+  if [[ $SHARD_N -gt 0 ]]; then
+    if [[ $((idx % SHARD_N)) != "$SHARD_IDX" ]]; then idx=$((idx+1)); continue; fi
+  fi
+  idx=$((idx+1))
   if [[ ${#FILTER[@]} -gt 0 ]]; then
     keep=0
     for f in "${FILTER[@]}"; do [[ "$name" == *"$f"* ]] && keep=1; done

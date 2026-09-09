@@ -14,7 +14,7 @@
 #define LCD_START_BIT  (1u << 27)
 #define TRANS_DONE     (1u << 1)
 
-#define GDMA_BASE 0x60042000
+#define GDMA_BASE 0x6003F000UL // single GDMA controller (DR_REG_GDMA_BASE)
 #define G_OUT_PERI(ch) (GDMA_BASE + (ch) * 0xC0 + 0x60 + 0x48)
 #define G_OUT_LINK(ch) (GDMA_BASE + (ch) * 0xC0 + 0x60 + 0x20)
 

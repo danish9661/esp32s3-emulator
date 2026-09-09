@@ -9,12 +9,12 @@
 
 #define RMT_BASE    0x60016000UL
 #define RMTMEM_BASE 0x60016800UL
-#define GDMA_BASE   0x60042000UL
+#define GDMA_BASE   0x6003F000UL
 
 // GDMA channel 0 OUT block = ch0 stride(0xC0) + out offset(0x60) = 0x60.
 #define G_DMA_OUT0  0x60
 // OUT-block register offsets (soc/gdma_struct.h): conf0 0x00, int_ena 0x10,
-// int_clr 0x14, link 0x20, peri_sel 0x48.
+// int_clr 0x14, link 0x20, peri_sel 0x48 (both blocks).
 #define G_OUT_CONF0   ((GDMA_BASE + G_DMA_OUT0 + 0x00))
 #define G_OUT_INT_ENA ((GDMA_BASE + G_DMA_OUT0 + 0x10))
 #define G_OUT_INT_CLR ((GDMA_BASE + G_DMA_OUT0 + 0x14))

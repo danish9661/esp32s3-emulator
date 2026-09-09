@@ -2191,16 +2191,19 @@ fn p5_stub_peripherals_round_trip() {
     ];
     let mut m = Esp32S3::new();
     for (base, name) in addrs.iter() {
-        // Use 0x20 (a plain config register on every modeled block) so the
-        // round-trip holds even for peripherals whose 0x10 is a computed
-        // read-only register (e.g. I2S INT_ST).
+        // Use plain config registers so the round-trip holds even for
+        // peripherals whose control words have side effects on write: I2S
+        // RX_CONF/TX_CONF (0x20/0x24) self-clear reset/start/update bits, so
+        // use CONF1 (0x28/0x2C, plain field stores) instead. 0x10 stays
+        // avoided: it is a computed read-only register on some blocks
+        // (e.g. I2S INT_ST).
         let w = 0x1234_5678u32;
-        m.soc.write32(*base + 0x20, w);
-        let r = m.soc.read32(*base + 0x20);
+        m.soc.write32(*base + 0x28, w);
+        let r = m.soc.read32(*base + 0x28);
         assert_eq!(r, w, "{} register round-trip failed", name);
         // A second, distinct offset also round-trips.
-        m.soc.write32(*base + 0x24, 0xDEAD_BEEF);
-        assert_eq!(m.soc.read32(*base + 0x24), 0xDEAD_BEEF, "{} off 0x24", name);
+        m.soc.write32(*base + 0x2C, 0xDEAD_BEEF);
+        assert_eq!(m.soc.read32(*base + 0x2C), 0xDEAD_BEEF, "{} off 0x2C", name);
     }
 }
 
@@ -2304,6 +2307,7 @@ fn i2s_tx_drives_gpio_matrix_signals() {
     m.soc
         .write32(GPIO_BASE + 0x24, (1u32 << sd_pin) | (1u32 << bck_pin));
     m.soc.write32(i2s_fifo, 0x8000);
+    m.soc.write32(I2S0_BASE + 0x34, 1); // TX_CLKM_CONF M = 1 (reset M = 2 halves the pace)
     m.soc.write32(i2s_tx_conf, 1 << 2); // TX_START
     m.soc.tick_timers(1);
     let out = m.soc.gpio_output();
@@ -2372,7 +2376,13 @@ fn i2s_gdma_out_feeds_tx_fifo() {
     m.soc.write32(GDMA_BASE + 0xA8, GDMA_I2S0_PERIPH); // out_peri_sel[0]
     m.soc
         .write32(GDMA_BASE + 0x80, (desc & 0x000F_FFFF) | (1 << 21)); // out_link start
+    // Let the streaming pump pre-fill the TX FIFO before TX_START: starting
+    // with an empty FIFO would shift out a zero underflow word first (as on
+    // silicon) and the loopback would return it instead of the pattern.
+    m.soc.tick_timers(4);
     // Start I2S0 TX with loopback so the FIFO words arrive at RX.
+    // M = 1: the reset pre-div M = 2 would halve the shift pace.
+    m.soc.write32(I2S0_BASE + 0x34, 1); // TX_CLKM_CONF
     m.soc.write32(i2s_tx_conf, (1 << 27) | (1 << 2)); // SIG_LOOPBACK | TX_START
     m.soc.tick_timers(200);
     assert_eq!(
@@ -3332,4 +3342,81 @@ fn psram_write16_preserves_adjacent_halfword() {
     for (i, &w) in want.iter().enumerate() {
         assert_eq!(m.soc.read32(STASH + i as u32 * 4), w, "halfword {i}");
     }
+}
+/// I2S GDMA streaming pump advances across an IN descriptor chain (EOF is
+/// an event, not a stop): two 8-byte descs fill from the loopback-fed RX
+/// FIFO in order.
+#[test]
+fn i2s_in_pump_advances_desc_chain() {
+    use esp32s3_soc::gdma::{GDMA_BASE, GDMA_I2S0_PERIPH};
+    use esp32s3_soc::memmap::I2S0_BASE;
+    let mut m = Esp32S3::new();
+    // Two IN descs: 8 bytes then 8 bytes (4 words total), eof on second.
+    let d0 = 0x3FC8_3000u32;
+    let d1 = 0x3FC8_3100u32;
+    let b0 = 0x3FC8_4000u32;
+    let b1 = 0x3FC8_4100u32;
+    m.soc.write32(d0, (1u32 << 31) | (8u32 << 12));
+    m.soc.write32(d0 + 4, b0);
+    m.soc.write32(d0 + 8, d1);
+    m.soc
+        .write32(d1, (1u32 << 31) | (1u32 << 30) | (8u32 << 12));
+    m.soc.write32(d1 + 4, b1);
+    m.soc.write32(d1 + 8, 0);
+    m.soc.write32(GDMA_BASE + 0x48, GDMA_I2S0_PERIPH); // in_peri_sel[0]
+    m.soc
+        .write32(GDMA_BASE + 0x20, (d0 & 0x000F_FFFF) | (1 << 22)); // in_link start
+    // Inject 4 words via loopback-style: push TX words with loopback on.
+    m.soc.write32(I2S0_BASE + 0x34, 1); // M = 1
+    m.soc.write32(I2S0_BASE + 0x3C, 1); // N = 1
+    for w in [0x11111111u32, 0x22222222, 0x33333333, 0x44444444] {
+        m.soc.write32(I2S0_BASE + 0x80, w);
+    }
+    m.soc.write32(I2S0_BASE + 0x24, (1 << 27) | (1 << 2)); // loopback + start
+    m.soc.tick_timers(600);
+    assert_eq!(m.soc.read32(b0), 0x11111111, "chain word0");
+    assert_eq!(m.soc.read32(b0 + 4), 0x22222222, "chain word1");
+    assert_eq!(m.soc.read32(b1), 0x33333333, "chain word2");
+    assert_eq!(m.soc.read32(b1 + 4), 0x44444444, "chain word3");
+}
+
+#[test]
+fn gdma_inlink_reset_reads_zero() {
+    use esp32s3_soc::gdma::GDMA_BASE;
+    let mut m = Esp32S3::new();
+    assert_eq!(m.soc.read32(GDMA_BASE + 0x20), 0, "IN0 link reset");
+    assert_eq!(m.soc.read32(0x6000_F020), 0, "I2S0 RX_CONF reset");
+}
+
+#[test]
+fn i2s_out_pump_large_chain() {
+    use esp32s3_soc::gdma::{GDMA_BASE, GDMA_I2S0_PERIPH};
+    use esp32s3_soc::memmap::I2S0_BASE;
+    let mut m = Esp32S3::new();
+    // OUT chain across uneven descriptors: 960 + 8 bytes, eof on second.
+    // EOF raises the per-descriptor event but does not stop the walk.
+    let d0 = 0x3FC8_5000u32;
+    let d1 = 0x3FC8_5100u32;
+    let b0 = 0x3FC8_6000u32;
+    let b1 = 0x3FC8_7000u32;
+    for i in 0..240u32 {
+        m.soc.write32(b0 + 4 * i, 0x1000_0000 + i);
+    }
+    m.soc.write32(b1, 0x5555AAAA);
+    m.soc.write32(b1 + 4, 0x5555BBBB);
+    m.soc.write32(d0, (1u32 << 31) | (960u32 << 12));
+    m.soc.write32(d0 + 4, b0);
+    m.soc.write32(d0 + 8, d1);
+    m.soc
+        .write32(d1, (1u32 << 31) | (1u32 << 30) | (8u32 << 12));
+    m.soc.write32(d1 + 4, b1);
+    m.soc.write32(d1 + 8, 0);
+    m.soc.write32(GDMA_BASE + 0xA8, GDMA_I2S0_PERIPH);
+    m.soc
+        .write32(GDMA_BASE + 0x80, (d0 & 0x000F_FFFF) | (1 << 21));
+    m.soc.write32(I2S0_BASE + 0x34, 1);
+    m.soc.write32(I2S0_BASE + 0x3C, 1);
+    m.soc.write32(I2S0_BASE + 0x24, (1 << 27) | (1 << 2));
+    m.soc.tick_timers(9000);
+    assert_eq!(m.soc.read32(0x6000_F00C) & 2, 2, "tx_done after chain");
 }

@@ -1,6 +1,7 @@
 //! ESP32-S3 GDMA (General DMA controller) model.
 //!
-//! Register block at `0x6004_2000` (TRM GDMA chapter). The block is an array
+//! Register block at `0x6003_F000` (`DR_REG_GDMA_BASE` per
+//! `esp32s3.peripherals.ld`). The block is an array
 //! of 5 channel pairs (`gdma_dev_t.channel[5]`); each pair is an `in` (RX)
 //! block followed by an `out` (TX) block, each 0x60 bytes, so a channel
 //! stride is 0xC0 and the `out` block sits at `ch*0xC0 + 0x60`
@@ -30,8 +31,13 @@
 
 use alloc::vec::Vec;
 
-/// GDMA register-block base (APB).
-pub const GDMA_BASE: u32 = 0x6004_2000;
+/// GDMA register-block base (APB): `DR_REG_GDMA_BASE = 0x6003_F000` per
+/// `esp32s3.peripherals.ld` (`PROVIDE ( GDMA = 0x6003F000 )`). One
+/// controller with 5 channel pairs shared by ALL peripherals — RMT, SPI,
+/// LCD_CAM, ADC, SHA, AES and I2S alike (the esp-idf crypto drivers allocate
+/// channels on this same controller via `esp_crypto_shared_gdma`; there is
+/// no separate crypto DMA block, and 0x60042000 is unmapped on S3).
+pub const GDMA_BASE: u32 = 0x6003_F000;
 
 /// GDMA per-channel interrupt sources (esp32s3 interrupts.h):
 /// RX channels are `ETS_DMA_IN_CH0..4` (66..70), TX channels
@@ -102,11 +108,17 @@ pub struct Gdma {
     out_conf0: [u32; NCH],
     out_conf1: [u32; NCH],
     out_int_raw: [u32; NCH],
+    /// TEMP I2S-driver probe (remove): completed-walk counters.
+    pub dbg_walks_out: u64,
+    pub dbg_walks_in: u64,
     out_int_ena: [u32; NCH],
     out_link: [u32; NCH],
     out_state: [u32; NCH],
     out_peri_sel: [u32; NCH],
     out_eof_des_addr: [u32; NCH],
+    /// IN success-EOF descriptor address (IN+0x28, read by the GDMA ISR
+    /// to build the RX event).
+    in_eof_des_addr: [u32; NCH],
     // RX (`in`) channel registers (modeled for register completeness only).
     in_conf0: [u32; NCH],
     in_conf1: [u32; NCH],
@@ -127,11 +139,14 @@ impl Default for Gdma {
             out_conf0: [0; NCH],
             out_conf1: [0; NCH],
             out_int_raw: [0; NCH],
+            dbg_walks_out: 0,
+            dbg_walks_in: 0,
             out_int_ena: [0; NCH],
             out_link: [0; NCH],
             out_state: [0; NCH],
             out_peri_sel: [0; NCH],
             out_eof_des_addr: [0; NCH],
+            in_eof_des_addr: [0; NCH],
             in_conf0: [0; NCH],
             in_conf1: [0; NCH],
             in_int_raw: [0; NCH],
@@ -170,18 +185,34 @@ impl Gdma {
         self.in_peri_sel[ch] & 0x3F
     }
 
+    /// Raw link-start state (the driver may program link before peri_sel;
+    /// the SoC retro-arms the I2S pump when peri_sel lands — see soc.rs).
+    pub fn out_link_started(&self, ch: usize) -> bool {
+        self.out_link[ch] & (1 << 21) != 0
+    }
+    pub fn in_link_started(&self, ch: usize) -> bool {
+        self.in_link[ch] & (1 << 22) != 0
+    }
+
     pub fn set_out_eof_des_addr(&mut self, ch: usize, addr: u32) {
         self.out_eof_des_addr[ch] = addr;
+    }
+
+    /// Record the IN success-EOF descriptor address.
+    pub fn set_in_eof_des_addr(&mut self, ch: usize, addr: u32) {
+        self.in_eof_des_addr[ch] = addr;
     }
 
     /// Assert `out_done` + `out_eof` + `out_total_eof` for an OUT channel.
     pub fn raise_out_done(&mut self, ch: usize) {
         self.out_int_raw[ch] |= (1 << 0) | (1 << 1) | (1 << 3);
+        self.dbg_walks_out += 1; // TEMP I2S-driver probe (remove)
     }
 
     /// Assert `in_done` + `in_eof` + `in_total_eof` for an IN channel.
     pub fn raise_in_done(&mut self, ch: usize) {
         self.in_int_raw[ch] |= (1 << 0) | (1 << 1) | (1 << 3);
+        self.dbg_walks_in += 1; // TEMP I2S-driver probe (remove)
     }
 
     /// Enable all interrupt bits for an IN channel (so the firmware GDMA ISR
@@ -283,6 +314,7 @@ impl Gdma {
                 0x20 => self.out_link[ch],
                 0x24 => self.out_state[ch],
                 0x28 => self.out_eof_des_addr[ch],
+                // peri_sel is +0x48 in both blocks (verified via offsetof).
                 0x48 => self.out_peri_sel[ch],
                 _ => 0,
             }
@@ -295,6 +327,10 @@ impl Gdma {
                 0x10 => self.in_int_ena[ch],
                 0x14 => self.in_int_st(ch),
                 0x20 => self.in_link[ch],
+                // IN success-EOF descriptor address (+0x28, read by the
+                // GDMA ISR to build RX events).
+                0x28 => self.in_eof_des_addr[ch],
+                // peri_sel is +0x48 in both blocks (verified via offsetof).
                 0x48 => self.in_peri_sel[ch],
                 _ => 0,
             }
@@ -324,6 +360,7 @@ impl Gdma {
                         return Some((ch, true));
                     }
                 }
+                // peri_sel is +0x48 in both blocks (verified via offsetof).
                 0x48 => self.out_peri_sel[ch] = value,
                 _ => {}
             }
@@ -346,6 +383,7 @@ impl Gdma {
                         return Some((ch, false));
                     }
                 }
+                // IN peri_sel is +0x48 like OUT (verified via offsetof).
                 0x48 => self.in_peri_sel[ch] = value,
                 _ => {}
             }

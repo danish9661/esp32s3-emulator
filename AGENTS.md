@@ -2565,3 +2565,54 @@ Core design:
     (classic-ESP32 assumption) — LV bit IS the mode. NOT modeled: GPIO
     wakeup (light-sleep-only per soc/rtc.h), ULP TRAP trigger, CAM_STOP_EN
     equivalents. Battery 59/0/0 (3 new entries).
+  - 2026-09-09: **I2S esp-idf driver path VALIDATED (P5)**. New sketch
+    `esp32s3_i2s_driver` (Arduino `ESP_I2S` duplex + GDMA, 960B write, 7x960B
+    reads, loopback via `I2S_SIG_LOOPBACK` poke) → `LOOPBACK PASS` (battery
+    entry, 300M STEPS). Model work (`i2s.rs`/`soc.rs`/`gdma.rs`):
+    (1) **two-stage BCK clock**: divisor = M (CLKM_CONF[7:0], reset 2, now
+    seeded) x fractional N from DIV_CONF (TRM average formula; raw-N pokes
+    keep legacy behavior) — the driver programs fractional N=1/x=15 (eff 17)
+    with M=39 (MCLK 4.1MHz from the IDF clock calc, verified in
+    `i2s_std.c`), which the old N-only model ran 39x too fast;
+    (2) **EOF is an event, not a stop**: the pump used to halt at eof +
+    clear owner, truncating every multi-descriptor IDF transfer after its
+    first buffer — now it cycles owned descriptors (silicon streaming),
+    raising per-buffer EOF events (IDF recycles via queue);
+    (3) **retroactive pump arm**: the driver programs link(+START) before
+    peri_sel, so the start write falls into the sync walk unarmed — arm when
+    peri_sel lands on I2S with link already started (harmless when spurious:
+    unowned descs deactivate immediately). Sketch protocol lessons
+    (silicon-true, verified vs IDF source): TX descs ring 6x960B
+    calloc-zeroed with eof=1 all; the single write lands in desc[1], so the
+    stream is [zeros, pattern, zeros...] (auto_clear zeroes post-pass);
+    reader read-entry resets wipe the in-flight word (~1, stable), so the
+    verdict sync-searches a unique sync word over 7 reads (239 pattern words
+    exact, zeros framing asserted). Cautionary tales: (1) stale release
+    binary after model edits mimics real failure — always rebuild before
+    concluding; (2) objdump linear sweep desyncs on dense Xtensa (real
+    `ee.*` DSP insns in setup!) — decode with our own decoder, and
+    printf-varargs-looking anomalies need FMT-probe controls before blaming
+    the model (here the FMT probe cleared printf; the real defects were
+    clock + EOF + order).
+    Collateral: fixed 3 stale GDMA-base sketches the single-controller WIP
+    missed (`lcd_cam`, `spi_dma`, `adc_dma`: 0x60042000 → 0x6003F000, all
+    PASS); `p5_stub_peripherals_round_trip` now pokes plain CONF1
+    (0x28/0x2C) since TX/RX_CONF have side effects under the functional I2S
+    model. 2 pump machine tests (IN advance, 960+8 chain) + fractional clock
+    KAT. Battery +1 (i2s_driver). Full workspace green, clippy pre-existing
+    warns only, fmt/wasm32 clean.
+  - 2026-09-09: **Battery-as-CI (P5 hardening)**. New `battery` job in
+    `.github/workflows/ci.yml`: 4-shard matrix over
+    `tools/run_battery.sh --build` (full arduino rebuild + validation, no
+    reliance on local bins which are gitignored), with node 22 + wasm-pack
+    for the NODE harnesses (they rebuild their wasm pkg when stale).
+    `run_battery.sh` gains `--shard K/N` (both `--shard 0/4` and
+    `--shard=0/4` forms; index counts every CASES entry incl. SKIPs, so
+    shards stay stable as entries are added). 61 cases split 16/15/15/15;
+    shard 0 verified green locally (16/0/0), cold-path NODE harness verified
+    (deleted pkg rebuilds + passes). Deliberately NOT gated on the `rust`
+    job: `cargo clippy --all-targets -D warnings` is red at HEAD on
+    pre-existing warnings (machine.rs sleep identical-blocks, ecdsa/lcd_cam/
+    gpio nits, example/test casts — none from current work), fixing those is
+    separate tech debt. Full local battery not run (subsets only); shards
+    carry 300-min step timeouts (i2s_driver alone needs ~10 min).

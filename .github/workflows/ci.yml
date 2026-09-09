@@ -49,3 +49,36 @@ jobs:
         run: |
           cargo run -q --release -p esp32s3-emu --example run_flash -- /tmp/hello/esp32s3_hello.ino.merged.bin > /tmp/boot.log 2>&1
           grep -E "boot OK|Hello from ESP32-S3" /tmp/boot.log || (echo "BOOT FAILED"; cat /tmp/boot.log; exit 1)
+
+  battery:
+    name: Firmware battery (shard ${{ matrix.shard }}/4)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install arduino-cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+      - name: Install ESP32 core
+        run: |
+          arduino-cli config init --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json || true
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.10
+      - name: Install wasm-pack
+        run: |
+          curl -sSf https://raw.githubusercontent.com/drager/wasm-pack/master/installer/init.sh | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Run battery shard (rebuild + validate)
+        run: ./tools/run_battery.sh --build --shard ${{ matrix.shard }}/4
+        timeout-minutes: 300

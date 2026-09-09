@@ -10,7 +10,7 @@
 
 #define APB 0x60040000u
 #define A(x) ((volatile uint32_t*)(APB + (x)))
-#define GDMA 0x60042000u
+#define GDMA 0x6003F000u // single GDMA controller (DR_REG_GDMA_BASE)
 #define D(x) ((volatile uint32_t*)(GDMA + (x)))
 
 typedef struct {

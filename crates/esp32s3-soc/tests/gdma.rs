@@ -3,9 +3,9 @@
 
 use esp32s3_soc::gdma::*;
 
-// Absolute GDMA-page offsets (base 0x6004_2000), relative to the SoC mmio arm.
+// Absolute GDMA-page offsets (base 0x6003_F000), relative to the SoC mmio arm.
 // Channel pair stride 0xC0; out (TX) block sits at +0x60 within a pair.
-// out.link = 0x20, out.peri_sel = 0x48, out.int_raw = 0x08, out.int_ena = 0x10,
+// out.link = 0x20, out.peri_sel = 0x48 (both blocks, verified via offsetof), out.int_raw = 0x08, out.int_ena = 0x10,
 // out.int_clr = 0x14. Channel 0 out block = 0x60; channel 2 out block = 0x180.
 const C0_LINK: u32 = 0x60 + 0x20;
 const C0_PERI: u32 = 0x60 + 0x48;

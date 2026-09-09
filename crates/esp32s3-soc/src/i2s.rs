@@ -60,12 +60,25 @@ const RX_CONF1: u32 = 0x28;
 const TX_CONF1: u32 = 0x2C;
 const RX_CLKM_DIV_CONF: u32 = 0x38;
 const TX_CLKM_DIV_CONF: u32 = 0x3C;
+// Clock pre-divider stage (TRM I2S_TX/RX_CLKM_CONF): the BCK rate is
+// f_src / (M * N_frac) with M = CLKM_DIV_NUM[7:0] (reset 2) and N_frac
+// from the DIV_CONF fractional fields below. The driver often leaves M
+// at reset and programs only DIV_CONF, so M must be honored (default 2)
+// or the bit clock runs M x too fast.
+const RX_CLKM_CONF: u32 = 0x30;
+const TX_CLKM_CONF: u32 = 0x34;
 const TX_TDM_CTRL: u32 = 0x54;
 pub const FIFO: u32 = 0x80;
 const DATE: u32 = 0xFC;
 
 const TX_START_BIT: u32 = 1 << 2;
 const RX_START_BIT: u32 = 1 << 2;
+// `*_update` (bit 8) latches config into the serial clock domain and is
+// cleared by hardware — the esp-idf driver polls it (i2s_tx/rx_channel_start
+// spins until clear). `*_reset`/`*_fifo_reset` (bits 0/1) reset the
+// engine/FIFO; the driver sets then clears them explicitly, and our reset
+// takes effect on set (also self-clearing, so a poll sees completion).
+const TXRX_UPDATE_BIT: u32 = 1 << 8;
 const TX_BIT_ORDER: u32 = 1 << 18;
 const RX_BIT_ORDER: u32 = 1 << 18;
 const TX_SLAVE_MOD: u32 = 1 << 3;
@@ -86,7 +99,7 @@ const FIFO_DEPTH: usize = 16;
 pub const I2S0_INTR_SOURCE: u32 = 25;
 pub const I2S1_INTR_SOURCE: u32 = 26;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct I2s {
     idx: u32,
     regs: [u32; REG_COUNT],
@@ -96,6 +109,8 @@ pub struct I2s {
     rx_count: usize,
     rx_in: [u32; FIFO_DEPTH],
     rx_in_count: usize,
+    /// TEMP I2S-driver probe (remove): recent (offset, value) writes.
+    pub dbg_writes: alloc::vec::Vec<(u32, u32)>,
     int_raw: u32,
     int_ena: u32,
     // TX serial-shift state.
@@ -119,13 +134,22 @@ pub struct I2s {
     rx_ws: u32,
     // RX clock divider.
     rx_bck_div: u32,
+    // GDMA streaming has unfinished OUT descriptors for this port: TX_DONE
+    // must wait for them (not just an empty FIFO), or a mid-transfer FIFO
+    // drain would complete the transfer early. Set by the SoC pump.
+    tx_dma_pending: bool,
 }
 
 impl I2s {
     pub fn new(idx: u32) -> Self {
+        let mut regs = [0; REG_COUNT];
+        // Reset defaults the esp-idf driver relies on without writing:
+        // CLKM_DIV_NUM = 2 (TRM I2S_TX/RX_CLKM_CONF default 8'd2).
+        regs[Self::idx_of(TX_CLKM_CONF)] = 0x02;
+        regs[Self::idx_of(RX_CLKM_CONF)] = 0x02;
         Self {
             idx,
-            regs: [0; REG_COUNT],
+            regs,
             tx_fifo: [0; FIFO_DEPTH],
             tx_count: 0,
             rx_fifo: [0; FIFO_DEPTH],
@@ -150,6 +174,8 @@ impl I2s {
             rx_bck: 0,
             rx_ws: 0,
             rx_bck_div: 1,
+            dbg_writes: alloc::vec::Vec::new(), // TEMP (remove)
+            tx_dma_pending: false,
         }
     }
 
@@ -201,15 +227,52 @@ impl I2s {
         }
     }
 
-    /// BCK half-cycle period in emulator steps (1 = one bit per step).
+    /// BCK half-cycle period in emulator steps: the two-stage divider
+    /// M (CLKM_CONF[7:0], reset 2) times the fractional N from DIV_CONF.
+    /// Fractional average per the TRM (TX_CLKM_DIV_CONF field doc): with
+    /// n = DIV_NUM, yn1 = 0 gives z*[x*n + (n+1)] + y*n, yn1 = 1 gives
+    /// z*[n + x*(n+1)] + y*(n+1). The fractional term applies only when
+    /// programmed (x/yn1 set, or y outside its reset value 1 — a raw-N
+    /// poke leaves reset-like (x=0,y=1,z=0) or all-zero fields and keeps
+    /// legacy plain-N behavior); all-zero results fall back to N.
     fn tx_bck_divisor(&self) -> u32 {
-        let d = self.regs[Self::idx_of(TX_CLKM_DIV_CONF)] & 0xFF;
-        if d == 0 { 1 } else { d }
+        Self::bck_divisor(
+            self.regs[Self::idx_of(TX_CLKM_CONF)],
+            self.regs[Self::idx_of(TX_CLKM_DIV_CONF)],
+        )
     }
 
     fn rx_bck_divisor(&self) -> u32 {
-        let d = self.regs[Self::idx_of(RX_CLKM_DIV_CONF)] & 0xFF;
-        if d == 0 { 1 } else { d }
+        Self::bck_divisor(
+            self.regs[Self::idx_of(RX_CLKM_CONF)],
+            self.regs[Self::idx_of(RX_CLKM_DIV_CONF)],
+        )
+    }
+
+    fn bck_divisor(clkm_conf: u32, div_conf: u32) -> u32 {
+        let m = clkm_conf & 0xFF;
+        let m = if m == 0 { 1 } else { m };
+        let n = div_conf & 0xFF;
+        let n = if n == 0 { 1 } else { n };
+        let yn1 = (div_conf >> 27) & 1;
+        let x = (div_conf >> 18) & 0x1FF;
+        let y = (div_conf >> 9) & 0x1FF;
+        let z = div_conf & 0x1FF;
+        // Fractional term active only when actually programmed (reset is
+        // x = 0, y = 1, z = 0); raw-N pokes keep plain-N timing.
+        let frac = if x != 0 || yn1 != 0 || (y != 0 && y != 1) {
+            if yn1 == 0 {
+                z.saturating_mul(x.saturating_mul(n).saturating_add(n + 1))
+                    .saturating_add(y.saturating_mul(n))
+            } else {
+                z.saturating_mul(n.saturating_add(x.saturating_mul(n + 1)))
+                    .saturating_add(y.saturating_mul(n + 1))
+            }
+        } else {
+            n
+        };
+        let frac = if frac == 0 { n } else { frac };
+        m.saturating_mul(frac).max(1)
     }
 
     /// First-order sigma-delta PDM bit for the current TX sample. The sample
@@ -267,6 +330,12 @@ impl I2s {
 
     pub fn write32(&mut self, offset: u32, value: u32) {
         let o = offset & 0xFFF;
+        if o == RX_CONF || o == TX_CONF {
+            // TEMP I2S-driver probe (remove)
+            if self.dbg_writes.len() < 60 {
+                self.dbg_writes.push((o, value));
+            }
+        }
         match o {
             FIFO => {
                 if self.tx_count < FIFO_DEPTH {
@@ -278,12 +347,28 @@ impl I2s {
             INT_CLR => self.int_raw &= !value,
             INT_RAW => { /* read-only */ }
             RX_CONF => {
+                let mut value = value & !TXRX_UPDATE_BIT;
+                // Reset takes effect on set (engine + FIFO), then self-clears.
+                if value & 0x3 != 0 {
+                    self.rx_busy = false;
+                    self.rx_count = 0;
+                    self.rx_in_count = 0;
+                    self.rx_bit = 0;
+                    value &= !0x3;
+                }
                 self.regs[Self::idx_of(o)] = value;
                 if value & RX_START_BIT != 0 && !self.rx_busy && !self.loopback() {
                     self.start_rx();
                 }
             }
             TX_CONF => {
+                let mut value = value & !TXRX_UPDATE_BIT;
+                if value & 0x3 != 0 {
+                    self.tx_busy = false;
+                    self.tx_count = 0;
+                    self.tx_bit = 0;
+                    value &= !0x3;
+                }
                 self.regs[Self::idx_of(o)] = value;
                 if value & TX_START_BIT != 0 && !self.tx_busy {
                     self.tx_busy = true;
@@ -334,6 +419,34 @@ impl I2s {
         }
     }
 
+    /// FIFO push/pop/count accessors for the SoC GDMA streaming pump.
+    pub(crate) fn tx_space(&self) -> usize {
+        FIFO_DEPTH - self.tx_count
+    }
+    pub(crate) fn tx_push(&mut self, w: u32) {
+        if self.tx_count < FIFO_DEPTH {
+            self.tx_fifo[self.tx_count] = w;
+            self.tx_count += 1;
+        }
+    }
+    pub(crate) fn rx_ready(&self) -> usize {
+        self.rx_count
+    }
+    pub(crate) fn rx_pop(&mut self) -> u32 {
+        if self.rx_count == 0 {
+            return 0;
+        }
+        let v = self.rx_fifo[0];
+        for i in 1..self.rx_count {
+            self.rx_fifo[i - 1] = self.rx_fifo[i];
+        }
+        self.rx_count -= 1;
+        v
+    }
+    /// Whether GDMA OUT descriptors remain for this port (gates TX_DONE).
+    pub(crate) fn set_tx_dma_pending(&mut self, p: bool) {
+        self.tx_dma_pending = p;
+    }
     /// Advance the serial shift paths by one emulator step.
     /// True while transmitting or receiving. The SoC skips `tick()`
     /// otherwise — `tick_tx`/`tick_rx` both return immediately when their
@@ -394,7 +507,10 @@ impl I2s {
                         self.tx_fifo[i - 1] = self.tx_fifo[i];
                     }
                     self.tx_count -= 1;
-                } else {
+                } else if !self.tx_dma_pending {
+                    // FIFO drained with no GDMA OUT descriptors left: done.
+                    // (With streaming DMA pending, an empty FIFO is just
+                    // starvation — the pump refills it.)
                     self.tx_busy = false;
                     self.int_raw |= TX_DONE;
                     if self.loopback() {
@@ -510,6 +626,8 @@ mod tests {
     fn msb_first_matches_word() {
         let mut d = I2s::new(1);
         // tx_bit_order defaults to 0 (MSB first); tx_bits_mod default -> 16 bits.
+        // M = 1 so one BCK edge lands on the first tick (reset M = 2).
+        d.write32(TX_CLKM_CONF, 1);
         d.write32(FIFO, 0x8000);
         d.write32(TX_CONF, TX_START_BIT);
         d.tick(); // bck -> 1 (rising), shifts MSB (bit15) = 1
@@ -519,6 +637,7 @@ mod tests {
     #[test]
     fn lsb_first_matches_word() {
         let mut d = I2s::new(0);
+        d.write32(TX_CLKM_CONF, 1); // M = 1 (see above)
         d.write32(TX_CONF, TX_BIT_ORDER); // LSB first
         d.write32(FIFO, 0x0001);
         d.write32(TX_CONF, TX_BIT_ORDER | TX_START_BIT);
@@ -529,7 +648,8 @@ mod tests {
     #[test]
     fn clock_divisor_slows_bck() {
         let mut d = I2s::new(0);
-        // div_num = 2 -> BCK toggles every 2 emulator steps.
+        // M = 1 (pre-div) x N = 2 -> BCK toggles every 2 emulator steps.
+        d.write32(TX_CLKM_CONF, 1);
         d.write32(TX_CLKM_DIV_CONF, 2);
         d.write32(FIFO, 0xFFFF);
         d.write32(TX_CONF, TX_START_BIT);
@@ -537,6 +657,17 @@ mod tests {
         assert_eq!(d.signal_level(22), 0, "BCK still low after 1 step (div=2)");
         d.tick(); // step2: div 1->0, edge -> BCK=1
         assert_eq!(d.signal_level(22), 1, "BCK high after 2 steps (div=2)");
+    }
+
+    #[test]
+    fn fractional_divider_matches_driver_programming() {
+        // Exact words the esp-idf STD driver programs for 16 kHz stereo-16
+        // (captured from the driver-path sketch): pre-div M = 2 (reset),
+        // DIV_CONF = 0x3c0001 (N = 1, x = 15, y = 0, z = 1, yn1 = 0) ->
+        // 1*[15*1 + 2] + 0 = 17, times M = 34 half-cycles per BCK edge.
+        assert_eq!(I2s::bck_divisor(0x02, 0x003C_0001), 34);
+        // Legacy plain-N programming is unchanged (M = 1 x N = 2).
+        assert_eq!(I2s::bck_divisor(0x01, 0x02), 2);
     }
 
     #[test]
@@ -574,12 +705,14 @@ mod tests {
     #[test]
     fn pdm_encodes_extremes() {
         let mut d = I2s::new(0);
-        // PDM of max sample -> all 1s; min sample -> all 0s.
+        // PDM of max sample -> all 1s; min sample -> all 0s (M = 1: first edge on tick 1).
+        d.write32(TX_CLKM_CONF, 1);
         d.write32(FIFO, 0xFFFF);
         d.write32(TX_CONF, TX_PDM_EN | TX_START_BIT);
         d.tick();
         assert_eq!(d.signal_level(25), 1, "PDM max -> SD=1");
         let mut d2 = I2s::new(0);
+        d2.write32(TX_CLKM_CONF, 1);
         d2.write32(FIFO, 0x0000);
         d2.write32(TX_CONF, TX_PDM_EN | TX_START_BIT);
         d2.tick();
@@ -589,6 +722,7 @@ mod tests {
     #[test]
     fn injected_rx_fills_fifo_and_asserts_rx_done() {
         let mut d = I2s::new(0);
+        d.write32(RX_CLKM_CONF, 1); // M = 1 (reset M = 2 halves the pace)
         d.inject_rx(0x1234);
         d.inject_rx(0x5678);
         d.write32(INT_ENA, RX_DONE);
