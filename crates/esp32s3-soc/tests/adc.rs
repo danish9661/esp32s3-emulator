@@ -254,3 +254,26 @@ fn digital_results_stage_for_gdma() {
     assert_eq!(adc.dma_pop(), Some(825 * 4095 / 1100));
     assert_eq!(adc.dma_pop(), None, "queue drained");
 }
+
+#[test]
+fn tsens_ready_and_out_round_trip() {
+    // SENS_TSENS_CTRL @ 0x50 (sens_reg.h): driver powers up (bits 22,23),
+    // polls READY (bit 8), reads OUT[7:0]. Host injects the DAC code.
+    let mut adc = Adc::new();
+    adc.sens_write32(0x50, (1 << 22) | (1 << 23));
+    adc.tsens_inject(0xAB);
+    let v = adc.sens_read32(0x50);
+    assert_eq!(v & 0xFF, 0xAB, "OUT carries injected code");
+    assert_ne!(v & (1 << 8), 0, "READY latched");
+    // Power/control bits round-trip through the stored word.
+    assert_ne!(v & (1 << 22), 0, "POWER_UP retained");
+}
+
+#[test]
+fn tsens_ctrl2_is_plain_store() {
+    // SENS_TSENS_CTRL2 @ 0x54 carries XPD/clock fields (stored, no side
+    // effects in the synchronous model).
+    let mut adc = Adc::new();
+    adc.sens_write32(0x54, 0x4002);
+    assert_eq!(adc.sens_read32(0x54), 0x4002);
+}

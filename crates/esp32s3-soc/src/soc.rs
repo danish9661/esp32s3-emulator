@@ -696,6 +696,11 @@ impl Soc {
         self.adc.inject_voltage(unit, channel, milli_volts);
     }
 
+    /// Inject the TSENS DAC code (host frontend for temperatureRead).
+    pub fn tsens_inject(&mut self, raw: u8) {
+        self.adc.tsens_inject(raw);
+    }
+
     /// Inject a touch counter value on pad 1..=14 (host frontend — drives
     /// what the firmware reads from the touch STATUS registers).
     pub fn touch_inject(&mut self, pad: usize, value: u32) {

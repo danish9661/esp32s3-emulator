@@ -282,6 +282,12 @@ impl Rtc {
             STATE0_OFF if value & SLEEP_EN_BIT != 0 => {
                 // Legacy S3 deep-sleep trigger.  Capture the period the
                 // firmware already programmed into SLP_TIMER0/1.
+                // NOTE: light sleep (esp_light_sleep_start) shares SLEEP_EN
+                // but hangs earlier in its SMP stall handshake (both cores
+                // MEMW-spin, SLEEP_EN never written), so gating on DIG_PWC
+                // PD bits was tried and reverted: it misrouted direct-poke
+                // deep sleep (which sets no PD bits yet expects a reboot).
+                // SLEEP_EN unconditionally means deep (reboot) here.
                 self.sleep_req = true;
                 self.sleep_target =
                     (self.slp_timer0 as u64) | ((self.slp_timer1 as u64 & 0xFFFF) << 32);

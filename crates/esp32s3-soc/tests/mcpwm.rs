@@ -208,3 +208,15 @@ fn capture_negedge_and_disabled_channel() {
     // Channel 1 (never enabled) stays quiet.
     assert_eq!(m.read32(CAP_INT_RAW) & (1 << 28), 0);
 }
+
+/// Software sync reloads the stopped timer with PHASE.
+#[test]
+fn sync_sw_reloads_timer_with_phase() {
+    let mut m = Mcpwm::new();
+    // Timer0 SYNC @ 0x0C: PHASE=500 in [19:4] + SYNC_SW (bit 1).
+    m.write32(0x0C, (500 << 4) | (1 << 1));
+    assert_eq!(m.read32(0x10), 500, "timer0 reloaded with phase");
+    // A write without SYNC_SW leaves the counter alone.
+    m.write32(0x0C, (700 << 4));
+    assert_eq!(m.read32(0x10), 500, "no reload without SYNC_SW");
+}

@@ -62,6 +62,24 @@ fn main() {
         println!("[host] injected {mv} mV on ADC1_CH3 (GPIO4)");
     }
 
+    // TSENS injection for temperatureRead: TEMP_RAW=<0..255> sets the
+    // SENS_TSENS_OUT DAC code the firmware reads.
+    if let Ok(raw) = env::var("TEMP_RAW")
+        && let Ok(raw) = raw.parse::<u8>()
+    {
+        m.soc.tsens_inject(raw);
+        println!("[host] injected TSENS raw={raw}");
+    }
+    // Celsius shorthand: TEMP_C=<c> inverts the driver-observed middle
+    // line T = 0.4375*raw - 21 (blank-eFuse cal; ends are nonlinear).
+    if let Ok(c) = env::var("TEMP_C")
+        && let Ok(c) = c.parse::<f32>()
+    {
+        let raw = (((c + 21.0) * 16.0 / 7.0).round() as i32).clamp(0, 255) as u8;
+        m.soc.tsens_inject(raw);
+        println!("[host] injected TSENS {c}C as raw={raw}");
+    }
+
     // Touch injection for sketches doing touchRead: TOUCH_INJECT=<pad>:<val>
     // sets the counter touch pad 1..=14 reports (falls when touched).
     if let Ok(spec) = env::var("TOUCH_INJECT")

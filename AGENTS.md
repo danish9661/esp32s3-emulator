@@ -2790,3 +2790,49 @@ Core design:
     92 lib KATs, 38/38 workspace green. REMAINING (loud trap):
     ldf/stf.128 (needs 12 clean FPR probes), ams.uaup/decp, srs.accx
     (unencodable), cmul-fused (overlap). Touch/WiFi/BLE per directive.
+  - 2026-09-10: **USB-Serial-JTAG confirmed done (no work needed)**.
+    `usb_serial_jtag.rs` (269 lines, zero TODOs) models EP1 TX/RX +
+    wr_done/empty/recv interrupts as matrix source 96, validated by
+    `esp32s3_usb_serial` (`USB TEST`, battery-green) + unit tests; every
+    sketch's `Serial` output flows through it. S3 has no USB-OTG/host
+    block, so there is nothing else USB to model.
+  - 2026-09-10: **ldf/stf.128 deferred (FPR scatter)**. 128-bit FPR
+    loads scatter 4×4-bit FPR indices across b0[0]/b1/b2/b3[2:0] with
+    per-FPR 1-bit splits + an f0↔f3 alias in b2[3:0]; clean mapping
+    needs 13 single-varying probes (all-differ constraint blocks
+    isolation) for 4 zero-usage mnemonics (64-bit forms work). Loud
+    trap, documented. ee.* file closed: ~155 mnemonics executing, 92
+    KATs + DSP sketch, remainder traps (srs/cmul-fused unencodable or
+    overlapping, ams.uaup/decp temp_asm chain, ldf128 scatter).
+  - 2026-09-10: **Protocol-gap sweep (all but WiFi/BLE) + GDB stub**.
+    - **Temp sensor**: SENS TSENS block (`OUT`/`READY` @ 0x50, `TEMP_RAW`/
+      `TEMP_C` injection like `ADC_INJECT_MV`); driver polls SENS+0x50
+      directly (no ROM involved). Curve fit live: linear middle
+      `T=0.4375*raw-21`, steep ends (driver math, blank-eFuse cal).
+      `esp32s3_temp` (Arduino `temperatureRead`) → exactly 25.00C.
+    - **AES-GCM**: no model change — mbedTLS GHASH is software over HW
+      CTR/ECB (the "GCM falls back" note was correct behavior).
+      `esp32s3_aes_gcm` NIST zero-vector passes; caught my own wrong
+      remembered constant via PyCryptodome triangulation
+      (`...971b2fe78`, not `...772b5e9a`).
+    - **MCPWM sync**: `TIMERx_SYNC_REG` SW-sync reloads counter with
+      PHASE; S3 silicon has NO Trip-Zone/fault submodule (header-verified,
+      doc fixed). Cautionary tale: first run failed on a stale release
+      binary (model was right).
+    - **Light sleep DEFERRED (SKIP)**: `esp_light_sleep_start` hangs in
+      its SMP stall handshake (both cores MEMW-spin at 0x40378038/
+      0x40378f41, SLEEP_EN never written, WAKEUP_ENA=0). A DIG_PWC PD-bit
+      gate was tried and reverted (misrouted direct-poke deep sleep,
+      which sets no PD bits yet expects reboot); SLEEP_EN stays
+      deep-only. `lightsleep|SKIP:...` documents it.
+    - **SDIO slave**: confirmed absent on S3 (`SOC_SDIO_SLAVE_SUPPORTED`
+      missing, no SLC registers) — only SDMMC host exists (done).
+    - **GDB remote stub** (`examples/gdbstub.rs`, new capability):
+      RSP over TCP (qSupported/threads/g/p/P/m/M/c/s/Z0/z0/D/k,
+      Ctrl-C, custom 19-reg target.xml, whole-machine lockstep,
+      software-breakpoint addrs, UART to stdout). Validated by committed
+      `tools/gdb_harness.mjs` (battery `NODE:` entry, rebuilds-if-stale,
+      `GDB HARNESS PASS`); system x86 gdb can't use custom regs (needs
+      xtensa gdb — documented). Battery gains `NODE:` binrel override
+      (harnesses reusing another sketch's image, e.g. gdb→hello).
+    Battery 67/0/1 (only `lightsleep` skipped).

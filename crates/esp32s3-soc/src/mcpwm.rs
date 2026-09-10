@@ -17,8 +17,9 @@
 //!
 //! This models the core PWM path (up / down / up-down counting + action-based
 //! generators) enough for a real firmware to produce a correct duty cycle on a
-//! GPIO. Dead-time, carrier, fault, capture and the update-shadow machinery
-//! are latched but not yet simulated.
+//! GPIO, plus capture and software-sync reload. Dead-time, carrier and the
+//! update-shadow machinery are latched but not simulated (S3 silicon has no
+//! Trip-Zone/fault submodule, so there is nothing to model there).
 
 /// MCPWM group-0 register block base (esp-idf `DR_REG_PWM0_BASE`).
 pub const MCPWM_BASE: u32 = 0x6001_E000;
@@ -41,6 +42,11 @@ const OPER_STRIDE: usize = 0x38;
 const TIMER_CFG0: u32 = 0x04;
 const TIMER_CFG1: u32 = 0x08;
 const TIMER_STATUS: u32 = 0x10;
+// Timer sync (mcpwm_timer_sync_reg_t): SYNCI_EN[0], SYNC_SW[1] (toggle to
+// trigger), PHASE[19:4] reload value, at timer stride + 0x0C.
+const TIMER_SYNC: u32 = 0x0C;
+const SYNC_SW: u32 = 1 << 1;
+const PHASE_SHIFT: u32 = 4;
 // Operator block base (operator[k] at OPER_BASE0 + k*0x38) and the
 // per-operator field offsets LOCAL to that block (mcpwm_operator_reg_t).
 const OPER_BASE0: u32 = 0x3C;
@@ -379,6 +385,17 @@ impl Mcpwm {
             _ => {
                 if idx < REG_WORDS {
                     self.regs[idx] = value;
+                    // Timer sync: a SYNC_SW write reloads the counter with
+                    // PHASE (SYNCI_EN external input is not modeled; the
+                    // level-triggered write matches what the driver emits).
+                    if offset >= TIMER_SYNC
+                        && offset < TIMER_SYNC + NTIMER as u32 * TIMER_STRIDE as u32
+                        && (offset - TIMER_SYNC) % TIMER_STRIDE as u32 == 0
+                        && value & SYNC_SW != 0
+                    {
+                        let t = ((offset - TIMER_SYNC) / TIMER_STRIDE as u32) as usize;
+                        self.timer_count[t] = (value >> PHASE_SHIFT) & 0xFFFF;
+                    }
                     // gen_force: direct force of generator A/B output level.
                     if offset >= OPER_BASE0
                         && offset < OPER_BASE0 + NOPER as u32 * OPER_STRIDE as u32

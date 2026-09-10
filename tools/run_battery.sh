@@ -57,6 +57,7 @@ CASES=(
 "uart_multi||MULTI_UART PASS|"
 "usb_serial||USB TEST|"
 "aes||AES DONE;AES CBC PASS;AES XTS PASS|"
+"aes_gcm||AES GCM PASS;AES GCM DONE|"
 "aes_poke||AES POKE PASS|"
 "sha||SHA DONE;SHA384 PASS;SHA512 PASS|"
 "spi||SPI DONE|"
@@ -81,6 +82,7 @@ CASES=(
 "twai||TWAI LOOPBACK PASS|"
 "twai_driver||TWAI DRIVER LOOPBACK PASS|"
 "mcpwm||MCPWM PASS|"
+"mcpwm_sync||MCPWM SYNC PASS|"
 "mcpwm_cap||MCPWM CAP PASS|"
 "pcnt||PCNT PASS|"
 "ledc||LEDC PASS|"
@@ -98,6 +100,7 @@ CASES=(
 "deepsleep_ext0||DEEPSLEEP EXT0 START;DEEPSLEEP EXT0 WOKE;DEEPSLEEP EXT0 PASS|50000000"
 "deepsleep_ext1||DEEPSLEEP EXT1 START;DEEPSLEEP EXT1 WOKE;DEEPSLEEP EXT1 PASS|50000000"
 "deepsleep_ulp||DEEPSLEEP ULP START;DEEPSLEEP ULP WOKE;DEEPSLEEP ULP PASS|80000000"
+"lightsleep|SKIP:SMP stall handshake deadlock (both cores MEMW-spin, SLEEP_EN never written)"
 "hmac||HMAC DONE|"
 "ds||DS DONE|"
 "rsa||RSA POKE PASS||esp32s3_rsa/esp32s3_rsa_poke/esp32s3_rsa_poke.merged.bin"
@@ -105,6 +108,7 @@ CASES=(
 "i2s||I2S POKE PASS|"
 "i2s_driver||I2S DRIVER LOOPBACK PASS|300000000"
 "touch|TOUCH_INJECT=3:1877|TOUCH PASS|150000000"
+"temp|TEMP_C=25|TEMP 25C OK;TEMP DONE|"
 "lcd_cam||LCD CAM POKE PASS;LCD GDMA PASS|"
 "p5_stubs||P5 STUBS POKE PASS|"
 "gdma||GDMA RMT TX done|"
@@ -113,6 +117,7 @@ CASES=(
 "ee_dsp||EE DSP DOT OK;EE DSP VADDS OK;EE DSP DONE|"
 "virtual_demo|NODE:tools/virtual_demo_harness.mjs|VIRTUAL DEMO HARNESS PASS|"
 "camcap|NODE:tools/camcap_harness.mjs|CAMCAP HARNESS PASS|"
+"gdb|NODE:tools/gdb_harness.mjs|GDB HARNESS PASS||esp32s3_hello/esp32s3_hello.merged.bin"
 )
 
 pass=0; fail=0; skipped=0
@@ -138,14 +143,20 @@ for c in "${CASES[@]}"; do
   dir="$SK/esp32s3_$name"
   if [[ "$envstr" == NODE:* ]]; then
     # Node-driven harness (not run_flash): resolve the sketch binary the
-    # same way, optionally rebuild it, then run the harness with the bin
-    # path as argv[1] and check its output markers like any other entry.
-    bin="$dir/esp32s3_$name.merged.bin"
-    [[ -f "$bin" ]] || bin="$dir/esp32s3_$name.ino.merged.bin"
+    # same way (or via an explicit 4th-field path for harnesses like gdb
+    # that reuse another sketch's image), optionally rebuild it, then run
+    # the harness with the bin path as argv[1] and check its output
+    # markers like any other entry.
+    if [[ -n "$binrel" ]]; then
+      bin="$SK/$binrel"
+    else
+      bin="$dir/esp32s3_$name.merged.bin"
+      [[ -f "$bin" ]] || bin="$dir/esp32s3_$name.ino.merged.bin"
+    fi
     if [[ ! -f "$bin" ]]; then
       bin=$(find "$dir/build" -name "*.merged.bin" 2>/dev/null | head -1)
     fi
-    if [[ $BUILD == 1 ]]; then
+    if [[ $BUILD == 1 && -z "$binrel" ]]; then
       if ! arduino-cli compile --fqbn esp32:esp32:esp32s3 --build-path "$dir/build" "$dir" >/tmp/battery_build.log 2>&1; then
         echo "FAIL $name (compile)"; tail -3 /tmp/battery_build.log; fail=$((fail+1)); continue
       fi

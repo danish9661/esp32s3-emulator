@@ -133,6 +133,8 @@ pub struct Adc {
     /// (`peri_sel` ADC): each timer pass pushes its data_status word here
     /// (cap 256, oldest dropped). The IN walk drains them to DRAM.
     dma_queue: alloc::collections::VecDeque<u32>,
+    /// TSENS 8-bit DAC output code (host-injected; SENS_TSENS_OUT).
+    tsens_raw: u8,
 }
 
 impl Adc {
@@ -146,6 +148,7 @@ impl Adc {
             timer_cycle: 0,
             alt_phase: false,
             dma_queue: alloc::collections::VecDeque::new(),
+            tsens_raw: 128,
         };
         // Reset values from sens_reg.h / apb_saradc_reg.h (idle FSM fields,
         // so firmware that reads config back sees sensible defaults).
@@ -178,6 +181,12 @@ impl Adc {
         if unit < NUM_UNITS && channel < NUM_CHANNELS {
             self.voltages[unit][channel] = milli_volts;
         }
+    }
+
+    /// Inject the TSENS 8-bit DAC output code (host frontend — drives
+    /// what the firmware reads from SENS_TSENS_OUT).
+    pub fn tsens_inject(&mut self, raw: u8) {
+        self.tsens_raw = raw;
     }
 
     /// 12-bit raw for (unit, channel) scaled by its SENS attenuation, with
@@ -323,8 +332,7 @@ impl Adc {
     }
 
     /// Read a SENS register (`offset` relative to SENS_BASE).
-    pub fn sens_read32(&mut self, offset: u32) -> u32 {
-        match offset {
+    pub fn sens_read32(&mut self, offset: u32) -> u32 {        match offset {
             SENS_SAR_SLAVE_ADDR1 => {
                 // Live meas_status [29:22]: the shared SAR FSM busy flag
                 // (adc_oneshot_ll_start polls this before starting).
@@ -333,6 +341,15 @@ impl Adc {
                 if self.meas_busy {
                     v |= 1 << MEAS_STATUS_SHIFT;
                 }
+                v
+            }
+            // TSENS_CTRL @ 0x50 (sens_reg.h): READY (bit 8) latches once
+            // powered; OUT[7:0] is the host-injected DAC code. The tsens
+            // driver polls READY then reads OUT (no ROM involved).
+            0x50 => {
+                let mut v = self.sens[0x50 / 4] & !0x1FF;
+                v |= 1 << 8;
+                v |= self.tsens_raw as u32;
                 v
             }
             _ if offset.is_multiple_of(4) && offset < (SENS_REGS * 4) as u32 => {
