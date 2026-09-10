@@ -220,3 +220,25 @@ fn sync_sw_reloads_timer_with_phase() {
     m.write32(0x0C, (700 << 4));
     assert_eq!(m.read32(0x10), 500, "no reload without SYNC_SW");
 }
+
+/// Dead-time delays rising edges (RED) while FED=0 passes falling edges
+/// through immediately.
+#[test]
+fn dead_time_delays_rising_edge_only() {
+    let mut m = Mcpwm::new();
+    // DT0 RED = 3 ticks (FED stays 0).
+    m.write32(0x60, 3);
+    // Force generator A high via GEN_FORCE (oper0 + 0x10, fa=1).
+    m.write32(0x4C, 1);
+    // Rising edge arms; output stays low for RED ticks.
+    m.tick();
+    m.tick();
+    assert_eq!(m.signal_level(160), 0, "rise held during RED");
+    m.tick();
+    m.tick();
+    assert_eq!(m.signal_level(160), 1, "rise released after RED");
+    // Falling edge with FED=0 applies immediately.
+    m.write32(0x4C, 2);
+    m.tick();
+    assert_eq!(m.signal_level(160), 0, "fall immediate with FED=0");
+}

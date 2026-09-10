@@ -134,6 +134,12 @@ pub struct Rtc {
     regs: [u32; 0x400 / 4],
     /// ULP-RISC-V control/status block (offset 0x100..0x200 of this page).
     ulp: crate::ulp::Ulp,
+    /// RTC watchdog (RWDT, WDTCONFIG0..4 @ 0x98..0xA8, FEED @ 0xAC,
+    /// WPROTECT @ 0xB0): counter, per-stage cumulative holds, fired latches,
+    /// reset request, and write-protect key latch (mirrors the MWDT model).
+    wdt_count: u64,
+    wdt_fired: [bool; 4],
+    wdt_reset: bool,
 }
 
 impl Default for Rtc {
@@ -160,6 +166,9 @@ impl Default for Rtc {
             touch_raw: 0,
             regs: [0u32; 0x400 / 4],
             ulp: crate::ulp::Ulp::default(),
+            wdt_count: 0,
+            wdt_fired: [false; 4],
+            wdt_reset: false,
         }
     }
 }
@@ -175,6 +184,37 @@ impl Rtc {
             self.acc -= SLOW_CLK_DIV;
             self.count += 1;
         }
+        self.tick_rwdt(cycles);
+    }
+
+    /// RTC watchdog: counts up while WDT_EN (CONFIG0[31]); each stage fires
+    /// once at its cumulative hold (CONFIG1..4, full 32-bit each); stage
+    /// actions mirror MWDT (0 = none, 1 = interrupt (not wired; RTC_CORE is
+    /// shared with touch), 2/3 = system reset via `wdt_reset`). FEED (any
+    /// write) restarts. CONFIG writes require the WPROTECT key latched.
+    fn tick_rwdt(&mut self, cycles: u64) {
+        let cfg0 = self.regs[0x98 / 4];
+        if cfg0 & (1 << 31) == 0 {
+            return;
+        }
+        self.wdt_count += cycles;
+        let stg = [(cfg0 >> 28) & 7, (cfg0 >> 25) & 7, (cfg0 >> 22) & 7, (cfg0 >> 19) & 7];
+        let mut cum: u64 = 0;
+        for i in 0..4 {
+            cum += self.regs[(0x9C + 4 * i as u32) as usize / 4] as u64;
+            if !self.wdt_fired[i] && self.wdt_count >= cum {
+                self.wdt_fired[i] = true;
+                let a = stg[i];
+                if a == 2 || a == 3 {
+                    self.wdt_reset = true;
+                }
+            }
+        }
+    }
+
+    /// True when an RWDT reset stage elapsed (machine reboots); cleared.
+    pub fn consume_reset(&mut self) -> bool {
+        core::mem::replace(&mut self.wdt_reset, false)
     }
 
     /// True if firmware requested a deep-sleep since the last call; returns
@@ -295,6 +335,22 @@ impl Rtc {
             // Touch FSM trigger: any scan-control write latches DONE +
             // SCAN_DONE (synchronous completion, like SHA BUSY). The
             // driver's oneshot wait blocks on the resulting interrupt/event.
+            // RTC watchdog (WDTCONFIG0..4 @ 0x98..0xA8, FEED @ 0xAC,
+            // WPROTECT @ 0xB0): CONFIG gated on the protect key, FEED
+            // restarts the counter and clears fired latches.
+            0xB0 => {
+                self.regs[0xB0 / 4] = value;
+                // Latch key state implicitly via stored value (checked below).
+            }
+            0x98 | 0x9C | 0xA0 | 0xA4 | 0xA8 => {
+                if self.regs[0xB0 / 4] == 0x50D8_3AA1 {
+                    self.regs[offset as usize / 4] = value;
+                }
+            }
+            0xAC => {
+                self.wdt_count = 0;
+                self.wdt_fired = [false; 4];
+            }
             TOUCH_CTRL2_OFF | TOUCH_SCAN_CTRL_OFF => {
                 self.regs[offset as usize / 4] = value;
                 self.touch_raw |= TOUCH_DONE_BIT | TOUCH_SCAN_DONE_BIT;

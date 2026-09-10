@@ -2836,3 +2836,54 @@ Core design:
       xtensa gdb — documented). Battery gains `NODE:` binrel override
       (harnesses reusing another sketch's image, e.g. gdb→hello).
     Battery 67/0/1 (only `lightsleep` skipped).
+  - 2026-09-10: **Second protocol-gap sweep (all but WiFi/BLE)**.
+    - **eFuse burn**: PGM_DATA staging + PGM_CMD (BLK_NUM) OR into RD
+      mirror; only BLOCK_USR_DATA (block 3, verified via driver "BURN
+      BLOCK3" log) modeled. `esp32s3_efuse_burn` (blob write + readback)
+      → `EFUSE BURN PASS`. Unit test pins OR/idempotence/block gate.
+    - **MCPWM dead-time**: inertial FED/RED edge delay (tick units) on
+      both generator outputs, combinatorial passthrough at zero (caught
+      a real regression live: ticked-only update broke the indices
+      test). `esp32s3_mcpwm_dt` (complementary + RED=2000) → 396-tick
+      dead band, zero overlap → `MCPWM DT PASS`. S3 TZ/fault confirmed
+      absent (header); carrier/shadow stay latched-only (documented).
+    - **RTC WDT**: RWDT block (EN/stages/holds/FEED/WPROTECT, MWDT mirror;
+      interrupt unwired, RTC_CORE shared) + reset into `consume_reset`.
+      `esp32s3_rwdt_feed` (no reboot) + `esp32s3_rwdt_reset` (reboot
+      loop) both pass; unit test pins lock/feed/single-shot.
+    - **RMT/MCPWM carrier, update-shadow, SPI slave DMA, GDMA M2M**:
+      documented approximations (matched-passthrough / immediate-apply),
+      no firmware-visible gap found.
+    Battery 71/0/1 (only `lightsleep` skipped).
+  - 2026-09-10: **OPI (octal) PSRAM validated (was QSPI-only)**. The
+    `PSRAM=opi` variant failed init ("chip not connected") while QSPI
+    passed (2MB). Root-caused via a temporary MEMSPI tx_trace probe
+    (since removed): after the SPI RDID probe the OPI driver issues
+    16-bit commands on CS1 — 0x4040 (MR read) / 0xC0C0 (MR write) /
+    0x8080 (array write) / 0x0000 (array read) — then a dummy-sweep
+    timing tune, then sizes the chip from `MR2[2:0]`. Three stacked
+    model gaps fixed in `memspi.rs` (`run_psram_usr` takes `cmd_bytes`;
+    OPI arms gated on 16-bit cmds so 1-byte 0x00/0x80 can't alias):
+    (1) OPI array RW (RAM-overwrite semantics, plain byte flow);
+    (2) MR latch (0xC0C0 latches per index, 0x4040 reads it back —
+    driver writes MR0=0x28 and verifies); (3) MR2 reset default 0x03
+    (density: 1=32Mb/4MB, 3=64Mb/8MB, 5=128Mb/16MB — recovered from the
+    `beqi 5 / bltui 6 / beqi 1 / movnez` chain in
+    `esp_psram_impl_enable`, verified against the prebuilt
+    `opi_opi/libesp_psram.a` object disassembly; all-zero MRs sized the
+    chip 0 → `get_physical_size` ESP_FAIL → `panic_abort`, which
+    double-faulted on the zeroed `_KernelExceptionVector`). Dead ends
+    logged: ID-byte-2 density theory (identical-crash-step-count A/B
+    disproved — byte ignored), objdump linear-sweep desync (again —
+    our own decoder is ground truth), `s_psram_ctx` all-zero mislead
+    (size lives in a separate static). New `esp32s3_psram` sketch
+    (`ESP.getPsramSize` + `ps_malloc` + pattern): QSPI `total=2097152`
+    + OPI `total=8388608`, both `RW OK`/`PASS`. Battery gains variant
+    entries (`psram_qspi`/`psram_opi`) via a srcdir/fqbn case block so
+    `--build` reproduces both exactly (`PSRAM=enabled`/`PSRAM=opi`).
+    3 new memspi unit tests (OPI round-trip, MR latch + density,
+    cmd_bytes gate). Cautionary tale: my first OPI fix (RW only) made
+    boot WORSE (graceful init-fail → late `panic_abort` double-fault
+    with zero UART) — a partial init fix that passes one check only to
+    trip a later assert; always run to the PASS marker, never stop at
+    "error message changed".

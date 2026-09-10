@@ -107,6 +107,14 @@ const ACT_TOGGLE: u32 = 3;
 // GPIO-matrix output signal indices for MCPWM0 (gpio_sig_map.h: PWM0_OUTy*_IDX).
 const PWM0_OUT0A_IDX: u32 = 160;
 const PWM0_OUT2B_IDX: u32 = 165;
+// Dead-time submodule (mcpwm_dt_reg_t): DT[k] base stride 0x38 with FED
+// (falling-edge delay) @ +0x04 and RED (rising-edge delay) @ +0x08,
+// both [15:0] in (emulator) tick units. INSEL routing is not modeled;
+// delays apply to both generator outputs symmetrically.
+const DT_BASE0: u32 = 0x58;
+const DT_STRIDE: u32 = 0x38;
+const DT_FED: u32 = 0x04;
+const DT_RED: u32 = 0x08;
 
 pub struct Mcpwm {
     regs: [u32; REG_WORDS],
@@ -118,6 +126,14 @@ pub struct Mcpwm {
     timer_dir: [u8; NTIMER],
     /// Current generator output level: [operator][0=A, 1=B].
     gen_level: [[u32; 2]; NOPER],
+    /// Dead-time delayed output level (what the pads actually drive).
+    dt_out: [[u32; 2]; NOPER],
+    /// Pending dead-time edge: tick it was armed + target level + armed.
+    dt_tick: [[u64; 2]; NOPER],
+    dt_level: [[u32; 2]; NOPER],
+    dt_pend: [[bool; 2]; NOPER],
+    /// Free-running emulator-tick counter (dead-time delay time base).
+    now: u64,
     /// Latched interrupt raw bits.
     int_raw: u32,
     /// Capture-timer free-running counter (APB ticks while enabled).
@@ -139,6 +155,11 @@ impl Mcpwm {
             timer_prescale_cnt: [0; NTIMER],
             timer_dir: [0; NTIMER],
             gen_level: [[0; 2]; NOPER],
+            dt_out: [[0; 2]; NOPER],
+            dt_tick: [[0; 2]; NOPER],
+            dt_level: [[0; 2]; NOPER],
+            dt_pend: [[false; 2]; NOPER],
+            now: 0,
             int_raw: 0,
             cap_timer: 0,
             cap_edge_cnt: [0; 3],
@@ -193,6 +214,7 @@ impl Mcpwm {
     }
 
     pub fn tick(&mut self) {
+        self.now = self.now.wrapping_add(1);
         for t in 0..NTIMER {
             let cfg1 = self.timer_cfg1(t);
             let start = (cfg1 >> TIMER_START_SHIFT) & 0x7;
@@ -274,6 +296,41 @@ impl Mcpwm {
                 }
             }
         }
+        self.tick_dead_time();
+    }
+
+    /// Inertial dead-time edge delay (FED on falling, RED on rising edges,
+    /// in emulator ticks). Zero delays pass through untouched so existing
+    /// PWM behavior is bit-identical when DT is unprogrammed.
+    fn tick_dead_time(&mut self) {
+        for op in 0..NOPER {
+            let fed = self.regs[(DT_BASE0 + op as u32 * DT_STRIDE + DT_FED) as usize / 4] & 0xFFFF;
+            let red = self.regs[(DT_BASE0 + op as u32 * DT_STRIDE + DT_RED) as usize / 4] & 0xFFFF;
+            for g in 0..2 {
+                let raw = self.gen_level[op][g];
+                if fed == 0 && red == 0 {
+                    self.dt_out[op][g] = raw;
+                    self.dt_pend[op][g] = false;
+                    continue;
+                }
+                if raw == self.dt_out[op][g] {
+                    // Back at the driven level: cancel any pending edge.
+                    self.dt_pend[op][g] = false;
+                } else if !self.dt_pend[op][g] || self.dt_level[op][g] != raw {
+                    // New (or changed) edge: arm with latest-wins.
+                    self.dt_pend[op][g] = true;
+                    self.dt_tick[op][g] = self.now;
+                    self.dt_level[op][g] = raw;
+                }
+                if self.dt_pend[op][g] {
+                    let wait = if self.dt_level[op][g] == 1 { red } else { fed };
+                    if self.now.wrapping_sub(self.dt_tick[op][g]) >= wait as u64 {
+                        self.dt_out[op][g] = self.dt_level[op][g];
+                        self.dt_pend[op][g] = false;
+                    }
+                }
+            }
+        }
     }
 
     /// True while the capture timer runs (gates `tick_capture`).
@@ -338,7 +395,17 @@ impl Mcpwm {
     pub fn signal_level(&self, sig: u32) -> u32 {
         if (PWM0_OUT0A_IDX..=PWM0_OUT2B_IDX).contains(&sig) {
             let s = (sig - PWM0_OUT0A_IDX) as usize;
-            self.gen_level[s / 2][s % 2]
+            let op = s / 2;
+            // Unprogrammed dead-time (FED=RED=0) reads the generator level
+            // directly (combinatorial passthrough, exactly the old path);
+            // programmed delays come from the ticked inertial state.
+            let fed = self.regs[(DT_BASE0 + op as u32 * DT_STRIDE + DT_FED) as usize / 4] & 0xFFFF;
+            let red = self.regs[(DT_BASE0 + op as u32 * DT_STRIDE + DT_RED) as usize / 4] & 0xFFFF;
+            if fed == 0 && red == 0 {
+                self.gen_level[op][s % 2]
+            } else {
+                self.dt_out[op][s % 2]
+            }
         } else {
             0
         }

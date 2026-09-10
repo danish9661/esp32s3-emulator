@@ -83,7 +83,9 @@ const MISC_CS1_DIS: u32 = 1 << 1;
 // PSRAM (Ext_RAM) ID reply bytes, MSB-first on the wire (APM 64 Mb part:
 // mfr 0x0D, density/KGD 0x5D). A 3-byte MISO read lands the KGD byte at ID
 // word bits [15:8], where the esp-idf quad PSRAM probe checks it
-// (`PSRAM_KGD(id) == 0x5D`, esp_psram_impl_quad.c).
+// (`PSRAM_KGD(id) == 0x5D`, esp_psram_impl_quad.c). The OPI size path
+// ignores the ID bytes (it sizes from MR2[2:0] instead), verified by an
+// identical-crash-step-count A/B with byte 2 = 0x02 vs 0x00.
 const PSRAM_ID: [u8; 3] = [0x0D, 0x5D, 0x00];
 
 // PSRAM backing for the CS1 device (pattern/test traffic only — runtime
@@ -388,6 +390,16 @@ pub struct Memspi {
     /// PSRAM (Ext_RAM on CS1) backing for init/test-pattern traffic
     /// (extram_test writes magic via 0x02 and reads it back via 0x03).
     psram: Box<[u8; PSRAM_DEV_SIZE]>,
+    /// PSRAM mode-register latch (APM MR0..: 0xC0/0xC0C0 writes latch the
+    /// first MOSI byte per MR index = transaction address; 0x40/0x4040
+    /// reads return it). The esp-idf OPI init writes MR0 then reads it
+    /// back to confirm the latency/burst configuration took. MR2 reset
+    /// default is 0x03: `esp_psram_impl_enable` sizes the chip from
+    /// `MR2[2:0]` (1 = 32 Mb / 4 MB, 3 = 64 Mb / 8 MB, 5 = 128 Mb / 16 MB,
+    /// recovered from the `beqi 5 / bltui 6 / beqi 1 / movnez` chain in
+    /// `esp_psram_impl_enable`), so an all-zero MR file sizes the chip as
+    /// 0 and `get_physical_size` fails.
+    psram_mr: [u8; 16],
     /// Ring of the most recent transactions (host debug tracing).
     pub tx_trace: [TxRec; 16],
     pub tx_head: usize,
@@ -408,6 +420,7 @@ impl Memspi {
             chip: Chip::default(),
             xip: false,
             psram: Box::new([0; PSRAM_DEV_SIZE]),
+            psram_mr: [0, 0, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             tx_trace: [TxRec {
                 cmd_reg: 0,
                 addr: 0,
@@ -532,7 +545,7 @@ impl Memspi {
         // the PSRAM device; anything else talks to the NOR flash.
         let misc = self.regs[(REG_MISC >> 2) as usize];
         if (misc & (MISC_CS0_DIS | MISC_CS1_DIS)) == MISC_CS0_DIS {
-            self.run_psram_usr(cmd, addr, tx_bytes, rx_bytes);
+            self.run_psram_usr(cmd, cmd_bytes, addr, tx_bytes, rx_bytes);
             return;
         }
         // XIP-silenced flash: once the ROM bootloader enables continuous
@@ -566,9 +579,56 @@ impl Memspi {
     /// and mode-command absorbs. Addresses are plain (no NOR swap quirk);
     /// writes overwrite (RAM, not flash-AND). MISO for unrecognized reads
     /// is zeros (undriven bus).
-    fn run_psram_usr(&mut self, cmd: u32, addr: u32, tx_bytes: u32, rx_bytes: u32) {
+    ///
+    /// OPI (octal) PSRAM issues 16-bit commands (`cmd_bytes == 2`, APM OPI
+    /// mode after the SPI RDID probe): 0x0000 = OPI array read, 0x8080 =
+    /// OPI array write (both plain byte flow like 0x03/0x02); 0x4040 =
+    /// mode-register read (returns the `psram_mr` latch for the MR index =
+    /// transaction address), 0xC0C0 = mode-register write (latches the
+    /// first MOSI byte). Gated on `cmd_bytes` so a (never-issued) 1-byte
+    /// cmd 0x00/0x80 can't alias them.
+    fn run_psram_usr(&mut self, cmd: u32, cmd_bytes: u32, addr: u32, tx_bytes: u32, rx_bytes: u32) {
         let ntx = tx_bytes as usize;
         let nrx = rx_bytes as usize;
+        if cmd_bytes == 2 {
+            match cmd {
+                // OPI array read (esp-idf octal_psram pattern-test readback).
+                0x0000 => {
+                    for i in 0..nrx {
+                        let a = (addr as usize).wrapping_add(i);
+                        self.set_data_byte(i, *self.psram.get(a).unwrap_or(&0));
+                    }
+                    return;
+                }
+                // OPI array write (pattern-test magic store; RAM overwrite).
+                0x8080 => {
+                    for i in 0..ntx {
+                        let b = self.data_byte(i);
+                        let a = (addr as usize).wrapping_add(i);
+                        if let Some(slot) = self.psram.get_mut(a) {
+                            *slot = b;
+                        }
+                    }
+                    return;
+                }
+                // OPI mode-register read: latched value, zero beyond it.
+                0x4040 => {
+                    let v = self.psram_mr[(addr & 0xF) as usize];
+                    for i in 0..nrx {
+                        self.set_data_byte(i, if i == 0 { v } else { 0 });
+                    }
+                    return;
+                }
+                // OPI mode-register write: latch first MOSI byte per index.
+                0xC0C0 => {
+                    if ntx > 0 {
+                        self.psram_mr[(addr & 0xF) as usize] = self.data_byte(0);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         match cmd as u8 {
             CMD_JEDEC => {
                 for (i, &b) in PSRAM_ID.iter().enumerate().take(nrx) {
@@ -951,6 +1011,113 @@ mod tests {
         assert_eq!(m.read32(REG_W0), 0x5A6B7C8D);
         // Flash backing untouched by the CS1 write.
         assert_eq!(f[0x100], 0);
+    }
+
+    /// OPI (octal) PSRAM 16-bit array write/read round-trip (the
+    /// esp-idf octal_psram pattern-test shape: USER2 0xF0008080/0xF0000000).
+    #[test]
+    fn opi_psram_write_read_round_trip() {
+        let mut f = flash4m();
+        let mut m = Memspi::new();
+        m.write32(&mut f, REG_MISC, 0x1); // CS1 only (PSRAM)
+        m.write32(
+            &mut f,
+            REG_USER,
+            USER_USR_COMMAND | USER_USR_ADDR | USER_USR_MOSI,
+        );
+        m.write32(&mut f, REG_USER2, 0x8080 | (15 << 28)); // 16-bit OPI write
+        m.write32(&mut f, REG_ADDR, 0x20);
+        m.write32(&mut f, REG_USER1, 31 << 26); // 32-bit address
+        m.write32(&mut f, REG_MOSI_DLEN, 31);
+        m.write32(&mut f, REG_W0, 0xA5FF005A);
+        m.write32(&mut f, REG_CMD, CMD_USR);
+        m.write32(
+            &mut f,
+            REG_USER,
+            USER_USR_COMMAND | USER_USR_ADDR | USER_USR_MISO,
+        );
+        m.write32(&mut f, REG_USER2, 0x0000 | (15 << 28)); // 16-bit OPI read
+        m.write32(&mut f, REG_MISO_DLEN, 31);
+        m.write32(&mut f, REG_CMD, CMD_USR);
+        assert_eq!(m.read32(REG_W0), 0xA5FF005A);
+        // Flash backing untouched by the CS1 write.
+        assert_eq!(f[0x20], 0);
+    }
+
+    /// OPI mode-register latch: MR0 reads 0 before the 0xC0C0 write and
+    /// 0x28 after; MR2 resets to the 64 Mb density (low 3 bits = 3), which
+    /// `esp_psram_impl_enable` sizes 8 MB from.
+    #[test]
+    fn opi_mode_register_latch_and_density_default() {
+        let mut f = flash4m();
+        let mut m = Memspi::new();
+        m.write32(&mut f, REG_MISC, 0x1); // CS1 only (PSRAM)
+        // MR0 read before any write -> 0 (USER shapes mirror the
+        // esp-idf OPI traffic: COMMAND|ADDR|MISO, 16-bit cmd, 32-bit addr).
+        m.write32(
+            &mut f,
+            REG_USER,
+            USER_USR_COMMAND | USER_USR_ADDR | USER_USR_MISO,
+        );
+        m.write32(&mut f, REG_USER2, 0x4040 | (15 << 28));
+        m.write32(&mut f, REG_ADDR, 0);
+        m.write32(&mut f, REG_USER1, 31 << 26);
+        m.write32(&mut f, REG_MISO_DLEN, 15);
+        m.write32(&mut f, REG_CMD, CMD_USR);
+        assert_eq!(m.read32(REG_W0) & 0xFF, 0);
+        // MR0 write 0x28, then read back.
+        m.write32(
+            &mut f,
+            REG_USER,
+            USER_USR_COMMAND | USER_USR_ADDR | USER_USR_MOSI,
+        );
+        m.write32(&mut f, REG_USER2, 0xC0C0 | (15 << 28));
+        m.write32(&mut f, REG_MOSI_DLEN, 15);
+        m.write32(&mut f, REG_W0, 0x28);
+        m.write32(&mut f, REG_CMD, CMD_USR);
+        m.write32(
+            &mut f,
+            REG_USER,
+            USER_USR_COMMAND | USER_USR_ADDR | USER_USR_MISO,
+        );
+        m.write32(&mut f, REG_USER2, 0x4040 | (15 << 28));
+        m.write32(&mut f, REG_MISO_DLEN, 15);
+        m.write32(&mut f, REG_CMD, CMD_USR);
+        assert_eq!(m.read32(REG_W0) & 0xFF, 0x28);
+        // MR2 density default: low 3 bits = 3 (64 Mb -> 8 MB).
+        m.write32(&mut f, REG_ADDR, 2);
+        m.write32(&mut f, REG_CMD, CMD_USR);
+        assert_eq!(m.read32(REG_W0) & 0x7, 3);
+    }
+
+    /// 1-byte commands 0x00/0x80 must NOT alias the 16-bit OPI array
+    /// path (gated on `cmd_bytes == 2`): no PSRAM write happens.
+    #[test]
+    fn opi_commands_gated_on_cmd_bytes() {
+        let mut f = flash4m();
+        let mut m = Memspi::new();
+        m.write32(&mut f, REG_MISC, 0x1); // CS1 only (PSRAM)
+        m.write32(
+            &mut f,
+            REG_USER,
+            USER_USR_COMMAND | USER_USR_ADDR | USER_USR_MOSI,
+        );
+        m.write32(&mut f, REG_USER2, 0x80 | (7 << 28)); // 1-byte cmd 0x80
+        m.write32(&mut f, REG_ADDR, 0x40);
+        m.write32(&mut f, REG_USER1, 23 << 26);
+        m.write32(&mut f, REG_MOSI_DLEN, 31);
+        m.write32(&mut f, REG_W0, 0xDEADBEEF);
+        m.write32(&mut f, REG_CMD, CMD_USR);
+        // Read back via the OPI 16-bit read: still zeros (no alias write).
+        m.write32(
+            &mut f,
+            REG_USER,
+            USER_USR_COMMAND | USER_USR_ADDR | USER_USR_MISO,
+        );
+        m.write32(&mut f, REG_USER2, 0x0000 | (15 << 28));
+        m.write32(&mut f, REG_MISO_DLEN, 31);
+        m.write32(&mut f, REG_CMD, CMD_USR);
+        assert_eq!(m.read32(REG_W0), 0);
     }
 
     /// Special-command RDID (CMD bit 28) reads 3 id bytes into W0.

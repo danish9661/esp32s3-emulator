@@ -83,11 +83,13 @@ CASES=(
 "twai_driver||TWAI DRIVER LOOPBACK PASS|"
 "mcpwm||MCPWM PASS|"
 "mcpwm_sync||MCPWM SYNC PASS|"
+"mcpwm_dt||MCPWM DT PASS|"
 "mcpwm_cap||MCPWM CAP PASS|"
 "pcnt||PCNT PASS|"
 "ledc||LEDC PASS|"
 "sigmadelta||SIGMADELTA PASS|"
 "efuse||EFUSE DONE|"
+"efuse_burn||EFUSE BURN PASS;EFUSE BURN DONE|"
 "rng||RNG PASS|"
 "rtcio||RTCIO PASS|"
 "lpi2c||LP I2C POKE PASS|"
@@ -109,11 +111,15 @@ CASES=(
 "i2s_driver||I2S DRIVER LOOPBACK PASS|300000000"
 "touch|TOUCH_INJECT=3:1877|TOUCH PASS|150000000"
 "temp|TEMP_C=25|TEMP 25C OK;TEMP DONE|"
+"rwdt_feed||RWDT FEED TEST START|"
+"rwdt_reset||RWDT RESET TEST|"
 "lcd_cam||LCD CAM POKE PASS;LCD GDMA PASS|"
 "p5_stubs||P5 STUBS POKE PASS|"
 "gdma||GDMA RMT TX done|"
 "full_load||FULL_LOAD PASS|150000000"
 "ota_slot||OTA SLOT TEST PASS|"
+"psram_qspi||PSRAM total=2097152;PSRAM RW OK;PSRAM PROBE PASS|"
+"psram_opi||PSRAM total=8388608;PSRAM RW OK;PSRAM PROBE PASS|"
 "ee_dsp||EE DSP DOT OK;EE DSP VADDS OK;EE DSP DONE|"
 "virtual_demo|NODE:tools/virtual_demo_harness.mjs|VIRTUAL DEMO HARNESS PASS|"
 "camcap|NODE:tools/camcap_harness.mjs|CAMCAP HARNESS PASS|"
@@ -174,8 +180,18 @@ for c in "${CASES[@]}"; do
     if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); fi
     continue
   fi
+  # Variant sketches share one source dir but need different arduino-cli
+  # options and produce distinct committed binaries (plain `--build` must
+  # reproduce them exactly).
+  srcdir="$dir"; fqbn="esp32:esp32:esp32s3"; inobin="esp32s3_$name.ino.merged.bin"
+  case "$name" in
+    psram_qspi) srcdir="$SK/esp32s3_psram"; fqbn="$fqbn:PSRAM=enabled"; bin="$srcdir/esp32s3_psram_qspi.merged.bin"; inobin="esp32s3_psram.ino.merged.bin";;
+    psram_opi) srcdir="$SK/esp32s3_psram"; fqbn="$fqbn:PSRAM=opi"; bin="$srcdir/esp32s3_psram_opi.merged.bin"; inobin="esp32s3_psram.ino.merged.bin";;
+  esac
   if [[ -n "$binrel" ]]; then
     bin="$SK/$binrel"
+  elif [[ "$srcdir" != "$dir" ]]; then
+    : # variant bin already resolved above
   else
     bin="$dir/esp32s3_$name.merged.bin"
     [[ -f "$bin" ]] || bin="$dir/esp32s3_$name.ino.merged.bin"
@@ -184,10 +200,10 @@ for c in "${CASES[@]}"; do
     fi
   fi
   if [[ $BUILD == 1 ]]; then
-    if ! arduino-cli compile --fqbn esp32:esp32:esp32s3 --build-path "$dir/build" "$dir" >/tmp/battery_build.log 2>&1; then
+    if ! arduino-cli compile --fqbn "$fqbn" --build-path "$srcdir/build" "$srcdir" >/tmp/battery_build.log 2>&1; then
       echo "FAIL $name (compile)"; tail -3 /tmp/battery_build.log; fail=$((fail+1)); continue
     fi
-    cp "$dir/build/esp32s3_$name.ino.merged.bin" "$bin"
+    cp "$srcdir/build/$inobin" "$bin"
   fi
   if [[ ! -f "$bin" ]]; then echo "FAIL $name (no binary $bin)"; fail=$((fail+1)); continue; fi
   log=$(STEPS=$steps env $envstr timeout 300 "$EMU" "$bin" 2>&1 | tr -d '\0')

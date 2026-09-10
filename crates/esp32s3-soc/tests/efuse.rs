@@ -40,3 +40,24 @@ fn read_cmd_is_noop_and_preserves_mac() {
     // Random read of an unmodeled register returns 0.
     assert_eq!(e.read32(0x200), 0);
 }
+
+#[test]
+fn burn_block3_ors_usr_data_and_sticks() {
+    // PGM_DATA staging (0x00..0x1C) + PGM_CMD (0x1D4: PGM bit 1,
+    // BLK_NUM 3 in [5:2]) ORs into RD_USR_DATA0..7 (@ 0x7C).
+    // eFuse bits only set (never clear): burning twice accumulates.
+    use esp32s3_soc::efuse::Efuse;
+    let mut e = Efuse::new();
+    assert_eq!(e.read32(0x7C), 0);
+    e.write32(0x00, 0xA5A5_00FF);
+    e.write32(0x1D4, (3 << 2) | 0x2);
+    assert_eq!(e.read32(0x7C), 0xA5A5_00FF);
+    // Second burn ORs (cannot clear).
+    e.write32(0x00, 0x00FF_00FF);
+    e.write32(0x1D4, (3 << 2) | 0x2);
+    assert_eq!(e.read32(0x7C), 0xA5FF_00FF);
+    // Other block numbers are ignored (only USR_DATA modeled).
+    e.write32(0x00, 0xFFFF_FFFF);
+    e.write32(0x1D4, (5 << 2) | 0x2);
+    assert_eq!(e.read32(0x7C), 0xA5FF_00FF, "block 5 untouched");
+}

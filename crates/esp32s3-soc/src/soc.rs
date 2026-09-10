@@ -1997,7 +1997,7 @@ impl Soc {
     /// True if any device requested a hard reset (e.g. a WDT stage action of
     /// reset-CPU/system). The machine consumes this each step to reboot.
     pub fn consume_reset(&mut self) -> bool {
-        self.timg[0].consume_reset() || self.timg[1].consume_reset()
+        self.timg[0].consume_reset() || self.timg[1].consume_reset() || self.rtc.consume_reset()
     }
 
     /// True if firmware requested a deep-sleep (wrote `RTC_CNTL_SLEEP_EN`).

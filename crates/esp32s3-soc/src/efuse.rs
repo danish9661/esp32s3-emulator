@@ -46,6 +46,8 @@ const MAC_HI: u32 = 0x0000_6655;
 
 pub struct Efuse {
     regs: [u32; REG_COUNT],
+    /// Staged PGM_DATA0..7 burn words (written before PGM_CMD).
+    pgm_stage: [u32; 8],
 }
 
 impl Efuse {
@@ -57,7 +59,7 @@ impl Efuse {
         regs[RD_SYS_PART1_DATA1_OFF] = MAC_HI;
         regs[RD_MAC_SPI_SYS0_OFF] = MAC_LO;
         regs[RD_MAC_SPI_SYS1_OFF] = MAC_HI;
-        Self { regs }
+        Self { regs, pgm_stage: [0; 8] }
     }
 }
 
@@ -70,6 +72,10 @@ impl Default for Efuse {
 impl Efuse {
     pub fn read32(&mut self, off: u32) -> u32 {
         let w = (off >> 2) as usize;
+        // PGM_DATA reads back the staged burn words.
+        if off <= 0x1C {
+            return self.pgm_stage[(off >> 2) as usize];
+        }
         match w {
             // EFUSE_STATUS_REG state field reads idle (0) — the driver's
             // read-done poll exits immediately on our materialized array.
@@ -100,11 +106,26 @@ impl Efuse {
 
     pub fn write32(&mut self, off: u32, value: u32) {
         let w = (off >> 2) as usize;
+        // PGM_DATA0..7 staging (off 0x00..0x1C): held until PGM_CMD.
+        if off <= 0x1C {
+            self.pgm_stage[(off >> 2) as usize] = value;
+            return;
+        }
         match w {
             // read_cmd (bit 0): on real silicon this copies the eFuse array into
             // the RD_* registers. Our array is already materialized, so this is a
             // no-op (the STATUS poll sees idle immediately).
+            // PGM_CMD (bit 1) with BLK_NUM[5:2]: one-way burn — OR the staged
+            // PGM_DATA words into the block's RD mirror. Only BLOCK_USR_DATA
+            // (block 3, RD_USR_DATA0..7 @ 0x7C) is modeled; other blocks are
+            // ignored (documented). Verified: the driver prints
+            // "BURN BLOCK3" for ESP_EFUSE_USER_DATA.
             EFUSE_CMD_OFF => {
+                if value & 0x2 != 0 && (value >> 2) & 0xF == 3 {
+                    for i in 0..8 {
+                        self.regs[0x7C / 4 + i] |= self.pgm_stage[i];
+                    }
+                }
                 let _ = value & 1;
             }
             // clk_en / power control — ignored.

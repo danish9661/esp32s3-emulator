@@ -59,3 +59,28 @@ fn soc_page_dispatch_routes_rtc_cntl_time_regs() {
     assert_eq!(soc.read32(0x6000_8014), 0);
     assert_eq!(soc.read32(0x6000_8400), 0, "RTC_IO unmapped");
 }
+
+#[test]
+fn rwdt_reset_fires_once_then_feeds_clear() {
+    // RWDT: CONFIG0 (EN + STG0=3/system-reset) @ 0x98, STG0_HOLD @ 0x9C,
+    // FEED @ 0xAC, WPROTECT @ 0xB0 (key-gated like MWDT).
+    use esp32s3_soc::rtc::Rtc;
+    let mut r = Rtc::default();
+    // Locked config is dropped.
+    r.write32(0x98, (1 << 31) | (3 << 28));
+    r.tick(100000);
+    assert!(!r.consume_reset(), "locked config must not arm");
+    // Unlock, arm stage0 reset at hold 100.
+    r.write32(0xB0, 0x50D8_3AA1);
+    r.write32(0x98, (1 << 31) | (3 << 28));
+    r.write32(0x9C, 100);
+    r.tick(50);
+    assert!(!r.consume_reset(), "not yet");
+    r.tick(60);
+    assert!(r.consume_reset(), "reset stage fires");
+    assert!(!r.consume_reset(), "single-shot until feed");
+    // Feed restarts (no immediate re-fire).
+    r.write32(0xAC, 0xABAD_1DEA);
+    r.tick(50);
+    assert!(!r.consume_reset(), "fed, quiet");
+}
