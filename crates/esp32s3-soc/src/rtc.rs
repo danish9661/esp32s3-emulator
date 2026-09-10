@@ -45,6 +45,25 @@ pub const SLP_TIMER1_OFF: u32 = 0x08;
 pub const STATE0_OFF: u32 = 0x18;
 pub const SLEEP_EN_BIT: u32 = 1 << 31;
 pub const SLP_WAKEUP_CAUSE_OFF: u32 = 0x130;
+// RTC_CNTL interrupt block (rtc_cntl_reg.h): ENA @ +0x40, RAW @ +0x44,
+// ST @ +0x48, CLR @ +0x4C. Touch DONE = bit 6, SCAN_DONE = bit 4
+// (matches touch_sensor_ll.h TOUCH_LL_INTR_MASK_*).
+const INT_ENA_OFF: u32 = 0x40;
+const INT_RAW_OFF: u32 = 0x44;
+const INT_ST_OFF: u32 = 0x48;
+const INT_CLR_OFF: u32 = 0x4C;
+const TOUCH_DONE_BIT: u32 = 1 << 6;
+const TOUCH_SCAN_DONE_BIT: u32 = 1 << 4;
+// Touch FSM trigger registers (rtc_cntl_reg.h): CTRL2 @ +0x10C
+// (touch_start_force / timer_force_done), SCAN_CTRL @ +0x110 (pad map).
+const TOUCH_CTRL2_OFF: u32 = 0x10C;
+const TOUCH_SCAN_CTRL_OFF: u32 = 0x110;
+// RTC-core interrupt source (interrupts.h: WIFI_MAC 0..UHCI1 15, GPIO
+// 16..19, SPI1 20, SPI2 21, SPI3 22, (23), LCD_CAM 24, I2S0/1 25/26,
+// UART0/1/2 27/28/29, SDIO 30, PWM0/1 31/32, (33, 34), LEDC 35, EFUSE 36,
+// TWAI 37, USB 38, RTC_CORE 39). Carries the touch DONE/SCAN_DONE (and
+// WDT) interrupts; TWAI=37 cross-checks against twai.rs (driver-validated).
+pub const RTC_CORE_INTR_SOURCE: u32 = 39;
 // Reset-cause register (rtc_cntl_reg.h RTC_CNTL_RESET_STATE_REG @ +0x38):
 // PROCPU cause [5:0], APPCPU cause [11:6]. The live ROM's
 // `esp_rom_get_reset_reason` (0x4000057C) returns these fields directly
@@ -105,6 +124,11 @@ pub struct Rtc {
     /// heuristic: the direct-poke sleep flow programs them without touching
     /// WAKEUP_ENA, while no-timer flows never write them).
     slp_timer_written: bool,
+    /// Latched touch FSM completion (DONE + SCAN_DONE, rtc_cntl_reg.h
+    /// INT_RAW bits 6/4): raised synchronously when firmware triggers a
+    /// scan via TOUCH_CTRL2/SCAN_CTRL (the event the driver's oneshot wait
+    /// blocks on), cleared by INT_CLR. Other INT_RAW bits live in `regs`.
+    touch_raw: u32,
     /// Generic backing store for the full RTC_CNTL page (0x000..0x400).  Most
     /// registers are simple stores; the special-cased ones below override this.
     regs: [u32; 0x400 / 4],
@@ -133,6 +157,7 @@ impl Default for Rtc {
             // wait as a hang. Size validation budgets accordingly.
             reset_state: RESET_CAUSE_POWERON | (RESET_CAUSE_POWERON << 6),
             slp_timer_written: false,
+            touch_raw: 0,
             regs: [0u32; 0x400 / 4],
             ulp: crate::ulp::Ulp::default(),
         }
@@ -205,6 +230,12 @@ impl Rtc {
         self.reset_state = (pro & 0x3F) | ((app & 0x3F) << 6);
     }
 
+    /// Masked RTC-core interrupt status (INT_ST = RAW & ENA), covering
+    /// the latched touch DONE/SCAN_DONE bits.
+    pub fn int_st(&self) -> u32 {
+        (self.regs[INT_RAW_OFF as usize / 4] | self.touch_raw) & self.regs[INT_ENA_OFF as usize / 4]
+    }
+
     pub fn read32(&mut self, offset: u32) -> u32 {
         match offset {
             TIME_VALUE_LO_OFF => self.latched as u32,
@@ -214,6 +245,13 @@ impl Rtc {
             SLP_WAKEUP_CAUSE_OFF => self.wakeup_cause,
             RESET_STATE_OFF => self.reset_state,
             EXT1_STATUS_OFF => self.ext1_status,
+            // Interrupt status: live touch completion latched in
+            // `touch_raw` ORed over the stored RAW; ST masks by ENA.
+            INT_RAW_OFF => self.regs[INT_RAW_OFF as usize / 4] | self.touch_raw,
+            INT_ST_OFF => {
+                (self.regs[INT_RAW_OFF as usize / 4] | self.touch_raw)
+                    & self.regs[INT_ENA_OFF as usize / 4]
+            }
             // ULP-RISC-V block lives at offset 0x100..0x200 of this page.
             o if (ULP_OFF_START..ULP_OFF_END).contains(&o) => self.ulp.read32(RTC_CNTL_BASE + o),
             o => self.regs[o as usize / 4],
@@ -247,6 +285,22 @@ impl Rtc {
                 self.sleep_req = true;
                 self.sleep_target =
                     (self.slp_timer0 as u64) | ((self.slp_timer1 as u64 & 0xFFFF) << 32);
+            }
+            // Touch FSM trigger: any scan-control write latches DONE +
+            // SCAN_DONE (synchronous completion, like SHA BUSY). The
+            // driver's oneshot wait blocks on the resulting interrupt/event.
+            TOUCH_CTRL2_OFF | TOUCH_SCAN_CTRL_OFF => {
+                self.regs[offset as usize / 4] = value;
+                self.touch_raw |= TOUCH_DONE_BIT | TOUCH_SCAN_DONE_BIT;
+            }
+            INT_ENA_OFF => {
+                self.regs[offset as usize / 4] = value;
+            }
+            INT_CLR_OFF => {
+                // Write-1-to-clear over stored RAW and latched touch bits.
+                self.regs[INT_RAW_OFF as usize / 4] &= !value;
+                self.touch_raw &= !value;
+                self.regs[offset as usize / 4] = value;
             }
             o if (ULP_OFF_START..ULP_OFF_END).contains(&o) => {
                 self.ulp.write32(RTC_CNTL_BASE + o, value);

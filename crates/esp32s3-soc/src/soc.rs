@@ -48,6 +48,7 @@ use crate::sigmadelta::Sdm;
 use crate::spi::Spi;
 use crate::systimer::Systimer;
 use crate::timg::{INT_T0, INT_T1, INT_WDT, Timg};
+use crate::touch::Touch;
 use crate::twai::{TWAI_BASE, Twai};
 use crate::uart::Uart;
 use crate::ulp::{ULP_OFF_END, ULP_OFF_START, Ulp};
@@ -240,6 +241,7 @@ pub struct Soc {
     cache: Cache,
     timg: [Timg; 2],
     systimer: Systimer,
+    touch: Touch,
     rtc: Rtc,
     rtc_i2c: RtcI2c,
     rtc_io: RtcIo,
@@ -395,6 +397,7 @@ impl Soc {
             cache: Cache::new(),
             timg: [Timg::new(), Timg::new()],
             systimer: Systimer::new(),
+            touch: Touch::new(),
             rtc: Rtc::new(),
             rtc_i2c: RtcI2c::new(),
             rtc_io: RtcIo::new(),
@@ -691,6 +694,12 @@ impl Soc {
     /// frontend — drives what the firmware reads from the SAR ADC).
     pub fn adc_inject_voltage(&mut self, unit: usize, channel: usize, milli_volts: u32) {
         self.adc.inject_voltage(unit, channel, milli_volts);
+    }
+
+    /// Inject a touch counter value on pad 1..=14 (host frontend — drives
+    /// what the firmware reads from the touch STATUS registers).
+    pub fn touch_inject(&mut self, pad: usize, value: u32) {
+        self.touch.inject(pad, value);
     }
 
     /// Snapshot of driven output-pin state (host LED visualization).  A
@@ -1637,7 +1646,19 @@ impl Soc {
             // RTC_MEM is not.
             0x6000_8000 => {
                 if in_range!(off, 0x800, 0x400) {
-                    if is_write {
+                    // SENS page: the ADC oneshot owns offsets 0x00..0x5C;
+                    // the touch block (CONF 0x5C through APPR_STATUS 0xE0)
+                    // owns 0x5C..0x100 (see touch.rs; no overlap with any ADC
+                    // register, whose highest is SLAVE_ADDR1 @ 0x40).
+                    let soff = off - 0x800;
+                    if (0x85C..0x900).contains(&off) {
+                        if is_write {
+                            self.touch.write32(soff, value);
+                            0
+                        } else {
+                            self.touch.read32(soff)
+                        }
+                    } else if is_write {
                         self.adc.sens_write32(off - 0x800, value);
                         0
                     } else {
@@ -2345,6 +2366,11 @@ impl Soc {
         }
         if self.pcnt.int_st() != 0 {
             src |= 1 << crate::pcnt::PCNT_INTR_SOURCE;
+        }
+        // RTC core (ETS_RTC_CORE_INTR_SOURCE = 39): touch DONE/SCAN_DONE
+        // (oneshot completion event) and friends, INT_ST = RAW & ENA.
+        if self.rtc.int_st() != 0 {
+            src |= 1 << crate::rtc::RTC_CORE_INTR_SOURCE;
         }
         // GDMA channels have per-channel sources (ETS_DMA_IN_CH0..4 =
         // 66..70, ETS_DMA_OUT_CH0..4 = 71..75) on the single shared

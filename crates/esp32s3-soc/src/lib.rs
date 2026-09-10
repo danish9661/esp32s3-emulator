@@ -43,6 +43,7 @@ pub mod soc;
 pub mod spi;
 pub mod systimer;
 pub mod timg;
+pub mod touch;
 pub mod twai;
 pub mod uart;
 pub mod ulp;

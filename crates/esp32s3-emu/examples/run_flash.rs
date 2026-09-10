@@ -33,6 +33,14 @@ fn unimp_detail(m: &mut Esp32S3, core: usize) -> String {
         _ => decode_inst(raw),
     };
     match opc {
+        Some(o) if xtensa_core::ee::is_ee_opcode(o) => {
+            // TIE/DSP trap: name the hardware unit, not just the mnemonic.
+            format!(
+                "{} [ee:{}] (raw {raw:#010x})",
+                o.name(),
+                xtensa_core::ee::ee_family(o)
+            )
+        }
         Some(o) => format!("{} (raw {raw:#010x})", o.name()),
         None => format!("undecodable (raw {raw:#010x})"),
     }
@@ -52,6 +60,16 @@ fn main() {
     {
         m.soc.adc_inject_voltage(0, 3, mv);
         println!("[host] injected {mv} mV on ADC1_CH3 (GPIO4)");
+    }
+
+    // Touch injection for sketches doing touchRead: TOUCH_INJECT=<pad>:<val>
+    // sets the counter touch pad 1..=14 reports (falls when touched).
+    if let Ok(spec) = env::var("TOUCH_INJECT")
+        && let Some((pad, val)) = spec.split_once(':')
+        && let (Ok(pad), Ok(val)) = (pad.parse::<usize>(), val.parse::<u32>())
+    {
+        m.soc.touch_inject(pad, val);
+        println!("[host] injected touch pad {pad} = {val}");
     }
 
     // UART1 RX injection (echo-sketch support): UART_INJECT=<text> is

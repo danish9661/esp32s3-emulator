@@ -2638,3 +2638,56 @@ Core design:
     naive collapse would have introduced in the CAM loopback (kept the guard
     via let-chain). Full workspace 37/37 green, fmt/wasm32 clean, battery
     smoke (hello/periph/uart_echo/adc_dma) green.
+  - 2026-09-10: **Browser bundle rebuilt + revalidated (P6 hygiene)**.
+    `web/pkg/` was stale (predating the I2S driver work and the clippy
+    refactor). Rebuilt via wasm-pack 0.14.0 (web target, correct
+    `../../web/pkg` out-dir); gallery +1 (`esp32s3_i2s_driver`, 23 entries).
+    Validated: API-compat grep (every `emu.*` call in main.js exists in the
+    d.ts), `node --check`, manifest JSON-valid, all assets serve 200, plus
+    a nodejs-target harness booting hello in-wasm to `boot OK`
+    (`NODE BOOT PASS`, ~80M steps POWERON). Cautionary tale: harness bugs
+    mimic model failure — byte-array UART output compared as text, and
+    step budgets sized for the old 13M-step boot, both fixed by decoding
+    properly and stepping to completion.
+  - 2026-09-10: **Full local battery green 61/0/0, post-everything** (all 4
+    shards 16/15/15/15 after the clippy refactor + CI commit). No new rot.
+    Remaining work: none in scope — every modeled peripheral is validated,
+    CI (rust gate + 4-shard battery matrix) is committed but has never run
+    remotely (no git remote configured); WiFi/BLE, Touch, and `ee.*` stay
+    excluded per directive.
+  - 2026-09-10: **Touch sensor controller validated (was user-excluded,
+    now in scope)**. New `esp32s3-soc/src/touch.rs`: S3 touch block carved
+    out of the SENS page (`DR_REG_SENS_BASE` + `0x5C..0x100`, no overlap
+    with the ADC oneshot at `0x00..0x40`), CONF/THRES/CHN_ST/STATUS1-14/
+    SLP/APPR per `sens_struct.h` (pad N = STATUS base + N, GPIO N 1:1).
+    Synchronous model: `meas_done` reads 1 and STATUS returns the
+    host-injected counter (`touch_inject`, `TOUCH_INJECT=<pad>:<val>` like
+    `ADC_INJECT_MV`); `pad_active` is live (counter < nonzero threshold).
+    Two real spec details found via headers + disassembly (not guessing):
+    (1) `SENS_TOUCH_MEAS_DONE` is bit **31** (the driver's oneshot wait
+    polls CHN_ST with `bltz`; a bit-30 model timed out forever while reads
+    still worked); (2) the oneshot completion also latches RTC
+    DONE/SCAN_DONE (bits 6/4) into a new `touch_raw` overlay with
+    INT_RAW/ENA/ST/CLR semantics, wired as matrix source 39
+    (`ETS_RTC_CORE_INTR_SOURCE`, counted from `interrupts.h`, TWAI=37
+    cross-check). Validated: 5 unit tests + machine test +
+    `tools/sketches/esp32s3_touch` (Arduino `touchRead`, exact injected
+    value + idle baseline) → `TOUCH PASS` (battery entry, 150M STEPS).
+    KNOWN LIMITATION (documented in-code): no threshold ISR — S3 touch
+    interrupts route via the ULP-coprocessor block with no matrix source.
+  - 2026-09-10: **I2C-Wire ABI limitation closed as verified-silicon-true
+    (no model change)**. Re-derived from IDF release/v5.3 source (was
+    disassembly-only): `i2c_master_isr_handler_default` sets
+    `status=ACK_ERROR` NACK-first, `s_i2c_transaction_start` returns
+    `ESP_ERR_INVALID_STATE` (0x103) when status != DONE, and Arduino Wire
+    `endTransmission` maps only OK→0/FAIL+NOT_FOUND→2/TIMEOUT→5, so 0x103
+    falls through to 4 ("other"). Empty-bus scan printing `other=119` is
+    what silicon does; there is no `cmd_link` struct in v5.3 (verdict lives
+    in firmware-owned `status`/`event`), so no peripheral bit can change
+    it. Battery sketch keeps asserting the correct behavior.
+  - 2026-09-10: **ee.* trap diagnostics completed (execution stays out)**.
+    Full TIE/DSP execution remains unvalidatable (nothing in-tree executes
+    it), so the work is diagnostic: `ee_family` now derives the hardware
+    unit from the mnemonic prefix (covers all ~129 variants, no
+    enumeration) and the run_flash trap prints `[ee:<unit>]` with pc +
+    mnemonic. 7 ee unit tests green.

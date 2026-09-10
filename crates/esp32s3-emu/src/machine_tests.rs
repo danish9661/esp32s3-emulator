@@ -3420,3 +3420,19 @@ fn i2s_out_pump_large_chain() {
     m.soc.tick_timers(9000);
     assert_eq!(m.soc.read32(0x6000_F00C) & 2, 2, "tx_done after chain");
 }
+
+/// Touch pad counter flows from host injection through the SENS-page
+/// dispatch to the STATUS register the driver reads.
+#[test]
+fn touch_status_reports_injected_counter() {
+    use esp32s3_soc::touch::{TOUCH_CHN_ST_OFF, TOUCH_CONF_OFF};
+    const SENS: u32 = 0x6000_8800;
+    let mut m = Esp32S3::new();
+    // Plain CONF round-trip through the carved touch window.
+    m.soc.write32(SENS + TOUCH_CONF_OFF, 0x7FFF);
+    assert_eq!(m.soc.read32(SENS + TOUCH_CONF_OFF), 0x7FFF);
+    // Injected counter visible in STATUS3 (pad 3); meas_done set.
+    m.soc.touch_inject(3, 1877);
+    assert_eq!(m.soc.read32(SENS + 0xAC), 1877);
+    assert_eq!(m.soc.read32(SENS + TOUCH_CHN_ST_OFF) & (1 << 31), 1 << 31);
+}

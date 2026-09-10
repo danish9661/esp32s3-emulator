@@ -33,26 +33,18 @@ pub fn is_ee_opcode(op: Opcode) -> bool {
     matches!(op as u32, 498..=753)
 }
 
-/// Coarse family label for an `ee.*` opcode, used for diagnostics.
+/// Coarse family label for an `ee.*` opcode, used for diagnostics (the
+/// trap message names the TIE unit the firmware reached for). Derived from
+/// the mnemonic's first component so it stays correct across all ~129
+/// decoded variants without enumerating them; curated aliases normalize
+/// the historic names.
 pub fn ee_family(op: Opcode) -> &'static str {
-    match op {
-        Opcode::OPCODE_EE_VMULAS_U16_ACCX
-        | Opcode::OPCODE_EE_VMULAS_U8_ACCX
-        | Opcode::OPCODE_EE_VMULAS_U16_QACC
-        | Opcode::OPCODE_EE_VMULAS_U8_QACC
-        | Opcode::OPCODE_EE_VMULAS_S16_ACCX
-        | Opcode::OPCODE_EE_VMULAS_S8_ACCX
-        | Opcode::OPCODE_EE_VMULAS_S16_QACC
-        | Opcode::OPCODE_EE_VMULAS_S8_QACC
-        | Opcode::OPCODE_EE_VMULAS_S16_QACC_LDBC_INCP
-        | Opcode::OPCODE_EE_VMULAS_S8_QACC_LDBC_INCP
-        | Opcode::OPCODE_EE_VMULAS_U16_QACC_LDBC_INCP
-        | Opcode::OPCODE_EE_VMULAS_U8_QACC_LDBC_INCP => "vmac",
-        Opcode::OPCODE_EE_LDF_64_XP | Opcode::OPCODE_EE_STF_64_XP => "fld",
-        Opcode::OPCODE_EE_WR_MASK_GPIO_OUT
-        | Opcode::OPCODE_EE_SET_BIT_GPIO_OUT
-        | Opcode::OPCODE_EE_CLR_BIT_GPIO_OUT => "gpio",
-        _ => "tie",
+    let rest = op.name().strip_prefix("ee_").unwrap_or("tie");
+    let unit = rest.split('_').next().unwrap_or("tie");
+    match unit {
+        "vmulas" | "vmul" => "vmac",
+        "wr" | "set" | "clr" | "get" => "gpio",
+        _ => unit,
     }
 }
 
@@ -106,8 +98,12 @@ mod tests {
     #[test]
     fn ee_family_labels() {
         assert_eq!(ee_family(Opcode::OPCODE_EE_VMULAS_U16_ACCX), "vmac");
-        assert_eq!(ee_family(Opcode::OPCODE_EE_LDF_64_XP), "fld");
+        assert_eq!(ee_family(Opcode::OPCODE_EE_LDF_64_XP), "ldf");
+        assert_eq!(ee_family(Opcode::OPCODE_EE_STF_64_XP), "stf");
         assert_eq!(ee_family(Opcode::OPCODE_EE_WR_MASK_GPIO_OUT), "gpio");
+        assert_eq!(ee_family(Opcode::OPCODE_EE_ZERO_ACCX), "zero");
+        assert_eq!(ee_family(Opcode::OPCODE_EE_VCMP_EQ_S16), "vcmp");
+        assert_eq!(ee_family(Opcode::OPCODE_EE_UNIMPLEMENTED), "unimplemented");
     }
 
     #[test]
