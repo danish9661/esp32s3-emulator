@@ -341,6 +341,210 @@ mod cpu_tests {
         assert_eq!(cpu.sreg(SR_SAR), 3, "ssr wrote SAR");
     }
 
+    /// Run one raw instruction word (assembled with
+    /// xtensa-esp32s3-elf-as; every encoding below was verified against
+    /// the generated decoder) with registers preset, then return.
+    fn run1(prog_word: u32, setup: impl FnOnce(&mut Cpu, &mut RamBus)) -> (Cpu, RamBus) {
+        let mut bus = RamBus::load(&[(0x4000_0000, prog_word)]);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_0000;
+        setup(&mut cpu, &mut bus);
+        run(&mut cpu, &mut bus, 0x4000_0003);
+        (cpu, bus)
+    }
+
+    #[test]
+    fn mac16_mul_overwrites_acc() {
+        // MUL.AA.HH a2, a3 = 0x770234: ACC <- sext(a2.hi) * sext(a3.hi).
+        let (cpu, _) = run1(0x770234, |cpu, _| {
+            cpu.set_reg(2, 0x0002_0003);
+            cpu.set_reg(3, 0x0004_0005);
+        });
+        assert_eq!(cpu.sreg(SR_ACCLO), 8, "2*4");
+        assert_eq!(cpu.sreg(SR_ACCHI), 0, "positive sign extension");
+        // Signed halves: (-1) * 3 = -3.
+        let (cpu, _) = run1(0x770234, |cpu, _| {
+            cpu.set_reg(2, 0xFFFF_0000);
+            cpu.set_reg(3, 0x0003_0000);
+        });
+        assert_eq!(cpu.sreg(SR_ACCLO), 0xFFFF_FFFD, "-3 low");
+        assert_eq!(cpu.sreg(SR_ACCHI), 0xFFFF_FFFF, "-3 sign extension");
+        // UMUL.AA.HH a2, a3 = 0x730234: unsigned halves, ACCHI = 0.
+        let (cpu, _) = run1(0x730234, |cpu, _| {
+            cpu.set_reg(2, 0xFFFF_0000);
+            cpu.set_reg(3, 0xFFFF_0000);
+        });
+        assert_eq!(cpu.sreg(SR_ACCLO), 0xFFFE_0001, "65535^2 low");
+        assert_eq!(cpu.sreg(SR_ACCHI), 0, "umul clears high");
+    }
+
+    #[test]
+    fn mac16_mula_muls_accumulate() {
+        // MULA.DA.HH m0, a3 = 0x6b0034: ACC += sext(MR0.hi) * sext(a3.hi).
+        let (cpu, _) = run1(0x6b0034, |cpu, _| {
+            cpu.set_sreg(SR_ACCLO, 100);
+            cpu.set_sreg(SR_ACCHI, 0);
+            cpu.set_sreg(SR_M0, 0x0002_0003);
+            cpu.set_reg(3, 0x0004_0005);
+        });
+        assert_eq!(cpu.sreg(SR_ACCLO), 108, "100 + 2*4");
+        assert_eq!(cpu.sreg(SR_ACCHI), 0);
+        // MULS.AD.HL a2, m3 = 0x3d0244: ACC -= sext(a2.hi) * sext(MR3.lo).
+        let (cpu, _) = run1(0x3d0244, |cpu, _| {
+            cpu.set_sreg(SR_ACCLO, 1000);
+            cpu.set_sreg(SR_ACCHI, 0);
+            cpu.set_reg(2, 0x000A_0000);
+            cpu.set_sreg(SR_M0 + 3, 0x0000_0009);
+        });
+        assert_eq!(cpu.sreg(SR_ACCLO), 1000 - 10 * 9, "1000 - 90");
+        // 40-bit wrap: (0x7F:FFFFFFFF) + 1 -> LO=0, HI=ext8s(0x80).
+        // MULA.AA.HH a2, a3 = 0x7b0234.
+        let (cpu, _) = run1(0x7b0234, |cpu, _| {
+            cpu.set_sreg(SR_ACCLO, 0xFFFF_FFFF);
+            cpu.set_sreg(SR_ACCHI, 0x7F);
+            cpu.set_reg(2, 0x0001_0000);
+            cpu.set_reg(3, 0x0001_0000);
+        });
+        assert_eq!(cpu.sreg(SR_ACCLO), 0, "wrapped low");
+        assert_eq!(cpu.sreg(SR_ACCHI), 0xFFFF_FF80, "ext8s(0x80)");
+    }
+
+    #[test]
+    fn mac16_mr_select_bits() {
+        // MUL.AD.HH a2, m3 = 0x370244 must read MR3 (not MR2): with
+        // MR2.hi = 0x1111 and MR3.hi = 5, result 2*5 = 10 proves the
+        // t[2] select bit (a const-MR2 decoder would give 2*0x1111).
+        let (cpu, _) = run1(0x370244, |cpu, _| {
+            cpu.set_reg(2, 0x0002_0003);
+            cpu.set_sreg(SR_M0 + 2, 0x1111_1111);
+            cpu.set_sreg(SR_M0 + 3, 0x0005_0007);
+        });
+        assert_eq!(cpu.sreg(SR_ACCLO), 10, "AR.hi * MR3.hi");
+        // MUL.DD.HH m1, m3 word 0x274044 (assembler-verified): MR1.hi=7,
+        // MR3.hi=9 -> 63. (DD mx aliases mod 2 like DA: m2->m0, m3->m1.)
+        let (cpu, _) = run1(0x274044, |cpu, _| {
+            cpu.set_sreg(SR_M0 + 1, 0x0007_0000);
+            cpu.set_sreg(SR_M0 + 3, 0x0009_0000);
+        });
+        assert_eq!(cpu.sreg(SR_ACCLO), 63, "MR1.hi * MR3.hi");
+    }
+
+    #[test]
+    fn mac16_ldinc_lddec() {
+        // MULA.DA.HH.LDINC m2, a2, m1, a3 = 0x4b6234: MR2 <- mem[AR2+4],
+        // AR2 += 4, ACC += sext(MR1.hi) * sext(AR3.hi).
+        let (cpu, mut bus) = run1(0x4b6234, |cpu, bus| {
+            bus.write32(0x1004, 0xDEAD_BEEF);
+            cpu.set_reg(2, 0x1000);
+            cpu.set_sreg(SR_M0 + 1, 0x0002_0003);
+            cpu.set_reg(3, 0x0004_0005);
+            cpu.set_sreg(SR_ACCLO, 1000);
+            cpu.set_sreg(SR_ACCHI, 0);
+        });
+        assert_eq!(cpu.sreg(SR_M0 + 2), 0xDEAD_BEEF, "loaded word to MR2");
+        assert_eq!(cpu.reg(2), 0x1004, "postincrement by 4");
+        assert_eq!(cpu.sreg(SR_ACCLO), 1008, "1000 + 2*4");
+        assert_eq!(bus.read32(0x1004), 0xDEAD_BEEF, "memory unchanged");
+        // MULA.DA.HH.LDDEC m1, a4, m0, a5 = 0x5b1454: MR1 <- mem[AR4-4],
+        // AR4 -= 4, ACC += sext(MR0.hi) * sext(AR5.hi).
+        let (cpu, _) = run1(0x5b1454, |cpu, bus| {
+            bus.write32(0x1FFC, 0xCAFE_BABE);
+            cpu.set_reg(4, 0x2000);
+            cpu.set_sreg(SR_M0, 0x0003_0002);
+            cpu.set_reg(5, 0x0005_0004);
+        });
+        assert_eq!(cpu.sreg(SR_M0 + 1), 0xCAFE_BABE, "loaded word to MR1");
+        assert_eq!(cpu.reg(4), 0x1FFC, "postdecrement by 4");
+        assert_eq!(cpu.sreg(SR_ACCLO), 15, "3*5");
+    }
+
+    #[test]
+    fn mac16_dot_product_unrolled() {
+        // Four MULA.AA.LL words assembled with xtensa-esp32s3-elf-as
+        // (0x780234/0x780454/0x780674/0x780894): dot([1,2,3,4],[5,6,7,8])
+        // = 5+12+21+32 = 70 in the low halves.
+        let mut prog = Vec::new();
+        let mut a = 0x4000_0000u32;
+        put(&mut prog, &mut a, 0x0078_0234);
+        put(&mut prog, &mut a, 0x0078_0454);
+        put(&mut prog, &mut a, 0x0078_0674);
+        put(&mut prog, &mut a, 0x0078_0894);
+        let end = a;
+        let mut bus = RamBus::load(&prog);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_0000;
+        cpu.set_sreg(SR_ACCLO, 0);
+        cpu.set_sreg(SR_ACCHI, 0);
+        let xs = [1u32, 2, 3, 4];
+        let ys = [5u32, 6, 7, 8];
+        for i in 0..4 {
+            cpu.set_reg(2 + 2 * i as u32, xs[i]);
+            cpu.set_reg(3 + 2 * i as u32, ys[i]);
+        }
+        run(&mut cpu, &mut bus, end);
+        assert_eq!(cpu.sreg(SR_ACCLO), 70, "dot product");
+        assert_eq!(cpu.sreg(SR_ACCHI), 0, "no overflow");
+    }
+
+    #[test]
+    fn bool_all_any() {
+        // ALL4 b2, b0 = 0x009020: BR2 <- AND of BR[0..3].
+        let (cpu, _) = run1(0x009020, |cpu, _| {
+            for b in 0..4 {
+                cpu.set_br(b, true);
+            }
+        });
+        assert!(cpu.br(2), "all four set");
+        let (cpu, _) = run1(0x009020, |cpu, _| {
+            cpu.set_br(0, true);
+            cpu.set_br(1, true);
+            cpu.set_br(3, true);
+        });
+        assert!(!cpu.br(2), "bit 2 clear");
+        // ANY8 b7, b8 = 0x00a870: BR7 <- OR of BR[8..15].
+        let (cpu, _) = run1(0x00a870, |cpu, _| {
+            cpu.set_br(12, true);
+        });
+        assert!(cpu.br(7), "one of eight set");
+        let (cpu, _) = run1(0x00a870, |_, _| {});
+        assert!(!cpu.br(7), "none set");
+        // ALL8 b9, b8 word 0x00b890 needs all of BR[8..15].
+        let (cpu, _) = run1(0x00b890, |cpu, _| {
+            for b in 8..16 {
+                cpu.set_br(b, true);
+            }
+        });
+        assert!(cpu.br(9), "all eight set");
+    }
+
+    #[test]
+    fn dsp_load_store() {
+        // S32RI a2, a3, 4 = 0x01f322: plain word store like S32I.
+        let (cpu, mut bus) = run1(0x01f322, |cpu, _| {
+            cpu.set_reg(2, 0xA5A5_A5A5);
+            cpu.set_reg(3, 0x3000);
+        });
+        assert_eq!(bus.read32(0x3004), 0xA5A5_A5A5, "s32ri stored");
+        assert_eq!(cpu.reg(2), 0xA5A5_A5A5, "data reg preserved");
+        // LDDR32.P a2 = 0x0072e0: DDR <- mem64[AR2], AR2 += 8.
+        let (cpu, _) = run1(0x0072e0, |cpu, bus| {
+            cpu.set_reg(2, 0x4000);
+            bus.write32(0x4000, 0x1111_1111);
+            bus.write32(0x4004, 0x2222_2222);
+        });
+        assert_eq!(cpu.ddr, 0x2222_2222_1111_1111, "ddr loaded LE");
+        // SDDR32.P a3 = 0x0073f0 tested against the loaded DDR below.
+        assert_eq!(cpu.reg(2), 0x4008, "postupdate by 8");
+        // SDDR32.P a3 = 0x0073f0: mem64[AR3] <- DDR, AR3 += 8.
+        let (cpu, mut bus) = run1(0x0073f0, |cpu, _| {
+            cpu.ddr = 0x3333_3333_4444_4444;
+            cpu.set_reg(3, 0x5000);
+        });
+        assert_eq!(bus.read32(0x5000), 0x4444_4444, "low half stored LE");
+        assert_eq!(bus.read32(0x5004), 0x3333_3333, "high half stored LE");
+        assert_eq!(cpu.reg(3), 0x5008, "postupdate by 8");
+    }
+
     #[test]
     fn windowed_call_entry_retw() {
         // call4/entry/retw: PS.WOE set first, then a windowed call chain
@@ -1191,11 +1395,1338 @@ mod cpu_tests {
         // An unimplemented TIE/DSP (`ee.*`) instruction must halt the core with
         // StepResult::Unimplemented rather than mis-executing or raising a
         // spurious illegal-instruction exception.
-        let prog = [(0x4000_1000u32, 0x0007_0000u32)]; // ee.ldf.64.xp
+        // ee.srs.accx a1, a2, 0 = 24 11 7e: decodes but has no executor
+        // (its shift-AR operand is not encoded), so it still traps loud.
+        let prog = [(0x4000_1000u32, 0x007E_1124u32)];
         let mut bus = RamBus::load(&prog);
         let mut cpu = Cpu::new(0);
         cpu.pc = 0x4000_1000;
         let r = cpu.step(&mut bus);
         assert_eq!(r, StepResult::Unimplemented("opcode"));
+    }
+
+    /// Run one ee.* word at 0x4000_1000 after `setup`, return cpu.
+    fn ee_run1(word: u32, setup: impl FnOnce(&mut Cpu)) -> Cpu {
+        let mut bus = RamBus::load(&[(0x4000_1000, word)]);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_1000;
+        setup(&mut cpu);
+        run(&mut cpu, &mut bus, 0x4000_1003);
+        cpu
+    }
+
+    /// Run one ee.* word (3- or 4-byte `len`) with data-memory `setup`.
+    fn ee_run_mem(word: u32, len: u32, setup: impl FnOnce(&mut Cpu, &mut RamBus)) -> (Cpu, RamBus) {
+        let mut bus = RamBus::load(&[(0x4000_1000, word)]);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_1000;
+        setup(&mut cpu, &mut bus);
+        run(&mut cpu, &mut bus, 0x4000_1000 + len);
+        (cpu, bus)
+    }
+
+    #[test]
+    fn ee_vadds_s8_saturates_asymmetric() {
+        // ee.vadds.s8 q2, q0, q1 = 84 08 9e
+        let cpu = ee_run1(0x009E_0884, |c| {
+            c.qregs[0] = [100; 16];
+            c.qregs[1] = [50; 16];
+        });
+        assert_eq!(cpu.qregs[2], [127; 16]);
+        // Negative overflow clamps to -0x7f (-127), NOT -128.
+        let cpu = ee_run1(0x009E_0884, |c| {
+            c.qregs[0] = [156; 16]; // -100
+            c.qregs[1] = [206; 16]; // -50
+        });
+        assert_eq!(cpu.qregs[2], [129; 16]); // -127
+    }
+
+    #[test]
+    fn ee_vsubs_s16_saturates() {
+        // ee.vsubs.s16 q3, q1, q0 = d4 a1 9e
+        let cpu = ee_run1(0x009E_A1D4, |c| {
+            c.qregs[1] = [
+                0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03, 0xE8, 0x03,
+                0xE8, 0x03,
+            ]; // 1000 x8
+            c.qregs[0] = [
+                0x2C, 0x01, 0x2C, 0x01, 0x2C, 0x01, 0x2C, 0x01, 0x2C, 0x01, 0x2C, 0x01, 0x2C, 0x01,
+                0x2C, 0x01,
+            ]; // 300 x8
+        });
+        for i in 0..8 {
+            let lo = cpu.qregs[3][2 * i];
+            let hi = cpu.qregs[3][2 * i + 1];
+            assert_eq!((lo as u16) | ((hi as u16) << 8), 700, "lane {i}");
+        }
+        // -30000 - 3000 = -33000 clamps to -32767 (0x8001).
+        let cpu = ee_run1(0x009E_A1D4, |c| {
+            c.qregs[1] = [
+                0xD0, 0x8A, 0xD0, 0x8A, 0xD0, 0x8A, 0xD0, 0x8A, 0xD0, 0x8A, 0xD0, 0x8A, 0xD0, 0x8A,
+                0xD0, 0x8A,
+            ]; // -30000
+            c.qregs[0] = [
+                0xB8, 0x0B, 0xB8, 0x0B, 0xB8, 0x0B, 0xB8, 0x0B, 0xB8, 0x0B, 0xB8, 0x0B, 0xB8, 0x0B,
+                0xB8, 0x0B,
+            ]; // 3000
+        });
+        for i in 0..8 {
+            let lo = cpu.qregs[3][2 * i];
+            let hi = cpu.qregs[3][2 * i + 1];
+            assert_eq!((lo as u16) | ((hi as u16) << 8), 0x8001, "lane {i}");
+        }
+    }
+
+    #[test]
+    fn ee_vmul_s8_shifts_by_sar() {
+        // ee.vmul.s8 q0, q1, q2 = 94 31 8e, SAR = 2: (8*4)>>2 = 8.
+        let cpu = ee_run1(0x008E_3194, |c| {
+            c.qregs[1] = [8; 16];
+            c.qregs[2] = [4; 16];
+            c.set_sreg(crate::cpu::SR_SAR, 2);
+        });
+        assert_eq!(cpu.qregs[0], [8; 16]);
+    }
+
+    #[test]
+    fn ee_vmin_vmax_select_lanes() {
+        // ee.vmin.s32 q1, q0, q3 = 64 b8 8e
+        let cpu = ee_run1(0x008E_B864, |c| {
+            // q0 lanes [5, -1, 100, 156], q3 lanes [3, 7, -200, 0].
+            c.qregs[0] = [
+                5, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 100, 0, 0, 0, 156, 0, 0, 0,
+            ];
+            c.qregs[3] = [3, 0, 0, 0, 7, 0, 0, 0, 0x38, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0];
+        });
+        let w = |q: &[u8; 16], i: usize| {
+            u32::from_le_bytes([q[4 * i], q[4 * i + 1], q[4 * i + 2], q[4 * i + 3]])
+        };
+        assert_eq!(w(&cpu.qregs[1], 0), 3);
+        assert_eq!(w(&cpu.qregs[1], 1) as i32, -1);
+        assert_eq!(w(&cpu.qregs[1], 2) as i32, -200);
+        assert_eq!(w(&cpu.qregs[1], 3), 0);
+        // ee.vmax.s16 q2, q1, q0 = 24 21 9e: max(-5, 3) = 3.
+        let cpu = ee_run1(0x009E_2124, |c| {
+            c.qregs[1] = [
+                0xFB, 0xFF, 0xFB, 0xFF, 0xFB, 0xFF, 0xFB, 0xFF, 0xFB, 0xFF, 0xFB, 0xFF, 0xFB, 0xFF,
+                0xFB, 0xFF,
+            ]; // -5
+            c.qregs[0] = [3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0]; // 3
+        });
+        for i in 0..8 {
+            assert_eq!(cpu.qregs[2][2 * i], 3);
+            assert_eq!(cpu.qregs[2][2 * i + 1], 0);
+        }
+    }
+
+    #[test]
+    fn ee_vcmp_produces_lane_masks() {
+        // ee.vcmp.eq.s8 q0, q1, q1 (same reg => all equal) = b4 09 8e
+        let cpu = ee_run1(0x008E_09B4, |c| {
+            c.qregs[1] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        });
+        assert_eq!(cpu.qregs[0], [0xFF; 16]);
+        // ee.vcmp.lt.s16 q2, q0, q1: 1 < 2 => all set = f4 08 9e
+        let cpu = ee_run1(0x009E_08F4, |c| {
+            c.qregs[0] = [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0];
+            c.qregs[1] = [2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0];
+        });
+        assert_eq!(cpu.qregs[2], [0xFF; 16]);
+        // ee.vcmp.gt.s8 q2, q0, q1: 6 > 5 => set = e4 08 9e
+        let cpu = ee_run1(0x009E_08E4, |c| {
+            c.qregs[0] = [6; 16];
+            c.qregs[1] = [5; 16];
+        });
+        assert_eq!(cpu.qregs[2], [0xFF; 16]);
+    }
+
+    #[test]
+    fn ee_logic_ops() {
+        // andq/orq/xorq q0,q1,q2; notq q0,q1.
+        let (a, b) = ([0xF0; 16], [0xCC; 16]);
+        let cpu = ee_run1(0x00CD_3414, |c| {
+            c.qregs[1] = a;
+            c.qregs[2] = b;
+        });
+        assert_eq!(cpu.qregs[0], [0xC0; 16]);
+        let cpu = ee_run1(0x00CD_7414, |c| {
+            c.qregs[1] = a;
+            c.qregs[2] = b;
+        });
+        assert_eq!(cpu.qregs[0], [0xFC; 16]);
+        let cpu = ee_run1(0x00CD_3514, |c| {
+            c.qregs[1] = a;
+            c.qregs[2] = b;
+        });
+        assert_eq!(cpu.qregs[0], [0x3C; 16]);
+        let cpu = ee_run1(0x00CD_7F14, |c| {
+            c.qregs[1] = a;
+        });
+        assert_eq!(cpu.qregs[0], [0x0F; 16]);
+    }
+
+    #[test]
+    fn ee_vzip_vunzip_round_trip() {
+        // ee.vzip.16 q0, q5 = b4 83 ec
+        let mut q0 = [0u8; 16];
+        let mut q5 = [0u8; 16];
+        for i in 0..16 {
+            q0[i] = i as u8;
+            q5[i] = 100 + i as u8;
+        }
+        let cpu = ee_run1(0x00EC_83B4, |c| {
+            c.qregs[0] = q0;
+            c.qregs[5] = q5;
+        });
+        // vzip.16 interleaves 16-bit units: q0 gets sa.u16[0..4]/sb.u16[0..4].
+        for i in 0..4 {
+            assert_eq!(cpu.qregs[0][4 * i], i as u8 * 2);
+            assert_eq!(cpu.qregs[0][4 * i + 1], i as u8 * 2 + 1);
+            assert_eq!(cpu.qregs[0][4 * i + 2], 100 + i as u8 * 2);
+            assert_eq!(cpu.qregs[0][4 * i + 3], 100 + i as u8 * 2 + 1);
+            assert_eq!(cpu.qregs[5][4 * i], 8 + i as u8 * 2);
+            assert_eq!(cpu.qregs[5][4 * i + 1], 8 + i as u8 * 2 + 1);
+            assert_eq!(cpu.qregs[5][4 * i + 2], 108 + i as u8 * 2);
+            assert_eq!(cpu.qregs[5][4 * i + 3], 108 + i as u8 * 2 + 1);
+        }
+        // ee.vunzip.8 q1, q2 = a4 13 dc inverts a byte interleave.
+        let cpu = ee_run1(0x00DC_13A4, |c| {
+            c.qregs[1] = [
+                0, 100, 1, 101, 2, 102, 3, 103, 4, 104, 5, 105, 6, 106, 7, 107,
+            ];
+            c.qregs[2] = [
+                8, 108, 9, 109, 10, 110, 11, 111, 12, 112, 13, 113, 14, 114, 15, 115,
+            ];
+        });
+        for i in 0..16 {
+            assert_eq!(cpu.qregs[1][i], i as u8, "q1[{i}]");
+            assert_eq!(cpu.qregs[2][i], 100 + i as u8, "q2[{i}]");
+        }
+    }
+
+    #[test]
+    fn ee_cmul_s16_complex_product() {
+        // ee.cmul.s16 q0, q1, q2, 1 = 14 11 8e: (3+4i)(1+0i)>>1 = (1,2).
+        let cpu = ee_run1(0x008E_1114, |c| {
+            c.qregs[1] = [3, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            c.qregs[2] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        });
+        assert_eq!(cpu.qregs[0][0], 1);
+        assert_eq!(cpu.qregs[0][1], 0);
+        assert_eq!(cpu.qregs[0][2], 2);
+        assert_eq!(cpu.qregs[0][3], 0);
+        for i in 4..16 {
+            assert_eq!(cpu.qregs[0][i], 0);
+        }
+    }
+
+    #[test]
+    fn ee_zero_and_movi_move_data() {
+        // ee.zero.q q3 = a4 ff dd
+        let cpu = ee_run1(0x00DD_FFA4, |c| {
+            c.qregs[3] = [0xAA; 16];
+        });
+        assert_eq!(cpu.qregs[3], [0; 16]);
+        // ee.movi.32.q q1, a2, 1 = 24 b6 cd
+        let cpu = ee_run1(0x00CD_B624, |c| {
+            c.set_reg(2, 0xDEAD_BEEF);
+            c.qregs[1] = [0; 16];
+        });
+        assert_eq!(
+            u32::from_le_bytes(cpu.qregs[1][4..8].try_into().unwrap()),
+            0xDEAD_BEEF
+        );
+        assert_eq!(
+            u32::from_le_bytes(cpu.qregs[1][0..4].try_into().unwrap()),
+            0
+        );
+    }
+
+    #[test]
+    fn ee_vrelu_vprelu_predicated_scale() {
+        // ee.vrelu.s8 q1, a2, a3 = 34 d2 cd: lanes (-4,5,-128,0), mult 2, shr 1.
+        let cpu = ee_run1(0x00CD_D234, |c| {
+            c.qregs[1] = [252, 5, 128, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]; // -4,5,-128,0,...
+            c.set_reg(2, 2);
+            c.set_reg(3, 1);
+        });
+        assert_eq!(cpu.qregs[1][0], 252); // -4 unchanged
+        assert_eq!(cpu.qregs[1][1], 5);
+        assert_eq!(cpu.qregs[1][2], 128); // -128 unchanged
+        assert_eq!(cpu.qregs[1][3], 0);
+        // ee.vprelu.s8 q1, q2, q3, a4 = 44 ba 8c: q2=(-4,6), q3=(3,3), shr 1.
+        let cpu = ee_run1(0x008C_BA44, |c| {
+            c.qregs[2] = [252, 6, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+            c.qregs[3] = [3; 16];
+            c.set_reg(4, 1);
+        });
+        assert_eq!(cpu.qregs[1][0], 250); // (-4*3)>>1 = -6
+        assert_eq!(cpu.qregs[1][1], 6); // positive passes through
+    }
+
+    #[test]
+    fn ee_vsl_32_shifts_left() {
+        // ee.vsl.32 q1, q2 = 14 3f dd: shift LEFT by SAR.
+        let cpu = ee_run1(0x00DD_3F14, |c| {
+            c.qregs[2] = [0, 0, 0, 0x80, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // 0x80000000, 1
+            c.set_sreg(crate::cpu::SR_SAR, 1);
+        });
+        assert_eq!(
+            u32::from_le_bytes(cpu.qregs[1][0..4].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u32::from_le_bytes(cpu.qregs[1][4..8].try_into().unwrap()),
+            2
+        );
+    }
+
+    #[test]
+    fn ee_vsmulas_s8_accumulates_scalar_product() {
+        // ee.vsmulas.s8.qacc q0, q1, 0 = 44 08 8e: scalar q1.s8[0] = 2.
+        let cpu = ee_run1(0x008E_0844, |c| {
+            c.qregs[0] = [1; 16];
+            c.qregs[1] = [2; 16];
+        });
+        for acc in 0..2 {
+            for i in 0..8 {
+                assert_eq!(crate::ee::acc_s20(&cpu, acc, i), 2, "acc{acc}[{i}]");
+            }
+        }
+    }
+
+    #[test]
+    fn ee_srcmb_s16_shifts_qacc_into_q() {
+        // ee.srcmb.s16.qacc q1, a2, 1 = 24 f6 cd: QACC = 0x1000, shr 4.
+        let cpu = ee_run1(0x00CD_F624, |c| {
+            for acc in 0..2 {
+                for i in 0..4 {
+                    crate::ee::set_acc_s40(c, acc, i, 0x1000);
+                }
+            }
+            c.set_reg(2, 4);
+        });
+        for i in 0..8 {
+            let v = (cpu.qregs[1][2 * i] as u16) | ((cpu.qregs[1][2 * i + 1] as u16) << 8);
+            assert_eq!(v, 0x100, "lane {i}");
+        }
+        for acc in 0..2 {
+            for i in 0..4 {
+                assert_eq!(crate::ee::acc_s40(&cpu, acc, i), 0x100);
+            }
+        }
+    }
+
+    #[test]
+    fn ee_vmulas_accumulates_dot_products() {
+        // ee.vmulas.s8.accx q0, q1 = c4 08 1a: dot(ones, ones) = 16.
+        let cpu = ee_run1(0x001A_08C4, |c| {
+            c.qregs[0] = [1; 16];
+            c.qregs[1] = [1; 16];
+        });
+        assert_eq!(cpu.accx, 16);
+        // ee.vmulas.s16.qacc q2, q3 = 84 3a 1a: 100*100 x4 per half.
+        let cpu = ee_run1(0x001A_3A84, |c| {
+            c.qregs[2] = [
+                100, 0, 100, 0, 100, 0, 100, 0, 100, 0, 100, 0, 100, 0, 100, 0,
+            ];
+            c.qregs[3] = [
+                100, 0, 100, 0, 100, 0, 100, 0, 100, 0, 100, 0, 100, 0, 100, 0,
+            ];
+        });
+        for acc in 0..2 {
+            for i in 0..4 {
+                assert_eq!(crate::ee::acc_s40(&cpu, acc, i), 10_000, "acc{acc}[{i}]");
+            }
+        }
+    }
+
+    #[test]
+    fn ee_bitrev_folds_reversed_indices() {
+        // ee.bitrev q1, a2 = 24 fb cd, fft_width 3, base 0.
+        let cpu = ee_run1(0x00CD_FB24, |c| {
+            c.fft_width = 3;
+            c.set_reg(2, 0);
+        });
+        assert_eq!(
+            cpu.qregs[1],
+            [0, 0, 4, 0, 2, 0, 6, 0, 4, 0, 5, 0, 6, 0, 7, 0]
+        );
+        assert_eq!(cpu.reg(2), 8);
+    }
+
+    #[test]
+    fn ee_vmulas_fused_mac_then_load() {
+        // ee.vmulas.s8.accx.ld.ip q0, a2, 16, q3, q4 = 2e e1 02 f0:
+        // MAC first (accx = 1*2*16 = 32), then load, then +16.
+        let (cpu, _) = ee_run_mem(0xF002_E12E, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            c.qregs[3] = [1; 16];
+            c.qregs[4] = [2; 16];
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 3);
+            }
+        });
+        assert_eq!(cpu.accx, 32);
+        assert_eq!(cpu.qregs[0], [3; 16]);
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+        // ee.vmulas.s8.accx.ld.xp q0, a2, a3, q3, q4 = 2e e3 12 f0.
+        let (cpu, _) = ee_run_mem(0xF012_E32E, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            c.set_reg(3, 32);
+            c.qregs[3] = [1; 16];
+            c.qregs[4] = [2; 16];
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 5);
+            }
+        });
+        assert_eq!(cpu.accx, 32);
+        assert_eq!(cpu.qregs[0], [5; 16]);
+        assert_eq!(cpu.reg(2), 0x4000_2020);
+        // ee.vmulas.s16.qacc.ld.ip q0, a2, 16, q3, q4 = 2e e1 01 f0.
+        let (cpu, _) = ee_run_mem(0xF001_E12E, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            for i in 0..8 {
+                c.qregs[3][2 * i] = 100;
+                c.qregs[3][2 * i + 1] = 0;
+                c.qregs[4][2 * i] = 100;
+                c.qregs[4][2 * i + 1] = 0;
+                b.write8(0x4000_2000 + i as u32, 7);
+            }
+            for i in 8..16 {
+                b.write8(0x4000_2000 + i as u32, 7);
+            }
+        });
+        for acc in 0..2 {
+            for i in 0..4 {
+                assert_eq!(crate::ee::acc_s40(&cpu, acc, i), 10_000, "acc{acc}[{i}]");
+            }
+        }
+        assert_eq!(cpu.qregs[0], [7; 16]);
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+    }
+
+    #[test]
+    fn ee_vmulas_ldbc_mac_then_broadcast() {
+        // ee.vmulas.s8.qacc.ldbc.incp q0, a2, q3, q4 = 24 43 a7:
+        // MAC first (lanes = 1*2 = 2), then broadcast mem8, then +1.
+        let (cpu, _) = ee_run_mem(0xA74324, 3, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            c.qregs[3] = [1; 16];
+            c.qregs[4] = [2; 16];
+            b.write8(0x4000_2000, 9);
+        });
+        for acc in 0..2 {
+            for i in 0..8 {
+                assert_eq!(crate::ee::acc_s20(&cpu, acc, i), 2, "acc{acc}[{i}]");
+            }
+        }
+        assert_eq!(cpu.qregs[0], [9; 16]);
+        assert_eq!(cpu.reg(2), 0x4000_2001);
+    }
+
+    #[test]
+    fn ee_mov_qacc_widens_lanes() {
+        // ee.mov.s16.qacc q2 = 24 7f dd with q2 = -1 lanes.
+        let cpu = ee_run1(0x00DD_7F24, |c| {
+            c.qregs[2] = [0xFF; 16];
+        });
+        for acc in 0..2 {
+            for i in 0..4 {
+                assert_eq!(crate::ee::acc_s40(&cpu, acc, i), -1, "acc{acc}[{i}]");
+            }
+        }
+        // ee.mov.u8.qacc q2 = 74 7f dd: zero-extended bytes.
+        let cpu = ee_run1(0x00DD_7F74, |c| {
+            c.qregs[2] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        });
+        for i in 0..8 {
+            assert_eq!(crate::ee::acc_s20(&cpu, 0, i), (i + 1) as i64);
+            assert_eq!(crate::ee::acc_s20(&cpu, 1, i), (i + 9) as i64);
+        }
+    }
+
+    #[test]
+    fn ee_gpio_latch_round_trip() {
+        // ee.set_bit_gpio_out 3 = 34 40 75; wr_mask; get_gpio_in.
+        let cpu = ee_run1(0x0075_4034, |_| {});
+        assert_eq!(cpu.tie_gpio, 3);
+        // ee.wr_mask_gpio_out a2, a3 = 24 43 72: gpio = (gpio & ~mask) | (data & mask).
+        let cpu = ee_run1(0x0072_4324, |c| {
+            c.tie_gpio = 3;
+            c.set_reg(2, 0xF);
+            c.set_reg(3, 0xA);
+        });
+        assert_eq!(cpu.tie_gpio, 0xA);
+        // ee.get_gpio_in a2 = 24 08 65 reads back the latch.
+        let cpu = ee_run1(0x0065_0824, |c| {
+            c.tie_gpio = 0xA;
+        });
+        assert_eq!(cpu.reg(2), 0xA);
+    }
+
+    #[test]
+    fn ee_slci_srci_slide_pairs() {
+        // ee.slci.2q q0, q1, 3 = 34 16 cc (shift 4 left).
+        let (cpu, _) = ee_run_mem(0xCC1634, 3, |c, _| {
+            c.qregs[1] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+            c.qregs[0] = [
+                100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
+            ];
+        });
+        assert_eq!(
+            cpu.qregs[1],
+            [0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        );
+        assert_eq!(
+            cpu.qregs[0],
+            [
+                12, 13, 14, 15, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111
+            ]
+        );
+        // ee.srci.2q q0, q1, 3 = 34 1a cc (shift 4 right).
+        let (cpu, _) = ee_run_mem(0xCC1A34, 3, |c, _| {
+            c.qregs[1] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+            c.qregs[0] = [
+                100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
+            ];
+        });
+        assert_eq!(
+            cpu.qregs[1],
+            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 100, 101, 102, 103]
+        );
+        assert_eq!(
+            cpu.qregs[0],
+            [
+                104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 0, 0, 0, 0
+            ]
+        );
+    }
+
+    #[test]
+    fn ee_src_q_funnel_shifts() {
+        // ee.src.q q0, q1, q2 = 04 13 dc, sar_byte 4.
+        let (cpu, _) = ee_run_mem(0xDC1304, 3, |c, _| {
+            c.qregs[1] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+            c.qregs[2] = [
+                100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
+            ];
+            c.sar_byte = 4;
+        });
+        assert_eq!(
+            cpu.qregs[0],
+            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 100, 101, 102, 103]
+        );
+        // ee.src.q.qup q0, q1, q2 = 04 17 dc also copies q2 over q1.
+        let (cpu, _) = ee_run_mem(0xDC1704, 3, |c, _| {
+            c.qregs[1] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+            c.qregs[2] = [
+                100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
+            ];
+            c.sar_byte = 4;
+        });
+        assert_eq!(
+            cpu.qregs[0],
+            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 100, 101, 102, 103]
+        );
+        assert_eq!(
+            cpu.qregs[1],
+            [
+                100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115
+            ]
+        );
+    }
+
+    #[test]
+    fn ee_vldbc_broadcasts_memory() {
+        // ee.vldbc.8 q2, a3 = 34 3b dd.
+        let (cpu, _) = ee_run_mem(0xDD3B34, 3, |c, b| {
+            c.set_reg(3, 0x4000_2000);
+            b.write8(0x4000_2000, 0xAB);
+        });
+        assert_eq!(cpu.qregs[2], [0xAB; 16]);
+        // ee.vldbc.8.ip q1, a2, 16 = 24 90 c5.
+        let (cpu, _) = ee_run_mem(0xC59024, 3, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            b.write8(0x4000_2000, 0xCD);
+        });
+        assert_eq!(cpu.qregs[1], [0xCD; 16]);
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+    }
+
+    #[test]
+    fn ee_vld_vst_128_round_trip() {
+        // ee.vld.128.ip q4, a2, 16 = 24 01 a3.
+        let (cpu, _) = ee_run_mem(0xA30124, 3, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, i as u32 + 1);
+            }
+        });
+        for i in 0..16 {
+            assert_eq!(cpu.qregs[4][i], i as u8 + 1);
+        }
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+        // ee.vst.128.ip q4, a2, 16 = 24 01 aa stores it back elsewhere.
+        let (cpu, mut bus) = ee_run_mem(0xAA0124, 3, |c, _| {
+            c.set_reg(2, 0x4000_3000);
+            for i in 0..16 {
+                c.qregs[4][i] = 16 - i as u8;
+            }
+        });
+        for i in 0..16 {
+            assert_eq!(bus.read8(0x4000_3000 + i as u32), 16 - i as u32);
+        }
+        assert_eq!(cpu.reg(2), 0x4000_3010);
+        // ee.vld.128.xp q1, a2, a3 = 24 a3 8d adds AR.
+        let (cpu, _) = ee_run_mem(0x8DA324, 3, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            c.set_reg(3, 32);
+            b.write32(0x4000_2000, 0x1111_1111);
+            b.write32(0x4000_2004, 0x2222_2222);
+            b.write32(0x4000_2008, 0x3333_3333);
+            b.write32(0x4000_200C, 0x4444_4444);
+        });
+        assert_eq!(
+            u32::from_le_bytes(cpu.qregs[1][0..4].try_into().unwrap()),
+            0x1111_1111
+        );
+        assert_eq!(
+            u32::from_le_bytes(cpu.qregs[1][12..16].try_into().unwrap()),
+            0x4444_4444
+        );
+        assert_eq!(cpu.reg(2), 0x4000_2020);
+    }
+
+    #[test]
+    fn ee_vld_vst_64_halves() {
+        // ee.vld.h.64.ip q1, a2, 8 = 24 81 88 loads the high half only.
+        let (cpu, _) = ee_run_mem(0x888124, 3, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            c.qregs[1] = [0xAA; 16];
+            b.write32(0x4000_2000, 0x1111_1111);
+            b.write32(0x4000_2004, 0x2222_2222);
+        });
+        assert_eq!(&cpu.qregs[1][..8], &[0xAA; 8]);
+        assert_eq!(
+            u32::from_le_bytes(cpu.qregs[1][8..12].try_into().unwrap()),
+            0x1111_1111
+        );
+        assert_eq!(
+            u32::from_le_bytes(cpu.qregs[1][12..16].try_into().unwrap()),
+            0x2222_2222
+        );
+        assert_eq!(cpu.reg(2), 0x4000_2008);
+        // ee.vst.l.64.ip q1, a2, 8 = 24 81 84 stores the low half only.
+        let (cpu, mut bus) = ee_run_mem(0x848124, 3, |c, _| {
+            c.set_reg(2, 0x4000_3000);
+            c.qregs[1] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        });
+        for i in 0..8 {
+            assert_eq!(bus.read8(0x4000_3000 + i as u32), i as u32 + 1);
+        }
+        assert_eq!(cpu.reg(2), 0x4000_3008);
+    }
+
+    #[test]
+    fn ee_ldxq_stxq_indexed_lanes() {
+        // ee.ldxq.32 q1, q2, a3, 0, 1 = 3e 8d f1 e0: offset 5*4-4 = 16.
+        let (cpu, _) = ee_run_mem(0xE0F1_8D3E, 4, |c, b| {
+            c.set_reg(3, 0x4000_2000);
+            c.qregs[2] = [0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // s16[1] = 5
+            b.write32(0x4000_2010, 0x1234_5678);
+        });
+        assert_eq!(
+            u32::from_le_bytes(cpu.qregs[1][0..4].try_into().unwrap()),
+            0x1234_5678
+        );
+        // ee.stxq.32 q0, q1, a2, 3, 2 = 2e 50 08 e7: offset 4*4-4 = 12.
+        let (_, mut bus) = ee_run_mem(0xE708_502E, 4, |c, _| {
+            c.set_reg(2, 0x4000_2000);
+            c.qregs[0] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xDD, 0xCC, 0xBB, 0xAA]; // u32[3]
+            c.qregs[1] = [0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // s16[2] = 4
+        });
+        assert_eq!(bus.read32(0x4000_200C), 0xAABB_CCDD);
+    }
+
+    #[test]
+    fn ee_accx_spill_fill_masks_44_bits() {
+        // ee.st.accx.ip a2, 8 = 24 01 02.
+        let (_, mut bus) = ee_run_mem(0x020124, 3, |c, _| {
+            c.set_reg(2, 0x4000_2000);
+            c.accx = 0x0123_4567_89AB;
+        });
+        assert_eq!(bus.read32(0x4000_2000), 0x4567_89AB);
+        assert_eq!(bus.read32(0x4000_2004), 0x0000_0123);
+        // ee.ld.accx.ip a4, 0 = 44 00 0e masks to 44 bits (no postupdate).
+        let (cpu, _) = ee_run_mem(0x0E0044, 3, |c, b| {
+            c.set_reg(4, 0x4000_2000);
+            b.write32(0x4000_2000, 0xFFFF_FFFF);
+            b.write32(0x4000_2004, 0xFFFF_FFFF);
+        });
+        assert_eq!(cpu.accx, 0x0FFF_FFFF_FFFF);
+        assert_eq!(cpu.reg(4), 0x4000_2000);
+    }
+
+    #[test]
+    fn ee_qacc_spill_fill() {
+        // ee.ld.qacc_h.h.32.ip a4, 4 = 44 01 1e loads the top word.
+        let (cpu, _) = ee_run_mem(0x1E0144, 3, |c, b| {
+            c.set_reg(4, 0x4000_2000);
+            b.write32(0x4000_2000, 0xDEAD_BEEF);
+        });
+        assert_eq!(crate::ee::qacc_word(&cpu.accq[1], 4), 0xDEAD_BEEF);
+        assert_eq!(cpu.reg(4), 0x4000_2004);
+        // ee.st.qacc_h.h.32.ip a2, 4 = 24 01 12 stores it back.
+        let (_, mut bus) = ee_run_mem(0x120124, 3, |c, _| {
+            c.set_reg(2, 0x4000_3000);
+            crate::ee::set_qacc_word(&mut c.accq[1], 4, 0xCAFE_BABE);
+        });
+        assert_eq!(bus.read32(0x4000_3000), 0xCAFE_BABE);
+        // ee.ld.qacc_h.l.128.ip a4, 16 = 44 01 06 fills bytes 0..16.
+        let (cpu, _) = ee_run_mem(0x060144, 3, |c, b| {
+            c.set_reg(4, 0x4000_2000);
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, i as u32 + 1);
+            }
+        });
+        assert_eq!(
+            &cpu.accq[1][..16],
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
+        assert_eq!(cpu.reg(4), 0x4000_2010);
+        // ee.st.qacc_h.l.128.ip a2, 16 = 24 01 0d spills bytes 0..16.
+        let (_, mut bus) = ee_run_mem(0x0D0124, 3, |c, _| {
+            c.set_reg(2, 0x4000_3000);
+            c.accq[1] = [0x55; 20];
+        });
+        for i in 0..16 {
+            assert_eq!(bus.read8(0x4000_3000 + i as u32), 0x55);
+        }
+    }
+
+    #[test]
+    fn ee_ldqa_widens_into_qacc() {
+        // ee.ldqa.s16.128.ip a4, 16 = 44 01 01: -1 lanes sign-extend.
+        let (cpu, _) = ee_run_mem(0x010144, 3, |c, b| {
+            c.set_reg(4, 0x4000_2000);
+            for i in 0..8 {
+                b.write16(0x4000_2000 + 2 * i as u32, 0xFFFF);
+            }
+        });
+        for acc in 0..2 {
+            for i in 0..4 {
+                assert_eq!(crate::ee::acc_s40(&cpu, acc, i), -1, "acc{acc}[{i}]");
+            }
+        }
+        assert_eq!(cpu.reg(4), 0x4000_2010);
+    }
+
+    #[test]
+    fn ee_ldf_stf_swap_halves() {
+        // ee.ldf.64.xp f0, f1, a4, a5 = 40 05 16: mem[0]->f1, mem[4]->f0.
+        let (cpu, _) = ee_run_mem(0x160540, 3, |c, b| {
+            c.set_reg(4, 0x4000_2000);
+            c.set_reg(5, 8);
+            b.write32(0x4000_2000, 1.0f32.to_bits());
+            b.write32(0x4000_2004, 2.0f32.to_bits());
+        });
+        assert_eq!(cpu.freg(1), 1.0);
+        assert_eq!(cpu.freg(0), 2.0);
+        assert_eq!(cpu.reg(4), 0x4000_2008);
+        // ee.stf.64.ip f0, f1, a2, 8 = 2e 07 10 e0 stores f1 then f0.
+        let (_, mut bus) = ee_run_mem(0xE010_072E, 4, |c, _| {
+            c.set_reg(2, 0x4000_3000);
+            c.set_freg(1, 3.0);
+            c.set_freg(0, 4.0);
+        });
+        assert_eq!(bus.read32(0x4000_3000), 3.0f32.to_bits());
+        assert_eq!(bus.read32(0x4000_3004), 4.0f32.to_bits());
+    }
+
+    #[test]
+    fn ee_ua_state_spill_fill() {
+        // ee.ld.ua_state.ip a4, 16 = 44 01 10.
+        let (cpu, _) = ee_run_mem(0x100144, 3, |c, b| {
+            c.set_reg(4, 0x4000_2000);
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 0x10 + i as u32);
+            }
+        });
+        assert_eq!(
+            cpu.ua_state,
+            [
+                0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
+                0x1E, 0x1F
+            ]
+        );
+        assert_eq!(cpu.reg(4), 0x4000_2010);
+        // ee.st.ua_state.ip a2, 0 = 24 00 1c (no postupdate).
+        let (cpu2, mut bus) = ee_run_mem(0x1C0024, 3, |c, _| {
+            c.set_reg(2, 0x4000_3000);
+            c.ua_state = [0xAA; 16];
+        });
+        for i in 0..16 {
+            assert_eq!(bus.read8(0x4000_3000 + i as u32), 0xAA);
+        }
+        assert_eq!(cpu2.reg(2), 0x4000_3000);
+    }
+
+    #[test]
+    fn ee_ld_usar_snapshots_address_nibble() {
+        // ee.ld.128.usar.ip q1, a2, 16 = 24 81 81 with unaligned a2.
+        let (cpu, _) = ee_run_mem(0x818124, 3, |c, b| {
+            c.set_reg(2, 0x4000_2003);
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, i as u32);
+            }
+        });
+        for i in 0..16 {
+            assert_eq!(cpu.qregs[1][i], i as u8);
+        }
+        assert_eq!(cpu.sar_byte, 3);
+        assert_eq!(cpu.reg(2), 0x4000_2013);
+    }
+
+    #[test]
+    fn ee_vldhbc_broadcasts_pairs() {
+        // ee.vldhbc.16.incp q0, q1, a2 = 24 12 cc: two pair-broadcasts, +16.
+        let (cpu, _) = ee_run_mem(0xCC1224, 3, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            for i in 0..8 {
+                b.write8(0x4000_2000 + i as u32, i as u32 + 1);
+                b.write8(0x4000_2008 + i as u32, 0x10 + i as u32);
+            }
+        });
+        assert_eq!(
+            cpu.qregs[0],
+            [1, 2, 1, 2, 3, 4, 3, 4, 5, 6, 5, 6, 7, 8, 7, 8]
+        );
+        assert_eq!(
+            cpu.qregs[1],
+            [
+                0x10, 0x11, 0x10, 0x11, 0x12, 0x13, 0x12, 0x13, 0x14, 0x15, 0x14, 0x15, 0x16, 0x17,
+                0x16, 0x17
+            ]
+        );
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+    }
+
+    #[test]
+    fn ee_ams_butterfly_then_load() {
+        // ee.fft.ams.s16.ld.incp q0, a2, q2, q4, q0, q0, q0, 0 = 2e 10 00 d1.
+        // AMS on (qx=q0,qy=q0,qm=q0) lanes 2,3, then load into q0.
+        // Alias probes: q1 (qx|1) holds sentinel 77 (HW must use q0);
+        // q3 (qz|1) stays zero (HW must write q2, not q3).
+        let (cpu, _) = ee_run_mem(0xD100_102E, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            c.qregs[0] = [0, 0, 0, 0, 3, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // s16[2]=3, s16[3]=1
+            c.qregs[1] = [77; 16];
+            c.qregs[3] = [0; 16];
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 20 + i as u32);
+            }
+        });
+        let s16 = |q: &[u8; 16], i: usize| i16::from_le_bytes([q[2 * i], q[2 * i + 1]]);
+        // temp0=6, temp1=0, temp2=-2, temp3=6.
+        assert_eq!(s16(&cpu.qregs[2], 2), 4);
+        assert_eq!(s16(&cpu.qregs[2], 3), 6);
+        assert_eq!(s16(&cpu.qregs[4], 2), 8);
+        assert_eq!(s16(&cpu.qregs[4], 3), 6);
+        assert_eq!(cpu.qregs[3], [0; 16]);
+        for i in 0..16 {
+            assert_eq!(cpu.qregs[0][i], 20 + i as u8);
+        }
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+    }
+
+    #[test]
+    fn ee_dsp_dot_product_vehicle() {
+        // End-to-end DSP path: two post-increment 128-bit loads feed a
+        // vector MAC. A = B = [1..16], dot = sum(i^2) = 1496.
+        //   vld.128.ip q0, a2, 16 = 24 01 83
+        //   vld.128.ip q1, a2, 16 = 24 81 83
+        //   vmulas.s8.accx q0, q1 = c4 08 1a
+        let prog = [
+            (0x4000_1000u32, 0x0083_0124u32),
+            (0x4000_1003u32, 0x0083_8124u32),
+            (0x4000_1006u32, 0x001A_08C4u32),
+        ];
+        let mut bus = RamBus::load(&prog);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_1000;
+        cpu.set_reg(2, 0x4000_2000);
+        for i in 0..16 {
+            bus.write8(0x4000_2000 + i as u32, i as u32 + 1);
+            bus.write8(0x4000_2010 + i as u32, i as u32 + 1);
+        }
+        run(&mut cpu, &mut bus, 0x4000_1009);
+        assert_eq!(cpu.accx, 1496);
+        assert_eq!(cpu.reg(2), 0x4000_2020);
+    }
+
+    #[test]
+    fn ee_vldbc_width_variants() {
+        // ee.vldbc.16 q2, a3 = 34 73 dd.
+        let (cpu, _) = ee_run_mem(0xDD7334, 3, |c, b| {
+            c.set_reg(3, 0x4000_2000);
+            b.write16(0x4000_2000, 0xABCD);
+        });
+        for i in 0..8 {
+            assert_eq!(
+                (cpu.qregs[2][2 * i] as u16) | ((cpu.qregs[2][2 * i + 1] as u16) << 8),
+                0xABCD
+            );
+        }
+        // ee.vldbc.32 q4, a3 = 34 77 ed.
+        let (cpu, _) = ee_run_mem(0xED7734, 3, |c, b| {
+            c.set_reg(3, 0x4000_2000);
+            b.write32(0x4000_2000, 0x1234_5678);
+        });
+        for i in 0..4 {
+            assert_eq!(
+                u32::from_le_bytes(cpu.qregs[4][4 * i..4 * i + 4].try_into().unwrap()),
+                0x1234_5678
+            );
+        }
+        // ee.vldbc.16.ip q1, a2, 16 = 24 88 85.
+        let (cpu, _) = ee_run_mem(0x858824, 3, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            b.write16(0x4000_2000, 0xBEEF);
+        });
+        for i in 0..8 {
+            assert_eq!(
+                (cpu.qregs[1][2 * i] as u16) | ((cpu.qregs[1][2 * i + 1] as u16) << 8),
+                0xBEEF
+            );
+        }
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+        // ee.vldbc.32.ip q1, a2, 16 = 24 84 82.
+        let (cpu, _) = ee_run_mem(0x828424, 3, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            b.write32(0x4000_2000, 0xDEAD_BEEF);
+        });
+        for i in 0..4 {
+            assert_eq!(
+                u32::from_le_bytes(cpu.qregs[1][4 * i..4 * i + 4].try_into().unwrap()),
+                0xDEAD_BEEF
+            );
+        }
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+        // ee.vldbc.8.xp q1, a2, a3 = 24 d3 8d.
+        let (cpu, _) = ee_run_mem(0x8DD324, 3, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            c.set_reg(3, 16);
+            b.write8(0x4000_2000, 0x55);
+        });
+        assert_eq!(cpu.qregs[1], [0x55; 16]);
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+        // ee.vldbc.16.xp q1, a2, a3 = 24 c3 8d.
+        let (cpu, _) = ee_run_mem(0x8DC324, 3, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            c.set_reg(3, 16);
+            b.write16(0x4000_2000, 0xCAFE);
+        });
+        for i in 0..8 {
+            assert_eq!(
+                (cpu.qregs[1][2 * i] as u16) | ((cpu.qregs[1][2 * i + 1] as u16) << 8),
+                0xCAFE
+            );
+        }
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+        // ee.vldbc.32.xp q1, a2, a3 = 24 93 8d.
+        let (cpu, _) = ee_run_mem(0x8D9324, 3, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            c.set_reg(3, 16);
+            b.write32(0x4000_2000, 0x0BAD_F00D);
+        });
+        for i in 0..4 {
+            assert_eq!(
+                u32::from_le_bytes(cpu.qregs[1][4 * i..4 * i + 4].try_into().unwrap()),
+                0x0BAD_F00D
+            );
+        }
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+    }
+
+    #[test]
+    fn ee_ld_usar_xp_adds_register() {
+        // ee.ld.128.usar.xp q1, a2, a3 = 24 83 8d.
+        let (cpu, _) = ee_run_mem(0x8D8324, 3, |c, b| {
+            c.set_reg(2, 0x4000_2005);
+            c.set_reg(3, 11);
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 0x20 + i as u32);
+            }
+        });
+        for i in 0..16 {
+            assert_eq!(cpu.qregs[1][i], 0x20 + i as u8);
+        }
+        assert_eq!(cpu.sar_byte, 5);
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+    }
+
+    #[test]
+    fn ee_slcxxp_srcxxp_indexed_slides() {
+        // ee.slcxxp.2q q0, q1, a2, a3 = 24 13 86 (shift 4 left, a2 += 8).
+        let (cpu, _) = ee_run_mem(0x861324, 3, |c, _| {
+            c.qregs[1] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+            c.qregs[0] = [
+                100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
+            ];
+            c.set_reg(2, 3);
+            c.set_reg(3, 8);
+        });
+        assert_eq!(
+            cpu.qregs[1],
+            [0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        );
+        assert_eq!(
+            cpu.qregs[0],
+            [
+                12, 13, 14, 15, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111
+            ]
+        );
+        assert_eq!(cpu.reg(2), 11);
+        // ee.srcxxp.2q q0, q1, a2, a3 = 24 13 c6 (shift 4 right).
+        let (cpu, _) = ee_run_mem(0xC61324, 3, |c, _| {
+            c.qregs[1] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+            c.qregs[0] = [
+                100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
+            ];
+            c.set_reg(2, 3);
+            c.set_reg(3, 8);
+        });
+        assert_eq!(
+            cpu.qregs[1],
+            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 100, 101, 102, 103]
+        );
+        assert_eq!(
+            cpu.qregs[0],
+            [
+                104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 0, 0, 0, 0
+            ]
+        );
+        assert_eq!(cpu.reg(2), 11);
+    }
+
+    #[test]
+    fn ee_fused_valu_load_then_add() {
+        // ee.vadds.s8.ld.incp q0, a2, q3, q4, q5 = 2f 2c 93 e0.
+        let (cpu, _) = ee_run_mem(0xE093_2C2F, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 10);
+            }
+            c.qregs[4] = [1; 16];
+            c.qregs[5] = [2; 16];
+        });
+        assert_eq!(cpu.qregs[0], [10; 16]);
+        assert_eq!(cpu.qregs[3], [3; 16]);
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+    }
+
+    #[test]
+    fn ee_fused_valu_store_then_add() {
+        // ee.vadds.s8.st.incp q0, a2, q3, q4, q5 = 2f 22 8b e4.
+        let (cpu, mut bus) = ee_run_mem(0xE48B_222F, 4, |c, _| {
+            c.set_reg(2, 0x4000_3000);
+            c.qregs[0] = [7; 16];
+            c.qregs[4] = [1; 16];
+            c.qregs[5] = [2; 16];
+        });
+        for i in 0..16 {
+            assert_eq!(bus.read8(0x4000_3000 + i as u32), 7);
+        }
+        assert_eq!(cpu.qregs[3], [3; 16]);
+        assert_eq!(cpu.reg(2), 0x4000_3010);
+    }
+
+    #[test]
+    fn ee_fused_vmul_load_then_multiply() {
+        // ee.vmul.s8.ld.incp q0, a2, q3, q4, q5 = 2f 2c c3 e0, SAR = 1.
+        let (cpu, _) = ee_run_mem(0xE0C3_2C2F, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 4);
+            }
+            c.qregs[4] = [3; 16];
+            c.qregs[5] = [2; 16];
+            c.set_sreg(crate::cpu::SR_SAR, 1);
+        });
+        assert_eq!(cpu.qregs[0], [4; 16]);
+        assert_eq!(cpu.qregs[3], [3; 16]);
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+    }
+
+    #[test]
+    fn ee_r2bf_butterfly_sums_and_differences() {
+        // ee.fft.r2bf.s16 q0, q1, q2, q3, 0 = 64 14 cc.
+        let (cpu, _) = ee_run_mem(0xCC1464, 3, |c, _| {
+            for i in 0..8 {
+                c.qregs[2][2 * i] = i as u8;
+                c.qregs[2][2 * i + 1] = 0;
+                c.qregs[3][2 * i] = 10 + i as u8;
+                c.qregs[3][2 * i + 1] = 0;
+            }
+        });
+        let s16 = |q: &[u8; 16], i: usize| i16::from_le_bytes([q[2 * i], q[2 * i + 1]]);
+        assert_eq!(
+            [
+                s16(&cpu.qregs[0], 0),
+                s16(&cpu.qregs[0], 1),
+                s16(&cpu.qregs[0], 2),
+                s16(&cpu.qregs[0], 3)
+            ],
+            [4, 6, 8, 10]
+        );
+        assert_eq!(
+            [
+                s16(&cpu.qregs[0], 4),
+                s16(&cpu.qregs[0], 5),
+                s16(&cpu.qregs[0], 6),
+                s16(&cpu.qregs[0], 7)
+            ],
+            [-4, -4, -4, -4]
+        );
+        assert_eq!(
+            [
+                s16(&cpu.qregs[1], 0),
+                s16(&cpu.qregs[1], 1),
+                s16(&cpu.qregs[1], 2),
+                s16(&cpu.qregs[1], 3)
+            ],
+            [24, 26, 28, 30]
+        );
+        assert_eq!(
+            [
+                s16(&cpu.qregs[1], 4),
+                s16(&cpu.qregs[1], 5),
+                s16(&cpu.qregs[1], 6),
+                s16(&cpu.qregs[1], 7)
+            ],
+            [-4, -4, -4, -4]
+        );
+        // sel2 = 1 reroutes lanes: ee.fft.r2bf.s16 q0, q1, q2, q3, 1 = 64 15 cc.
+        let (cpu, _) = ee_run_mem(0xCC1564, 3, |c, _| {
+            for i in 0..8 {
+                c.qregs[2][2 * i] = i as u8;
+                c.qregs[2][2 * i + 1] = 0;
+                c.qregs[3][2 * i] = 10 + i as u8;
+                c.qregs[3][2 * i + 1] = 0;
+            }
+        });
+        assert_eq!(
+            [
+                s16(&cpu.qregs[0], 0),
+                s16(&cpu.qregs[0], 1),
+                s16(&cpu.qregs[0], 2),
+                s16(&cpu.qregs[0], 3)
+            ],
+            [2, 4, 10, 12]
+        );
+        assert_eq!(
+            [
+                s16(&cpu.qregs[0], 4),
+                s16(&cpu.qregs[0], 5),
+                s16(&cpu.qregs[0], 6),
+                s16(&cpu.qregs[0], 7)
+            ],
+            [-2, -2, -2, -2]
+        );
+        assert_eq!(
+            [
+                s16(&cpu.qregs[1], 0),
+                s16(&cpu.qregs[1], 1),
+                s16(&cpu.qregs[1], 2),
+                s16(&cpu.qregs[1], 3)
+            ],
+            [22, 24, 30, 32]
+        );
+    }
+
+    #[test]
+    fn ee_src_q_ld_slides_then_loads() {
+        // ee.src.q.ld.ip q0, a2, 16, q1, q2 = 2e 41 20 e0: qup(q1,q2)
+        // by sar_byte=4 first, then load into q0, then +16.
+        let (cpu, _) = ee_run_mem(0xE020_412E, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            c.sar_byte = 4;
+            c.qregs[1] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+            c.qregs[2] = [
+                100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
+            ];
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 50 + i as u32);
+            }
+        });
+        assert_eq!(
+            cpu.qregs[1],
+            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 100, 101, 102, 103]
+        );
+        for i in 0..16 {
+            assert_eq!(cpu.qregs[0][i], 50 + i as u8);
+        }
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+    }
+
+    #[test]
+    fn ee_srcq_stores_slide() {
+        // ee.srcq.128.st.incp q1, q2, a3 = 34 1e dc, sar_byte=4.
+        let (cpu, mut bus) = ee_run_mem(0xDC1E34, 3, |c, _| {
+            c.set_reg(3, 0x4000_3000);
+            c.sar_byte = 4;
+            c.qregs[1] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+            c.qregs[2] = [
+                100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
+            ];
+        });
+        for i in 0..16 {
+            let want = if i < 12 {
+                4 + i as u32
+            } else {
+                100 + (i - 12) as u32
+            };
+            assert_eq!(bus.read8(0x4000_3000 + i as u32), want, "byte {i}");
+        }
+        assert_eq!(cpu.reg(3), 0x4000_3010);
+    }
+
+    #[test]
+    fn ee_r2bf_st_differences_and_shifted_sums() {
+        // ee.fft.r2bf.s16.st.incp q0, q2, q3, a2, 0 = 2e 84 38 e8.
+        // qy=q3 (odd) executes as qy=q1 (masked); q1 holds decoys.
+        let (cpu, mut bus) = ee_run_mem(0xE838_842E, 4, |c, _| {
+            c.set_reg(2, 0x4000_3000);
+            for i in 0..8 {
+                c.qregs[2][2 * i] = i as u8;
+                c.qregs[2][2 * i + 1] = 0;
+                c.qregs[1][2 * i] = 10 + i as u8;
+                c.qregs[1][2 * i + 1] = 0;
+                c.qregs[3][2 * i] = 20 + i as u8;
+                c.qregs[3][2 * i + 1] = 0;
+            }
+        });
+        let s16 = |q: &[u8; 16], i: usize| i16::from_le_bytes([q[2 * i], q[2 * i + 1]]);
+        for i in 0..8 {
+            assert_eq!(s16(&cpu.qregs[0], i), -10, "diff {i}");
+        }
+        for i in 0..8 {
+            let want = if i < 4 {
+                10 + 2 * i as u32
+            } else {
+                18 + 2 * (i - 4) as u32
+            };
+            let got = bus.read16(0x4000_3000 + 2 * i as u32);
+            assert_eq!(got, want, "sum {i}");
+        }
+        assert_eq!(cpu.reg(2), 0x4000_3010);
+    }
+    #[test]
+    fn ee_cmul_ld_pair_multiply_then_load() {
+        // ee.fft.cmul.s16.ld.xp q0, a2, a3, q1, q2, q3, 0 = 2e 83 31 dc,
+        // SAR = 1: (3+4i)(1+0i)>>1 = (1,2) into q1[0,1], then load.
+        let (cpu, _) = ee_run_mem(0xDC31_832E, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            c.set_reg(3, 16);
+            c.set_sreg(crate::cpu::SR_SAR, 1);
+            c.qregs[2] = [3, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            c.qregs[3] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 30 + i as u32);
+            }
+        });
+        assert_eq!(cpu.qregs[1][0], 1);
+        assert_eq!(cpu.qregs[1][1], 0);
+        assert_eq!(cpu.qregs[1][2], 2);
+        assert_eq!(cpu.qregs[1][3], 0);
+        for i in 0..16 {
+            assert_eq!(cpu.qregs[0][i], 30 + i as u8);
+        }
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+    }
+    #[test]
+    fn ee_src_q_ld_xp_adds_register() {
+        // ee.src.q.ld.xp q0, a2, a3, q1, q2 = 2e 43 20 e8.
+        let (cpu, _) = ee_run_mem(0xE820_432E, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            c.set_reg(3, 32);
+            c.sar_byte = 4;
+            c.qregs[1] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+            c.qregs[2] = [
+                100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
+            ];
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 60 + i as u32);
+            }
+        });
+        assert_eq!(
+            cpu.qregs[1],
+            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 100, 101, 102, 103]
+        );
+        for i in 0..16 {
+            assert_eq!(cpu.qregs[0][i], 60 + i as u8);
+        }
+        assert_eq!(cpu.reg(2), 0x4000_2020);
+    }
+    #[test]
+    fn ee_cmul_st_shifted_sums_then_store() {
+        // ee.fft.cmul.s16.st.xp q0, q2, q4, a2, a3, 0, 0, 0 = 2e 03 24 a8.
+        // low = qv[0..4], high = [qv[4],qv[5],cmul-pair], then a2 += a3.
+        let (cpu, mut bus) = ee_run_mem(0xA824_032E, 4, |c, _| {
+            c.set_reg(2, 0x4000_3000);
+            c.set_reg(3, 16);
+            c.qregs[0] = [3, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            c.qregs[2] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            c.qregs[4] = [7, 0, 8, 0, 9, 0, 10, 0, 11, 0, 12, 0, 0, 0, 0, 0];
+        });
+        for (i, want) in [7u32, 8, 9, 10, 11, 12, 3, 4].iter().enumerate() {
+            assert_eq!(bus.read16(0x4000_3000 + 2 * i as u32), *want, "lane {i}");
+        }
+        assert_eq!(cpu.reg(2), 0x4000_3010);
+    }
+    #[test]
+    fn ee_vst_decp_reversed_halves_then_decrement() {
+        // ee.fft.vst.r32.decp q0, a2, 0 = 24 33 cd: mem = [u32[3],u32[2],
+        // u32[1],u32[0]], then a2 -= 16.
+        let (cpu, mut bus) = ee_run_mem(0xCD3324, 3, |c, _| {
+            c.set_reg(2, 0x4000_3000);
+            c.qregs[0] = [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0];
+        });
+        for (i, want) in [4u32, 3, 2, 1].iter().enumerate() {
+            assert_eq!(bus.read32(0x4000_3000 + 4 * i as u32), *want, "lane {i}");
+        }
+        assert_eq!(cpu.reg(2), 0x4000_2FF0);
+    }
+    #[test]
+    fn ee_vmulas_qup_mac_load_then_slide() {
+        // ee.vmulas.s8.accx.ld.ip.qup q0, a2, 16, q3, q4, q5, q6
+        // = 2e e1 56 20: MAC (accx=32), load q0, +16, slide.
+        // qs0=q5 executes as q4 ([1:0] masked); q4 holds the source,
+        // q5 stays untouched (proves the masking direction).
+        let (cpu, _) = ee_run_mem(0x2056_E12E, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            c.sar_byte = 4;
+            c.qregs[3] = [1; 16];
+            c.qregs[4] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+            c.qregs[5] = [77; 16];
+            c.qregs[6] = [
+                100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
+            ];
+            // NOTE q4 doubles as MAC source qy AND slide source (distinct
+            // lanes used: MAC reads all, slide reads all — set once).
+            c.qregs[4] = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2];
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 9);
+            }
+        });
+        assert_eq!(cpu.accx, 32);
+        assert_eq!(cpu.qregs[0], [9; 16]);
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+        assert_eq!(cpu.qregs[5], [77; 16]);
+        assert_eq!(
+            cpu.qregs[4],
+            [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 100, 101, 102, 103]
+        );
     }
 }

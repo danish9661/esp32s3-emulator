@@ -7101,19 +7101,19 @@ pub fn opnds(opc: Opcode, insn: u32, pc: u32) -> [Opnd; MAX_OPERANDS] {
         }
         Opcode::OPCODE_MUL_AD_LL => {
             o[0] = Opnd::reg(fld_inst::s(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MUL_AD_HL => {
             o[0] = Opnd::reg(fld_inst::s(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MUL_AD_LH => {
             o[0] = Opnd::reg(fld_inst::s(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MUL_AD_HH => {
             o[0] = Opnd::reg(fld_inst::s(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MUL_DA_LL => {
             o[0] = Opnd::reg(fld_inst::x(insn));
@@ -7133,19 +7133,19 @@ pub fn opnds(opc: Opcode, insn: u32, pc: u32) -> [Opnd; MAX_OPERANDS] {
         }
         Opcode::OPCODE_MUL_DD_LL => {
             o[0] = Opnd::reg(fld_inst::x(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MUL_DD_HL => {
             o[0] = Opnd::reg(fld_inst::x(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MUL_DD_LH => {
             o[0] = Opnd::reg(fld_inst::x(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MUL_DD_HH => {
             o[0] = Opnd::reg(fld_inst::x(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULA_AA_LL => {
             o[0] = Opnd::reg(fld_inst::s(insn));
@@ -7181,35 +7181,35 @@ pub fn opnds(opc: Opcode, insn: u32, pc: u32) -> [Opnd; MAX_OPERANDS] {
         }
         Opcode::OPCODE_MULA_AD_LL => {
             o[0] = Opnd::reg(fld_inst::s(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULA_AD_HL => {
             o[0] = Opnd::reg(fld_inst::s(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULA_AD_LH => {
             o[0] = Opnd::reg(fld_inst::s(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULA_AD_HH => {
             o[0] = Opnd::reg(fld_inst::s(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULS_AD_LL => {
             o[0] = Opnd::reg(fld_inst::s(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULS_AD_HL => {
             o[0] = Opnd::reg(fld_inst::s(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULS_AD_LH => {
             o[0] = Opnd::reg(fld_inst::s(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULS_AD_HH => {
             o[0] = Opnd::reg(fld_inst::s(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULA_DA_LL => {
             o[0] = Opnd::reg(fld_inst::x(insn));
@@ -7245,35 +7245,35 @@ pub fn opnds(opc: Opcode, insn: u32, pc: u32) -> [Opnd; MAX_OPERANDS] {
         }
         Opcode::OPCODE_MULA_DD_LL => {
             o[0] = Opnd::reg(fld_inst::x(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULA_DD_HL => {
             o[0] = Opnd::reg(fld_inst::x(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULA_DD_LH => {
             o[0] = Opnd::reg(fld_inst::x(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULA_DD_HH => {
             o[0] = Opnd::reg(fld_inst::x(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULS_DD_LL => {
             o[0] = Opnd::reg(fld_inst::x(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULS_DD_HL => {
             o[0] = Opnd::reg(fld_inst::x(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULS_DD_LH => {
             o[0] = Opnd::reg(fld_inst::x(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULS_DD_HH => {
             o[0] = Opnd::reg(fld_inst::x(insn));
-            o[1] = Opnd::reg(0x2u32);
+            o[1] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULA_DA_LL_LDDEC => {
             o[0] = Opnd::reg(fld_inst::w(insn));
@@ -7327,49 +7327,49 @@ pub fn opnds(opc: Opcode, insn: u32, pc: u32) -> [Opnd; MAX_OPERANDS] {
             o[0] = Opnd::reg(fld_inst::w(insn));
             o[1] = Opnd::reg(fld_inst::s(insn));
             o[2] = Opnd::reg(fld_inst::x(insn));
-            o[3] = Opnd::reg(0x2u32);
+            o[3] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULA_DD_LL_LDINC => {
             o[0] = Opnd::reg(fld_inst::w(insn));
             o[1] = Opnd::reg(fld_inst::s(insn));
             o[2] = Opnd::reg(fld_inst::x(insn));
-            o[3] = Opnd::reg(0x2u32);
+            o[3] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULA_DD_HL_LDDEC => {
             o[0] = Opnd::reg(fld_inst::w(insn));
             o[1] = Opnd::reg(fld_inst::s(insn));
             o[2] = Opnd::reg(fld_inst::x(insn));
-            o[3] = Opnd::reg(0x2u32);
+            o[3] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULA_DD_HL_LDINC => {
             o[0] = Opnd::reg(fld_inst::w(insn));
             o[1] = Opnd::reg(fld_inst::s(insn));
             o[2] = Opnd::reg(fld_inst::x(insn));
-            o[3] = Opnd::reg(0x2u32);
+            o[3] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULA_DD_LH_LDDEC => {
             o[0] = Opnd::reg(fld_inst::w(insn));
             o[1] = Opnd::reg(fld_inst::s(insn));
             o[2] = Opnd::reg(fld_inst::x(insn));
-            o[3] = Opnd::reg(0x2u32);
+            o[3] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULA_DD_LH_LDINC => {
             o[0] = Opnd::reg(fld_inst::w(insn));
             o[1] = Opnd::reg(fld_inst::s(insn));
             o[2] = Opnd::reg(fld_inst::x(insn));
-            o[3] = Opnd::reg(0x2u32);
+            o[3] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULA_DD_HH_LDDEC => {
             o[0] = Opnd::reg(fld_inst::w(insn));
             o[1] = Opnd::reg(fld_inst::s(insn));
             o[2] = Opnd::reg(fld_inst::x(insn));
-            o[3] = Opnd::reg(0x2u32);
+            o[3] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_MULA_DD_HH_LDINC => {
             o[0] = Opnd::reg(fld_inst::w(insn));
             o[1] = Opnd::reg(fld_inst::s(insn));
             o[2] = Opnd::reg(fld_inst::x(insn));
-            o[3] = Opnd::reg(0x2u32);
+            o[3] = Opnd::reg(2 + ((fld_inst::t(insn) >> 2) & 1));
         }
         Opcode::OPCODE_LDDEC => {
             o[0] = Opnd::reg(fld_inst::w(insn));

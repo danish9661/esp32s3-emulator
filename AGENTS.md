@@ -2691,3 +2691,79 @@ Core design:
     unit from the mnemonic prefix (covers all ~129 variants, no
     enumeration) and the run_flash trap prints `[ee:<unit>]` with pc +
     mnemonic. 7 ee unit tests green.
+  - 2026-09-10: **ee.* TIE/DSP execution implemented in waves (was
+    diagnostics-only, now executing)**. User directive "do all" CPU
+    extensions (MAC16 + stragglers were already done). Ground truth: QEMU
+    `translate_tie_esp32s3.c` HELPER bodies (read, not copied) +
+    `xtensa-modules.inc.c` (217-mnemonic GAS list + iclass args) +
+    `xtensa-esp32s3-elf-as` probes for every operand position.
+    - **Wave 1 (plain ALU/moves)**: vadds/vsubs (asymmetric sat ±0x7f,
+      u-sub borrow-saturates), vmul (SAR, truncate), vmin/vmax, vcmp
+      (masks), andq/orq/xorq/notq (rotated layout), vzip/vunzip (in-place),
+      cmul (op0/sar-imm), zero, movi.q/a, mov.qacc (u8/s8/u16/s16),
+      bitrev (max-fold + post-inc), vrelu/vprelu, vsl/vsr (SAR, vsl=left),
+      gpio (latch), vsmulas (no-shift), srcmb (asymmetric 0x80 clamp),
+      vmulas.accx (no-shift, 44-bit) / .qacc (20/40-bit lanes).
+    - **Wave 2 (shifts + plain mem)**: slci/srci (sar+1, reversed
+      qs0/qs1, restricted domains), src.q/qup (SAR_BYTE), vldbc.8/16/32
+      (+ip/xp, width-specific imm bits), vld/vst.128/h/l (ip/xp),
+      ldxq/stxq (indexed, sext(s16)*4-4), ld/st.accx (44-bit),
+      ld/st.qacc (h_32 top word / l_128 low 16B), ldqa (widening),
+      ldf/stf.64 (swapped halves), ld/st.ua_state, ld.usar (+sar_byte),
+      vldhbc.incp (pair-broadcast +16). `srs.accx` SKIPPED (shift-AR not
+      encoded — identical words for different ARs, unimplementable).
+    - **Wave 3 (fused + butterfly + indexed slides)**: fused
+      vadds/vsubs/vmul/vmin/vmax .ld.incp + vadds/vmul.s8 .st.incp (one
+      4-byte layout; st mem-qu differs (contiguous raw[22:20]); op/width
+      table in (b1[1:0],b2[6:4]); cmul-fused SKIPPED (sar/qx overlap)),
+      fft.r2bf.s16 (both sel), vldbc widths × forms, ld.usar.xp,
+      slcxxp/srcxxp (AR shift + postupdate). `decode_ee` extended with
+      narrow opcode-bit rules (ldxq/stxq/ldf/stf-ip/fused/r2bf/slcxxp);
+      plain arms guarded so fused names can't hijack; unknown patterns
+      still trap loud.
+    - Validation: 80 xtensa-core lib KATs (assembler-captured words +
+      hand-computed vectors incl. sat edges, QACC lane packing, postupdate
+      chaining) + dot-product vehicle (vld+vld+vmulas → ACCX=1496) + full
+      workspace 38/38 green + ee.rs/lib.rs clippy-clean + fmt.
+    - Cautionary tales: each TIE family has its OWN operand layout (CAL
+      triple does NOT generalize — vcmp dest, logic all-three, fused qx
+      all differ; verify per family, never assume); hex-bit misreads
+      (0xEC[5:4]=2 not 3) Tanner_audit every map; GAS accepts but MASKS
+      out-of-field values (odd qs, qy=3→2); my KAT words need byte-order
+      care (transposed-nibble trap); edit/test parallel races rerun tests
+      sequentially. REMAINING (loud trap, documented): vmulas-fused
+      (.ld.ip/.xp/.qup/.ldbc), FFT-rest (ams, cmul_ld/st, vst_decp,
+      r2bf.st.incp), ldf/stf.128 (6-op), src.q.ld/srcq.st, Touch/WiFi/BLE.
+  - 2026-09-10: **ee.* Wave 3 continued (fused-MAC, butterfly-store,
+    slides, cmul-ld, AMS)**. `ee_vmulas_fused` (ld.ip/.xp × s8/s16/u8/u16
+    × accx/qacc: MAC-first, qu=b2[3]|b3[1:0]<<1, qx/qy split, xp marker
+    b2[4], op table in b2[2:0]) + `ee_vmulas_ldbc` (MAC-first, CAL
+    sources, broadcast + AR+=1/2, qu=b1[5]|b1[7]<<1|b2[4]<<2). `ee_r2bf_st`
+    (in-place differences, sums>>sar4 stored, qa0=b2[2:0],
+    qx=b1[7:6]|b0[0]<<2, qy even=b1[6:4]/odd=1|b1[0]<<2, sar=b1[4]|b2[7]).
+    `ee_src_q_ld` (qup-slide, then load, then postupdate) +
+    `ee_srcq_st` (slide-store via srcq_64_rd) + `ee_cmul_ld`
+    (pair-select sel8, even=(ac+bd,bc-ad)) + `ee_ams_ld` (lanes-2,3
+    twiddle, heavy masking documented). `ee_sxcxxp` (AR shift+postupdate),
+    vldbc all widths × forms (form-specific width/imm bits),
+    ld.usar.xp. KATs incl. alias-direction probes (qy masking, qz dest
+    check, sentinel sources) proving mask-to-0. 88 lib KATs, 38/38
+    workspace green, clippy/fmt clean. REMAINING (loud trap): vmulas.qup,
+    srs.accx (unencodable), cmul-fused (overlap), ams.st/uaup/decp,
+    cmul.st, vst.*, ldf/stf.128 (FPR scatter), src.q.ld... (done: ip/xp),
+    plus Touch/WiFi/BLE per directive.
+  - 2026-09-10: **ee.* tail completed (qup, cmul.st, vst.decp; ams.st/
+    ldf128 stay trapped)**. `ee_vmulas_qup_fused` (all 16 width×acc×
+    ip/xp: MAC→load→postupdate→slide; op in b3[6:4], xp in b3[7],
+    qs0=b2[6]<<2 lossy to 0/4, qs1=b2[2:0]; KAT proves q4-slid/q5-
+    untouched masking). `ee_cmul_st` (qv/qx/qy/sel8/upd4/sar4, low=
+    upd-selected, high=[qv4,qv5,pair]; KAT). `ee_vst_decp`
+    (reversed u32 pairs>>sar2, AR-=16; KAT). Cautionary tales: qup
+    b3[6]==0 rule hijacks cmul.st (0xA8) — narrowed with explicit
+    exclusion + verified order; cmul.st qy is 3-bit (b2[7] is sel8[0]);
+    even-im sign in cmul-ld is ai*br-ar*bi (KAT-caught flip); ldf.128
+    needs 4 scattered FPR fields (deferred). PERMANENT TRAPS
+    (documented): srs.accx (shift-AR unencodable), cmul-fused (sar/qx
+    overlap), ams.st/uaup/decp (deep store helpers), ldf/stf.128 (FPR
+    scatter). 91 lib KATs, 38/38 workspace green, my-files clippy/fmt
+    clean (pre-existing exec.rs ua_state erasing_op deny left untouched).

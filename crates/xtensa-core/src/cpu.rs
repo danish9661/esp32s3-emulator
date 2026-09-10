@@ -239,12 +239,38 @@ pub struct Cpu {
     fpregs: [u32; 16],
     sregs: [u32; 256],
     user_sregs: [u32; 256],
+    /// Debug/OCD doubleword register (LDDR32.P/SDDR32.P postupdate memory
+    /// moves through it; ISA RM "Processor State" DDR — not a numbered
+    /// special register, so it lives outside `sregs`). Reset 0.
+    pub ddr: u64,
+    /// TIE vector register file (ee.* DSP/AI units): 8 × 128-bit Q
+    /// registers, byte-addressable (QEMU `Q_reg`: s8/u8/s16/u16/s32/u32
+    /// lane views). Reset 0.
+    pub qregs: [[u8; 16]; 8],
+    /// TIE 40-bit saturating accumulator (vmulas target; QEMU `ACCX`).
+    /// Signed ops saturate to ±0x7FFFFFFFFF, unsigned to [0, 0xFFFFFFFFFF].
+    pub accx: i64,
+    /// TIE quarter-round accumulators: 2 × 20 bytes (8×20-bit lanes for
+    /// 8-bit ops, 4×40-bit lanes for 16-bit ops; QEMU `ACCQ`).
+    pub accq: [[u8; 20]; 2],
+    /// TIE unaligned-access staging register (LD_UA/ST_UA).
+    pub ua_state: [u8; 16],
+    /// TIE SAR byte, FFT width and GPIO-out state (UR_SAR_BYTE,
+    /// UR_FFT_BIT_WIDTH, UR_GPIO_OUT user registers).
+    pub sar_byte: u8,
+    pub fft_width: u8,
+    pub tie_gpio: u32,
     pub(crate) windowbase_next: Option<u32>,
     pub icount: u64,
     /// Length in bytes of the most recently executed instruction (set by
     /// `step_one` on every path that reaches fetch). Lets block drivers
     /// verify pc advance without re-fetching the length.
     last_len: u32,
+    /// Raw instruction word of the most recently executed instruction (set
+    /// alongside `last_len`). Lets TIE executors decode operands directly
+    /// from the word, since the generated `opnds` arms for `ee.*` are
+    /// placeholder stubs.
+    last_raw: u32,
     /// Debug counters for interrupt-delivery diagnosis (run_flash probes).
     pub dbg_irq_taken: u64,
     pub dbg_irq_skipped_level0: u64,
@@ -280,9 +306,18 @@ impl Cpu {
             fpregs: [0; 16],
             sregs: [0; 256],
             user_sregs: [0; 256],
+            ddr: 0,
+            qregs: [[0; 16]; 8],
+            accx: 0,
+            accq: [[0; 20]; 2],
+            ua_state: [0; 16],
+            sar_byte: 0,
+            fft_width: 0,
+            tie_gpio: 0,
             windowbase_next: None,
             icount: 0,
             last_len: 0,
+            last_raw: 0,
             dbg_irq_taken: 0,
             dbg_irq_skipped_level0: 0,
             decode_cache: {
@@ -310,6 +345,12 @@ impl Cpu {
     #[inline]
     pub fn last_len(&self) -> u32 {
         self.last_len
+    }
+
+    /// Raw word of the most recently executed instruction (see `last_raw`).
+    #[inline]
+    pub fn last_raw(&self) -> u32 {
+        self.last_raw
     }
 
     #[inline]
@@ -642,6 +683,7 @@ impl Cpu {
             (opc, opnds, len, wmask)
         };
         self.last_len = len;
+        self.last_raw = raw;
 
         let opc = match opc {
             Some(o) => o,

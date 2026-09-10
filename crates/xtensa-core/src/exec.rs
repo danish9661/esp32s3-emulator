@@ -13,11 +13,9 @@
 use crate::bus::Bus;
 use crate::cpu::{
     ALLOCA_CAUSE, Cpu, ILLEGAL_INSTRUCTION_CAUSE, PS_CALLINC, PS_CALLINC_SHIFT, PS_EXCM, PS_OWB,
-    PS_WOE, SR_EPC1, SR_EPS2, SR_INTSET, SR_LBEG, SR_LCOUNT, SR_LEND, SR_PS, SR_SAR, SR_SCOMPARE1,
-    SR_WINDOW_BASE, SR_WINDOW_START, SYSCALL_CAUSE, UR_ACCX_0, UR_ACCX_1, UR_FCR, UR_FFT_BIT_WIDTH,
-    UR_FSR, UR_GPIO_OUT, UR_QACC_H_0, UR_QACC_H_1, UR_QACC_H_2, UR_QACC_H_3, UR_QACC_H_4,
-    UR_QACC_L_0, UR_QACC_L_1, UR_QACC_L_2, UR_QACC_L_3, UR_QACC_L_4, UR_SAR_BYTE, UR_THREADPTR,
-    UR_UA_STATE_0, UR_UA_STATE_1, UR_UA_STATE_2, UR_UA_STATE_3,
+    PS_WOE, SR_ACCHI, SR_ACCLO, SR_BR, SR_EPC1, SR_EPS2, SR_INTSET, SR_LBEG, SR_LCOUNT, SR_LEND,
+    SR_M0, SR_PS, SR_SAR, SR_SCOMPARE1, SR_WINDOW_BASE, SR_WINDOW_START, SYSCALL_CAUSE, UR_FCR,
+    UR_FSR, UR_THREADPTR,
 };
 use crate::generated::{Opcode, Opnd};
 
@@ -48,6 +46,50 @@ fn clrsb(v: u32) -> u32 {
     // of leading bits equal to the sign bit, excluding the sign bit itself.
     let t = if (v >> 31) & 1 == 1 { !v } else { v };
     t.leading_zeros() - 1
+}
+
+/// MAC16 half-select (ISA RM "MAC16 Option"; QEMU `gen_mac16_m` in
+/// target/xtensa/translate.c): high half is bits [31:16] (arithmetic shift
+/// down for signed, logical for unsigned), low half is bits [15:0]
+/// (sign- or zero-extended).
+#[inline]
+fn mac16_half(v: u32, hi: bool, unsigned: bool) -> i32 {
+    if hi {
+        if unsigned {
+            (v >> 16) as i32
+        } else {
+            (v as i32) >> 16
+        }
+    } else if unsigned {
+        (v & 0xFFFF) as i32
+    } else {
+        ((v & 0xFFFF) as u16) as i16 as i32
+    }
+}
+
+/// MUL/UMUL: overwrite the 40-bit ACC with the 16x16 product (QEMU sets
+/// ACCLO to the product and ACCHI to its sign extension, or 0 for UMUL).
+fn mac16_set(cpu: &mut Cpu, m1: i32, m2: i32, unsigned: bool) {
+    let p = (m1 as i64).wrapping_mul(m2 as i64);
+    cpu.set_sreg(SR_ACCLO, p as u32);
+    cpu.set_sreg(SR_ACCHI, if unsigned { 0 } else { (p >> 32) as u32 });
+}
+
+/// MULA/MULS: ACC += (or -=) the sign-extended product, then truncate
+/// ACCHI to its low 8 bits sign-extended (QEMU `ext8s`: the ACC is 40-bit,
+/// ACCHI[7:0]:ACCLO[31:0]).
+fn mac16_acc(cpu: &mut Cpu, m1: i32, m2: i32, add: bool) {
+    let p = (m1 as i64).wrapping_mul(m2 as i64);
+    let hi = cpu.sreg(SR_ACCHI) as i64;
+    let lo = cpu.sreg(SR_ACCLO) as u64;
+    let mut acc = (hi << 32) | lo as i64;
+    if add {
+        acc = acc.wrapping_add(p);
+    } else {
+        acc = acc.wrapping_sub(p);
+    }
+    cpu.set_sreg(SR_ACCLO, acc as u32);
+    cpu.set_sreg(SR_ACCHI, (((acc >> 32) as u8) as i8) as i32 as u32);
 }
 
 pub(crate) fn execute<B: Bus>(
@@ -354,7 +396,7 @@ pub(crate) fn execute<B: Bus>(
             bus.write16(addr, cpu.reg(o[0].value));
             Outcome::Seq
         }
-        Opcode::OPCODE_S32I | Opcode::OPCODE_S32NB | Opcode::OPCODE_S32E => {
+        Opcode::OPCODE_S32I | Opcode::OPCODE_S32NB | Opcode::OPCODE_S32E | Opcode::OPCODE_S32RI => {
             let addr = cpu.reg(o[1].value).wrapping_add(o[2].value);
             bus.write32(addr, cpu.reg(o[0].value));
             Outcome::Seq
@@ -429,6 +471,45 @@ pub(crate) fn execute<B: Bus>(
         Opcode::OPCODE_BBSI => branch_if(o, 2, (cpu.reg(o[0].value) >> (o[1].value & 31)) & 1 == 1),
         Opcode::OPCODE_BF => branch_if(o, 1, !cpu.br(o[0].value)),
         Opcode::OPCODE_BT => branch_if(o, 1, cpu.br(o[0].value)),
+        // ALL4/ANY4/ALL8/ANY8 (ISA RM Boolean Option; QEMU translate_all):
+        // BR[t] <- AND/OR of 4 (resp. 8) consecutive BR bits starting at
+        // the immediate. o[0] is the dest BR index (like BT's s), o[1] the
+        // start bit (s4<<2 / s8<<3, verified against the assembler).
+        Opcode::OPCODE_ALL4 | Opcode::OPCODE_ALL8 => {
+            let width = if opc == Opcode::OPCODE_ALL4 { 4 } else { 8 };
+            let start = o[1].value;
+            let brw = cpu.sreg(SR_BR);
+            let mut v = (brw >> start) & ((1 << width) - 1);
+            v = u32::from(v == (1 << width) - 1);
+            cpu.set_br(o[0].value, v != 0);
+            Outcome::Seq
+        }
+        Opcode::OPCODE_ANY4 | Opcode::OPCODE_ANY8 => {
+            let width = if opc == Opcode::OPCODE_ANY4 { 4 } else { 8 };
+            let start = o[1].value;
+            let brw = cpu.sreg(SR_BR);
+            let v = (brw >> start) & ((1 << width) - 1);
+            cpu.set_br(o[0].value, v != 0);
+            Outcome::Seq
+        }
+        // LDDR32.P/SDDR32.P (debug doubleword moves through the DDR state;
+        // single s operand, postupdated by the 8-byte access width): LDDR
+        // loads DDR from mem64[AR[s]], SDDR stores DDR to mem64[AR[s]].
+        Opcode::OPCODE_LDDR32_P => {
+            let addr = cpu.reg(o[0].value);
+            let lo = bus.read32(addr) as u64;
+            let hi = bus.read32(addr.wrapping_add(4)) as u64;
+            cpu.ddr = (hi << 32) | lo;
+            cpu.set_reg(o[0].value, addr.wrapping_add(8));
+            Outcome::Seq
+        }
+        Opcode::OPCODE_SDDR32_P => {
+            let addr = cpu.reg(o[0].value);
+            bus.write32(addr, cpu.ddr as u32);
+            bus.write32(addr.wrapping_add(4), (cpu.ddr >> 32) as u32);
+            cpu.set_reg(o[0].value, addr.wrapping_add(8));
+            Outcome::Seq
+        }
 
         // ------------------------------------------------------------------
         // Jumps and calls.
@@ -954,11 +1035,12 @@ pub(crate) fn execute<B: Bus>(
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_SAR_BYTE => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_SAR_BYTE));
+            cpu.set_reg(o[0].value, cpu.sar_byte as u32);
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_SAR_BYTE => {
-            cpu.set_user_sreg(UR_SAR_BYTE, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            cpu.sar_byte = v as u8;
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_FCR => {
@@ -978,147 +1060,178 @@ pub(crate) fn execute<B: Bus>(
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_FFT_BIT_WIDTH => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_FFT_BIT_WIDTH));
+            cpu.set_reg(o[0].value, cpu.fft_width as u32);
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_FFT_BIT_WIDTH => {
-            cpu.set_user_sreg(UR_FFT_BIT_WIDTH, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            cpu.fft_width = v as u8;
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_ACCX_0 => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_ACCX_0));
+            cpu.set_reg(o[0].value, cpu.accx as u32);
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_ACCX_0 => {
-            cpu.set_user_sreg(UR_ACCX_0, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            // QEMU wur_s3 masks ACCX to 44 bits on every half write.
+            cpu.accx = ((cpu.accx & -0x1_0000_0000) | v as u64 as i64) & 0xFFF_FFFF_FFFF;
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_ACCX_1 => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_ACCX_1));
+            cpu.set_reg(o[0].value, (cpu.accx >> 32) as u32);
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_ACCX_1 => {
-            cpu.set_user_sreg(UR_ACCX_1, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            cpu.accx = (((v as i64) << 32) | (cpu.accx & 0xFFFF_FFFF)) & 0xFFF_FFFF_FFFF;
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_QACC_H_0 => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_QACC_H_0));
+            cpu.set_reg(o[0].value, crate::ee::qacc_word(&cpu.accq[1], 0));
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_QACC_H_1 => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_QACC_H_1));
+            cpu.set_reg(o[0].value, crate::ee::qacc_word(&cpu.accq[1], 1));
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_QACC_H_2 => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_QACC_H_2));
+            cpu.set_reg(o[0].value, crate::ee::qacc_word(&cpu.accq[1], 2));
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_QACC_H_3 => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_QACC_H_3));
+            cpu.set_reg(o[0].value, crate::ee::qacc_word(&cpu.accq[1], 3));
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_QACC_H_4 => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_QACC_H_4));
+            cpu.set_reg(o[0].value, crate::ee::qacc_word(&cpu.accq[1], 4));
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_QACC_H_0 => {
-            cpu.set_user_sreg(UR_QACC_H_0, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            crate::ee::set_qacc_word(&mut cpu.accq[1], 0, v);
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_QACC_H_1 => {
-            cpu.set_user_sreg(UR_QACC_H_1, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            crate::ee::set_qacc_word(&mut cpu.accq[1], 1, v);
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_QACC_H_2 => {
-            cpu.set_user_sreg(UR_QACC_H_2, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            crate::ee::set_qacc_word(&mut cpu.accq[1], 2, v);
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_QACC_H_3 => {
-            cpu.set_user_sreg(UR_QACC_H_3, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            crate::ee::set_qacc_word(&mut cpu.accq[1], 3, v);
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_QACC_H_4 => {
-            cpu.set_user_sreg(UR_QACC_H_4, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            crate::ee::set_qacc_word(&mut cpu.accq[1], 4, v);
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_QACC_L_0 => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_QACC_L_0));
+            cpu.set_reg(o[0].value, crate::ee::qacc_word(&cpu.accq[0], 0));
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_QACC_L_1 => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_QACC_L_1));
+            cpu.set_reg(o[0].value, crate::ee::qacc_word(&cpu.accq[0], 1));
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_QACC_L_2 => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_QACC_L_2));
+            cpu.set_reg(o[0].value, crate::ee::qacc_word(&cpu.accq[0], 2));
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_QACC_L_3 => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_QACC_L_3));
+            cpu.set_reg(o[0].value, crate::ee::qacc_word(&cpu.accq[0], 3));
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_QACC_L_4 => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_QACC_L_4));
+            cpu.set_reg(o[0].value, crate::ee::qacc_word(&cpu.accq[0], 4));
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_QACC_L_0 => {
-            cpu.set_user_sreg(UR_QACC_L_0, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            crate::ee::set_qacc_word(&mut cpu.accq[0], 0, v);
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_QACC_L_1 => {
-            cpu.set_user_sreg(UR_QACC_L_1, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            crate::ee::set_qacc_word(&mut cpu.accq[0], 1, v);
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_QACC_L_2 => {
-            cpu.set_user_sreg(UR_QACC_L_2, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            crate::ee::set_qacc_word(&mut cpu.accq[0], 2, v);
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_QACC_L_3 => {
-            cpu.set_user_sreg(UR_QACC_L_3, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            crate::ee::set_qacc_word(&mut cpu.accq[0], 3, v);
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_QACC_L_4 => {
-            cpu.set_user_sreg(UR_QACC_L_4, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            crate::ee::set_qacc_word(&mut cpu.accq[0], 4, v);
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_UA_STATE_0 => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_UA_STATE_0));
+            cpu.set_reg(
+                o[0].value,
+                u32::from_le_bytes(cpu.ua_state[4 * 0..4 * 0 + 4].try_into().unwrap()),
+            );
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_UA_STATE_1 => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_UA_STATE_1));
+            cpu.set_reg(
+                o[0].value,
+                u32::from_le_bytes(cpu.ua_state[4 * 1..4 * 1 + 4].try_into().unwrap()),
+            );
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_UA_STATE_2 => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_UA_STATE_2));
+            cpu.set_reg(
+                o[0].value,
+                u32::from_le_bytes(cpu.ua_state[4 * 2..4 * 2 + 4].try_into().unwrap()),
+            );
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_UA_STATE_3 => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_UA_STATE_3));
+            cpu.set_reg(
+                o[0].value,
+                u32::from_le_bytes(cpu.ua_state[4 * 3..4 * 3 + 4].try_into().unwrap()),
+            );
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_UA_STATE_0 => {
-            cpu.set_user_sreg(UR_UA_STATE_0, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            cpu.ua_state[4 * 0..4 * 0 + 4].copy_from_slice(&v.to_le_bytes());
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_UA_STATE_1 => {
-            cpu.set_user_sreg(UR_UA_STATE_1, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            cpu.ua_state[4 * 1..4 * 1 + 4].copy_from_slice(&v.to_le_bytes());
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_UA_STATE_2 => {
-            cpu.set_user_sreg(UR_UA_STATE_2, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            cpu.ua_state[4 * 2..4 * 2 + 4].copy_from_slice(&v.to_le_bytes());
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_UA_STATE_3 => {
-            cpu.set_user_sreg(UR_UA_STATE_3, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            cpu.ua_state[4 * 3..4 * 3 + 4].copy_from_slice(&v.to_le_bytes());
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_GPIO_OUT => {
-            cpu.set_reg(o[0].value, cpu.user_sreg(UR_GPIO_OUT));
+            cpu.set_reg(o[0].value, cpu.tie_gpio);
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_GPIO_OUT => {
-            cpu.set_user_sreg(UR_GPIO_OUT, cpu.reg(o[0].value));
+            let v = cpu.reg(o[0].value);
+            cpu.tie_gpio = v;
             Outcome::Seq
         }
 
@@ -1195,6 +1308,700 @@ pub(crate) fn execute<B: Bus>(
             let addr = cpu.reg(o[1].value);
             cpu.set_reg(o[0].value, bus.read32(addr));
             cpu.set_reg(o[1].value, addr.wrapping_add(4));
+            Outcome::Seq
+        }
+        // ------------------------------------------------------------------
+        // MAC16 16-bit multiply-accumulate (ISA RM "MAC16 Option"; QEMU
+        // target/xtensa/translate.c translate_mac16 plus the
+        // core-esp32s3 operand tables for reference; every operand mapping
+        // below was additionally verified byte-for-byte against
+        // xtensa-esp32s3-elf-as output). First suffix letter selects the s
+        // source (A=AR[s], D=MR[x-field]); second selects the t source
+        // (A=AR[t], D=MR[2+t[2]] — the my operand decodes the y field plus
+        // 2, QEMU OperandSem_opnd_sem_MR_0_decode). H/L pick the high
+        // ([31:16], sign-extended down-shift) or low ([15:0],
+        // sign/zero-extended) half; UMUL.AA is the unsigned variant.
+        // Results accumulate into the 40-bit ACC (ACCHI[7:0]:ACCLO):
+        // MUL/UMUL overwrite it (ACCHI = sign extension, 0 for UMUL);
+        // MULA/MULS add/subtract the sign-extended product, then truncate
+        // ACCHI to its low 8 bits (QEMU ext8s). .LDINC/.LDDEC (MULA.DA/DD
+        // only) first move mem32[AR[s]+/-4] into MR[w] and postupdate AR[s]
+        // by +/-4 (QEMU ld_offset; TEUL so unaligned never faults, matching
+        // the S32I convention below).
+        Opcode::OPCODE_MUL_AA_HH => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), true, false),
+                mac16_half(cpu.reg(o[1].value), true, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MUL_AA_HL => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), true, false),
+                mac16_half(cpu.reg(o[1].value), false, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MUL_AA_LH => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), false, false),
+                mac16_half(cpu.reg(o[1].value), true, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MUL_AA_LL => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), false, false),
+                mac16_half(cpu.reg(o[1].value), false, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MUL_AD_HH => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), true, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), true, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MUL_AD_HL => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), true, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), false, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MUL_AD_LH => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), false, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), true, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MUL_AD_LL => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), false, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), false, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MUL_DA_HH => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), true, false),
+                mac16_half(cpu.reg(o[1].value), true, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MUL_DA_HL => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), true, false),
+                mac16_half(cpu.reg(o[1].value), false, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MUL_DA_LH => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), false, false),
+                mac16_half(cpu.reg(o[1].value), true, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MUL_DA_LL => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), false, false),
+                mac16_half(cpu.reg(o[1].value), false, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MUL_DD_HH => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), true, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), true, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MUL_DD_HL => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), true, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), false, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MUL_DD_LH => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), false, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), true, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MUL_DD_LL => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), false, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), false, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_AA_HH => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), true, false),
+                mac16_half(cpu.reg(o[1].value), true, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_AA_HL => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), true, false),
+                mac16_half(cpu.reg(o[1].value), false, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_AA_LH => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), false, false),
+                mac16_half(cpu.reg(o[1].value), true, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_AA_LL => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), false, false),
+                mac16_half(cpu.reg(o[1].value), false, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_AD_HH => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), true, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), true, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_AD_HL => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), true, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), false, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_AD_LH => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), false, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), true, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_AD_LL => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), false, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), false, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DA_HH => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), true, false),
+                mac16_half(cpu.reg(o[1].value), true, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DA_HL => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), true, false),
+                mac16_half(cpu.reg(o[1].value), false, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DA_LH => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), false, false),
+                mac16_half(cpu.reg(o[1].value), true, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DA_LL => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), false, false),
+                mac16_half(cpu.reg(o[1].value), false, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DD_HH => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), true, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), true, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DD_HL => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), true, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), false, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DD_LH => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), false, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), true, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DD_LL => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), false, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), false, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULS_AA_HH => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), true, false),
+                mac16_half(cpu.reg(o[1].value), true, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULS_AA_HL => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), true, false),
+                mac16_half(cpu.reg(o[1].value), false, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULS_AA_LH => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), false, false),
+                mac16_half(cpu.reg(o[1].value), true, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULS_AA_LL => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), false, false),
+                mac16_half(cpu.reg(o[1].value), false, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULS_AD_HH => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), true, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), true, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULS_AD_HL => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), true, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), false, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULS_AD_LH => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), false, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), true, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULS_AD_LL => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), false, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), false, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULS_DA_HH => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), true, false),
+                mac16_half(cpu.reg(o[1].value), true, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULS_DA_HL => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), true, false),
+                mac16_half(cpu.reg(o[1].value), false, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULS_DA_LH => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), false, false),
+                mac16_half(cpu.reg(o[1].value), true, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULS_DA_LL => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), false, false),
+                mac16_half(cpu.reg(o[1].value), false, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULS_DD_HH => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), true, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), true, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULS_DD_HL => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), true, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), false, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULS_DD_LH => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), false, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), true, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULS_DD_LL => {
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[0].value), false, false),
+                mac16_half(cpu.sreg(SR_M0 + o[1].value), false, false),
+                false,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_UMUL_AA_HH => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), true, true),
+                mac16_half(cpu.reg(o[1].value), true, true),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_UMUL_AA_HL => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), true, true),
+                mac16_half(cpu.reg(o[1].value), false, true),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_UMUL_AA_LH => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), false, true),
+                mac16_half(cpu.reg(o[1].value), true, true),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_UMUL_AA_LL => {
+            mac16_set(
+                cpu,
+                mac16_half(cpu.reg(o[0].value), false, true),
+                mac16_half(cpu.reg(o[1].value), false, true),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DA_HH_LDINC => {
+            let addr = cpu.reg(o[1].value).wrapping_add(4u32);
+            let wv = bus.read32(addr);
+            cpu.set_reg(o[1].value, addr);
+            cpu.set_sreg(SR_M0 + o[0].value, wv);
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[2].value), true, false),
+                mac16_half(cpu.reg(o[3].value), true, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DA_HH_LDDEC => {
+            let addr = cpu.reg(o[1].value).wrapping_add(0xFFFF_FFFCu32);
+            let wv = bus.read32(addr);
+            cpu.set_reg(o[1].value, addr);
+            cpu.set_sreg(SR_M0 + o[0].value, wv);
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[2].value), true, false),
+                mac16_half(cpu.reg(o[3].value), true, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DA_HL_LDINC => {
+            let addr = cpu.reg(o[1].value).wrapping_add(4u32);
+            let wv = bus.read32(addr);
+            cpu.set_reg(o[1].value, addr);
+            cpu.set_sreg(SR_M0 + o[0].value, wv);
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[2].value), true, false),
+                mac16_half(cpu.reg(o[3].value), false, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DA_HL_LDDEC => {
+            let addr = cpu.reg(o[1].value).wrapping_add(0xFFFF_FFFCu32);
+            let wv = bus.read32(addr);
+            cpu.set_reg(o[1].value, addr);
+            cpu.set_sreg(SR_M0 + o[0].value, wv);
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[2].value), true, false),
+                mac16_half(cpu.reg(o[3].value), false, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DA_LH_LDINC => {
+            let addr = cpu.reg(o[1].value).wrapping_add(4u32);
+            let wv = bus.read32(addr);
+            cpu.set_reg(o[1].value, addr);
+            cpu.set_sreg(SR_M0 + o[0].value, wv);
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[2].value), false, false),
+                mac16_half(cpu.reg(o[3].value), true, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DA_LH_LDDEC => {
+            let addr = cpu.reg(o[1].value).wrapping_add(0xFFFF_FFFCu32);
+            let wv = bus.read32(addr);
+            cpu.set_reg(o[1].value, addr);
+            cpu.set_sreg(SR_M0 + o[0].value, wv);
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[2].value), false, false),
+                mac16_half(cpu.reg(o[3].value), true, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DA_LL_LDINC => {
+            let addr = cpu.reg(o[1].value).wrapping_add(4u32);
+            let wv = bus.read32(addr);
+            cpu.set_reg(o[1].value, addr);
+            cpu.set_sreg(SR_M0 + o[0].value, wv);
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[2].value), false, false),
+                mac16_half(cpu.reg(o[3].value), false, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DA_LL_LDDEC => {
+            let addr = cpu.reg(o[1].value).wrapping_add(0xFFFF_FFFCu32);
+            let wv = bus.read32(addr);
+            cpu.set_reg(o[1].value, addr);
+            cpu.set_sreg(SR_M0 + o[0].value, wv);
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[2].value), false, false),
+                mac16_half(cpu.reg(o[3].value), false, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DD_HH_LDINC => {
+            let addr = cpu.reg(o[1].value).wrapping_add(4u32);
+            let wv = bus.read32(addr);
+            cpu.set_reg(o[1].value, addr);
+            cpu.set_sreg(SR_M0 + o[0].value, wv);
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[2].value), true, false),
+                mac16_half(cpu.sreg(SR_M0 + o[3].value), true, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DD_HH_LDDEC => {
+            let addr = cpu.reg(o[1].value).wrapping_add(0xFFFF_FFFCu32);
+            let wv = bus.read32(addr);
+            cpu.set_reg(o[1].value, addr);
+            cpu.set_sreg(SR_M0 + o[0].value, wv);
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[2].value), true, false),
+                mac16_half(cpu.sreg(SR_M0 + o[3].value), true, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DD_HL_LDINC => {
+            let addr = cpu.reg(o[1].value).wrapping_add(4u32);
+            let wv = bus.read32(addr);
+            cpu.set_reg(o[1].value, addr);
+            cpu.set_sreg(SR_M0 + o[0].value, wv);
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[2].value), true, false),
+                mac16_half(cpu.sreg(SR_M0 + o[3].value), false, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DD_HL_LDDEC => {
+            let addr = cpu.reg(o[1].value).wrapping_add(0xFFFF_FFFCu32);
+            let wv = bus.read32(addr);
+            cpu.set_reg(o[1].value, addr);
+            cpu.set_sreg(SR_M0 + o[0].value, wv);
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[2].value), true, false),
+                mac16_half(cpu.sreg(SR_M0 + o[3].value), false, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DD_LH_LDINC => {
+            let addr = cpu.reg(o[1].value).wrapping_add(4u32);
+            let wv = bus.read32(addr);
+            cpu.set_reg(o[1].value, addr);
+            cpu.set_sreg(SR_M0 + o[0].value, wv);
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[2].value), false, false),
+                mac16_half(cpu.sreg(SR_M0 + o[3].value), true, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DD_LH_LDDEC => {
+            let addr = cpu.reg(o[1].value).wrapping_add(0xFFFF_FFFCu32);
+            let wv = bus.read32(addr);
+            cpu.set_reg(o[1].value, addr);
+            cpu.set_sreg(SR_M0 + o[0].value, wv);
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[2].value), false, false),
+                mac16_half(cpu.sreg(SR_M0 + o[3].value), true, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DD_LL_LDINC => {
+            let addr = cpu.reg(o[1].value).wrapping_add(4u32);
+            let wv = bus.read32(addr);
+            cpu.set_reg(o[1].value, addr);
+            cpu.set_sreg(SR_M0 + o[0].value, wv);
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[2].value), false, false),
+                mac16_half(cpu.sreg(SR_M0 + o[3].value), false, false),
+                true,
+            );
+            Outcome::Seq
+        }
+        Opcode::OPCODE_MULA_DD_LL_LDDEC => {
+            let addr = cpu.reg(o[1].value).wrapping_add(0xFFFF_FFFCu32);
+            let wv = bus.read32(addr);
+            cpu.set_reg(o[1].value, addr);
+            cpu.set_sreg(SR_M0 + o[0].value, wv);
+            mac16_acc(
+                cpu,
+                mac16_half(cpu.sreg(SR_M0 + o[2].value), false, false),
+                mac16_half(cpu.sreg(SR_M0 + o[3].value), false, false),
+                true,
+            );
             Outcome::Seq
         }
         // ------------------------------------------------------------------
@@ -1498,6 +2305,14 @@ pub(crate) fn execute<B: Bus>(
                 cpu.set_reg(o[1].value, addr);
             }
             Outcome::Seq
+        }
+        o if crate::ee::is_ee_opcode(o) => {
+            // TIE/DSP extension (operands derived from the raw word inside).
+            if crate::ee::exec_ee(cpu, bus, o, cpu.last_raw()) {
+                Outcome::Seq
+            } else {
+                Outcome::Unimplemented
+            }
         }
         _ => Outcome::Unimplemented,
     }
