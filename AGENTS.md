@@ -2767,3 +2767,26 @@ Core design:
     overlap), ams.st/uaup/decp (deep store helpers), ldf/stf.128 (FPR
     scatter). 91 lib KATs, 38/38 workspace green, my-files clippy/fmt
     clean (pre-existing exec.rs ua_state erasing_op deny left untouched).
+  - 2026-09-10: **Real-firmware DSP validation (ee.* end-to-end)**. New
+    `tools/sketches/esp32s3_ee_dsp` drives TIE ops through inline asm
+    (stock GAS, no driver): `zero.accx` + `vld.128.ip` ×2 + `vmulas.s8.
+    accx` + `rur.accx_0/1` → `EE DSP DOT accx=1496` / `DOT OK`, and
+    `vld` ×2 + `vadds.s8` + `vst.128.ip` → `o0=127` / `VADDS OK` →
+    `EE DSP DONE` (battery entry, default STEPS). First real-firmware
+    ee.* execution — proves decode+exec+mem+RUR through the real
+    toolchain (GCC accepts ee.* with no extra flags; Q regs explicit,
+    single asm blocks so no compiler collision). Battery 63/0/0.
+    Deferred tail (loud trap, documented): ams.st (needs temp_asm
+    cross-call state), ldf/stf.128 (FPR scatter), srs.accx/cmul-fused
+    (unencodable/overlap). WiFi/BLE stay out per directive.
+  - 2026-09-10: **ee.* ams.st + decode-page hardening**. `ee_ams_st`
+    (sel2 branches: shifted/passthrough halves, qz1[6,7] side effects,
+    temp_asm unwired (no reader); KAT). Hardened 4-byte decode pages
+    after live hijacks: qup rule excluded the ams.st 0xA0 page, ams.st
+    narrowed to `(b3&0xFC)==0xA0` (was swallowing cmul.st's 0xA8 —
+    caught by cmul.st KAT going zero), cmul.st keeps 0xA8 page. Lesson:
+    every new 4-byte rule must prove disjointness against ALL existing
+    b3 pages (E0/E4/F0/20/D0/DC/A8/E8/A0), not just its neighbors.
+    92 lib KATs, 38/38 workspace green. REMAINING (loud trap):
+    ldf/stf.128 (needs 12 clean FPR probes), ams.uaup/decp, srs.accx
+    (unencodable), cmul-fused (overlap). Touch/WiFi/BLE per directive.

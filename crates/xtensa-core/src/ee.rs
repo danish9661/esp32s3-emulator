@@ -129,8 +129,9 @@ pub fn decode_ee(insn: u32) -> Opcode {
             };
         }
         // Fused vector-MAC + Q-slide (b3[7:6] != 11, excluding the
-        // cmul.st 0xA8 page; (uns,is8,qacc) in b3[6:4], xp in b3[7]).
-        if (b3 & 0xC0) != 0xC0 && (b3 & 0xF8) != 0xA8 {
+        // cmul.st 0xA8 and ams.st 0xA0 pages; (uns,is8,qacc) in b3[6:4],
+        // xp in b3[7]).
+        if (b3 & 0xC0) != 0xC0 && (b3 & 0xF8) != 0xA8 && (b3 & 0xF0) != 0xA0 {
             let xp = (b3 >> 7) & 1 == 1;
             return match ((b3 >> 6) & 1, (b3 >> 5) & 1, (b3 >> 4) & 1, xp) {
                 (0, 1, 0, false) => Opcode::OPCODE_EE_VMULAS_S8_ACCX_LD_IP_QUP,
@@ -161,6 +162,11 @@ pub fn decode_ee(insn: u32) -> Opcode {
     // FFT AMS + load (b3 top 6 bits 110100).
     if b3 & 0xFC == 0xD0 && (b0 & 0x0E) == 0x0E {
         return Opcode::OPCODE_EE_FFT_AMS_S16_LD_INCP;
+    }
+    // FFT AMS store (b3[7:2] == 101000; sel2 and qz1[2:1] live in
+    // b3[3:0]; disjoint from cmul.st's 10101x page and qup below).
+    if (b3 & 0xFC) == 0xA0 && (b0 & 0x0E) == 0x0E {
+        return Opcode::OPCODE_EE_FFT_AMS_S16_ST_INCP;
     }
     // Fused complex-multiply + load (b3 top 6 bits 110111).
     if (b3 & 0xFC) == 0xDC && (b0 & 0x0E) == 0x0E {
@@ -1120,6 +1126,8 @@ pub fn exec_ee<B: Bus>(cpu: &mut Cpu, bus: &mut B, opc: Opcode, raw: u32) -> boo
         ee_fused_vmul(cpu, bus, raw, Width::S8, true);
     } else if name == "ee_fft_ams_s16_ld_incp" {
         ee_ams_ld(cpu, bus, raw);
+    } else if name == "ee_fft_ams_s16_st_incp" {
+        ee_ams_st(cpu, bus, raw);
     } else if name.starts_with("ee_vmulas_") && name.contains("_ldbc_") {
         let w = if name.contains("_s8_") {
             Width::S8
@@ -2388,6 +2396,108 @@ fn ee_vmulas_qup_fused<B: Bus>(
     for i in 16 - sar..16 {
         cpu.qregs[qs0 & 7][i] = sb[i - (16 - sar)];
     }
+}
+
+/// FFT AMS store (QEMU `fft_ams_st_0/1_s16_*`): mem[(as&~15)] gets
+/// [as0>>1,qv>>1] (sel2=0) or [as0,qv] (sel2=1); mem[+8] gets
+/// [qv>>1] (sel2=0) or [qv] (sel2=1); qz1[6,7] side effects; then AR
+/// += 16. qv = raw[22:20], qz1 = raw[19] ++ raw[25:24]<<1, as0 =
+/// raw[7:4], as = raw[11:8], qx = raw[18:16], qy = raw[15:14] ++
+/// raw[0]<<2, qm = raw[12]<<1 ++ raw[13]<<2 ([0] masked), sel2 =
+/// raw[26]. (temp_asm has no implemented reader; qz1 writes kept.)
+fn ee_ams_st<B: Bus>(cpu: &mut Cpu, bus: &mut B, raw: u32) {
+    let qv = ((raw >> 20) & 7) as usize;
+    let qz1 = (((raw >> 19) & 1) | (((raw >> 24) & 3) << 1)) as usize;
+    let as0 = cpu.reg(ar_t(raw));
+    let qx = ((raw >> 16) & 7) as usize;
+    let qy = (((raw >> 14) & 3) | (((raw) & 1) << 2)) as usize;
+    let qm = (((raw >> 12) & 1) << 1 | (((raw >> 13) & 1) << 2)) as usize;
+    let sel = ((raw >> 26) & 1) as usize;
+    let sar = std_sar(cpu).min(31);
+    let a = (raw >> 8) & 0xF;
+    let base = cpu.reg(a);
+    let aligned = base & !15;
+    let as0_lo = (as0 & 0xFFFF) as u16 as i16;
+    let as0_hi = ((as0 >> 16) & 0xFFFF) as u16 as i16;
+    // Low half.
+    let mut lo = [0u8; 8];
+    for (i, v) in [
+        if sel == 0 {
+            as0_lo.wrapping_shr(1)
+        } else {
+            as0_lo
+        },
+        if sel == 0 {
+            as0_hi.wrapping_shr(1)
+        } else {
+            as0_hi
+        },
+        if sel == 0 {
+            q_s16(cpu, qv, 0).wrapping_shr(1)
+        } else {
+            q_s16(cpu, qv, 0)
+        },
+        if sel == 0 {
+            q_s16(cpu, qv, 1).wrapping_shr(1)
+        } else {
+            q_s16(cpu, qv, 1)
+        },
+    ]
+    .iter()
+    .enumerate()
+    {
+        lo[2 * i] = *v as u8;
+        lo[2 * i + 1] = (*v >> 8) as u8;
+    }
+    ee_st64(bus, aligned, u64::from_le_bytes(lo));
+    // High half + qz1 side effects (lanes 6,7 twiddle).
+    let (ax6, ax7) = (q_s16(cpu, qx, 6) as i32, q_s16(cpu, qx, 7) as i32);
+    let (ay6, ay7) = (q_s16(cpu, qy, 6) as i32, q_s16(cpu, qy, 7) as i32);
+    let (am6, am7) = (q_s16(cpu, qm, 6) as i32, q_s16(cpu, qm, 7) as i32);
+    // sel2=0 uses (qx-qy, qx+qy) pairing; sel2=1 uses (qx+qy, qx-qy).
+    // (QEMU st_0 vs st_1 high bodies differ in which lanes feed temp.)
+    let (t2, t3) = if sel == 0 {
+        let t2 =
+            (((ax6 - ay6) as i64 * am6 as i64 - (ax7 + ay7) as i64 * am7 as i64) >> sar) as i16;
+        let t3 =
+            (((ax6 - ay6) as i64 * am7 as i64 + (ax7 + ay7) as i64 * am6 as i64) >> sar) as i16;
+        (t2, t3)
+    } else {
+        let t2 =
+            (((ax7 + ay7) as i64 * am7 as i64 + (ax6 - ay6) as i64 * am6 as i64) >> sar) as i16;
+        let t3 =
+            (((ax7 + ay7) as i64 * am6 as i64 - (ax6 - ay6) as i64 * am7 as i64) >> sar) as i16;
+        (t2, t3)
+    };
+    let t0 = (ax6 + ay6) as i16;
+    let t1 = (ax7 - ay7) as i16;
+    set_q_u16(cpu, qz1, 6, t0.wrapping_sub(t2) as u16);
+    set_q_u16(cpu, qz1, 7, t3.wrapping_sub(t1) as u16);
+    let (h0, h1) = if sel == 0 {
+        (
+            q_s16(cpu, qv, 2).wrapping_shr(1),
+            q_s16(cpu, qv, 3).wrapping_shr(1),
+        )
+    } else {
+        (q_s16(cpu, qv, 2), q_s16(cpu, qv, 3))
+    };
+    // High stored lanes: sel2=0 [qv2,qv3,qv4,qv5]>>1; sel2=1 [qv2..qv5].
+    // (temp4/temp5 go to temp_asm, unwired.)
+    let (q4, q5) = if sel == 0 {
+        (
+            q_s16(cpu, qv, 4).wrapping_shr(1),
+            q_s16(cpu, qv, 5).wrapping_shr(1),
+        )
+    } else {
+        (q_s16(cpu, qv, 4), q_s16(cpu, qv, 5))
+    };
+    let mut hi = [0u8; 8];
+    for (i, v) in [h0, h1, q4, q5].iter().enumerate() {
+        hi[2 * i] = *v as u8;
+        hi[2 * i + 1] = (*v >> 8) as u8;
+    }
+    ee_st64(bus, aligned.wrapping_add(8), u64::from_le_bytes(hi));
+    cpu.set_reg(a, base.wrapping_add(16));
 }
 
 #[cfg(test)]

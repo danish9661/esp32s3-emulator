@@ -2729,4 +2729,25 @@ mod cpu_tests {
             [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 100, 101, 102, 103]
         );
     }
+    #[test]
+    fn ee_ams_st_shifted_halves_then_store() {
+        // ee.fft.ams.s16.st.incp q0, q1, a2, a3, q2, q3, q4, 0
+        // = 2e e3 0a a0: low=[as0>>1,qv>>1], high=[qv>>1], qz1 side
+        // effects on lanes 6,7, then a3 += 16.
+        let (cpu, mut bus) = ee_run_mem(0xA00A_E32E, 4, |c, _| {
+            c.set_reg(2, 0x0002_0001);
+            c.set_reg(3, 0x4000_3000);
+            c.qregs[0] = [10, 0, 11, 0, 12, 0, 13, 0, 14, 0, 15, 0, 16, 0, 17, 0];
+            c.qregs[2] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 1, 0];
+            c.qregs[3] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 2, 0];
+            c.qregs[4] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1, 0];
+        });
+        for (i, want) in [0u32, 1, 5, 5, 6, 6, 7, 7].iter().enumerate() {
+            assert_eq!(bus.read16(0x4000_3000 + 2 * i as u32), *want, "lane {i}");
+        }
+        let s16 = |q: &[u8; 16], i: usize| i16::from_le_bytes([q[2 * i], q[2 * i + 1]]);
+        assert_eq!(s16(&cpu.qregs[1], 6), 3);
+        assert_eq!(s16(&cpu.qregs[1], 7), 9);
+        assert_eq!(cpu.reg(3), 0x4000_3010);
+    }
 }

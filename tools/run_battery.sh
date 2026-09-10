@@ -110,6 +110,7 @@ CASES=(
 "gdma||GDMA RMT TX done|"
 "full_load||FULL_LOAD PASS|150000000"
 "ota_slot||OTA SLOT TEST PASS|"
+"ee_dsp||EE DSP DOT OK;EE DSP VADDS OK;EE DSP DONE|"
 "virtual_demo|NODE:tools/virtual_demo_harness.mjs|VIRTUAL DEMO HARNESS PASS|"
 "camcap|NODE:tools/camcap_harness.mjs|CAMCAP HARNESS PASS|"
 )
