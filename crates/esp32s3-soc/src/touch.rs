@@ -20,6 +20,12 @@
 //! `pad_active` is live: pad N is active when its threshold is nonzero and
 //! the counter is below it (S3 counters fall when touched). `data_sel`
 //! (smooth/benchmark/raw views) is not modeled — one counter per pad.
+//! Proximity mode: CONF.approach_padN (4-bit pad numbers) arm three approach
+//! channels; each channel's APPR_STATUS counter saturates at 255 while its
+//! pad is active and clears when released. SLP_STATUS latches the sleep-
+//! entry triggering pad's counter (first active pad) for post-wake
+//! identification. STATUS0 denoise_data reads the pad-0 injection
+//! (`touch_inject(0, v)`); scan_curr is always 0 (no scan engine).
 //! KNOWN LIMITATION: no interrupt is wired. On S3 the touch interrupt goes
 //! through the ULP-coprocessor block (`SENS_COCPU_*`), which has no
 //! interrupt-matrix source (`interrupts.h`); threshold *status* reads work,
@@ -35,6 +41,9 @@ pub const TOUCH_PADS: usize = 14;
 const REG_BYTES: usize = 0x100;
 /// SENS_BASE-relative offsets (`soc/sens_reg.h`).
 pub const TOUCH_CONF_OFF: u32 = 0x5C;
+const TOUCH_STATUS0_OFF: u32 = 0xA0;
+const TOUCH_SLP_STATUS_OFF: u32 = 0xDC;
+const TOUCH_APPR_STATUS_OFF: u32 = 0xE0;
 const TOUCH_THRES_BASE: u32 = 0x64;
 pub const TOUCH_CHN_ST_OFF: u32 = 0x9C;
 const TOUCH_STATUS_BASE: u32 = 0xA4;
@@ -53,6 +62,10 @@ pub const TOUCH_OFF_START: u32 = 0x5C;
 pub struct Touch {
     regs: Vec<u32>,
     injected: [u32; TOUCH_PADS + 1],
+    /// Proximity approach counters (APPR_STATUS padN_cnt, saturate 255).
+    appr: [u8; 3],
+    /// Sleep-entry captured pad counter (SLP_STATUS slp_data).
+    slp_data: u32,
 }
 
 impl Touch {
@@ -60,6 +73,8 @@ impl Touch {
         Self {
             regs: alloc::vec![0; REG_BYTES / 4],
             injected: [0; TOUCH_PADS + 1],
+            appr: [0; 3],
+            slp_data: 0,
         }
     }
 
@@ -67,11 +82,55 @@ impl Touch {
         ((off - TOUCH_OFF_START) / 4) as usize
     }
 
-    /// Host injection: the counter pad 1..=14 reports (22-bit counter that
+    /// Host injection: the counter pad 0..=14 reports (22-bit counter that
     /// falls when touched; the sketch asserts the exact injected value).
+    /// Pad 0 is the denoise channel (STATUS0 denoise_data); pads 1..=14
+    /// are the touch pads (STATUS1..14).
     pub fn inject(&mut self, pad: usize, value: u32) {
-        if (1..=TOUCH_PADS).contains(&pad) {
+        if (0..=TOUCH_PADS).contains(&pad) {
             self.injected[pad] = value & DATA_MASK;
+        }
+    }
+
+    /// Configured approach pads (CONF.approach_padN, 4-bit; 0 = disabled).
+    fn approach_pads(&self) -> [usize; 3] {
+        let conf = self.regs[Self::idx(TOUCH_CONF_OFF)];
+        [
+            ((conf >> 28) & 0xF) as usize,
+            ((conf >> 24) & 0xF) as usize,
+            ((conf >> 20) & 0xF) as usize,
+        ]
+    }
+
+    /// Advance the proximity counters by `cycles` ticks: an armed channel
+    /// (nonzero pad) saturates at 255 while its pad reads active, and
+    /// clears the moment it releases.
+    pub fn tick(&mut self, cycles: u64) {
+        let pads = self.approach_pads();
+        if pads == [0, 0, 0] {
+            return;
+        }
+        let active = self.active();
+        for (i, pad) in pads.iter().enumerate() {
+            if *pad == 0 || *pad > TOUCH_PADS {
+                self.appr[i] = 0;
+            } else if active & (1 << (pad - 1)) != 0 {
+                self.appr[i] = self.appr[i].saturating_add(cycles.min(255) as u8);
+            } else {
+                self.appr[i] = 0;
+            }
+        }
+    }
+
+    /// Latch the sleep-entry triggering pad's counter (first active pad,
+    /// like the wakeup evaluation) into SLP_STATUS for post-wake reads.
+    pub fn set_sleep_data(&mut self) {
+        self.slp_data = 0;
+        for pad in 1..=TOUCH_PADS {
+            if self.thresh(pad) != 0 && self.injected[pad] < self.thresh(pad) {
+                self.slp_data = self.injected[pad];
+                break;
+            }
         }
     }
 
@@ -111,6 +170,22 @@ impl Touch {
                 // STATUSn: the pad counter (host-injected).
                 let pad = ((o - TOUCH_STATUS_BASE) / 4) as usize + 1;
                 (self.regs[Self::idx(o)] & !DATA_MASK) | self.injected[pad]
+            }
+            TOUCH_STATUS0_OFF => {
+                // denoise_data = pad-0 injection; scan_curr = 0 (no scan
+                // engine); upper reserved bits read stored.
+                (self.regs[Self::idx(TOUCH_STATUS0_OFF)] & !DATA_MASK) | self.injected[0]
+            }
+            TOUCH_SLP_STATUS_OFF => {
+                // Sleep-captured pad counter (latched at sleep entry when
+                // touch wakeup fires); debounce reads 0.
+                self.slp_data & DATA_MASK
+            }
+            TOUCH_APPR_STATUS_OFF => {
+                // Live approach counters (pad2 | pad1 | pad0 | slp=0).
+                ((self.appr[2] as u32) << 24)
+                    | ((self.appr[1] as u32) << 16)
+                    | ((self.appr[0] as u32) << 8)
             }
             _ if offset >= TOUCH_OFF_START
                 && offset < TOUCH_OFF_START + REG_BYTES as u32

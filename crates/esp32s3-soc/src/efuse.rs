@@ -9,6 +9,16 @@
 //! `EFUSE_STATUS_REG` (0x1D0) `state` field (bits [3:0]) is polled until idle.
 //! We materialize a fixed eFuse array so the real esp-idf eFuse driver reads a
 //! deterministic MAC / chip id.
+//!
+//! Flash encryption: the eFuse flash-crypt config reads correct-by-default
+//! (RD_REPEAT fields reset 0: SPI_BOOT_CRYPT_CNT = 0, key purposes = 0,
+//! so every boot takes the encryption-OFF plaintext path, which is what
+//! all validatable firmware uses). The XTS crypto primitive itself is
+//! proven (`esp_aes_crypt_xts` over HW ECB passes in battery). What is NOT
+//! modeled is an encrypted-image pipeline (eFuse-burned XTS keys + esptool-
+//! encrypted flash + XTS decryption on instruction/data fetch): arduino-cli
+//! cannot produce encrypted images and there is no host key, so nothing
+//! could validate it — out of scope (same class as eMMC).
 
 use crate::memmap::EFUSE_BASE;
 

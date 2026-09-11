@@ -3153,3 +3153,47 @@ Core design:
     `HIGH OK`, `PASS`). `tests/cache.rs` updated (page 200 = 12.8MB now
     round-trips; page 300 = 19.2MB still reads 0). Battery 3/3
     (qspi/opi/16m), workspace green.
+  - 2026-09-11: **Touch modes validated (was oneshot-only)**. `touch.rs`
+    gains: proximity approach counters (CONF.approach_padN 4-bit pads;
+    APPR_STATUS padN_cnt saturate at 255 while active, clear on
+    release, ticked per step when armed), SLP_STATUS wakeup-pad latch
+    (`set_sleep_data` at sleep entry captures the first active pad's
+    counter), STATUS0 denoise_data (`touch_inject(0, v)`,
+    `TOUCH_INJECT=0:<v>`). Touch device added to deep-sleep RTC
+    retention (SENS is RTC-domain; without it the reboot wiped the
+    SLP latch — observed SLP=0). Validated: 3 unit tests +
+    `esp32s3_touch` extended (approach `APPR>0 OK` via pad-3 inject +
+    denoise branch printing `TOUCH DENOISE <val>` for the shared-binary
+    `touch_denoise` entry) + `esp32s3_deepsleep_touch` asserts
+    `SLP=1877` post-wake. Cautionary tales: (1) `touch_denoise` needed
+    a case-block bin mapping (name-derived binary didn't exist);
+    (2) two stale-binary false runs (rebuild sketches after editing!);
+    (3) shared-binary entries must runtime-branch (denoise entry has
+    no pad-3 touch, so unconditional asserts false-fail).
+  - 2026-09-11: **Flash encryption triaged (no model gap)**. eFuse
+    flash-crypt config reads correct-by-default (RD_REPEAT resets 0:
+    SPI_BOOT_CRYPT_CNT=0, key purposes 0 → every boot takes the
+    encryption-OFF plaintext path, which is what all validatable
+    firmware uses). The XTS primitive itself is proven
+    (`esp_aes_crypt_xts` over HW ECB passes in battery). An
+    encrypted-image pipeline (burned XTS keys + esptool-encrypted flash
+    + XTS decrypt on fetch) is out of scope: arduino-cli cannot produce
+    encrypted images and there is no host key, so nothing could validate
+    it (same class as eMMC). Documented in `efuse.rs`; no code change.
+  - 2026-09-11: **USB-OTG device-init path validated (P5)**. New
+    `esp32s3-soc/src/usb_otg.rs`: DWC2 core @ `0x60080000` (7 EPs, IRQ
+    source 38 — recounted from `interrupts.h`: LEDC=35 → EFUSE=36 →
+    TWAI=37 → USB=38 → RTC_CORE=39) + DFIFO page @ `0x60081000` +
+    USB_WRAP `0x60039000` as a plain store. Modeled: GRSTCTL core soft
+    reset (self-clear + AHBIDL), GUSBCFG force-device, DCFG/DCTL
+    (speed/soft-disconnect), EP0 control + transfer sizes, TXFIFO0
+    staging with DTXFSTS0/GNPTXSTS space reporting (256-word depth),
+    GINT quiescence (no host → no events → source 38 quiet, wired
+    through `int_pending`). 3 unit tests + machine test (both pages) +
+    `tools/sketches/esp32s3_usb_otg` (`RESET OK`/`CFG OK`/`EP0 OK`/
+    `FIFO full=256 used=252`/`PASS`, battery entry). KNOWN LIMITATION
+    (documented in-code): device enumeration needs a USB host
+    counterparty (bus reset, SETUP/IN/OUT, descriptors, address/config,
+    class drivers) — out of scope; zero in-tree firmware needs it (all
+    `Serial` flows through validated USB-Serial-JTAG), and Arduino "USB
+    CDC On Boot" (Serial-via-OTG) is consequently unsupported.

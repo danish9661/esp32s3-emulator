@@ -2740,6 +2740,23 @@ fn gdma_m2m_copies_memory_to_memory() {
 }
 
 #[test]
+fn usb_otg_reset_and_fifo_page_routing() {
+    use esp32s3_soc::usb_otg::{USB_OTG_BASE, USB_OTG_FIFO_PAGE};
+    let mut m = Esp32S3::new();
+    // Core reset handshake through the bus (both pages route).
+    m.soc.write32(USB_OTG_BASE + 0x800, 0x1234_5678); // DCFG
+    m.soc.write32(USB_OTG_BASE + 0x010, 1); // GRSTCTL.CSFTRST
+    assert_eq!(m.soc.read32(USB_OTG_BASE + 0x010) & 1, 0, "self-clears");
+    assert_ne!(m.soc.read32(USB_OTG_BASE + 0x010) & (1 << 31), 0, "AHBIDLE");
+    assert_eq!(m.soc.read32(USB_OTG_BASE + 0x800), 0, "bank restored");
+    // TXFIFO staging via the second page.
+    m.soc.write32(USB_OTG_FIFO_PAGE, 0xA5A5_A5A5);
+    m.soc.write32(USB_OTG_FIFO_PAGE, 0x5A5A_5A5A);
+    assert_eq!(m.soc.read32(USB_OTG_BASE + 0x914), 256 - 2);
+    assert_eq!(m.soc.read32(USB_OTG_BASE + 0x014), 0, "quiet, no host");
+}
+
+#[test]
 fn ulp_runs_poked_program_via_bus() {
     use esp32s3_soc::memmap::RTC_SLOW_BASE;
     use esp32s3_soc::ulp::ULP_BASE;

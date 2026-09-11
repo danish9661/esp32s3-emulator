@@ -18,7 +18,10 @@ void setup() {
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
   if (cause == ESP_SLEEP_WAKEUP_TOUCHPAD) {
     Serial.println("DEEPSLEEP TOUCH WOKE");
-    Serial.println("DEEPSLEEP TOUCH PASS");
+    // SLP_STATUS must report the triggering pad's counter (1877).
+    uint32_t slp = *(volatile uint32_t *)(SENS_BASE + 0xDC) & 0x3FFFFFu;
+    Serial.printf("DEEPSLEEP TOUCH SLP=%u\n", (unsigned)slp);
+    Serial.println(slp == 1877 ? "DEEPSLEEP TOUCH PASS" : "DEEPSLEEP TOUCH FAIL");
     return;
   }
   Serial.println("DEEPSLEEP TOUCH START");

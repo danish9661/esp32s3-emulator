@@ -57,6 +57,7 @@ CASES=(
 "uart_rs485||UART RS485 PASS|"
 "uart_multi||MULTI_UART PASS|"
 "usb_serial||USB TEST|"
+"usb_otg||OTG RESET OK;OTG CFG OK;OTG EP0 OK;OTG FIFO OK;OTG PASS|"
 "aes||AES DONE;AES CBC PASS;AES XTS PASS|"
 "aes_gcm||AES GCM PASS;AES GCM DONE|"
 "aes_poke||AES POKE PASS|"
@@ -106,7 +107,7 @@ CASES=(
 "deepsleep_ext0||DEEPSLEEP EXT0 START;DEEPSLEEP EXT0 WOKE;DEEPSLEEP EXT0 PASS|50000000"
 "deepsleep_ext1||DEEPSLEEP EXT1 START;DEEPSLEEP EXT1 WOKE;DEEPSLEEP EXT1 PASS|50000000"
 "deepsleep_ulp||DEEPSLEEP ULP START;DEEPSLEEP ULP WOKE;DEEPSLEEP ULP PASS|80000000"
-"deepsleep_touch|TOUCH_INJECT=3:1877|DEEPSLEEP TOUCH START;DEEPSLEEP TOUCH WOKE;DEEPSLEEP TOUCH PASS|50000000"
+"deepsleep_touch|TOUCH_INJECT=3:1877|DEEPSLEEP TOUCH START;DEEPSLEEP TOUCH WOKE;DEEPSLEEP TOUCH SLP=1877;DEEPSLEEP TOUCH PASS|50000000"
 "lightsleep|SKIP:resume works but s_light_sleep_wakeup flag stays 0 (inner helper returns 0x103), so get_wakeup_cause reads 0 not TIMER (see AGENTS.md)"
 "hmac||HMAC DONE|"
 "ds||DS DONE|"
@@ -115,6 +116,7 @@ CASES=(
 "i2s||I2S POKE PASS|"
 "i2s_driver||I2S DRIVER LOOPBACK PASS|300000000"
 "touch|TOUCH_INJECT=3:1877|TOUCH PASS|150000000"
+"touch_denoise|TOUCH_INJECT=0:1234|TOUCH DENOISE 1234|150000000"
 "temp|TEMP_C=25|TEMP 25C OK;TEMP DONE|"
 "rwdt_feed||RWDT FEED TEST START|"
 "rwdt_reset||RWDT RESET TEST|"
@@ -199,6 +201,7 @@ for c in "${CASES[@]}"; do
     psram_qspi) srcdir="$SK/esp32s3_psram"; fqbn="$fqbn:PSRAM=enabled"; bin="$srcdir/esp32s3_psram_qspi.merged.bin"; inobin="esp32s3_psram.ino.merged.bin";;
     psram_opi) srcdir="$SK/esp32s3_psram"; fqbn="$fqbn:PSRAM=opi"; bin="$srcdir/esp32s3_psram_opi.merged.bin"; inobin="esp32s3_psram.ino.merged.bin";;
     psram_16m) srcdir="$SK/esp32s3_psram"; fqbn="$fqbn:PSRAM=opi"; bin="$srcdir/esp32s3_psram_16m.merged.bin"; inobin="esp32s3_psram.ino.merged.bin";;
+    touch_denoise) srcdir="$SK/esp32s3_touch"; bin="$srcdir/esp32s3_touch.merged.bin"; inobin="esp32s3_touch.ino.merged.bin";;
   esac
   if [[ -n "$binrel" ]]; then
     bin="$SK/$binrel"

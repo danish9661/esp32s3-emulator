@@ -52,6 +52,7 @@ use crate::touch::Touch;
 use crate::twai::{TWAI_BASE, Twai};
 use crate::uart::Uart;
 use crate::ulp::{ULP_OFF_END, ULP_OFF_START, Ulp};
+use crate::usb_otg::{USB_OTG_BASE, USB_OTG_FIFO_PAGE, USB_OTG_INTR_SOURCE, UsbOtg};
 use crate::usb_serial_jtag::{USB_SERIAL_JTAG_INTR_SOURCE, UsbSerialJtag};
 
 /// A host-observable emulator event, drained once per animation frame and
@@ -88,6 +89,9 @@ pub struct RtcRetain {
     slow: alloc::boxed::Box<[u8; RTC_SLOW_SIZE as usize]>,
     fast: alloc::boxed::Box<[u8; RTC_FAST_SIZE as usize]>,
     ulp: crate::ulp::Ulp,
+    // Touch controller state (thresholds, approach counters, SLP latch):
+    // SENS is RTC-domain and retains over deep sleep like the ULP.
+    touch: crate::touch::Touch,
 }
 
 /// I2S GDMA streaming cursor: the esp-idf I2S driver streams multi-hundred-
@@ -283,6 +287,13 @@ pub struct Soc {
     /// ASSIST_DEBUG (watchpoint/breakpoint unit, DR_REG_ASSIST_DEBUG_BASE
     /// 0x600CE000).
     assist_debug: RegStore,
+    /// USB-OTG DWC core (device/host, 0x60080000 + DFIFO page 0x60081000).
+    /// Functional init path: core soft reset, device config, EP0 control,
+    /// TXFIFO staging; enumeration needs a host (see usb_otg.rs).
+    usb_otg: UsbOtg,
+    /// USB_WRAP (OTG PHY wrapper, DR_REG_USB_WRAP_BASE 0x60039000):
+    /// plain register store (PHY test/pullup pokes never panic).
+    usb_wrap: RegStore,
     /// I2S audio controllers (I2S0 @ 0x6000F000, I2S1 @ 0x6002D000).
     /// Functional model: TX/RX FIFO + serial shift-out onto GPIO-matrix
     /// signals (BCK/WS/SD).
@@ -422,6 +433,8 @@ impl Soc {
             syscon: RegStore::new(0x1000),
             i2s: [I2s::new(0), I2s::new(1)],
             assist_debug: RegStore::new(0x1000),
+            usb_otg: UsbOtg::new(),
+            usb_wrap: RegStore::new(0x1000),
             lcd_cam: LcdCam::new(),
             appcpu_ctrl_a: 0,
             cpu_int_from_cpu: [0, 0, 0, 0],
@@ -725,7 +738,6 @@ impl Soc {
         self.memspi[0].set_mr2(v);
     }
 
-
     /// Snapshot of driven output-pin state (host LED visualization).  A
     /// pin whose FUNC_OUT_SEL selects a peripheral signal (LEDC 96..103)
     /// follows that signal instead of GPIO_OUT (TRM GPIO matrix).
@@ -1020,6 +1032,8 @@ impl Soc {
                 }
             }
             self.adc.tick(1);
+            // Touch proximity counters (no-op unless approach pads armed).
+            self.touch.tick(1);
             // Waveform peripherals: skip the tick while idle. Each gate
             // mirrors its tick's own early-out (inactive RMT channels /
             // stopped MCPWM timers / non-busy LCD / non-busy I2S), so a
@@ -2204,6 +2218,18 @@ impl Soc {
             }
             0x600C_1000 => store_dispatch(is_write, off, value, &mut self.sensitive),
             0x600C_E000 => store_dispatch(is_write, off, value, &mut self.assist_debug),
+            USB_OTG_BASE | USB_OTG_FIFO_PAGE => {
+                // DWC core (0x60080000) + TXFIFO page (0x60081000, DFIFO0).
+                let base = if dev == USB_OTG_BASE { 0 } else { 0x1000 };
+                if is_write {
+                    self.usb_otg.write32(base + off, value);
+                    0
+                } else {
+                    self.usb_otg.read32(base + off)
+                }
+            }
+            // USB_WRAP (OTG PHY wrapper, 0x60039000): plain store.
+            0x6003_9000 => store_dispatch(is_write, off, value, &mut self.usb_wrap),
             0x600D_0000 => store_dispatch(is_write, off, value, &mut self.wcl),
             // Everything else in the APB space: no model yet.
             _ => 0,
@@ -2303,6 +2329,8 @@ impl Soc {
         // modeled (any pad wakes, matching the default BOTH configuration).
         if ena & crate::rtc::wakeup_ena(8) != 0 && self.touch.any_touched() {
             cause |= crate::rtc::CAUSE_TOUCH;
+            // Capture the triggering pad's counter for SLP_STATUS.
+            self.touch.set_sleep_data();
         }
         // ULP halt edge is watched during the fast-forward (the ULP keeps
         // ticking while the CPUs halt); nothing to set yet. Either ULP
@@ -2493,6 +2521,7 @@ impl Soc {
             slow: self.rtc_slow.clone(),
             fast: self.rtc_fast.clone(),
             ulp: self.ulp.clone(),
+            touch: self.touch.clone(),
         }
     }
 
@@ -2501,6 +2530,7 @@ impl Soc {
         self.rtc_slow = s.slow;
         self.rtc_fast = s.fast;
         self.ulp = s.ulp;
+        self.touch = s.touch;
     }
 
     /// Debug accessor for the AES interrupt raw&enabled state (validation harness).
@@ -2666,6 +2696,10 @@ impl Soc {
         }
         if self.sdmmc.int_st() != 0 {
             src |= 1 << crate::sdmmc::SDMMC_INTR_SOURCE;
+        }
+        // USB-OTG DWC core (quiet without a host counterparty).
+        if self.usb_otg.int_pending() {
+            src |= 1 << crate::usb_otg::USB_OTG_INTR_SOURCE;
         }
         if self.ledc.int_st() != 0 {
             src |= 1 << crate::ledc::LEDC_INTR_SOURCE;
