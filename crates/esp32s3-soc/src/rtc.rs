@@ -218,7 +218,12 @@ impl Rtc {
             return;
         }
         self.wdt_count += cycles;
-        let stg = [(cfg0 >> 28) & 7, (cfg0 >> 25) & 7, (cfg0 >> 22) & 7, (cfg0 >> 19) & 7];
+        let stg = [
+            (cfg0 >> 28) & 7,
+            (cfg0 >> 25) & 7,
+            (cfg0 >> 22) & 7,
+            (cfg0 >> 19) & 7,
+        ];
         let mut cum: u64 = 0;
         for i in 0..4 {
             cum += self.regs[(0x9C + 4 * i as u32) as usize / 4] as u64;

@@ -126,6 +126,9 @@ fn main() {
     let spi_slave_xchg = env::var("SPI_SLAVE_XCHG").is_ok();
     let mut spi_slave_wrote = false;
     let mut spi_slave_read = false;
+    // Slave-DMA halves (separate markers, same env flag).
+    let mut spi_slave_dma_wrote = false;
+    let mut spi_slave_dma_read = false;
 
     // I2C-slave host exchange (slave-sketch support): I2C_SLAVE_XCHG=1 drives
     // both halves when the app prints its markers — a master-write-to-slave
@@ -334,6 +337,28 @@ fn main() {
                 println!("[host] SPI slave master-read -> {got:02x?}");
                 assert_eq!(got, vec![0xA5, 0xC3], "slave TX preload mismatch");
                 spi_slave_read = true;
+            }
+            // Slave-DMA halves: the model routes through the GDMA links
+            // when the sketch enables DMA_CONF rx/tx (same env flag).
+            if !spi_slave_dma_wrote
+                && uart_buf
+                    .windows(b"SPI SLAVE DMA READY".len())
+                    .any(|w| w == b"SPI SLAVE DMA READY")
+            {
+                m.soc.spi_slave_inject_write(0, &[0xDE, 0xAD, 0xBE, 0xEF]);
+                println!("[host] SPI slave DMA master-write [de ad be ef]");
+                spi_slave_dma_wrote = true;
+            }
+            if spi_slave_dma_wrote
+                && !spi_slave_dma_read
+                && uart_buf
+                    .windows(b"SPI SLAVE DMA TX-REQ".len())
+                    .any(|w| w == b"SPI SLAVE DMA TX-REQ")
+            {
+                let got = m.soc.spi_slave_take_read(0, 4);
+                println!("[host] SPI slave DMA master-read -> {got:02x?}");
+                assert_eq!(got, vec![0x12, 0x34, 0x56, 0x78], "slave DMA TX mismatch");
+                spi_slave_dma_read = true;
             }
         }
 

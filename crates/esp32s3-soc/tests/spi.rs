@@ -262,3 +262,23 @@ fn dma_transfer_beyond_data_buffer() {
     assert_eq!(s.read32(SPI_INT_RAW) & (1 << 12), 1 << 12, "trans_done");
     assert_eq!(s.dma_rx_word(76), 0);
 }
+
+/// Slave DMA enables gate on slave_mode + DMA_CONF bits; completion records
+/// SLAVE1 bitlen with the RD/WR DMA-done latches (not trans_done).
+#[test]
+fn slave_dma_flags_and_done_bits() {
+    let mut s = Spi::new(0);
+    assert!(!s.slave_dma_rx_enabled());
+    s.write32(SPI_SLAVE, 1 << 26);
+    assert!(!s.slave_dma_rx_enabled() && !s.slave_dma_tx_enabled());
+    s.write32(0x30, (1 << 25) | (1 << 26)); // dma_conf rx+tx ena
+    assert!(s.slave_dma_rx_enabled() && s.slave_dma_tx_enabled());
+    s.slave_dma_done(32, true);
+    assert_eq!(s.read32(SPI_SLAVE1) & 0x3FFFF, 32);
+    assert_eq!(s.read32(SPI_INT_RAW) & (1 << 9), 1 << 9, "WR_DMA_DONE");
+    assert_eq!(s.read32(SPI_INT_RAW) & (1 << 12), 0, "no trans_done");
+    s.slave_dma_done(16, false);
+    assert_eq!(s.read32(SPI_INT_RAW) & (1 << 8), 1 << 8, "RD_DMA_DONE");
+    s.write32(SPI_INT_CLR, (1 << 8) | (1 << 9));
+    assert_eq!(s.read32(SPI_INT_RAW) & ((1 << 8) | (1 << 9)), 0);
+}

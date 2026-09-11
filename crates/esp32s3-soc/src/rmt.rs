@@ -48,6 +48,17 @@ const CHN_TX_LIM: usize = 0xA0 / 4; // 40
 const TX_START: u32 = 1 << 0;
 const IDLE_OUT_LV: u32 = 1 << 5;
 const IDLE_OUT_EN: u32 = 1 << 6;
+// Carrier modulation (TRM RMT_CHnCONF0 + RMT_CHnCARRIER_DUTY @ 0x80+4n):
+// CARRIER_EFF_EN (bit 20): 1 = modulate only while sending data (reset),
+// 0 = modulate at all states (always-on, even when idle). CARRIER_EN
+// (bit 21) gates; CARRIER_OUT_LV (bit 22) selects the modulated level
+// (1 = high phases carry the wave, 0 = low phases). Duty = high [31:16] /
+// low [15:0] carrier clocks; a zero total disables (covers the reset state
+// alongside EN=0, so unprogrammed channels are bit-identical to before).
+const CARRIER_EFF_EN: u32 = 1 << 20;
+const CARRIER_EN: u32 = 1 << 21;
+const CARRIER_OUT_LV: u32 = 1 << 22;
+const CARRIER_DUTY_BASE: usize = 0x80 / 4; // word idx 32, stride 1/chn
 // tx_conti_mode (bit 15): continuous transmission — reload item 0 on end
 // instead of raising tx_end.  The IDF `rmt_transmit` loop_count path uses
 // tx_loop_cnt_en (bit 14) + tx_loop_cnt (bits [23:16]) == 0 for infinite
@@ -72,6 +83,25 @@ const MEM_OWNER: u32 = 1 << 3;
 const RX_FILTER_EN: u32 = 1 << 4;
 const RX_FILTER_THRES_SHIFT: u32 = 5; // [12:5]
 const MEM_RX_WRAP: u32 = 1 << 13;
+// RX carrier demodulation (TRM RMT_CHmCONF0): CARRIER_EN (bit 28) latches
+// the envelope, CARRIER_OUT_LV (bit 29) selects which level is the burst
+// (1 = high bursts demodulate to steady high). Unprogrammed channels keep
+// bit 28 clear (our reset), so existing captures are untouched.
+const DEMOD_EN: u32 = 1 << 28;
+const DEMOD_OUT_LV: u32 = 1 << 29;
+// Demodulated opposite-level persistence: a lone opposite sample (carrier
+// aliasing through the 32-tick sampling quantum) holds the burst level;
+// two in a row flip it (real transition, ~64-tick edge uncertainty).
+/// Demodulator lock/release runs, in sampling quanta (one quantum =
+/// TICKS_PER_STEP channel ticks per step). Lock is fast (a real edge
+/// asserts within ~2 quanta); release is slow on purpose: a 10/10-tick
+/// carrier sampled at a 32-tick quantum aliases into runs of up to a few
+/// consecutive gap samples, which must NOT split the envelope, while a
+/// genuine end-of-burst (hundreds of steady quanta) still releases a few
+/// hundred ticks late (inside envelope tolerances). Silicon's exact
+/// demodulator thresholds are unknown; this is a tuned approximation.
+const DEMOD_LOCK: u32 = 2;
+const DEMOD_RELEASE: u32 = 8;
 
 // RMT interrupt source number for the interrupt matrix (esp32s3 interrupts.h
 // ETS_RMT_INTR_SOURCE = 40).
@@ -89,8 +119,10 @@ struct TxCh {
     item_idx: usize,
     pulse: u32, // 0 = duration0/level0, 1 = duration1/level1
     ticks_left: u32,
-    level: u32, // current output level (0/1)
+    level: u32, // current data level (0/1), pre-carrier
     num_items: usize,
+    /// Carrier phase in channel ticks (advanced per consumed tick).
+    car_phase: u32,
 }
 
 const NUM_RX_CH: usize = 4;
@@ -115,6 +147,12 @@ struct RxCh {
     item_idx: usize,
     /// Half (0/1) of the open item being filled.
     half: u32,
+    /// Demodulated opposite-level run: consecutive quanta the raw input
+    /// read opposite the currently reported level (singletons are carrier
+    /// aliasing and hold the level).
+    dm_count: u32,
+    /// Currently reported demodulated level (optimistic `burst` at arming).
+    dm_lvl: u32,
 }
 
 /// The RMT module.
@@ -185,6 +223,9 @@ impl Rmt {
             ticks_left: 0,
             level: self.idle_level(ch),
             num_items,
+            // Deterministic carrier start (each transmission begins at the
+            // rising half of the wave).
+            car_phase: 0,
         };
         // Load the first pulse.
         let item = self.item(ch, 0);
@@ -233,22 +274,75 @@ impl Rmt {
                 continue;
             }
             self.tx[ch].ticks_left -= 1;
+            self.tx[ch].car_phase = self.tx[ch].car_phase.wrapping_add(1);
             ticks -= 1;
         }
     }
 
-    /// True when any TX channel is mid-transfer. The SoC skips `tick()`
-    /// otherwise — `tick` would no-op identically (it only advances active
-    /// channels), so gating is behavior-preserving.
-    pub fn is_active(&self) -> bool {
-        self.tx.iter().any(|t| t.active) || self.rx_pending()
+    /// Carrier duty (high, low) in channel ticks for TX channel `ch`.
+    /// Approximated 1:1 from the programmed module-clock ticks (exact at
+    /// divider 1; proportionally faster at higher dividers — the validated
+    /// property is visible modulation, not the absolute carrier rate,
+    /// which the emulator's untimed step model cannot resolve anyway).
+    fn carrier_duty(&self, ch: usize) -> (u32, u32) {
+        let duty = self.regs[CARRIER_DUTY_BASE + ch];
+        (duty & 0xFFFF, (duty >> 16) & 0xFFFF)
     }
 
-    /// Advance all active TX channels by `TICKS_PER_STEP`.
+    /// Carrier active for TX channel `ch`: enabled with a nonzero period.
+    /// (Reset state is duty 0/EN APP-side 0 here, so this is false until
+    /// firmware programs it; existing waveforms are untouched.)
+    fn carrier_on(&self, ch: usize) -> bool {
+        let (high, low) = self.carrier_duty(ch);
+        self.regs[CHNCONF0 + ch] & CARRIER_EN != 0 && high + low > 0
+    }
+
+    /// Always-on carrier (EFF_EN clear): modulates even while idle. Gated
+    /// like `carrier_on` (duty programmed).
+    fn carrier_always(&self, ch: usize) -> bool {
+        self.carrier_on(ch) && self.regs[CHNCONF0 + ch] & CARRIER_EFF_EN == 0
+    }
+
+    /// Modulated output level of TX channel `ch` (data level with the
+    /// carrier wave applied during the configured level).
+    fn tx_out(&self, ch: usize) -> u32 {
+        let level = self.tx[ch].level;
+        if !self.carrier_on(ch) {
+            return level;
+        }
+        if !self.tx[ch].active && self.regs[CHNCONF0 + ch] & CARRIER_EFF_EN != 0 {
+            // Data-state-only modulation while idle: steady idle level.
+            return level;
+        }
+        let lv = (self.regs[CHNCONF0 + ch] & CARRIER_OUT_LV) >> 22;
+        if level != lv {
+            return level;
+        }
+        let (high, low) = self.carrier_duty(ch);
+        if self.tx[ch].car_phase % (high + low) < high {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// True when any TX channel is mid-transfer (or driving an always-on
+    /// carrier while idle). The SoC skips `tick()` otherwise.
+    pub fn is_active(&self) -> bool {
+        self.tx.iter().any(|t| t.active)
+            || (0..NUM_TX_CH).any(|ch| self.carrier_always(ch))
+            || self.rx_pending()
+    }
+
+    /// Advance all active TX channels by `TICKS_PER_STEP` (plus idle
+    /// always-on carrier phases, which modulate with no data running).
     pub fn tick(&mut self) {
         for ch in 0..NUM_TX_CH {
             if self.tx[ch].active {
                 self.advance(ch, TICKS_PER_STEP);
+            } else if self.carrier_always(ch) {
+                let t = &mut self.tx[ch];
+                t.car_phase = t.car_phase.wrapping_add(TICKS_PER_STEP);
             }
         }
     }
@@ -318,6 +412,42 @@ impl Rmt {
         self.regs[CHMCONF1 + m * 2] &= !MEM_OWNER;
     }
 
+    /// Carrier-demodulated sample for RX channel `m`: while demodulation
+    /// is enabled, lone opposite-level samples are carrier aliasing through
+    /// the 32-tick sampling quantum and hold the burst level; a run of
+    /// DEMOD_LOCK opposite samples toward the burst level locks it, while
+    /// leaving the burst level needs a run of DEMOD_RELEASE (a real
+    /// end-of-burst; carrier gap runs are shorter). Reporting starts
+    /// optimistic (burst level) so a burst opening right at arming is not
+    /// missed. Disabled = transparent passthrough (existing captures
+    /// bit-identical).
+    fn demod_sample(&mut self, m: usize, raw: u32) -> u32 {
+        let conf0 = self.regs[CHMCONF0 + m * 2];
+        if conf0 & DEMOD_EN == 0 {
+            return raw;
+        }
+        let burst = (conf0 & DEMOD_OUT_LV) >> 29;
+        let cur = self.rx[m].dm_lvl;
+        if raw == cur {
+            self.rx[m].dm_count = 0;
+            cur
+        } else {
+            self.rx[m].dm_count += 1;
+            let need = if cur == burst {
+                DEMOD_RELEASE
+            } else {
+                DEMOD_LOCK
+            };
+            if self.rx[m].dm_count >= need {
+                self.rx[m].dm_lvl = raw;
+                self.rx[m].dm_count = 0;
+                raw
+            } else {
+                cur
+            }
+        }
+    }
+
     /// Advance RX captures by one step. `input(sig)` resolves an RMT input
     /// signal index to its pad level (undriven inputs read pull-up high).
     /// Widths are measured in the same channel-tick quantum the TX side
@@ -328,7 +458,9 @@ impl Rmt {
                 // Capture starts on the rx_en edge: the first sample both
                 // baselines the filtered level and counts its first quantum.
                 self.rx[m].active = true;
-                self.rx[m].flevel = input(RMT_RX_SIGNAL_BASE + m as u32) & 1;
+                let first = input(RMT_RX_SIGNAL_BASE + m as u32) & 1;
+                let base = self.demod_sample(m, first);
+                self.rx[m].flevel = base;
                 self.rx[m].fcount = 0;
                 self.rx[m].pwidth = TICKS_PER_STEP;
                 self.rx[m].item_idx = 0;
@@ -345,7 +477,8 @@ impl Rmt {
             let idle_thres = (conf0 >> 8) & 0x7FFF;
             let filter_on = conf1 & RX_FILTER_EN != 0;
             let filter_thres = (conf1 >> RX_FILTER_THRES_SHIFT) & 0xFF;
-            let sampled = input(RMT_RX_SIGNAL_BASE + m as u32) & 1;
+            let raw = input(RMT_RX_SIGNAL_BASE + m as u32) & 1;
+            let sampled = self.demod_sample(m, raw);
             // Glitch filter: only transitions held for the threshold reach
             // the edge detector (disabled = every sample passes through).
             let mut edge = false;
@@ -391,7 +524,7 @@ impl Rmt {
         if (RMT_TX_SIGNAL_BASE..RMT_TX_SIGNAL_BASE + NUM_TX_CH as u32).contains(&sig) {
             let ch = (sig - RMT_TX_SIGNAL_BASE) as usize;
             if ch < NUM_TX_CH {
-                return self.tx[ch].level;
+                return self.tx_out(ch);
             }
         }
         0
@@ -442,6 +575,17 @@ impl Rmt {
                     self.begin_tx(ch);
                 }
             }
+            // chmconf0[m] @ 0x30+8m: while the channel is not capturing,
+            // re-seed the optimistic demodulator level from DEMOD_OUT_LV
+            // (firmware may arm via rx_en before programming demod bits).
+            o if (0x30..=0x4C).contains(&o) && o % 8 == 0 => {
+                let m = (o - 0x30) as usize / 8;
+                self.regs[CHMCONF0 + m * 2] = value;
+                if !self.rx[m].active {
+                    self.rx[m].dm_lvl = (value & DEMOD_OUT_LV) >> 29;
+                    self.rx[m].dm_count = 0;
+                }
+            }
             // chmconf1[m] @ 0x34+8m: rx_en rising edge arms a capture (the
             // writer pointer resets); mem reset bits reset it too.
             o if (0x34..=0x4C).contains(&o) && o % 8 == 4 => {
@@ -457,6 +601,18 @@ impl Rmt {
                     self.rx[m].active = false;
                     self.rx[m].item_idx = 0;
                     self.rx[m].half = 0;
+                    // A re-arm after a finished capture must not inherit the
+                    // old capture's counters, or the stale idle count fires
+                    // rx_end on the first tick of the new capture.
+                    self.rx[m].idle = 0;
+                    self.rx[m].pwidth = 0;
+                    self.rx[m].flevel = 0;
+                    // Optimistic demodulator start: assume the burst level
+                    // until a DEMOD_RELEASE run disproves it, so a burst
+                    // opening right at arming is not missed.
+                    let c0 = self.regs[CHMCONF0 + m * 2];
+                    self.rx[m].dm_lvl = (c0 & DEMOD_OUT_LV) >> 29;
+                    self.rx[m].dm_count = 0;
                 }
             }
             0x70 => { /* int_raw is set by hardware only */ }

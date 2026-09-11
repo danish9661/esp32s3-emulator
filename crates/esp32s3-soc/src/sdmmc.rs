@@ -837,6 +837,25 @@ mod tests {
     }
 
     #[test]
+    /// CMD12 STOP_TRANSMISSION is accepted with a live R1 (no error):
+    /// the single-shot card model never opens a multi-block transfer, so
+    /// there is nothing to stop, but drivers may still emit CMD12 (e.g.
+    /// after ACMD51/CMD6 data) and must not see a failure. SDSC
+    /// byte-addressing is unreachable by construction (the card reports
+    /// SDHC/CCS, so the driver always uses block addresses).
+    #[test]
+    fn stop_transmission_accepted_with_live_r1() {
+        let mut d = Sdmmc::new();
+        issue(&mut d, 12, 0, true, false, false); // STOP_TRANSMISSION
+        assert_ne!(d.read32(RINTSTS) & INT_CMD_DONE, 0, "CMD_DONE latches");
+        assert_eq!(d.read32(RINTSTS) & INT_RTO, 0, "no timeout");
+        // Idle-state R1 is exactly 0 (no APP_CMD, not Tran, state Idle):
+        // no error bits by construction (r1() only sets APP_CMD/READY/
+        // CURRENT_STATE, never errors).
+        assert_eq!(d.read32(RESP0), 0, "clean idle R1");
+    }
+
+    #[test]
     fn erase_group_wipes_range_with_ff() {
         let mut d = Sdmmc::new();
         // Scribble block 10, then erase groups 8..12 and verify.

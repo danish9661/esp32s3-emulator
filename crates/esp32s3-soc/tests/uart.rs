@@ -111,3 +111,23 @@ fn rx_fifo_caps_at_hardware_depth() {
     }
     assert_eq!(u.read32(UART_FIFO), 0, "overrun bytes were dropped");
 }
+
+/// RS485 echo (RS485_CONF rs485_en + rs485tx_rx_en): a TX byte loops back
+/// into the RX FIFO; with only rs485_en (receiver muted during TX) or in
+/// normal mode nothing echoes.
+#[test]
+fn rs485_echo_needs_en_and_tx_rx_en() {
+    let mut u = Uart::new();
+    // Normal mode: TX never echoes.
+    u.write32(UART_FIFO, 0x5A);
+    assert_eq!(u.read32(UART_FIFO), 0, "no echo in normal mode");
+    // RS485 without the echo bit: receiver muted during TX.
+    u.write32(UART_RS485_CONF, 1 << 0);
+    u.write32(UART_FIFO, 0x5A);
+    assert_eq!(u.read32(UART_FIFO), 0, "muted without tx_rx_en");
+    // RS485 + echo bit: TX byte loops back.
+    u.write32(UART_RS485_CONF, (1 << 0) | (1 << 3));
+    u.write32(UART_FIFO, 0x5A);
+    assert_eq!(u.read32(UART_FIFO), 0x5A, "echo byte");
+    assert_eq!(u.read32(UART_FIFO), 0, "FIFO drained");
+}

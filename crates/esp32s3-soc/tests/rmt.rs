@@ -1,7 +1,6 @@
 //! RMT TX model unit tests (item-memory FSM + tx_end interrupt).
 
 use esp32s3_soc::rmt::*;
-
 // chnconf0[0] = div_cnt=2, idle_out_en, idle_out_lv=1  (idle level 1).
 const CONF: u32 = (2 << 8) | (1 << 5) | (1 << 6);
 const ITEM0: u32 = 100 | (1 << 15) | (50 << 16); // pulse0=1/100t, pulse1=0/50t
@@ -147,4 +146,153 @@ fn rx_filter_absorbs_short_glitch() {
     assert_eq!((w0 >> 15) & 1, 1, "first pulse is the long HIGH");
     assert!((w0 & 0x7FFF) > 200, "glitch absorbed into HIGH width");
     assert_eq!((w0 >> 16) & 0x7FFF, 0, "no short LOW half written");
+}
+
+/// TX carrier modulation: with EN + duty programmed, the HIGH phase of an
+/// item toggles at the carrier rate instead of staying steady.
+#[test]
+fn tx_carrier_modulates_high_phase() {
+    let mut r = Rmt::new();
+    // One item: HIGH for 512 ticks, then idle (tx_lim = 1).
+    r.write32(0x800, 512 | (1 << 15));
+    r.write32(0xA0, 1);
+    // CHNCONF0: idle low + tx_start + CARRIER_EN + EFF_EN + OUT_LV high.
+    r.write32(0x20, (1 << 6) | 1 | (1 << 20) | (1 << 21) | (1 << 22));
+    // Carrier duty: 10 high / 10 low channel ticks (period 20, deliberately
+    // not a divisor of the 32-tick sampling quantum, which would strobe).
+    r.write32(0x80, (10 << 16) | 10);
+    let mut highs = 0u32;
+    let mut lows = 0u32;
+    for _ in 0..16 {
+        r.tick(); // 32 ticks each: 512 total, all inside the HIGH pulse
+        match r.signal_level(RMT_TX_SIGNAL_BASE) {
+            1 => highs += 1,
+            _ => lows += 1,
+        }
+    }
+    assert!(
+        highs > 0 && lows > 0,
+        "carrier must toggle (hi={highs}, lo={lows})"
+    );
+    // Sample phases (32k mod 20 for k=1..16): 12,4,16,8,0 repeating
+    // (samples read post-tick) -> 9 high / 7 low.
+    assert_eq!(highs, 9, "carrier duty over 16 samples");
+    assert_eq!(lows, 7, "carrier duty over 16 samples");
+}
+
+/// Carrier with zero duty (or EN clear) is inert: steady levels, and the
+/// LOW phase of an item is never modulated.
+#[test]
+fn tx_carrier_zero_duty_is_inert() {
+    let mut r = Rmt::new();
+    r.write32(0x800, 512 | (1 << 15) | (50 << 16));
+    r.write32(0xA0, 1);
+    // EN + EFF + LV set but duty stays 0/0: must behave unmodulated.
+    r.write32(0x20, (1 << 6) | 1 | (1 << 20) | (1 << 21) | (1 << 22));
+    for _ in 0..4 {
+        r.tick();
+    }
+    assert_eq!(r.signal_level(RMT_TX_SIGNAL_BASE), 1, "HIGH steady");
+    for _ in 0..13 {
+        r.tick();
+    }
+    assert_eq!(r.signal_level(RMT_TX_SIGNAL_BASE), 0, "LOW steady");
+}
+
+/// RX demodulation: a toggling input with demod enabled captures as a
+/// steady HIGH envelope plus rx_end.
+#[test]
+fn rx_demodulation_envelopes_carrier() {
+    let mut r = Rmt::new();
+    r.write32(CHMCONF0_0, 2048 << 8);
+    // rx_en + DEMOD_EN (bit 28) + DEMOD_OUT_LV high (bit 29).
+    r.write32(CHMCONF1_0, RX_EN);
+    r.write32(CHMCONF0_0, (2048 << 8) | (1 << 28) | (1 << 29));
+    // Carrier burst (8 toggling samples) then steady LOW x8 (real edge).
+    let input = scripted(&[1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    for _ in 0..16 {
+        r.tick_rx(&input);
+    }
+    let w0 = r.read32(RX_MEM0);
+    assert_eq!((w0 >> 15) & 1, 1, "envelope is HIGH");
+    assert!((w0 & 0x7FFF) >= 160, "envelope spans the burst");
+}
+
+#[test]
+fn rx_demod_release_rides_carrier_gaps() {
+    // Aliased carrier gaps (runs of 2-3 opposite samples inside the burst)
+    // must not split the envelope, while a genuine end-of-burst releases
+    // DEMOD_RELEASE (8) samples late. Burst opens at sample 0 so the
+    // optimistic demod start reports HIGH immediately.
+    let mut r = Rmt::new();
+    r.write32(CHMCONF0_0, 2048 << 8);
+    r.write32(CHMCONF1_0, RX_EN);
+    r.write32(CHMCONF0_0, (2048 << 8) | (1 << 28) | (1 << 29));
+    let mut v = vec![1u32; 5];
+    v.extend([0u32; 3]);
+    v.extend([1u32; 5]);
+    v.extend([0u32; 2]);
+    v.extend([1u32; 8]);
+    v.extend([0u32; 20]);
+    let input = scripted(&v);
+    for _ in 0..v.len() {
+        r.tick_rx(&input);
+    }
+    let w0 = r.read32(RX_MEM0);
+    // HIGH half = 23 burst samples + 7 release-late samples, 32 ticks
+    // each (the 8th consecutive opposite sample is the first reported
+    // LOW, closing the HIGH half).
+    assert_eq!((w0 >> 15) & 1, 1, "envelope opens HIGH");
+    assert_eq!(w0 & 0x7FFF, 30 * 32, "gap runs held, release 8 late");
+    assert_eq!((w0 >> 31) & 1, 0, "LOW half opens after release");
+}
+
+#[test]
+fn probe_idle_fires_with_demod() {
+    use std::cell::Cell;
+    let mut r = Rmt::new();
+    r.write32(0x30, (4096 << 8) | (1 << 24) | (1 << 28) | (1 << 29));
+    r.write32(0x34, 1);
+    // HIGH 40 samples then LOW 200 samples.
+    let mut v = vec![1u32; 40];
+    v.extend([0u32; 200]);
+    let n = Cell::new(0);
+    let input = |_: u32| {
+        let i = n.get().min(v.len() - 1);
+        n.set(n.get() + 1);
+        v[i]
+    };
+    for _ in 0..240 {
+        r.tick_rx(&input);
+    }
+    assert_ne!(r.read32(0x70) & (1 << 16), 0, "rx_end must fire via idle");
+}
+
+#[test]
+fn probe_live_tx_to_rx_idle() {
+    let mut r = Rmt::new();
+    r.write32(0x800, 1200 | (1u32 << 15) | (1200 << 16));
+    r.write32(0xA0, 1);
+    r.write32(0x30, (4096 << 8) | (1 << 24) | (1 << 28) | (1 << 29));
+    r.write32(0x34, 1);
+    r.write32(0x80, (10 << 16) | 10);
+    r.write32(
+        0x20,
+        (1 << 0) | (1 << 6) | (1 << 20) | (1 << 21) | (1 << 22),
+    );
+    let mut fired_at = None;
+    for i in 0..250 {
+        r.tick();
+        let lv = r.signal_level(81);
+        r.tick_rx(&|_| lv);
+        if r.read32(0x70) & (1 << 16) != 0 {
+            fired_at = Some(i);
+            break;
+        }
+    }
+    assert!(
+        fired_at.is_some(),
+        "rx_end must fire, w0={:#010x}",
+        r.read32(0xC00)
+    );
 }

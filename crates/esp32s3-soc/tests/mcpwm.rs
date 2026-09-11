@@ -336,3 +336,116 @@ fn fault_enter_interrupt_pending_and_clear() {
     m.write32(INT_CLR, 1 << 9);
     assert!(!m.int_pending(), "CLR drops the line");
 }
+
+const OPER0_CARRIER: u32 = 0x64;
+const OPER0_FORCE: u32 = 0x4C;
+
+fn pwm50() -> Mcpwm {
+    // timer0 up, period=100, comparator A=50, utez=set / utea=clear.
+    let mut m = Mcpwm::new();
+    m.write32(TIMER0_CFG0, 100 << 8);
+    m.write32(TIMER0_CFG1, (1 << 3) | 2);
+    m.write32(OPER0_TSTMP_A, 50);
+    m.write32(OPER0_GEN0, (2 << 4) | 1);
+    for _ in 0..100 {
+        m.tick();
+    }
+    m
+}
+
+#[test]
+fn carrier_chops_generator_at_programmed_duty() {
+    let mut m = pwm50();
+    // Carrier: en + prescale 0 (period 8 steps) + duty 4/8 (50%).
+    m.write32(OPER0_CARRIER, 1 | (0 << 1) | (4 << 5));
+    let mut high = 0u32;
+    let mut edges = 0u32;
+    let mut prev = m.signal_level(160);
+    for _ in 0..800 {
+        m.tick();
+        let lv = m.signal_level(160);
+        high += lv;
+        edges += u32::from(lv != prev);
+        prev = lv;
+    }
+    // 50% PWM x 50% carrier = 25% average (200/800); unchopped would be 400.
+    assert!(
+        (180..=220).contains(&high),
+        "carrier duty wrong: {high}/800"
+    );
+    // Chopped: ~100 carrier toggles + 16 PWM edges over 8 periods.
+    assert!(edges >= 60, "carrier did not chop: {edges} edges");
+}
+
+#[test]
+fn carrier_out_invert_flips_wave() {
+    let mut m = pwm50();
+    // duty 2/8 (25%): normal ~25%, out-inverted ~75% over 800 ticks.
+    m.write32(OPER0_CARRIER, 1 | (0 << 1) | (2 << 5));
+    let mut high = 0u32;
+    for _ in 0..800 {
+        m.tick();
+        high += m.signal_level(160);
+    }
+    assert!((80..=120).contains(&high), "duty 2/8 wrong: {high}/800");
+    m.write32(OPER0_CARRIER, 1 | (0 << 1) | (2 << 5) | (1 << 12));
+    let mut high_i = 0u32;
+    for _ in 0..800 {
+        m.tick();
+        high_i += m.signal_level(160);
+    }
+    assert!(
+        (680..=720).contains(&high_i),
+        "inverted duty wrong: {high_i}/800"
+    );
+}
+
+#[test]
+fn carrier_in_invert_modulates_low_input() {
+    let mut m = Mcpwm::new();
+    // Generator A forced LOW (steady), carrier duty 4/8.
+    m.write32(OPER0_FORCE, 2);
+    for _ in 0..4 {
+        m.tick();
+    }
+    m.write32(OPER0_CARRIER, 1 | (0 << 1) | (4 << 5));
+    let mut high = 0u32;
+    for _ in 0..200 {
+        m.tick();
+        high += m.signal_level(160);
+    }
+    assert_eq!(high, 0, "LOW input must gate the carrier off");
+    // In-invert: the LOW input now reads HIGH and chops at 50%.
+    m.write32(OPER0_CARRIER, 1 | (0 << 1) | (4 << 5) | (1 << 13));
+    let mut high_i = 0u32;
+    for _ in 0..200 {
+        m.tick();
+        high_i += m.signal_level(160);
+    }
+    assert!(
+        (80..=120).contains(&high_i),
+        "in-inverted wave wrong: {high_i}/200"
+    );
+}
+
+#[test]
+fn carrier_oshtwth_widens_first_pulse() {
+    let mut m = Mcpwm::new();
+    // duty 0/8 (wave always LOW) + oshtwth 2: the first pulse after the
+    // rising edge is forced HIGH for 2 carrier periods (16 steps).
+    m.write32(OPER0_CARRIER, 1 | (0 << 1) | (0 << 5) | (2 << 8));
+    m.write32(OPER0_FORCE, 2);
+    for _ in 0..10 {
+        m.tick();
+    }
+    m.write32(OPER0_FORCE, 1);
+    for i in 0..16 {
+        m.tick();
+        assert_eq!(m.signal_level(160), 1, "one-shot must hold HIGH (step {i})");
+    }
+    // After the one-shot expires the duty-0 wave reads steady LOW.
+    for _ in 0..16 {
+        m.tick();
+    }
+    assert_eq!(m.signal_level(160), 0, "wave must be LOW after one-shot");
+}

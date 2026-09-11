@@ -11,6 +11,9 @@
 //! (4 fractional bits, see `ledc_ll_set_duty`), so the comparator value is
 //! `duty_reg >> 4`. Output signal `LEDC_CHn` = GPIO-matrix signal 73+n
 //! (`gpio_sig_map.h`); `sig_out_en` (conf0 bit 2) gates the pad.
+//!
+//! No gamma hardware exists on S3 (no gamma regs in `ledc_struct.h`; IDF
+//! gamma correction is pure software over set_duty) — nothing to model.
 
 /// LEDC interrupt source for the matrix (ETS_LEDC_INTR_SOURCE = 35).
 pub const LEDC_INTR_SOURCE: u32 = 35;

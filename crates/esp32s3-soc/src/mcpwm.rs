@@ -19,8 +19,11 @@
 //! generators) enough for a real firmware to produce a correct duty cycle on a
 //! GPIO, plus capture, software-sync reload, dead-time and the fault/trip
 //! submodule (FAULT0..2 inputs force generator outputs via CBC/one-shot
-//! actions with enter/exit interrupts). Carrier and the update-shadow
-//! machinery are latched but not simulated.
+//! actions with enter/exit interrupts). The carrier submodule is simulated
+//! (8-slice wave chopping the generator output post-dead-time, with
+//! first-pulse one-shot + in/out invert); the update-shadow machinery is
+//! latched but applies immediately (matching the reset all-immediate
+//! update methods).
 
 /// MCPWM group-0 register block base (esp-idf `DR_REG_PWM0_BASE`).
 pub const MCPWM_BASE: u32 = 0x6001_E000;
@@ -137,6 +140,18 @@ const DT_BASE0: u32 = 0x58;
 const DT_STRIDE: u32 = 0x38;
 const DT_FED: u32 = 0x04;
 const DT_RED: u32 = 0x08;
+// Carrier submodule (mcpwm_carrier_cfg_reg_t, per operator at OPER_BASE0 +
+// op*0x38 + 0x28 = 0x64/0x9C/0xD4): carrier_en[0], carrier_prescale[4:1]
+// (PC_clk period = PWM_clk x (prescale+1)), carrier_duty[7:5] (duty/8 of
+// the 8-slice carrier period), carrier_oshtwth[11:8] (first-pulse one-shot
+// width in carrier periods), carrier_out_invert[12], carrier_in_invert[13].
+const CARRIER_CFG_OFF: u32 = 0x28;
+const CARRIER_EN: u32 = 1 << 0;
+const CARRIER_PRESCALE_SHIFT: u32 = 1;
+const CARRIER_DUTY_SHIFT: u32 = 5;
+const CARRIER_OSHTWTH_SHIFT: u32 = 8;
+const CARRIER_OUT_INVERT: u32 = 1 << 12;
+const CARRIER_IN_INVERT: u32 = 1 << 13;
 
 pub struct Mcpwm {
     regs: [u32; REG_WORDS],
@@ -178,6 +193,18 @@ pub struct Mcpwm {
     fault_force: [[Option<u32>; 2]; NOPER],
     /// Last FHk_CFG1 value per operator (FORCE_CBC/FORCE_OST edge detect).
     fault_cfg1: [u32; NOPER],
+    /// Carrier clock phase per operator (emulator steps; the carrier wave
+    /// period is 8 x (prescale+1) steps, so the minimum period is 8 steps
+    /// and step-granular sampling can never alias it, unlike faster TIE
+    /// carriers). Freezes while the timers are stopped (tick is gated).
+    car_phase: [u32; NOPER],
+    /// Carrier one-shot: remaining forced-HIGH steps of the first pulse
+    /// after a rising edge of the (in-inverted) generator input, per
+    /// operator/generator. Zero disables (oshtwth = 0).
+    car_osht: [[u32; 2]; NOPER],
+    /// Previous (in-inverted) generator input per operator/generator, for
+    /// the one-shot rising-edge detect.
+    car_prev: [[u32; 2]; NOPER],
 }
 
 impl Mcpwm {
@@ -203,6 +230,9 @@ impl Mcpwm {
             fault_ost_on: [false; NOPER],
             fault_force: [[None; 2]; NOPER],
             fault_cfg1: [0; NOPER],
+            car_phase: [0; NOPER],
+            car_osht: [[0; 2]; NOPER],
+            car_prev: [[0; 2]; NOPER],
         }
     }
 
@@ -214,6 +244,10 @@ impl Mcpwm {
     }
     fn gen_reg(&self, op: usize, off: u32) -> u32 {
         self.regs[(OPER_BASE0 as usize + op * OPER_STRIDE + off as usize) / 4]
+    }
+    /// Carrier configuration word for operator `op`.
+    fn carrier_cfg(&self, op: usize) -> u32 {
+        self.gen_reg(op, CARRIER_CFG_OFF)
     }
     fn op_timer_sel(&self, op: usize) -> usize {
         ((self.regs[OPER_TIMERSEL as usize / 4] >> (2 * op)) & 0x3) as usize
@@ -335,6 +369,60 @@ impl Mcpwm {
             }
         }
         self.tick_dead_time();
+        self.tick_carrier();
+    }
+
+    /// Advance the carrier submodule by one step: the per-operator phase
+    /// always runs, and each generator's (in-inverted) input edge detector
+    /// reloads the first-pulse one-shot (`oshtwth` carrier periods).
+    fn tick_carrier(&mut self) {
+        for op in 0..NOPER {
+            let cfg = self.carrier_cfg(op);
+            self.car_phase[op] = self.car_phase[op].wrapping_add(1);
+            if cfg & CARRIER_EN == 0 {
+                continue;
+            }
+            let pre = ((cfg >> CARRIER_PRESCALE_SHIFT) & 0xF) + 1;
+            let period = 8 * pre;
+            let oshtwth = (cfg >> CARRIER_OSHTWTH_SHIFT) & 0xF;
+            let in_inv = (cfg & CARRIER_IN_INVERT) >> 13;
+            for g in 0..2 {
+                if self.car_osht[op][g] > 0 {
+                    self.car_osht[op][g] -= 1;
+                }
+                let x = self.gen_level[op][g] ^ in_inv;
+                if x == 1 && self.car_prev[op][g] == 0 && oshtwth != 0 {
+                    self.car_osht[op][g] = oshtwth * period;
+                }
+                self.car_prev[op][g] = x;
+            }
+        }
+    }
+
+    /// Carrier-modulated output for operator `op`, generator `g`: the
+    /// (in-inverted) generator level gates an 8-slice carrier wave
+    /// (duty/8, period 8 x (prescale+1) steps), widened by the one-shot on
+    /// the first pulse, then out-inverted. Applied post-dead-time at
+    /// `signal_level` (same documented ordering assumption as the fault
+    /// force: applying it pre-DT would let a programmed FED/RED swallow
+    /// the carrier whole, hiding it from any firmware sampling the pad).
+    fn carrier_out(&self, op: usize, g: usize, base: u32) -> u32 {
+        let cfg = self.carrier_cfg(op);
+        if cfg & CARRIER_EN == 0 {
+            return base;
+        }
+        let pre = ((cfg >> CARRIER_PRESCALE_SHIFT) & 0xF) + 1;
+        let duty = (cfg >> CARRIER_DUTY_SHIFT) & 0x7;
+        let period = 8 * pre;
+        let x = base ^ ((cfg & CARRIER_IN_INVERT) >> 13);
+        let w = if x == 0 {
+            0
+        } else if self.car_osht[op][g] > 0 {
+            1
+        } else {
+            u32::from(self.car_phase[op] % period < duty * pre)
+        };
+        w ^ ((cfg & CARRIER_OUT_INVERT) >> 12)
     }
 
     /// Inertial dead-time edge delay (FED on falling, RED on rising edges,
@@ -540,7 +628,8 @@ impl Mcpwm {
         if (PWM0_OUT0A_IDX..=PWM0_OUT2B_IDX).contains(&sig) {
             let s = (sig - PWM0_OUT0A_IDX) as usize;
             let op = s / 2;
-            if let Some(force) = self.fault_force[op][s % 2] {
+            let g = s % 2;
+            if let Some(force) = self.fault_force[op][g] {
                 return force;
             }
             // Unprogrammed dead-time (FED=RED=0) reads the generator level
@@ -548,11 +637,12 @@ impl Mcpwm {
             // programmed delays come from the ticked inertial state.
             let fed = self.regs[(DT_BASE0 + op as u32 * DT_STRIDE + DT_FED) as usize / 4] & 0xFFFF;
             let red = self.regs[(DT_BASE0 + op as u32 * DT_STRIDE + DT_RED) as usize / 4] & 0xFFFF;
-            if fed == 0 && red == 0 {
-                self.gen_level[op][s % 2]
+            let base = if fed == 0 && red == 0 {
+                self.gen_level[op][g]
             } else {
-                self.dt_out[op][s % 2]
-            }
+                self.dt_out[op][g]
+            };
+            self.carrier_out(op, g, base)
         } else {
             0
         }
@@ -586,11 +676,7 @@ impl Mcpwm {
                             | ((self.fault_ost_on[op] as u32) << 1);
                     }
                 }
-                if idx < REG_WORDS {
-                    self.regs[idx]
-                } else {
-                    0
-                }
+                if idx < REG_WORDS { self.regs[idx] } else { 0 }
             }
         }
     }

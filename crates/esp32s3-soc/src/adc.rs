@@ -332,7 +332,8 @@ impl Adc {
     }
 
     /// Read a SENS register (`offset` relative to SENS_BASE).
-    pub fn sens_read32(&mut self, offset: u32) -> u32 {        match offset {
+    pub fn sens_read32(&mut self, offset: u32) -> u32 {
+        match offset {
             SENS_SAR_SLAVE_ADDR1 => {
                 // Live meas_status [29:22]: the shared SAR FSM busy flag
                 // (adc_oneshot_ll_start polls this before starting).

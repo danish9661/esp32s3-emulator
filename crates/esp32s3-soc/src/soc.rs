@@ -791,15 +791,108 @@ impl Soc {
     /// Host-driven SPI slave master-write: capture `bytes` into the slave's
     /// data buffer on `chan` (0=GPSPI2, 1=GPSPI3), recording the bitlen and
     /// raising trans_done. Only acts when the controller is in slave mode.
+    /// With DMA receive enabled (slave_mode + DMA_CONF.dma_rx_ena) the bytes
+    /// stream into the GDMA IN-link DRAM buffers of the channel wired to
+    /// this SPI peripheral instead (descriptors handed back, IN done raised)
+    /// and completion latches SLV_WR_DMA_DONE.
     pub fn spi_slave_inject_write(&mut self, chan: usize, bytes: &[u8]) {
-        self.spi[chan].slave_inject_write(bytes);
+        if self.spi[chan].slave_dma_rx_enabled() {
+            let peri = if chan == 0 {
+                crate::gdma::GDMA_SPI2_PERIPH
+            } else {
+                crate::gdma::GDMA_SPI3_PERIPH
+            };
+            let mut done_ch = None;
+            for rx in 0..crate::gdma::NCH {
+                if self.gdma.in_peri_sel(rx) != peri || !self.gdma.in_link_started(rx) {
+                    continue;
+                }
+                let mut idesc = self.gdma.in_link_addr(rx);
+                let mut off = 0usize;
+                loop {
+                    let dw0 = self.read32(idesc);
+                    let ibuf = self.read32(idesc + 4);
+                    let inext = self.read32(idesc + 8);
+                    let ilen = ((dw0 >> 12) & 0xFFF) as usize;
+                    let ieof = (dw0 >> 30) & 1;
+                    let iowner = (dw0 >> 31) & 1;
+                    if iowner == 0 || off >= bytes.len() {
+                        break;
+                    }
+                    let n = (bytes.len() - off).min(ilen);
+                    for k in 0..n {
+                        self.write8(ibuf + k as u32, bytes[off + k] as u32);
+                    }
+                    off += n;
+                    if n >= ilen {
+                        self.write32(idesc, dw0 & !(1u32 << 31));
+                    }
+                    if off >= bytes.len() || inext == 0 || ieof == 1 {
+                        break;
+                    }
+                    idesc = inext;
+                }
+                done_ch = Some(rx);
+                break;
+            }
+            self.spi[chan].slave_dma_done((bytes.len() * 8) as u32, true);
+            if let Some(rx) = done_ch {
+                self.gdma.raise_in_done(rx);
+            }
+        } else {
+            self.spi[chan].slave_inject_write(bytes);
+        }
     }
 
     /// Host-driven SPI slave master-read: return the first `nbytes` of the
     /// slave's preloaded data buffer on `chan`, recording the bitlen and
     /// raising trans_done. Only acts when the controller is in slave mode.
+    /// With DMA transmit enabled the bytes source the GDMA OUT-link DRAM
+    /// buffers instead (fully consumed descriptors handed back, OUT done
+    /// raised) and completion latches SLV_RD_DMA_DONE.
     pub fn spi_slave_take_read(&mut self, chan: usize, nbytes: usize) -> Vec<u8> {
-        self.spi[chan].slave_take_read(nbytes)
+        if self.spi[chan].slave_dma_tx_enabled() {
+            let peri = if chan == 0 {
+                crate::gdma::GDMA_SPI2_PERIPH
+            } else {
+                crate::gdma::GDMA_SPI3_PERIPH
+            };
+            let mut out = alloc::vec::Vec::with_capacity(nbytes);
+            for tx in 0..crate::gdma::NCH {
+                if self.gdma.out_peri_sel(tx) != peri || !self.gdma.out_link_started(tx) {
+                    continue;
+                }
+                let mut odesc = self.gdma.out_link_addr(tx);
+                loop {
+                    let dw0 = self.read32(odesc);
+                    let obuf = self.read32(odesc + 4);
+                    let onext = self.read32(odesc + 8);
+                    let olen = ((dw0 >> 12) & 0xFFF) as usize;
+                    let oeof = (dw0 >> 30) & 1;
+                    let oowner = (dw0 >> 31) & 1;
+                    if oowner == 0 || out.len() >= nbytes {
+                        break;
+                    }
+                    let n = (nbytes - out.len()).min(olen);
+                    for k in 0..n {
+                        out.push(self.read8(obuf + k as u32) as u8);
+                    }
+                    if n >= olen {
+                        self.write32(odesc, dw0 & !(1u32 << 31));
+                    }
+                    if out.len() >= nbytes || onext == 0 || oeof == 1 {
+                        break;
+                    }
+                    odesc = onext;
+                }
+                self.gdma.raise_out_done(tx);
+                break;
+            }
+            self.spi[chan].slave_dma_done((out.len() * 8) as u32, false);
+            out
+        } else {
+            self.spi[chan].slave_take_read(nbytes)
+        }
     }
 
     /// Inject RX bytes for the next I2C master-read on `chan`
@@ -1388,11 +1481,85 @@ impl Soc {
                         // (all descriptors staged first); see below.
                         let mut spi_dma_pending: Option<usize> = None;
                         let mut desc = link_addr;
+                        // SPI slave DMA links arm only: the host-driven
+                        // exchange (spi_slave_inject_write/take_read) walks
+                        // the descriptors and raises completion when the
+                        // external master actually clocks. A master-style
+                        // walk here would stage phantom TX bytes (and even
+                        // fire a master dma_trigger) or consume the RX
+                        // descriptor setup with zeros before the exchange.
+                        let slave_arm_only = if peri == crate::gdma::GDMA_SPI2_PERIPH
+                            || peri == crate::gdma::GDMA_SPI3_PERIPH
+                        {
+                            let idx = if peri == crate::gdma::GDMA_SPI2_PERIPH {
+                                0
+                            } else {
+                                1
+                            };
+                            self.spi[idx].is_slave()
+                        } else {
+                            false
+                        };
                         // I2S GDMA streams through the per-tick pump (its
                         // frames dwarf the 16-word FIFO); arm the cursor and
                         // skip the synchronous walk. All other peripherals
                         // keep the immediate walk below.
-                        if is_out
+                        //
+                        // Memory-to-memory (IN_CONF0 mem_trans_en, TRM
+                        // gdma_struct.h bit 4): the OUT-link descriptors
+                        // source DRAM bytes the IN-link descriptors sink on
+                        // the same channel pair. The copy runs once BOTH
+                        // links are started (order-independent: a lone start
+                        // only arms — without this gate the first start
+                        // would fall into the normal peri walk and consume
+                        // the source descriptors) and hands both descriptor
+                        // chains back with OUT + IN done raised. Descriptor
+                        // pairs advance lockstep 1:1 (a longer side's excess
+                        // bytes are dropped) — validation uses exact pairs.
+                        let m2m_armed = self.gdma.in_mem_trans_en(ch);
+                        let m2m_ready = m2m_armed
+                            && self.gdma.out_link_started(ch)
+                            && self.gdma.in_link_started(ch);
+                        if m2m_ready {
+                            let mut odesc = self.gdma.out_link_addr(ch);
+                            let mut idesc = self.gdma.in_link_addr(ch);
+                            loop {
+                                let odw0 = self.read32(odesc);
+                                let obuf = self.read32(odesc + 4);
+                                let onext = self.read32(odesc + 8);
+                                let olen = ((odw0 >> 12) & 0xFFF) as usize;
+                                let oeof = (odw0 >> 30) & 1;
+                                if (odw0 >> 31) & 1 == 0 {
+                                    break;
+                                }
+                                let idw0 = self.read32(idesc);
+                                let ibuf = self.read32(idesc + 4);
+                                let inext = self.read32(idesc + 8);
+                                let ilen = ((idw0 >> 12) & 0xFFF) as usize;
+                                let ieof = (idw0 >> 30) & 1;
+                                if (idw0 >> 31) & 1 == 0 {
+                                    break;
+                                }
+                                let n = olen.min(ilen);
+                                for k in 0..n {
+                                    let b = self.read8(obuf + k as u32);
+                                    self.write8(ibuf + k as u32, b);
+                                }
+                                self.write32(odesc, odw0 & !(1u32 << 31));
+                                self.write32(idesc, idw0 & !(1u32 << 31));
+                                self.gdma.set_out_eof_des_addr(ch, odesc);
+                                if onext == 0 || oeof == 1 || inext == 0 || ieof == 1 {
+                                    break;
+                                }
+                                odesc = onext;
+                                idesc = inext;
+                            }
+                            self.gdma.raise_out_done(ch);
+                            self.gdma.raise_in_done(ch);
+                        } else if m2m_armed {
+                            // Lone M2M start: arm only (see above).
+                        } else if slave_arm_only {
+                        } else if is_out
                             && (peri == crate::gdma::GDMA_I2S0_PERIPH
                                 || peri == crate::gdma::GDMA_I2S1_PERIPH)
                         {

@@ -59,7 +59,10 @@ impl Efuse {
         regs[RD_SYS_PART1_DATA1_OFF] = MAC_HI;
         regs[RD_MAC_SPI_SYS0_OFF] = MAC_LO;
         regs[RD_MAC_SPI_SYS1_OFF] = MAC_HI;
-        Self { regs, pgm_stage: [0; 8] }
+        Self {
+            regs,
+            pgm_stage: [0; 8],
+        }
     }
 }
 

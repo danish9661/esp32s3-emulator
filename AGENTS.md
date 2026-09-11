@@ -3002,3 +3002,91 @@ Core design:
       SLEEP_EN-probe via accessors (no_std has no eprintln); (3) the
       machine consumes the request same-step, so harness checks must
       latch, not poll the flag.
+  - 2026-09-11: **RMT carrier modulation + RX demodulation validated
+    end-to-end (P5 small-approx batch, item 2)**. New sketch
+    `tools/sketches/esp32s3_rmt_carrier` (direct pokes: TX ch0 4x
+    HIGH1200/LOW1200 with carrier 20/20 EFF_EN+EN+OUT_LV-high, GPIO2
+    loopback into RX HW4 with DEMOD_EN+OUT_LV-high, tight pad-sample
+    loop + re-armed capture) → `RMT CARRIER PASS` (battery entry;
+    `edges=15 high=11`, envelope `1376/1 1120/0`, rx_end). Model work
+    (`rmt.rs`, all verified against the failing sketch, not guessed):
+    (1) **demodulator rewritten as lock/release latch** (`DEMOD_LOCK=2`,
+    `DEMOD_RELEASE=8` quanta + optimistic `dm_lvl=burst` seeded at arm
+    and re-seeded on CHMCONF0 writes while idle): the old flip-after-2
+    split the envelope on aliased carrier-gap runs (observed 32/192 +
+    1152 split), while symmetric counting can never also lock onto a
+    1,0,1,0 fast carrier (existing KAT) — asymmetric consecutive runs
+    satisfy both; release costs ≤256 ticks late (documented
+    approximation, silicon thresholds unknown). (2) **RX re-arm resets
+    idle/pwidth/flevel** (stale idle fired rx_end on the first tick of
+    the re-armed capture — observed n=1). Sketch lessons (all real
+    sketch bugs, model was right): no prints between TX restart and the
+    poll loop (one printf spans the burst+idle window → tn=0); no
+    millis() in the sample loop (64-bit division ≈ hundreds of steps
+    per iteration → n=1); mask the pad bit (packed TX_START/MEM_OWNER
+    flags fake edges); 4 items not 1 (4 burst samples alias into a fake
+    clean run — observed edges=1 — while ~18 burst samples give ~15
+    edges). New unit test `rx_demod_release_rides_carrier_gaps` pins
+    gap-hold + 8-late release (30*32); machine-test HIGH bound widened
+    [300,500]→[300,700] for the release latency. Cautionary tales: (1)
+    `%lx` prints HEX — outsel=51 was 0x51=81 CORRECT, not a routing bug;
+    (2) blk0 is RMTMEM+0x400 (RX block), not TX mem[0] — no overwrite
+    ever happened; (3) head-truncated probe logs hide the rx_end line —
+    the "never fires" verdict was a truncation artifact (fired step
+    166, now 172 with release latency). Full workspace green, battery
+    rmt/rmt_driver/rmt_carrier/gpio_interrupt green, fmt clean
+    (including 4 pre-existing peripheral fmt fixes), my-files
+    clippy-clean (the xtensa-core ua_state erasing_op deny under
+    --all-targets is pre-existing toolchain drift, untouched).
+  - 2026-09-11: **Small-approx batch: MCPWM carrier + SPI slave DMA +
+    GDMA-M2M + UART RS485 validated; SD CMD12 pinned; 4 N/A documented
+    (P5)**. All via arduino-cli direct-poke sketches (no driver needed).
+    - **MCPWM carrier** (`mcpwm.rs`): per-operator CARRIER_CFG @0x64/0x9C/
+      0xD4 (verified vs `mcpwm_reg.h` + struct member order): en[0],
+      prescale[4:1] (wave period 8x(pre+1) steps — min 8 steps, so step
+      sampling can never alias it), duty[7:5] (duty/8), oshtwth[11:8]
+      (first-pulse one-shot in carrier periods), out_invert[12],
+      in_invert[13]. Applied post-dead-time at `signal_level` (same
+      documented ordering as fault force — pre-DT would let FED/RED
+      swallow the carrier); phase/osht ticked per step (osht decays
+      before edge-reload so width is exactly oshtwth periods — off-by-one
+      caught live by the KAT). 4 unit tests (chop duty, out/in invert,
+      osht width) + machine test (GPIO 25% + edges) +
+      `esp32s3_mcpwm_carrier` sketch (`duty=24% edges=1018 PASS`).
+    - **SPI slave DMA** (`spi.rs`/`soc.rs`): DMA_CONF @0x30 rx_ena[25]+
+      tx_ena[26], SLV_RD/WR_DMA_DONE = INT bits 8/9 (same block as
+      trans_done — flows through existing `int_st`/matrix source 21/22
+      untouched). Slave GDMA links arm-only at START (a master-style
+      walk would stage phantom bytes + fire `dma_trigger`); the host
+      exchange walks them: inject fills IN-link DRAM + WR_DMA_DONE, take
+      sources OUT-link DRAM + RD_DMA_DONE (exact-fit descs; partial
+      consume keeps owner — documented). `run_flash` gains DMA markers
+      under the same `SPI_SLAVE_XCHG` flag; `esp32s3_spi_slave_dma`
+      sketch (`RX=de ad be ef`, `TXLEN=32`, host asserts TX bytes) PASS.
+    - **GDMA-M2M** (`gdma.rs`/`soc.rs`): IN_CONF0 `mem_trans_en` bit 4
+      (`SOC_GDMA_TRIG_PERIPH_M2M0=-1`, `gdma_channel.h`); OUT descs
+      source, IN descs sink, lockstep 1:1, both dones raised, both-started
+      guard (order-independent: lone start arms only). Found en route: a
+      lone OUT start MUST NOT fall into the peri walk (it consumed the
+      source descs into a phantom master-SPI transfer — observed owner
+      cleared + outdone with zeros); also caught a stale release
+      `run_flash` masquerading as a model bug (again — rebuild first).
+      Machine test pins guard + copy + dones; `esp32s3_gdma_m2m` sketch
+      (`dst=1122334455667788 PASS`).
+    - **UART RS485** (`uart.rs`): RS485_CONF @0x4C, echo = en[0] +
+      `rs485tx_rx_en`[3] (NOT dl1 — stop-bit delay; header-verified).
+      TX echoes into RX via `inject_rx`; en-only stays muted (already
+      the default). Unit test + `esp32s3_uart_rs485` sketch (UART1,
+      `echo=a5 mute=00 PASS`).
+    - **SD CMD12**: already accepted (status-bearing list → live R1);
+      pinned by `stop_transmission_accepted_with_live_r1` unit test.
+    - **N/A documented (header-verified, no HW)**: LEDC gamma (no gamma
+      regs in `ledc_struct.h` — IDF software), UART LIN (no `lin_*` in
+      `uart_struct.h` — software over break), SDSC byte-addressing
+      (unreachable: card reports SDHC/CCS), I2S `clk_en`/slave clock
+      (gating would break the validated poke path; driver path runs with
+      clock on), MCPWM shadow/CBCPULSE/SYNCI (immediate = reset
+      defaults; external sync has no source).
+    - 38/38 suites green, battery 14/14 (4 new + neighbors incl. sdfat),
+      fmt clean, my-files clippy-clean (xtensa-core ua_state deny is
+      pre-existing toolchain drift, untouched).

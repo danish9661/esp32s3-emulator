@@ -194,6 +194,13 @@ impl Gdma {
         self.in_link[ch] & (1 << 22) != 0
     }
 
+    /// Memory-to-memory mode (TRM `gdma_struct.h` IN_CONF0 `mem_trans_en`,
+    /// bit 4): the OUT-link descriptors source DRAM bytes the IN-link
+    /// descriptors sink on the same channel pair.
+    pub fn in_mem_trans_en(&self, ch: usize) -> bool {
+        self.in_conf0[ch] & (1 << 4) != 0
+    }
+
     pub fn set_out_eof_des_addr(&mut self, ch: usize, addr: u32) {
         self.out_eof_des_addr[ch] = addr;
     }

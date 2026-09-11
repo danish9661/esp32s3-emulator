@@ -105,6 +105,15 @@ pub const SPI_INT_ST: u32 = 0x40;
 /// first queued transfer can kick the ISR via `esp_intr_enable`).
 pub const SPI_INT_SET: u32 = 0x44;
 const INT_TRANS_DONE: u32 = 1 << 12;
+// Slave DMA completion (TRM SPI_DMA_INT_RAW: SLV_RD_DMA_DONE bit 8,
+// SLV_WR_DMA_DONE bit 9 — same INT_RAW/ENA/CLR block as trans_done).
+const INT_RD_DMA_DONE: u32 = 1 << 8;
+const INT_WR_DMA_DONE: u32 = 1 << 9;
+// DMA_CONF (@ 0x30, TRM SPI_DMA_CONF_REG): dma_rx_ena[25] enables DMA
+// receive, dma_tx_ena[26] DMA transmit (master or slave mode alike).
+const SPI_DMA_CONF: u32 = 0x30;
+const DMA_RX_ENA: u32 = 1 << 25;
+const DMA_TX_ENA: u32 = 1 << 26;
 
 const REG_COUNT: usize = 0xF4 / 4;
 const DATA_WORDS: usize = 16;
@@ -198,6 +207,35 @@ impl Spi {
     /// True when the controller is in slave mode (SPI_SLAVE.slave_mode).
     pub fn is_slave(&self) -> bool {
         self.regs[(SPI_SLAVE / 4) as usize] & SLAVE_MODE != 0
+    }
+
+    /// Slave DMA receive enabled (slave_mode + DMA_CONF.dma_rx_ena): a
+    /// host-driven master-write lands in the GDMA IN-link DRAM buffers
+    /// (walked by the SoC) and completes with SLV_WR_DMA_DONE, not the
+    /// CPU data buffer + trans_done.
+    pub fn slave_dma_rx_enabled(&self) -> bool {
+        self.is_slave() && self.regs[(SPI_DMA_CONF / 4) as usize] & DMA_RX_ENA != 0
+    }
+
+    /// Slave DMA transmit enabled (slave_mode + DMA_CONF.dma_tx_ena): a
+    /// host-driven master-read sources the GDMA OUT-link DRAM buffers and
+    /// completes with SLV_RD_DMA_DONE.
+    pub fn slave_dma_tx_enabled(&self) -> bool {
+        self.is_slave() && self.regs[(SPI_DMA_CONF / 4) as usize] & DMA_TX_ENA != 0
+    }
+
+    /// Record a DMA-backed slave exchange length + completion: SLAVE1
+    /// data_bitlen in bits plus the WR (master-write) or RD (master-read)
+    /// DMA-done latch. The SoC moves the bytes through the GDMA links.
+    pub fn slave_dma_done(&mut self, bits: u32, is_write: bool) {
+        let bitlen = bits.min(SLAVE1_DATA_BITLEN_MASK + 1);
+        let s1 = &mut self.regs[(SPI_SLAVE1 / 4) as usize];
+        *s1 = (*s1 & !SLAVE1_DATA_BITLEN_MASK) | (bitlen & SLAVE1_DATA_BITLEN_MASK);
+        self.regs[(SPI_INT_RAW / 4) as usize] |= if is_write {
+            INT_WR_DMA_DONE
+        } else {
+            INT_RD_DMA_DONE
+        };
     }
 
     /// Host-driven master-write-to-slave: capture `bytes` (MSB-first) into

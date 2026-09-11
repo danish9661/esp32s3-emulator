@@ -20,6 +20,10 @@
 //!   (CONF1 bit 23, MEM_CONF bits [26:17]).
 //! - Remaining registers are latched (writes stored, reads return stored
 //!   value or reset value) so firmware configuration writes are harmless.
+//! - RS485: `RS485_CONF` rs485_en + rs485tx_rx_en echoes TX into RX
+//!   (half-duplex loopback); en-only mutes during TX (already the default).
+//!   No LIN hardware exists on S3 (no `lin_*` in `uart_struct.h`; LIN is
+//!   software over break detect) — nothing to model.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -41,6 +45,13 @@ pub const UART_RXD_CNT: u32 = 0x30;
 pub const UART_MEM_CONF: u32 = 0x60;
 pub const UART_MEM_RX_STATUS: u32 = 0x64;
 pub const UART_DATE: u32 = 0x78;
+// RS485 mode (TRM RS485_CONF_REG @ 0x4C / uart_struct.h rs485_conf_reg_t):
+// rs485_en[0] selects RS485 mode, rs485tx_rx_en[3] lets the receiver hear
+// the transmitter (echo); dl0/dl1 stop-bit delays and rx/tx_dly_num are
+// timing-only here.
+pub const UART_RS485_CONF: u32 = 0x4C;
+const RS485_EN: u32 = 1 << 0;
+const RS485_TX_RX_EN: u32 = 1 << 3;
 
 // INT_RAW/ST/ENA/CLR bit positions (QEMU esp32_uart.h).
 pub const INT_RXFIFO_FULL: u32 = 1 << 0;
@@ -233,6 +244,18 @@ impl Uart {
                 // TXD_BRK (CONF0 bit 8) sends a break — ignore for now.
                 if self.regs[(UART_CONF0 / 4) as usize] & (1 << 8) == 0 {
                     self.tx_out.push(value as u8);
+                    // RS485 echo (TRM RS485_CONF rs485tx_rx_en, bit 3): in
+                    // RS485 mode with the echo bit set the receiver hears
+                    // the transmitter (half-duplex loopback). Without the
+                    // bit the receiver is muted during TX — which the model
+                    // already satisfies (TX never echoes by default). Stop-
+                    // bit delays (dl0/dl1) and signal delays (rx/tx_dly_num)
+                    // are timing-only at instant-drain granularity (no-op);
+                    // clash/parity/frm error interrupts need a real bus.
+                    let rs485 = self.regs[(UART_RS485_CONF / 4) as usize];
+                    if rs485 & (RS485_EN | RS485_TX_RX_EN) == (RS485_EN | RS485_TX_RX_EN) {
+                        self.inject_rx(value as u8);
+                    }
                 }
                 // FIFO drains instantly: TXFIFO_EMPTY + TX_DONE latch high.
                 let raw = &mut self.regs[(UART_INT_RAW / 4) as usize];

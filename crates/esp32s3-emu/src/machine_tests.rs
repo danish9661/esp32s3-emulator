@@ -1804,6 +1804,66 @@ fn rmt_signal_drives_gpio_in_loopback() {
 }
 
 #[test]
+fn rmt_carrier_tx_demod_rx_loopback_envelope() {
+    use esp32s3_soc::memmap::GPIO_BASE;
+    use esp32s3_soc::rmt::{RMT_BASE, RMTMEM_BASE};
+
+    let mut m = Esp32S3::new();
+    // Route GPIO2 to RMT TX signal 81 (channel 0) and enable output.
+    m.soc.write32(GPIO_BASE + 0x554 + 2 * 4, 81); // FUNC_OUT_SEL_CFG[2]
+    m.soc.write32(GPIO_BASE + 0x20, 1 << 2); // GPIO_ENABLE_W1TS bit2
+    // Route GPIO2 into RMT RX signal 81 (HW channel 4).
+    m.soc.write32(GPIO_BASE + 0x154 + 81 * 4, 2); // FUNC_IN_SEL_CFG[81]
+
+    // One item: HIGH 400 / LOW 400 channel ticks.
+    let item0: u32 = 400 | (1u32 << 15) | (400 << 16);
+    m.soc.write32(RMTMEM_BASE, item0);
+    // RX: idle timeout 2048, demod on (bit 28) bursting high (bit 29).
+    m.soc
+        .write32(RMT_BASE + 0x30, (2048 << 8) | (1 << 28) | (1 << 29));
+    // RX block limit 1 item, then arm.
+    m.soc.write32(RMT_BASE + 0xB0, 1); // CHM_RX_LIM
+    m.soc.write32(RMT_BASE + 0x34, 1); // rx_en
+    // TX: start + idle-low + carrier EN/EFF/LV-high + 10/10 duty.
+    m.soc.write32(RMT_BASE + 0x80, (10 << 16) | 10); // carrier duty
+    m.soc.write32(
+        RMT_BASE + 0x20,
+        (1 << 0) | (1 << 6) | (1 << 20) | (1 << 21) | (1 << 22),
+    );
+
+    // The carrier must chop the HIGH burst: far more pad edges than the
+    // two a clean burst would produce.
+    let mut edges = 0u32;
+    let mut prev = 0u32;
+    let mut rx_end = false;
+    for _ in 0..400 {
+        m.step();
+        let g = (m.soc.gpio_in_readback() >> 2) & 1;
+        if g != prev {
+            edges += 1;
+            prev = g;
+        }
+        if m.soc.read32(RMT_BASE + 0x70) & (1 << 16) != 0 {
+            rx_end = true;
+            break;
+        }
+    }
+    assert!(edges >= 6, "carrier chops the burst (edges={edges})");
+    assert!(rx_end, "demodulated capture raises rx_end");
+    // Envelope: first item HIGH ~400 then LOW (demod release costs up to
+    // DEMOD_RELEASE quanta = 256 ticks late on the falling edge, plus the
+    // usual ~64-tick edge uncertainty; the LOW half runs to the idle
+    // timeout by design).
+    let w0 = m.soc.read32(RMTMEM_BASE + 0x400);
+    assert_eq!((w0 >> 15) & 1, 1, "envelope opens HIGH");
+    let d0 = w0 & 0x7FFF;
+    assert!((300..=700).contains(&d0), "HIGH width ~400, got {d0}");
+    assert_eq!((w0 >> 31) & 1, 0, "envelope closes LOW");
+    let d1 = (w0 >> 16) & 0x7FFF;
+    assert!(d1 > 300, "LOW gap captured (runs to idle), got {d1}");
+}
+
+#[test]
 fn sigmadelta_drives_gpio_at_duty_ratio() {
     use crate::asm::Asm;
     use esp32s3_soc::memmap::{GPIO_BASE, IRAM_BASE};
@@ -2544,6 +2604,139 @@ fn mcpwm_capture_measures_pwm_period_via_loopback() {
     );
     let c1 = m.soc.read32(mcpwm + 0xFC);
     assert!(c1 > 9000 && c1 < 11000, "first capture ~10000, got {c1}");
+}
+
+#[test]
+fn mcpwm_carrier_chops_output_on_gpio() {
+    use esp32s3_soc::gpio::GPIO_ENABLE_W1TS;
+    use esp32s3_soc::memmap::GPIO_BASE;
+    let mcpwm = 0x6001_E000;
+    let mut m = Esp32S3::new();
+    // GPIO2 <- PWM0_OUT0A (160), output driver on.
+    m.soc.write32(GPIO_BASE + 0x554 + 2 * 4, 160);
+    m.soc.write32(GPIO_BASE + GPIO_ENABLE_W1TS, 1 << 2);
+    // Timer0: period 100, prescale 0, up mode, run; 50% via comparator A.
+    m.soc.write32(mcpwm + 0x04, 100 << 8);
+    m.soc.write32(mcpwm + 0x08, (1 << 3) | 2);
+    m.soc.write32(mcpwm + 0x40, 50);
+    m.soc.write32(mcpwm + 0x50, (2 << 4) | 1);
+    // Carrier: en + prescale 0 (period 8 steps) + duty 4/8.
+    m.soc.write32(mcpwm + 0x64, 1 | (0 << 1) | (4 << 5));
+    for _ in 0..200 {
+        m.step();
+    }
+    let mut high = 0u32;
+    let mut edges = 0u32;
+    let mut prev = (m.soc.gpio_output() >> 2) & 1;
+    for _ in 0..800 {
+        m.step();
+        let lv = (m.soc.gpio_output() >> 2) & 1;
+        high += lv;
+        edges += u32::from(lv != prev);
+        prev = lv;
+    }
+    // 50% PWM x 50% carrier = 25% average; unchopped would be 400/800.
+    assert!(
+        (180..=220).contains(&high),
+        "carrier duty wrong: {high}/800"
+    );
+    assert!(edges >= 60, "carrier did not chop: {edges} edges");
+}
+
+#[test]
+fn spi_slave_dma_routes_through_gdma_links() {
+    use esp32s3_soc::gdma::GDMA_BASE;
+    let spi2 = 0x6002_4000u32;
+    let mut m = Esp32S3::new();
+    // SPI2 slave + DMA RX/TX enabled.
+    m.soc.write32(spi2 + 0xE0, 1 << 26); // slave_mode
+    m.soc.write32(spi2 + 0x30, (1 << 25) | (1 << 26)); // dma_conf rx+tx ena
+    // DRAM scratch: TX desc + 4-byte pattern, RX desc + 4-byte buffer.
+    let txd = 0x3FC8_1000u32;
+    let txb = 0x3FC8_1100u32;
+    let rxd = 0x3FC8_1200u32;
+    let rxb = 0x3FC8_1300u32;
+    for (i, b) in [0x12u32, 0x34, 0x56, 0x78].iter().enumerate() {
+        m.soc.write8(txb + i as u32, *b);
+    }
+    for (d, b) in [(txd, txb), (rxd, rxb)] {
+        m.soc.write32(d, (4) | (4 << 12) | (1 << 30) | (1 << 31));
+        m.soc.write32(d + 4, b);
+        m.soc.write32(d + 8, 0);
+        m.soc.write32(d + 12, 0);
+    }
+    // GDMA ch0 OUT (TX) + IN (RX) links wired to SPI2, started. Slave
+    // links arm only: no done bits, descriptors stay owned.
+    m.soc.write32(GDMA_BASE + 0xA8, 0); // out_peri_sel = SPI2
+    m.soc.write32(GDMA_BASE + 0x80, (txd & 0xFFFFF) | (1 << 21));
+    m.soc.write32(GDMA_BASE + 0x48, 0); // in_peri_sel = SPI2
+    m.soc.write32(GDMA_BASE + 0x20, (rxd & 0xFFFFF) | (1 << 22));
+    assert_eq!(m.soc.read32(spi2 + 0x3C) & 0xF00, 0, "no done yet");
+    assert_ne!(m.soc.read32(txd) >> 31, 0, "TX desc still owned");
+    // Host master-write: bytes land in the IN-link DRAM buffer with
+    // WR_DMA_DONE (bit 9), not the CPU data buffer.
+    m.soc.spi_slave_inject_write(0, &[0xDE, 0xAD, 0xBE, 0xEF]);
+    for (i, b) in [0xDEu32, 0xAD, 0xBE, 0xEF].iter().enumerate() {
+        assert_eq!(m.soc.read8(rxb + i as u32), *b, "RX DRAM byte {i}");
+    }
+    assert_eq!(m.soc.read32(spi2 + 0xE4) & 0x3FFFF, 32, "SLAVE1 bitlen");
+    assert_ne!(m.soc.read32(spi2 + 0x3C) & (1 << 9), 0, "WR_DMA_DONE");
+    assert_eq!(m.soc.read32(rxd) >> 31, 0, "RX desc handed back");
+    // Host master-read: bytes source the OUT-link DRAM buffer with
+    // RD_DMA_DONE (bit 8); the OUT descriptor is handed back.
+    let got = m.soc.spi_slave_take_read(0, 4);
+    assert_eq!(got, alloc::vec![0x12, 0x34, 0x56, 0x78]);
+    assert_ne!(m.soc.read32(spi2 + 0x3C) & (1 << 8), 0, "RD_DMA_DONE");
+    assert_eq!(m.soc.read32(txd) >> 31, 0, "TX desc handed back");
+}
+
+#[test]
+fn gdma_m2m_copies_memory_to_memory() {
+    use esp32s3_soc::gdma::GDMA_BASE;
+    let mut m = Esp32S3::new();
+    // DRAM scratch: source pattern, source/dest descriptors (8 bytes).
+    let src = 0x3FC8_2000u32;
+    let dst = 0x3FC8_2100u32;
+    let odesc = 0x3FC8_2200u32;
+    let idesc = 0x3FC8_2300u32;
+    for (i, b) in [0x11u32, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]
+        .iter()
+        .enumerate()
+    {
+        m.soc.write8(src + i as u32, *b);
+        m.soc.write8(dst + i as u32, 0);
+    }
+    for d in [odesc, idesc] {
+        let b = if d == odesc { src } else { dst };
+        m.soc.write32(d, (8) | (8 << 12) | (1 << 30) | (1 << 31));
+        m.soc.write32(d + 4, b);
+        m.soc.write32(d + 8, 0);
+        m.soc.write32(d + 12, 0);
+    }
+    // M2M mode on channel 1 (IN_CONF0 mem_trans_en, bit 4).
+    m.soc.write32(GDMA_BASE + 0xC0, 1 << 4);
+    // OUT start alone only arms: no copy until the IN link starts too.
+    m.soc.write32(
+        GDMA_BASE + 0xC0 + 0x60 + 0x20,
+        (odesc & 0xFFFFF) | (1 << 21),
+    );
+    assert_eq!(m.soc.read8(dst), 0, "no copy before both links start");
+    m.soc
+        .write32(GDMA_BASE + 0xC0 + 0x20, (idesc & 0xFFFFF) | (1 << 22));
+    for (i, b) in [0x11u32, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(m.soc.read8(dst + i as u32), *b, "M2M byte {i}");
+    }
+    assert_eq!(m.soc.read32(odesc) >> 31, 0, "OUT desc handed back");
+    assert_eq!(m.soc.read32(idesc) >> 31, 0, "IN desc handed back");
+    assert_ne!(
+        m.soc.read32(GDMA_BASE + 0xC0 + 0x60 + 0x08) & 1,
+        0,
+        "OUT done"
+    );
+    assert_ne!(m.soc.read32(GDMA_BASE + 0xC0 + 0x08) & 1, 0, "IN done");
 }
 
 #[test]
