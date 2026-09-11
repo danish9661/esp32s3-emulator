@@ -242,3 +242,97 @@ fn dead_time_delays_rising_edge_only() {
     m.tick();
     assert_eq!(m.signal_level(160), 0, "fall immediate with FED=0");
 }
+
+// Fault submodule register offsets (mcpwm_reg.h).
+const FH0_CFG0: u32 = 0x68;
+const FH0_CFG1: u32 = 0x6C;
+const FH0_STATUS: u32 = 0x70;
+const FAULT_DETECT: u32 = 0xE4;
+const INT_ENA: u32 = 0x110;
+const INT_RAW: u32 = 0x114;
+const INT_CLR: u32 = 0x11C;
+
+/// Run timer0 up-mode (period 100) to steady state with generator0 driving
+/// high (utez=set), so a fault trip has a live high level to force low.
+fn pwm_high(m: &mut Mcpwm) {
+    m.write32(TIMER0_CFG0, 100 << 8);
+    m.write32(TIMER0_CFG1, (1 << 3) | 2);
+    m.write32(OPER0_GEN0, 1); // utez=set-high
+    for _ in 0..100 {
+        m.tick();
+    }
+    assert_eq!(m.signal_level(160), 1, "precondition: output high");
+}
+
+/// CBC trip forces the output low while the fault input is active and
+/// releases when it clears; enter/exit interrupts latch (bits 9 and 12).
+#[test]
+fn fault_cbc_trip_forces_low_then_releases() {
+    let mut m = Mcpwm::new();
+    pwm_high(&mut m);
+    // FH0: F0_CBC (bit 3) + A_CBC_U force-low (2 at [11:10]).
+    m.write32(FH0_CFG0, (1 << 3) | (2 << 10));
+    // FAULT_DETECT: F0_EN + high-active pole.
+    m.write32(FAULT_DETECT, (1 << 0) | (1 << 3));
+    assert!(m.fault_active(), "detector enabled");
+    m.tick_fault(163, &|_| 1);
+    assert_eq!(m.signal_level(160), 0, "CBC trip forces low");
+    assert_eq!(m.read32(FAULT_DETECT) & (1 << 6), 1 << 6, "EVENT_F0 live");
+    assert_eq!(m.read32(INT_RAW) & (1 << 9), 1 << 9, "fault-enter latched");
+    // Input clears: CBC ends, output resumes, exit latches.
+    m.tick_fault(163, &|_| 0);
+    assert_eq!(m.signal_level(160), 1, "CBC releases with event");
+    assert_eq!(m.read32(FAULT_DETECT) & (1 << 6), 0, "EVENT_F0 cleared");
+    assert_eq!(m.read32(INT_RAW) & (1 << 12), 1 << 12, "fault-exit latched");
+}
+
+/// One-shot trip latches the forced level past the end of the event until
+/// a CLR_OST rising edge; FH0_STATUS reports OST_ON.
+#[test]
+fn fault_ost_latches_until_clr_ost() {
+    let mut m = Mcpwm::new();
+    pwm_high(&mut m);
+    // FH0: F0_OST (bit 7) + A_OST_U force-low (2 at [15:14]).
+    m.write32(FH0_CFG0, (1 << 7) | (2 << 14));
+    m.write32(FAULT_DETECT, (1 << 0) | (1 << 3));
+    m.tick_fault(163, &|_| 1);
+    assert_eq!(m.signal_level(160), 0, "OST trip forces low");
+    assert_eq!(m.read32(FH0_STATUS) & 2, 2, "OST_ON latched");
+    // Event ends but the force persists.
+    m.tick_fault(163, &|_| 0);
+    assert_eq!(m.signal_level(160), 0, "OST holds past the event");
+    assert_eq!(m.read32(FH0_STATUS) & 2, 2, "OST_ON still latched");
+    // CLR_OST rising edge releases.
+    m.write32(FH0_CFG1, 1);
+    assert_eq!(m.signal_level(160), 1, "CLR_OST releases");
+    assert_eq!(m.read32(FH0_STATUS) & 3, 0, "no trip ongoing");
+}
+
+/// Software FORCE_CBC toggle triggers a CBC trip when SW_CBC is enabled.
+#[test]
+fn fault_software_force_cbc_triggers_trip() {
+    let mut m = Mcpwm::new();
+    pwm_high(&mut m);
+    // SW_CBC (bit 0) + A_CBC_U force-low; no fault input needed.
+    m.write32(FH0_CFG0, (1 << 0) | (2 << 10));
+    assert_eq!(m.signal_level(160), 1, "no trip before force");
+    m.write32(FH0_CFG1, 1 << 3); // FORCE_CBC 0->1 toggle
+    assert_eq!(m.signal_level(160), 0, "software CBC forces low");
+    assert_eq!(m.read32(FH0_STATUS) & 1, 1, "CBC_ON latched");
+}
+
+/// Fault interrupts flow through INT_ENA into int_pending and clear via
+/// INT_CLR.
+#[test]
+fn fault_enter_interrupt_pending_and_clear() {
+    let mut m = Mcpwm::new();
+    pwm_high(&mut m);
+    m.write32(FH0_CFG0, (1 << 3) | (2 << 10));
+    m.write32(FAULT_DETECT, (1 << 0) | (1 << 3));
+    m.write32(INT_ENA, 1 << 9); // fault0-enter
+    assert!(!m.int_pending(), "nothing pending before trip");
+    m.tick_fault(163, &|_| 1);
+    assert!(m.int_pending(), "enter pending through ENA");
+    m.write32(INT_CLR, 1 << 9);
+    assert!(!m.int_pending(), "CLR drops the line");
+}

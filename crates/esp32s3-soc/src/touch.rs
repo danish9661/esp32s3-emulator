@@ -92,6 +92,12 @@ impl Touch {
         bits
     }
 
+    /// True while any touch pad is touched (threshold programmed and counter
+    /// below it). Used by deep-sleep entry to evaluate a touch wakeup.
+    pub fn any_touched(&self) -> bool {
+        self.active() != 0
+    }
+
     pub fn read32(&mut self, offset: u32) -> u32 {
         match offset {
             TOUCH_CHN_ST_OFF => {

@@ -191,6 +191,10 @@ pub struct Sdmmc {
     storage: Vec<u8>,
     /// Current transfer LBA (set by CMD17/18/24/25).
     lba: u32,
+    /// Erase-group bounds (SDHC LBAs) latched by CMD32/CMD33; CMD38 wipes
+    /// the inclusive range with 0xFF like a real erase.
+    erase_start: u32,
+    erase_end: u32,
     /// Pending data transfer FIFO (bytes) for the PIO path.
     data: VecDeque<u8>,
     data_remaining: usize,
@@ -299,6 +303,8 @@ impl Sdmmc {
             rca: 0x1234,
             storage,
             lba: 0,
+            erase_start: 0,
+            erase_end: 0,
             data: VecDeque::new(),
             data_remaining: 0,
             data_dir: 0,
@@ -361,8 +367,12 @@ impl Sdmmc {
         self.app_cmd = false;
 
         // Record the transfer LBA for data commands (SDHC: arg = block addr).
+        // CMD32/33 latch the erase-group bounds; CMD38 wipes the range.
         match index {
             17 | 18 | 24 | 25 => self.lba = arg,
+            32 => self.erase_start = arg,
+            33 => self.erase_end = arg,
+            38 => self.do_erase(),
             _ => {}
         }
         self.serve_scr = is_acmd && index == 51; // ACMD51 = SEND_SCR (data)
@@ -491,6 +501,22 @@ impl Sdmmc {
         self.regs[self.idx(RESP1)] = 0;
         self.regs[self.idx(RESP2)] = 0;
         self.regs[self.idx(RESP3)] = 0;
+    }
+
+    /// CMD38: wipe the CMD32/33-latched inclusive LBA range with 0xFF
+    /// (erased state), clamped to the modeled storage.
+    fn do_erase(&mut self) {
+        let (lo, hi) = (
+            self.erase_start.min(self.erase_end),
+            self.erase_start.max(self.erase_end),
+        );
+        let blocks = STORAGE_BLOCKS as u32;
+        for lba in lo..=hi.min(blocks.saturating_sub(1)) {
+            let base = lba as usize * BLOCK_LEN;
+            if let Some(slice) = self.storage.get_mut(base..base + BLOCK_LEN) {
+                slice.fill(0xFF);
+            }
+        }
     }
 
     /// Begin a PIO data transfer of `BYTCNT` bytes.
@@ -808,6 +834,26 @@ mod tests {
         let mut d = Sdmmc::new();
         d.write32(CTRL, 0x7);
         assert_eq!(d.read32(CTRL) & 0x7, 0);
+    }
+
+    #[test]
+    fn erase_group_wipes_range_with_ff() {
+        let mut d = Sdmmc::new();
+        // Scribble block 10, then erase groups 8..12 and verify.
+        d.write32(BYTCNT, 512);
+        issue(&mut d, 24, 10, true, true, true); // WRITE_BLOCK LBA 10
+        for _ in 0..128u32 {
+            d.write32(FIFO, 0x1234_5678);
+        }
+        assert!(d.read32(RINTSTS) & INT_DATA_OVER != 0);
+        issue(&mut d, 32, 8, true, false, false); // ERASE_WR_BLK_START
+        issue(&mut d, 33, 12, true, false, false); // ERASE_WR_BLK_END
+        issue(&mut d, 38, 0, true, false, false); // ERASE
+        let base = 10 * BLOCK_LEN;
+        assert!(d.storage[base..base + BLOCK_LEN].iter().all(|&b| b == 0xFF));
+        // Outside the range is untouched (MBR signature still there).
+        assert_eq!(d.storage[510], 0x55);
+        assert_eq!(d.storage[511], 0xAA);
     }
 
     #[test]

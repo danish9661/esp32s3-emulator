@@ -31,6 +31,9 @@ pub struct Esp32S3 {
     asleep: bool,
     /// Remaining steps to fast-forward while `asleep`.
     sleep_remaining: u64,
+    /// Light (resume, clocks gated) vs deep (reboot) sleep for the current
+    /// `asleep` period. Captured from the SLEEP_EN-time DIG_PWC PD config.
+    sleep_light: bool,
     /// Dedup state for the ROM console doubling bug: the ROM's putc at
     /// 0x40043CE8 writes each char to BOTH UART0 (0x60000000) and
     /// USB-Serial-JTAG (0x60038000).  Merging both FIFOs doubles every char.
@@ -51,6 +54,7 @@ impl Esp32S3 {
             flash: Vec::new(),
             asleep: false,
             sleep_remaining: 0,
+            sleep_light: false,
             last_console_byte: None,
             last_console_was_usb: false,
             fast_tick: false,
@@ -78,9 +82,12 @@ impl Esp32S3 {
             self.sleep_tick();
             return StepResult::Ok;
         }
-        // Firmware requested a deep-sleep this step: enter it and skip the CPU.
-        if let Some(ticks) = self.soc.consume_sleep_request() {
+        // Firmware requested a sleep this step: enter it and skip the CPU.
+        // Deep sleep reboots on wake; light sleep resumes in place (the
+        // kind comes from the SLEEP_EN-time DIG_PWC power-down config).
+        if let Some((ticks, deep)) = self.soc.consume_sleep_request() {
             self.asleep = true;
+            self.sleep_light = !deep;
             self.sleep_remaining = ticks.max(1);
             return StepResult::Ok;
         }
@@ -94,7 +101,18 @@ impl Esp32S3 {
             self.soc.set_rom_boot_mode(false);
         }
         self.cpu[1].step(&mut self.soc);
+        self.sync_dedic_out();
         r
+    }
+
+    /// Mirror both CPUs' dedicated-GPIO output latches (`tie_gpio`, written
+    /// by the `ee.*gpio_out`/`wur.gpio_out` TIE instructions) into the SoC
+    /// so the CORE1_GPIO_OUT matrix signals drive pads every step.
+    fn sync_dedic_out(&mut self) {
+        for c in 0..2 {
+            let bits = self.cpu[c].tie_gpio;
+            self.soc.set_dedic_out(c, bits);
+        }
     }
 
     /// Advance both cores by one fast block each (block-at-a-time execution).
@@ -128,8 +146,9 @@ impl Esp32S3 {
                 self.sleep_tick();
                 return (StepResult::Ok, StepResult::Ok, 0);
             }
-            if let Some(ticks) = self.soc.consume_sleep_request() {
+            if let Some((ticks, deep)) = self.soc.consume_sleep_request() {
                 self.asleep = true;
+                self.sleep_light = !deep;
                 self.sleep_remaining = ticks.max(1);
                 return (StepResult::Ok, StepResult::Ok, 0);
             }
@@ -140,6 +159,7 @@ impl Esp32S3 {
                 self.soc.set_rom_boot_mode(false);
             }
             let r1 = self.cpu[1].step(&mut self.soc);
+            self.sync_dedic_out();
             return (r0, r1, 2);
         };
         // Deep-sleep plumbing mirrors `step` (per macro-step; entry mid-block
@@ -150,8 +170,9 @@ impl Esp32S3 {
             self.sleep_tick();
             return (StepResult::Ok, StepResult::Ok, 0);
         }
-        if let Some(ticks) = self.soc.consume_sleep_request() {
+        if let Some((ticks, deep)) = self.soc.consume_sleep_request() {
             self.asleep = true;
+            self.sleep_light = !deep;
             self.sleep_remaining = ticks.max(1);
             return (StepResult::Ok, StepResult::Ok, 0);
         }
@@ -165,6 +186,7 @@ impl Esp32S3 {
             // through the MMU again (see `Soc::rom_boot_mode`).
             self.soc.set_rom_boot_mode(false);
         }
+        self.sync_dedic_out();
         (r0, r1, n0 + n1)
     }
 
@@ -231,6 +253,7 @@ impl Esp32S3 {
         self.soc = Soc::new();
         self.asleep = false;
         self.sleep_remaining = 0;
+        self.sleep_light = false;
         self.last_console_byte = None;
         self.last_console_was_usb = false;
         let f = self.flash.clone();
@@ -263,6 +286,16 @@ impl Esp32S3 {
     /// the period elapses, then the machine reboots with the wakeup cause set.
     pub fn begin_sleep(&mut self, ticks: u64) {
         self.asleep = true;
+        self.sleep_light = false;
+        self.sleep_remaining = ticks.max(1);
+    }
+
+    /// Enter light-sleep for `ticks` steps (host-test helper mirroring
+    /// `begin_sleep`); the CPU halts, then resumes in place with the
+    /// stashed wakeup cause applied and no reboot.
+    pub fn begin_light_sleep(&mut self, ticks: u64) {
+        self.asleep = true;
+        self.sleep_light = true;
         self.sleep_remaining = ticks.max(1);
     }
 
@@ -288,13 +321,15 @@ impl Esp32S3 {
     }
 
     /// Reboot after a deep-sleep period, recording the evaluated wakeup
-    /// cause (timer / EXT0 / EXT1 / ULP) so `esp_sleep_get_wakeup_cause()`
-    /// returns it, plus the EXT1 triggering pads. RTC slow/fast memory and
-    /// ULP state are retained across the reboot, like silicon.
+    /// cause (timer / EXT0 / EXT1 / touch / ULP) so
+    /// `esp_sleep_get_wakeup_cause()` returns it, plus the EXT1 triggering
+    /// pads. RTC slow/fast memory and ULP state are retained across the
+    /// reboot, like silicon. A light sleep instead resumes in place (no
+    /// reset: DRAM, CPU state and the reset reason are untouched) after
+    /// applying the same wakeup cause.
     fn wake(&mut self) {
         let cause = self.soc.take_sleep_cause();
         let ext1 = self.soc.take_sleep_ext1();
-        let retain = self.soc.snapshot_rtc();
         let cause = if cause == 0 {
             // Should not happen (consume always stashes something), but keep
             // the old timer default rather than reporting UNDEFINED.
@@ -302,6 +337,15 @@ impl Esp32S3 {
         } else {
             cause
         };
+        if self.sleep_light {
+            self.soc.set_sleep_wakeup_cause(cause);
+            self.soc.set_sleep_wakeup_int();
+            self.soc.set_ext1_status(ext1);
+            self.asleep = false;
+            self.sleep_remaining = 0;
+            return;
+        }
+        let retain = self.soc.snapshot_rtc();
         self.reset();
         self.soc.set_sleep_wakeup_cause(cause);
         self.soc.set_ext1_status(ext1);

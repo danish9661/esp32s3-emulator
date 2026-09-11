@@ -54,6 +54,9 @@ const INT_ST_OFF: u32 = 0x48;
 const INT_CLR_OFF: u32 = 0x4C;
 const TOUCH_DONE_BIT: u32 = 1 << 6;
 const TOUCH_SCAN_DONE_BIT: u32 = 1 << 4;
+// Sleep-event interrupt bits (rtc_cntl_reg.h INT_RAW): SLP_REJECT = bit 0,
+// SLP_WAKEUP = bit 1 (`rtc_sleep_start` spins on bits [1:0]).
+const SLP_WAKEUP_BIT: u32 = 1 << 1;
 // Touch FSM trigger registers (rtc_cntl_reg.h): CTRL2 @ +0x10C
 // (touch_start_force / timer_force_done), SCAN_CTRL @ +0x110 (pad map).
 const TOUCH_CTRL2_OFF: u32 = 0x10C;
@@ -91,6 +94,9 @@ pub const fn wakeup_ena(n: u32) -> u32 {
 pub const CAUSE_EXT0: u32 = 1 << 0;
 pub const CAUSE_EXT1: u32 = 1 << 1;
 pub const CAUSE_TIMER: u32 = 1 << 3;
+// Touch-pad wakeup (`TOUCH_TRIG_EN = BIT8`, esp_rom rtc.h): the touch
+// controller runs during sleep and wakes on a threshold crossing.
+pub const CAUSE_TOUCH: u32 = 1 << 8;
 pub const CAUSE_ULP: u32 = 1 << 9;
 pub const CAUSE_COCPU: u32 = 1 << 11;
 
@@ -111,6 +117,12 @@ pub struct Rtc {
     sleep_req: bool,
     /// Captured sleep duration (slow ticks) for the pending request.
     sleep_target: u64,
+    /// Deep (reboot on wake) vs light (resume) sleep, captured at SLEEP_EN
+    /// from DIG_PWC DG_WRAP_PD_EN (bit 31): the deep-sleep driver powers
+    /// down the digital core, light sleep keeps it (rtc_cntl_reg.h
+    /// RTC_CNTL_DIG_PWC_REG @ +0x90; verified: deep driver programs
+    /// 0xC0020010, light sleep 0x00020010, direct pokes 0x00020000).
+    sleep_deep: bool,
     /// RTC_CNTL_SLP_WAKEUP_CAUSE_REG mirror (set by the emulator on wake).
     wakeup_cause: u32,
     /// EXT_WAKEUP1_STATUS mirror (triggering RTC pads, set on EXT1 wake).
@@ -129,6 +141,12 @@ pub struct Rtc {
     /// scan via TOUCH_CTRL2/SCAN_CTRL (the event the driver's oneshot wait
     /// blocks on), cleared by INT_CLR. Other INT_RAW bits live in `regs`.
     touch_raw: u32,
+    /// Latched sleep-event bits (SLP_REJECT bit 0 / SLP_WAKEUP bit 1,
+    /// rtc_cntl_reg.h INT_RAW): `rtc_sleep_start` spins on bits [1:0]
+    /// after triggering sleep, so a light-sleep wake latches SLP_WAKEUP
+    /// (cleared by INT_CLR like the touch latch). SLP_REJECT is never
+    /// raised (no rejected-sleep flow is modeled).
+    sleep_raw: u32,
     /// Generic backing store for the full RTC_CNTL page (0x000..0x400).  Most
     /// registers are simple stores; the special-cased ones below override this.
     regs: [u32; 0x400 / 4],
@@ -152,6 +170,7 @@ impl Default for Rtc {
             slp_timer1: 0,
             sleep_req: false,
             sleep_target: 0,
+            sleep_deep: true,
             wakeup_cause: 0,
             ext1_status: 0,
             // Silicon-accurate POWERON causes (verified live-ROM decode:
@@ -164,6 +183,7 @@ impl Default for Rtc {
             reset_state: RESET_CAUSE_POWERON | (RESET_CAUSE_POWERON << 6),
             slp_timer_written: false,
             touch_raw: 0,
+            sleep_raw: 0,
             regs: [0u32; 0x400 / 4],
             ulp: crate::ulp::Ulp::default(),
             wdt_count: 0,
@@ -217,16 +237,18 @@ impl Rtc {
         core::mem::replace(&mut self.wdt_reset, false)
     }
 
-    /// True if firmware requested a deep-sleep since the last call; returns
-    /// the captured sleep duration (slow-clock ticks) and clears the flag.
+    /// True if firmware requested a sleep since the last call; returns the
+    /// captured sleep duration (slow-clock ticks) plus whether it is a
+    /// deep sleep (reboot on wake) or light sleep (resume), and clears
+    /// the flag.
     pub fn sleep_req(&self) -> bool {
         self.sleep_req
     }
 
-    pub fn consume_sleep_request(&mut self) -> Option<u64> {
+    pub fn consume_sleep_request(&mut self) -> Option<(u64, bool)> {
         if self.sleep_req {
             self.sleep_req = false;
-            Some(self.sleep_target)
+            Some((self.sleep_target, self.sleep_deep))
         } else {
             None
         }
@@ -236,6 +258,12 @@ impl Rtc {
     /// after a deep-sleep reboot (called by the machine on wake).
     pub fn set_wakeup_cause(&mut self, bits: u32) {
         self.wakeup_cause = bits;
+    }
+
+    /// Latch the SLP_WAKEUP interrupt (called by the machine on a
+    /// light-sleep wake so `rtc_sleep_start`'s INT_RAW spin exits).
+    pub fn set_sleep_wakeup(&mut self) {
+        self.sleep_raw |= SLP_WAKEUP_BIT;
     }
 
     /// Record the EXT1 triggering pads for `esp_sleep_get_ext1_wakeup_status`.
@@ -287,9 +315,9 @@ impl Rtc {
             EXT1_STATUS_OFF => self.ext1_status,
             // Interrupt status: live touch completion latched in
             // `touch_raw` ORed over the stored RAW; ST masks by ENA.
-            INT_RAW_OFF => self.regs[INT_RAW_OFF as usize / 4] | self.touch_raw,
+            INT_RAW_OFF => self.regs[INT_RAW_OFF as usize / 4] | self.touch_raw | self.sleep_raw,
             INT_ST_OFF => {
-                (self.regs[INT_RAW_OFF as usize / 4] | self.touch_raw)
+                (self.regs[INT_RAW_OFF as usize / 4] | self.touch_raw | self.sleep_raw)
                     & self.regs[INT_ENA_OFF as usize / 4]
             }
             // ULP-RISC-V block lives at offset 0x100..0x200 of this page.
@@ -320,15 +348,13 @@ impl Rtc {
                 }
             }
             STATE0_OFF if value & SLEEP_EN_BIT != 0 => {
-                // Legacy S3 deep-sleep trigger.  Capture the period the
-                // firmware already programmed into SLP_TIMER0/1.
-                // NOTE: light sleep (esp_light_sleep_start) shares SLEEP_EN
-                // but hangs earlier in its SMP stall handshake (both cores
-                // MEMW-spin, SLEEP_EN never written), so gating on DIG_PWC
-                // PD bits was tried and reverted: it misrouted direct-poke
-                // deep sleep (which sets no PD bits yet expects a reboot).
-                // SLEEP_EN unconditionally means deep (reboot) here.
+                // Sleep trigger (shared by deep and light sleep). Capture
+                // the period the firmware already programmed into
+                // SLP_TIMER0/1 plus the deep/light kind: DG_WRAP_PD_EN
+                // (DIG_PWC bit 31) means the digital core powers down, so
+                // the CPUs cannot resume and the machine must reboot.
                 self.sleep_req = true;
+                self.sleep_deep = self.regs[0x90 / 4] & (1 << 31) != 0;
                 self.sleep_target =
                     (self.slp_timer0 as u64) | ((self.slp_timer1 as u64 & 0xFFFF) << 32);
             }
@@ -362,6 +388,7 @@ impl Rtc {
                 // Write-1-to-clear over stored RAW and latched touch bits.
                 self.regs[INT_RAW_OFF as usize / 4] &= !value;
                 self.touch_raw &= !value;
+                self.sleep_raw &= !value;
                 self.regs[offset as usize / 4] = value;
             }
             o if (ULP_OFF_START..ULP_OFF_END).contains(&o) => {

@@ -220,6 +220,10 @@ pub struct Soc {
     mcpwm: Mcpwm,
     /// MCPWM group 1: independent copy of the group-0 block.
     mcpwm1: Mcpwm,
+    /// Dedicated-GPIO output latches mirrored per CPU core from the CPUs'
+    /// `tie_gpio` TIE registers (the machine syncs them every step; the
+    /// SoC cannot see CPU state itself). Bit c = OUT channel c.
+    dedic_out: [u32; 2],
     lp_uart: LpUart,
     spi: [Spi; 2],
     /// SPI1 (0x60002000) + SPIMEM0 (0x60003000) flash controllers, sharing
@@ -377,6 +381,7 @@ impl Soc {
             gpio: Gpio::new(),
             ledc: Lcdc::new(),
             mcpwm: Mcpwm::new(),
+            dedic_out: [0; 2],
             mcpwm1: Mcpwm::new(),
             lp_uart: LpUart::new(),
             spi: [Spi::new(0), Spi::new(1)],
@@ -732,6 +737,16 @@ impl Soc {
         out
     }
 
+    /// Mirror a CPU's dedicated-GPIO output latch (`tie_gpio`, written by
+    /// the `ee.*gpio_out`/`wur.gpio_out` TIE instructions) into the SoC so
+    /// `signal_level` can drive the CORE1_GPIO_OUT matrix signals. Called
+    /// by the machine every step for both cores.
+    pub fn set_dedic_out(&mut self, core: usize, bits: u32) {
+        if core < 2 {
+            self.dedic_out[core] = bits;
+        }
+    }
+
     /// Drain all host-observable events accumulated since the last call
     /// (GPIO edges + SPI/I2C transactions). The wasm bridge calls this once
     /// per animation frame and dispatches each event to the matching
@@ -957,6 +972,32 @@ impl Soc {
                 };
                 self.mcpwm1.tick_capture(175, &cap_in);
             }
+            // MCPWM fault/trip: level-driven FAULT0..2 inputs (group 0 =
+            // 163..165, group 1 = 172..174, gpio_sig_map.h PWMx_Fn_IN_IDX),
+            // sampled even with every timer stopped. Unrouted inputs read
+            // low so an enabled-but-unconnected detector never trips.
+            if self.mcpwm.fault_active() {
+                let rb = self.gpio_in_readback();
+                let fault_in = |sig: u32| -> u32 {
+                    match self.gpio.in_sel(sig) {
+                        Some((pin, inv)) if pin < 32 => ((rb >> pin) & 1) ^ (inv as u32),
+                        Some((pin, inv)) => self.gpio.pin_level(pin) ^ (inv as u32),
+                        None => 0,
+                    }
+                };
+                self.mcpwm.tick_fault(163, &fault_in);
+            }
+            if self.mcpwm1.fault_active() {
+                let rb = self.gpio_in_readback();
+                let fault_in = |sig: u32| -> u32 {
+                    match self.gpio.in_sel(sig) {
+                        Some((pin, inv)) if pin < 32 => ((rb >> pin) & 1) ^ (inv as u32),
+                        Some((pin, inv)) => self.gpio.pin_level(pin) ^ (inv as u32),
+                        None => 0,
+                    }
+                };
+                self.mcpwm1.tick_fault(172, &fault_in);
+            }
             if self.sdm.is_active() {
                 self.sdm.tick();
             }
@@ -1151,6 +1192,11 @@ impl Soc {
     /// LEDC occupies 73..80, I2CEXT0 SCL/SDA = 89/90, I2CEXT1 = 91/92,
     /// GPSPI2 (FSPI) 101..105 + CS 110/111, GPSPI3 66..72 (S3
     /// gpio_sig_map.h); everything else reads 0.
+    ///
+    /// Dedicated-GPIO OUT channels (CORE1_GPIO_OUT0..2 = 129..131,
+    /// OUT3..6 = 252..255, OUT7 = 54) drive the OR of both cores'
+    /// mirrored `tie_gpio` latches (either core writing lights the pin;
+    /// single-core firmware is exact).
     fn signal_level(&self, sig: u32) -> u32 {
         if (73..=80).contains(&sig) {
             self.ledc.signal_level(sig)
@@ -1176,6 +1222,14 @@ impl Soc {
         } else if (28..=32).contains(&sig) {
             // I2S1 output signals (BCK/WS/SD + RX BCK/WS).
             self.i2s[1].signal_level(sig)
+        } else if matches!(sig, 54 | 129..=131 | 252..=255) {
+            // Dedicated-GPIO OUT channels 0..2/3..6/7 (CORE1_GPIO_OUTx).
+            let ch = match sig {
+                129..=131 => sig - 129,
+                252..=255 => sig - 252 + 3,
+                _ => 7,
+            };
+            ((self.dedic_out[0] | self.dedic_out[1]) >> ch) & 1
         } else {
             self.spi[0].signal_level(sig)
                 | self.spi[1].signal_level(sig)
@@ -2000,9 +2054,10 @@ impl Soc {
         self.timg[0].consume_reset() || self.timg[1].consume_reset() || self.rtc.consume_reset()
     }
 
-    /// True if firmware requested a deep-sleep (wrote `RTC_CNTL_SLEEP_EN`).
-    /// Returns the captured sleep duration (slow-clock ticks) and clears the
-    /// flag. The machine consumes this each step to fast-forward the sleep.
+    /// True if firmware requested a sleep (wrote `RTC_CNTL_SLEEP_EN`).
+    /// Returns the captured sleep duration (slow-clock ticks) plus the
+    /// deep/light kind, and clears the flag. The machine consumes this each
+    /// step to fast-forward the sleep.
     ///
     /// Wake-source evaluation happens here (all state is visible: RTC
     /// registers, GPIO levels, ULP run state): EXT0/EXT1 level triggers met
@@ -2012,8 +2067,8 @@ impl Soc {
     /// computed cause + EXT1 status are stashed for `wake()` (which reboots
     /// before applying them). With no timer and no immediate trigger the
     /// budget is unbounded — the sleep ends on a watched event.
-    pub fn consume_sleep_request(&mut self) -> Option<u64> {
-        let target = self.rtc.consume_sleep_request()?;
+    pub fn consume_sleep_request(&mut self) -> Option<(u64, bool)> {
+        let (target, deep) = self.rtc.consume_sleep_request()?;
         let ena = self.rtc.wakeup_state();
         let timer_armed = ena & crate::rtc::wakeup_ena(3) != 0 || self.rtc.slp_timer_written();
         let mut cause = 0;
@@ -2060,6 +2115,14 @@ impl Soc {
         if timer_armed {
             cause |= crate::rtc::CAUSE_TIMER;
         }
+        // Touch-pad wakeup (WAKEUP_ENA bit 8): any touched pad (threshold
+        // programmed and counter below it — the same live condition the
+        // touch STATUS path reports) wakes immediately with the touch
+        // cause. The sleep-mode SET1/SET2 trigger-source selection is not
+        // modeled (any pad wakes, matching the default BOTH configuration).
+        if ena & crate::rtc::wakeup_ena(8) != 0 && self.touch.any_touched() {
+            cause |= crate::rtc::CAUSE_TOUCH;
+        }
         // ULP halt edge is watched during the fast-forward (the ULP keeps
         // ticking while the CPUs halt); nothing to set yet. Either ULP
         // trigger (FSM bit 9, COCPU bit 11) arms the watch when the ULP is
@@ -2076,11 +2139,11 @@ impl Soc {
         self.sleep_cause = cause;
         self.sleep_ext1 = ext1;
         if timer_armed {
-            Some(target)
+            Some((target, deep))
         } else if cause != 0 {
-            Some(1) // immediate trigger: wake on the next step
+            Some((1, deep)) // immediate trigger: wake on the next step
         } else {
-            Some(u64::MAX) // ULP edge or nothing: fast-forward until an event
+            Some((u64::MAX, deep)) // ULP edge or nothing: fast-forward until an event
         }
     }
 
@@ -2222,6 +2285,12 @@ impl Soc {
     /// after a deep-sleep reboot (machine writes this on wake).
     pub fn set_sleep_wakeup_cause(&mut self, bits: u32) {
         self.rtc.set_wakeup_cause(bits);
+    }
+
+    /// Latch the RTC SLP_WAKEUP interrupt (machine writes this on a
+    /// light-sleep wake so `rtc_sleep_start`'s INT_RAW spin exits).
+    pub fn set_sleep_wakeup_int(&mut self) {
+        self.rtc.set_sleep_wakeup();
     }
 
     /// Record the reset causes read by the live ROM's
@@ -2459,6 +2528,26 @@ impl Bus for Soc {
             final_src |= 1 << (81 + cpu);
         }
         self.intc.pending_lines(cpu, final_src)
+    }
+
+    /// Dedicated-GPIO input channels for `ee.get_gpio_in`: the 8
+    /// CORE1_GPIO_IN signals (129..131, 252..255, 54, gpio_sig_map.h)
+    /// resolved through the GPIO-matrix input routing against the pad
+    /// readback (pins < 32) or pad level, exactly like MCPWM
+    /// capture/fault sampling. Unrouted channels read 0.
+    fn dedic_gpio_in(&mut self) -> u32 {
+        const IN_SIGS: [u32; 8] = [129, 130, 131, 252, 253, 254, 255, 54];
+        let rb = self.gpio_in_readback();
+        let mut v = 0u32;
+        for (c, sig) in IN_SIGS.iter().enumerate() {
+            let lvl = match self.gpio.in_sel(*sig) {
+                Some((pin, inv)) if pin < 32 => ((rb >> pin) & 1) ^ (inv as u32),
+                Some((pin, inv)) => self.gpio.pin_level(pin) ^ (inv as u32),
+                None => 0,
+            };
+            v |= (lvl & 1) << c;
+        }
+        v
     }
 
     #[inline(always)]

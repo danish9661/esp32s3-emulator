@@ -1665,6 +1665,44 @@ mod cpu_tests {
     }
 
     #[test]
+    fn ee_gpio_latch_operand_layout() {
+        // GAS-captured token words (stock xtensa-esp32s3-elf-as; objdump
+        // prints the LE word so tokens are used verbatim). This family does
+        // NOT use the CAL triple: wr_mask data = bits [7:4], mask =
+        // bits [11:8]; set/clr imm = bits [7:4]; get dest = bits [7:4].
+        // ee.wr_mask_gpio_out a2, a3 (token 0x724324).
+        let cpu = ee_run1(0x0072_4324, |c| {
+            c.set_reg(2, 0b1010);
+            c.set_reg(3, 0b1100);
+            c.tie_gpio = 0;
+        });
+        assert_eq!(cpu.tie_gpio, 0b1000);
+        // Clearing through the mask: latch=0xF, data=0, mask=0xF -> 0.
+        let cpu = ee_run1(0x0072_4324, |c| {
+            c.set_reg(2, 0);
+            c.set_reg(3, 0xF);
+            c.tie_gpio = 0xF;
+        });
+        assert_eq!(cpu.tie_gpio, 0);
+        // ee.set_bit_gpio_out 5 (token 0x754054).
+        let cpu = ee_run1(0x0075_4054, |c| {
+            c.tie_gpio = 0b1010;
+        });
+        assert_eq!(cpu.tie_gpio, 0b1111);
+        // ee.clr_bit_gpio_out 9 (token 0x764094).
+        let cpu = ee_run1(0x0076_4094, |c| {
+            c.tie_gpio = 0b1111;
+        });
+        assert_eq!(cpu.tie_gpio, 0b0110);
+        // ee.get_gpio_in a4 (token 0x650844): RamBus has no pins routed.
+        let cpu = ee_run1(0x0065_0844, |c| {
+            c.set_reg(4, 0xDEAD_BEEF);
+            c.tie_gpio = 0b1111;
+        });
+        assert_eq!(cpu.reg(4), 0);
+    }
+
+    #[test]
     fn ee_vsl_32_shifts_left() {
         // ee.vsl.32 q1, q2 = 14 3f dd: shift LEFT by SAR.
         let cpu = ee_run1(0x00DD_3F14, |c| {
@@ -1848,21 +1886,24 @@ mod cpu_tests {
 
     #[test]
     fn ee_gpio_latch_round_trip() {
-        // ee.set_bit_gpio_out 3 = 34 40 75; wr_mask; get_gpio_in.
+        // ee.set_bit_gpio_out 3 (token 0x754034); wr_mask; get_gpio_in.
         let cpu = ee_run1(0x0075_4034, |_| {});
         assert_eq!(cpu.tie_gpio, 3);
-        // ee.wr_mask_gpio_out a2, a3 = 24 43 72: gpio = (gpio & ~mask) | (data & mask).
+        // ee.wr_mask_gpio_out a2, a3 (token 0x724324): data = a2 at
+        // bits [7:4], mask = a3 at bits [11:8].
+        // gpio = (3 & ~0xA) | (0xF & 0xA) = 0xB.
         let cpu = ee_run1(0x0072_4324, |c| {
             c.tie_gpio = 3;
             c.set_reg(2, 0xF);
             c.set_reg(3, 0xA);
         });
-        assert_eq!(cpu.tie_gpio, 0xA);
-        // ee.get_gpio_in a2 = 24 08 65 reads back the latch.
+        assert_eq!(cpu.tie_gpio, 0xB);
+        // ee.get_gpio_in a2 (token 0x650824, dest = bits [7:4]) reads the
+        // SoC input channels, NOT the latch (RamBus: unrouted = 0).
         let cpu = ee_run1(0x0065_0824, |c| {
             c.tie_gpio = 0xA;
         });
-        assert_eq!(cpu.reg(2), 0xA);
+        assert_eq!(cpu.reg(2), 0);
     }
 
     #[test]

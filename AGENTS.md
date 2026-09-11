@@ -2887,3 +2887,118 @@ Core design:
     with zero UART) — a partial init fix that passes one check only to
     trip a later assert; always run to the PASS marker, never stop at
     "error message changed".
+  - 2026-09-10: **Depth audit round 2 (PSRAM follow-ups already landed
+    separately): SD erase, MCPWM fault, dedicated GPIO, touch wakeup;
+    USB-OTG/eMMC scoped out.**
+    - **SD erase-group semantics** (`sdmmc.rs`): CMD32/33 latch the SDHC
+      LBA range, CMD38 wipes it with 0xFF (clamped to the 4MB card).
+      Previously erase returned success without wiping. Unit test
+      `erase_group_wipes_range_with_ff`; `sdfat` still mounts (regression
+      green). CMD12/STOP and SDSC byte-addressing remain unmodeled
+      (single-shot model; card is consistently SDHC+v2.0/CCS).
+    - **eMMC: documented out-of-scope (no gap)**. The DWMMC host could
+      clock it, but the only card in the emulated world is our SD card
+      and `sdmmc_card_init` takes the SD path (CMD8/ACMD41 succeed, so
+      MMC CMD1 probing never runs). No firmware flow can reach MMC init.
+    - **MCPWM fault/trip submodule (was wrongly claimed absent — the old
+      "S3 has NO Trip-Zone/fault" note came from grepping "fault" and
+      matching "default" noise; `mcpwm_reg.h` HAS FAULT_DETECT @0xE4 +
+      FHx_CFG0/CFG1/STATUS and soc_caps has GPIO_FAULTS_PER_GROUP=3)**.
+      Implemented: F0/1/2 enable+polarity, live EVENT bits, per-operator
+      CBC (force while event ongoing; CBCPULSE refresh-moment not
+      modeled — reset behavior is immediate) and OST (latches until
+      CLR_OST rising edge) with D/U direction selectors, software
+      FORCE_CBC/OST toggles (SW-gated), FH_STATUS CBC_ON/OST_ON, enter
+      (INT 9/10/11) + exit (12/13/14) interrupts, fault inputs on matrix
+      163-165 (group0) / 172-174 (group1) sampled even with timers
+      stopped. Force applies post-dead-time at `signal_level`
+      (documented ordering assumption). 4 unit tests + machine-level
+      `esp32s3_mcpwm_fault` sketch (GPIO4 drives FAULT0, GPIO2 observed:
+      idle/trip/release 500/500 + EVENT + enter bit) → `MCPWM FAULT
+      PASS` (battery entry). Cautionary tale: the first sketch run
+      failed on a STALE run_flash binary (model was right) — always
+      rebuild the harness before concluding.
+    - **Dedicated GPIO via the real IDF driver**. Findings: S3 dedic GPIO
+      has NO peripheral registers (only SYSTEM clock/reset bits) — OUT/IN
+      channels ARE matrix signals (CORE1_GPIO_OUT/IN 0-2 = 129-131,
+      3-6 = 252-255, 7 = 54) driven by the CPU TIE latch (`tie_gpio`).
+      Model: `Bus::dedic_gpio_in` hook (default 0) resolves the 8 IN
+      signals through input routing for `ee.get_gpio_in`; OUT signals
+      drive the OR of both cores' latches mirrored per step by the
+      machine (`Soc::set_dedic_out`). **Real TIE bug fixed along the
+      way**: our `ee.wr_mask_gpio_out` had data/mask SWAPPED (mask from
+      bits[7:4], data from [11:8]) — the symmetric HIGH case passed
+      vacuously while LOW stuck. GAS-probed truth (this family ignores
+      the CAL triple): wr_mask data=[7:4]/mask=[11:8], set/clr imm=
+      [7:4], get dest=[7:4] (token sweep a2,a3->0x724324 etc.; objdump
+      prints the LE word so tokens are KAT words verbatim — the 3rd
+      byte-order incident in this file's history). The old round-trip
+      KAT pinned the swapped behavior (expectations corrected to 0xB
+      and bus-0) + new `ee_gpio_latch_operand_layout` KAT with
+      GAS-captured words. Validated: `esp32s3_dedic_gpio` (IDF
+      `dedic_gpio_new_bundle` + write/read on GPIO2 loopback + 5/5
+      polled edges) → `DEDIC GPIO PASS` (battery entry). S3 has NO
+      dedic bundle interrupts (`SOC_DEDIC_GPIO_HAS_INTERRUPT` absent —
+      polling `read_in` is the silicon path, in-sketch).
+    - **Touch-pad deep-sleep wakeup**. `TOUCH_TRIG_EN = BIT8` (ROM rtc.h);
+      sleep entry wakes immediately with CAUSE_TOUCH when ENA bit 8 is
+      set and any pad is touched (live threshold/counter condition).
+      Validated via the real driver (`esp_sleep_enable_touchpad_wakeup`
+      + `esp_deep_sleep_start`): `esp32s3_deepsleep_touch` (THRES3 poke
+      + TOUCH_INJECT) → `WOKE`/`PASS` (battery entry, 50M).
+    - **USB-OTG: documented out-of-scope (WiFi/BLE class)**. S3 HAS a
+      DesignWare OTG block (767-field `usb_dwc_struct.h`,
+      `SOC_USB_OTG_SUPPORTED`, TinyUSB stack present), but device-mode
+      enumeration (setup packets, descriptors, EP0 control, MSC/HID/CDC
+      classes) + host mode is weeks of work with an external
+      counterparty, and zero in-tree firmware needs it (all sketches use
+      USB-Serial-JTAG `Serial`). NOTE: Arduino "USB CDC On Boot" routes
+      `Serial` through OTG instead — that config is consequently
+      unsupported (no console output); default Serial/JTAG path is fully
+      validated.
+    Battery 76/0/1 (only `lightsleep` skipped).
+  - 2026-09-11: **Light-sleep machinery lands (resume works); wakeup-cause
+    flag pending (battery still SKIP)**. User directive "do light sleep".
+    - **Old deadlock cured along the way**: the documented SMP stall
+      handshake hang is gone (FROM_CPU_INTR2/3 + later fixes unblocked
+      it) — `esp_light_sleep_start` now reaches SLEEP_EN.
+    - **Deep/light routing via DIG_PWC**: SLEEP_EN is shared, so the kind
+      comes from `DG_WRAP_PD_EN` (DIG_PWC bit 31, RTC_CNTL+0x90) —
+      verified by probing all three entries (deep driver 0xC0020010,
+      light 0x00020010, poke 0x00020000). Deep reboots; light halts CPUs,
+      fast-forwards, and resumes in place (DRAM/CPU/reset-cause intact)
+      with the evaluated cause + EXT1 status applied. `wake()` branches
+      on a new `sleep_light` flag so all step paths + the wasm bridge
+      fast-forward stay correct. The `deepsleep_poke` sketch now sets PD
+      bits like the real driver; a stale machine test was updated the
+      same way. New machine test `light_sleep_resumes_without_reboot`
+      (cause + DRAM + POWERON-cause assertions).
+    - **RTC SLP_WAKEUP interrupt modeled** (`sleep_raw` latch like
+      `touch_raw`): `rtc_sleep_start` spins on INT_RAW[1:0] waiting for
+      SLP_REJECT/WAKEUP — without the latch bit the resume never
+      returns. Latched on light wake, cleared by INT_CLR, flows into
+      INT_ST/source 39.
+    - Validated: `LIGHTSLEEP START` → `RESUMED`, marker intact
+      (`marker=1234`), `wcause=8` (TIMER in the register), no reboot.
+    - **REMAINING GAP (why SKIP stays)**: `esp_sleep_get_wakeup_cause`
+      reads 0, not TIMER. Root-caused to the firmware-internal
+      `s_light_sleep_wakeup` DRAM flag staying 0: it is set iff the
+      sleep-inner helper returns 0, but it returns 0x103
+      (ESP_ERR_INVALID_STATE). The 0x103 comes from a UART-resume
+      helper's `movnez a2, a8(=0x103), a2` firing on a nonzero input
+      status (a2-in=1), downstream of `rtc_vddsdio_get_config` scratch
+      state — traced with single-step ground truth through ~40 dynamic
+      probes (pc triggers lie: exact-pc sampling misses mid-block pcs;
+      objdump desyncs repeatedly in this region — our decoder only).
+      Prime suspect: post-wake power-register restore semantics (SLEEP_EN
+      left set? SDIO_CONF?) making the resume instance diverge; the
+      suspend instance behaves (a2-out=0). Setting the flag from the
+      emulator was REJECTED (build-specific DRAM address — same class as
+      the documented i2c `cmd_link` boundary). Next step if resumed:
+      single-step the resume-helper instance's inputs vs the suspend
+      instance's to isolate the diverging read.
+    - Cautionary tales: (1) a stale `run_flash` binary + an independent
+      reboot-loop path initially masqueraded as "handshake passes"; (2)
+      SLEEP_EN-probe via accessors (no_std has no eprintln); (3) the
+      machine consumes the request same-step, so harness checks must
+      latch, not poll the flag.

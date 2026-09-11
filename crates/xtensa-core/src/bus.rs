@@ -21,4 +21,13 @@ pub trait Bus {
     fn int_pending(&mut self, _cpu: usize) -> u32 {
         0
     }
+
+    /// Dedicated-GPIO input channels currently seen by the CPU (bit c =
+    /// channel c level). The ESP32-S3 wires the `ee.get_gpio_in` TIE
+    /// instruction to the GPIO-matrix CORE1_GPIO_IN0..7 inputs (signals
+    /// 129..131, 252..255, 54); the SoC resolves them against pad levels.
+    /// Defaults to 0 (no pins routed, like an unconnected matrix input).
+    fn dedic_gpio_in(&mut self) -> u32 {
+        0
+    }
 }

@@ -1070,21 +1070,35 @@ fn ee_vmulas_qacc(cpu: &mut Cpu, name: &str, raw: u32) {
     }
 }
 
-/// GPIO output latch ops (QEMU `wr_mask_gpio_out_s3`); get_gpio_in reads
-/// back the latch. wr_mask takes (mask_ar, data_ar); set/clr take a 4-bit
-/// immediate mask at raw[7:4].
-pub fn ee_gpio(cpu: &mut Cpu, raw: u32, kind: u8) {
+/// GPIO output latch ops (QEMU `wr_mask_gpio_out_s3`); `ee.get_gpio_in`
+/// reads the SoC-resolved dedicated-input channels (GPIO-matrix
+/// CORE1_GPIO_IN0..7) via the bus, NOT the output latch.
+///
+/// GAS-probed operand layout (objdump prints the LE word, so KAT words are
+/// the printed tokens verbatim; this family does NOT use the CAL triple):
+/// - `ee.wr_mask_gpio_out data_ar, mask_ar`: data = AR at bits [7:4]
+///   (first operand), mask = AR at bits [11:8] (second operand). Verified
+///   by token sweep (`a2,a3` -> 0x724324, `a3,a2` -> 0x724234,
+///   `a5,a3` -> 0x724354, `a2,a6` -> 0x724624; bits [23:20] stay 2): the
+///   esp-idf dedic driver emits `a4, a3` = 0x724344 for value/mask. (An
+///   earlier data/mask swap passed vacuously on the symmetric HIGH case
+///   and stuck HIGH on the LOW write — real firmware caught it.)
+/// - `ee.set/clr_bit_gpio_out imm`: 4-bit immediate at bits [7:4]
+///   (verified: set 3 -> 0x754034, set 5 -> 0x754054, clr 9 -> 0x764094).
+/// - `ee.get_gpio_in dest_ar`: dest = AR at bits [7:4] (verified:
+///   a4/a2/a9 -> tokens 0x650844/0x650824/0x650894).
+pub fn ee_gpio<B: Bus>(cpu: &mut Cpu, bus: &mut B, raw: u32, kind: u8) {
     match kind {
         0 => {
-            let mask = cpu.reg(ar_t(raw));
-            let data = cpu.reg((raw >> 8) & 0xF);
+            let data = cpu.reg(ar_t(raw));
+            let mask = cpu.reg((raw >> 8) & 0xF);
             cpu.tie_gpio = (cpu.tie_gpio & !mask) | (data & mask);
         }
         1 => cpu.tie_gpio |= (raw >> 4) & 0xF,
         2 => cpu.tie_gpio &= !((raw >> 4) & 0xF),
         _ => {
             let a = ar_t(raw);
-            cpu.set_reg(a, cpu.tie_gpio);
+            cpu.set_reg(a, bus.dedic_gpio_in());
         }
     }
 }
@@ -1252,13 +1266,13 @@ pub fn exec_ee<B: Bus>(cpu: &mut Cpu, bus: &mut B, opc: Opcode, raw: u32) -> boo
     } else if name == "ee_vsr_32" {
         ee_vsx(cpu, raw, false);
     } else if name == "ee_wr_mask_gpio_out" {
-        ee_gpio(cpu, raw, 0);
+        ee_gpio(cpu, bus, raw, 0);
     } else if name == "ee_set_bit_gpio_out" {
-        ee_gpio(cpu, raw, 1);
+        ee_gpio(cpu, bus, raw, 1);
     } else if name == "ee_clr_bit_gpio_out" {
-        ee_gpio(cpu, raw, 2);
+        ee_gpio(cpu, bus, raw, 2);
     } else if name == "ee_get_gpio_in" {
-        ee_gpio(cpu, raw, 3);
+        ee_gpio(cpu, bus, raw, 3);
     } else if name.starts_with("ee_vsmulas_") && !name.contains("incp") {
         ee_vsmulas(cpu, name, raw);
     } else if name.starts_with("ee_srcmb_") && !name.contains("incp") {

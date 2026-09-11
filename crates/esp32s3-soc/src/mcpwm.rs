@@ -17,9 +17,10 @@
 //!
 //! This models the core PWM path (up / down / up-down counting + action-based
 //! generators) enough for a real firmware to produce a correct duty cycle on a
-//! GPIO, plus capture and software-sync reload. Dead-time, carrier and the
-//! update-shadow machinery are latched but not simulated (S3 silicon has no
-//! Trip-Zone/fault submodule, so there is nothing to model there).
+//! GPIO, plus capture, software-sync reload, dead-time and the fault/trip
+//! submodule (FAULT0..2 inputs force generator outputs via CBC/one-shot
+//! actions with enter/exit interrupts). Carrier and the update-shadow
+//! machinery are latched but not simulated.
 
 /// MCPWM group-0 register block base (esp-idf `DR_REG_PWM0_BASE`).
 pub const MCPWM_BASE: u32 = 0x6001_E000;
@@ -81,6 +82,27 @@ const CAPN_PRESCALE_SHIFT: u32 = 3; // [10:3], divide by prescale+1
 const CAPN_INVERT: u32 = 1 << 11;
 // Capture-channel interrupt bits (INT_ENA/RAW/ST/CLR).
 const CAP_INT_BASE: u32 = 27;
+
+// Fault submodule (mcpwm_fault_detect_reg_t @0xE4 + per-operator FH regs):
+// FAULT_DETECT: F0/1/2_EN[2:0], F0/1/2_POLE[5:3] (1 = high-active),
+// EVENT_F0/1/2[8:6] (RO, live). FHk_CFG0 @0x68/0xA0/0xD8 (stride 0x38):
+// SW_CBC[0], F2_CBC[1], F1_CBC[2], F0_CBC[3], SW_OST[4], F2_OST[5],
+// F1_OST[6], F0_OST[7], A_CBC_D[9:8], A_CBC_U[11:10], A_OST_D[13:12],
+// A_OST_U[15:14], B_CBC_D[17:16], B_CBC_U[19:18], B_OST_D[21:20],
+// B_OST_U[23:22] (action codes: 0 = keep, 1 = high, 2 = low, 3 = toggle).
+// FHk_CFG1 (+0x04): CLR_OST[0] (rising edge clears OST), CBCPULSE[2:1],
+// FORCE_CBC[3] + FORCE_OST[4] (any toggle triggers when SW_* enabled).
+// FHk_STATUS (+0x08, RO): CBC_ON[0], OST_ON[1]. Fault enter interrupts =
+// INT bits 9/10/11, exit ("CLR") = 12/13/14 (mcpwm_ll EVENT_FAULT_*).
+// Fault input signals: group 0 FAULT0..2 = 163..165, group 1 = 172..174
+// (gpio_sig_map.h PWMx_Fn_IN_IDX).
+const FAULT_DETECT: u32 = 0xE4;
+const FH_CFG0_BASE: u32 = 0x68;
+const FH_STRIDE: u32 = 0x38;
+const FH_CFG1_OFF: u32 = 0x04;
+const FH_STATUS_OFF: u32 = 0x08;
+const FAULT_INT_ENTER_BASE: u32 = 9;
+const FAULT_INT_EXIT_BASE: u32 = 12;
 
 const REG_WORDS: usize = 0x128 / 4;
 
@@ -145,6 +167,17 @@ pub struct Mcpwm {
     /// Per-channel first-sample seeding (a channel latches no edge on the
     /// tick its sampling starts, like the PCNT first-sample gate).
     cap_init: [bool; 3],
+    /// Live fault-event bitmap (EVENT_F0..2, recomputed every fault tick).
+    fault_events: u32,
+    /// Per-operator CBC (cycle-by-cycle) action ongoing.
+    fault_cbc_on: [bool; NOPER],
+    /// Per-operator OST (one-shot) action latched.
+    fault_ost_on: [bool; NOPER],
+    /// Final forced output level per operator/generator (None = no force).
+    /// Applied at `signal_level`, after dead-time (the trip override wins).
+    fault_force: [[Option<u32>; 2]; NOPER],
+    /// Last FHk_CFG1 value per operator (FORCE_CBC/FORCE_OST edge detect).
+    fault_cfg1: [u32; NOPER],
 }
 
 impl Mcpwm {
@@ -165,6 +198,11 @@ impl Mcpwm {
             cap_edge_cnt: [0; 3],
             prev_cap: [0; 3],
             cap_init: [false; 3],
+            fault_events: 0,
+            fault_cbc_on: [false; NOPER],
+            fault_ost_on: [false; NOPER],
+            fault_force: [[None; 2]; NOPER],
+            fault_cfg1: [0; NOPER],
         }
     }
 
@@ -391,11 +429,120 @@ impl Mcpwm {
         }
     }
 
+    fn fh_cfg0(&self, op: usize) -> u32 {
+        self.regs[(FH_CFG0_BASE as usize + op * FH_STRIDE as usize) / 4]
+    }
+    fn fh_cfg1(&self, op: usize) -> u32 {
+        self.regs[(FH_CFG0_BASE as usize + op * FH_STRIDE as usize) / 4 + 1]
+    }
+
+    /// True while any fault detector is enabled (gates `tick_fault`).
+    /// Fault detection is level-driven and independent of the PWM timers,
+    /// so it samples even with every timer stopped.
+    pub fn fault_active(&self) -> bool {
+        self.regs[FAULT_DETECT as usize / 4] & 0x7 != 0
+    }
+
+    /// Apply a fault action (CBC or OST selector pair) to an operator's
+    /// forced levels. Direction picks the _D/_U selector pair from the
+    /// operator's timer count direction (up-down uses the live direction;
+    /// up mode always takes _U, down mode always _D).
+    fn apply_fault_action(&mut self, op: usize, d_shift: u32, u_shift: u32) {
+        let t = self.op_timer_sel(op);
+        let down = self.timer_dir[t] != 0;
+        let cfg0 = self.fh_cfg0(op);
+        let a = (cfg0 >> if down { d_shift } else { u_shift }) & 3;
+        let b = (cfg0 >> if down { d_shift + 8 } else { u_shift + 8 }) & 3;
+        if a != 0 {
+            let cur = self.fault_force[op][0].unwrap_or(self.gen_level[op][0]);
+            self.fault_force[op][0] = Some(Self::do_action(cur, a));
+        }
+        if b != 0 {
+            let cur = self.fault_force[op][1].unwrap_or(self.gen_level[op][1]);
+            self.fault_force[op][1] = Some(Self::do_action(cur, b));
+        }
+    }
+
+    /// Recompute an operator's final force from its latched CBC/OST state
+    /// (cleared latches drop their contribution; OST re-applies first so
+    /// CBC wins while both hold, matching trigger order). Used on release
+    /// paths; trip-enter applies incrementally so toggle chains correctly.
+    fn recompute_fault_force(&mut self, op: usize) {
+        self.fault_force[op] = [None, None];
+        if self.fault_ost_on[op] {
+            self.apply_fault_action(op, 12, 14);
+        }
+        if self.fault_cbc_on[op] {
+            self.apply_fault_action(op, 8, 10);
+        }
+    }
+
+    /// Advance the fault submodule by one SoC step: sample the FAULT0..2
+    /// matrix inputs (`fault_base` + k, group 0 = 163, group 1 = 172),
+    /// latch enter/exit interrupts, and drive CBC/OST trip actions.
+    /// CBC forces while its event is ongoing (CBCPULSE refresh-moment
+    /// selection is not modeled: the force applies immediately on trigger,
+    /// matching the reset CBCPULSE = immediate behavior); OST latches
+    /// until a CLR_OST rising edge. Called regardless of the PWM timers.
+    pub fn tick_fault<F: Fn(u32) -> u32>(&mut self, fault_base: u32, input: &F) {
+        let det = self.regs[FAULT_DETECT as usize / 4];
+        let mut events = 0u32;
+        for k in 0..3 {
+            if det & (1 << k) == 0 {
+                continue;
+            }
+            let pole = (det >> (3 + k)) & 1;
+            if input(fault_base + k) == pole {
+                events |= 1 << k;
+            }
+        }
+        let entered = events & !self.fault_events;
+        let exited = self.fault_events & !events;
+        for k in 0..3 {
+            if entered & (1 << k) != 0 {
+                self.int_raw |= 1 << (FAULT_INT_ENTER_BASE + k);
+            }
+            if exited & (1 << k) != 0 {
+                self.int_raw |= 1 << (FAULT_INT_EXIT_BASE + k);
+            }
+        }
+        self.fault_events = events;
+        for op in 0..NOPER {
+            let cfg0 = self.fh_cfg0(op);
+            // CBC/OST source bitmaps aligned to the event bits: bit k =
+            // fault k (CFG0 stores F2/F1/F0 at [1]/[2]/[3] and [5]/[6]/[7]).
+            let cbc_src = ((cfg0 >> 3) & 1) | ((cfg0 >> 1) & 2) | ((cfg0 << 1) & 4);
+            let ost_src = ((cfg0 >> 7) & 1) | ((cfg0 >> 5) & 2) | ((cfg0 >> 3) & 4);
+            if entered & cbc_src != 0 {
+                self.fault_cbc_on[op] = true;
+                // CBC A pair at shifts 8 (D) / 10 (U), B pair +8.
+                self.apply_fault_action(op, 8, 10);
+            }
+            if entered & ost_src != 0 {
+                self.fault_ost_on[op] = true;
+                // OST A pair at shifts 12 (D) / 14 (U), B pair +8.
+                self.apply_fault_action(op, 12, 14);
+            }
+            if exited != 0 && self.fault_cbc_on[op] {
+                // Cycle-by-cycle ends with its event (no event left that
+                // this operator listens to keeps it alive: re-check).
+                if cbc_src & events == 0 {
+                    self.fault_cbc_on[op] = false;
+                    self.recompute_fault_force(op);
+                }
+            }
+        }
+    }
+
     /// Output level of a GPIO-matrix signal (PWM0 OUT0A..OUT2B = 160..165).
+    /// A latched fault trip overrides everything (post-dead-time force).
     pub fn signal_level(&self, sig: u32) -> u32 {
         if (PWM0_OUT0A_IDX..=PWM0_OUT2B_IDX).contains(&sig) {
             let s = (sig - PWM0_OUT0A_IDX) as usize;
             let op = s / 2;
+            if let Some(force) = self.fault_force[op][s % 2] {
+                return force;
+            }
             // Unprogrammed dead-time (FED=RED=0) reads the generator level
             // directly (combinatorial passthrough, exactly the old path);
             // programmed delays come from the ticked inertial state.
@@ -427,7 +574,18 @@ impl Mcpwm {
             }
             INT_RAW => self.int_raw,
             INT_ST => self.int_raw & self.regs[INT_ENA as usize / 4],
+            FAULT_DETECT => {
+                // EN/POLE stored; EVENT_F0..2 are the live bitmap.
+                (self.regs[FAULT_DETECT as usize / 4] & 0x3F) | (self.fault_events << 6)
+            }
             _ => {
+                // FHk_STATUS: CBC_ON/OST_ON live latch bits (RO).
+                for op in 0..NOPER {
+                    if offset == FH_CFG0_BASE + op as u32 * FH_STRIDE + FH_STATUS_OFF {
+                        return (self.fault_cbc_on[op] as u32)
+                            | ((self.fault_ost_on[op] as u32) << 1);
+                    }
+                }
                 if idx < REG_WORDS {
                     self.regs[idx]
                 } else {
@@ -440,7 +598,7 @@ impl Mcpwm {
     pub fn write32(&mut self, offset: u32, value: u32) {
         let idx = (offset / 4) as usize;
         match offset {
-            // timer_status and int_raw are read-only.
+            // timer_status, int_raw and FHk_STATUS are read-only.
             TIMER_STATUS | 0x20 | 0x30 | INT_RAW => {}
             INT_CLR => {
                 self.int_raw &= !value;
@@ -449,7 +607,41 @@ impl Mcpwm {
                 self.regs[INT_ENA as usize / 4] = value;
             }
             INT_ST => {}
+            FAULT_DETECT => {
+                // EVENT_F0..2 are RO (live); only EN/POLE are stored.
+                self.regs[FAULT_DETECT as usize / 4] = value & 0x3F;
+            }
             _ => {
+                // FHk_STATUS is RO (live latch bits).
+                for op in 0..NOPER {
+                    if offset == FH_CFG0_BASE + op as u32 * FH_STRIDE + FH_STATUS_OFF {
+                        return;
+                    }
+                }
+                // FHk_CFG1: CLR_OST rising edge clears the OST latch;
+                // FORCE_CBC/FORCE_OST toggles trigger software trip actions
+                // (gated on SW_CBC/SW_OST).
+                for op in 0..NOPER {
+                    if offset == FH_CFG0_BASE + op as u32 * FH_STRIDE + FH_CFG1_OFF {
+                        let prev = self.fault_cfg1[op];
+                        self.regs[idx] = value;
+                        self.fault_cfg1[op] = value;
+                        if value & 0x1 != 0 && prev & 0x1 == 0 && self.fault_ost_on[op] {
+                            self.fault_ost_on[op] = false;
+                            self.recompute_fault_force(op);
+                        }
+                        let cfg0 = self.fh_cfg0(op);
+                        if (value ^ prev) & (1 << 3) != 0 && cfg0 & 0x1 != 0 {
+                            self.fault_cbc_on[op] = true;
+                            self.apply_fault_action(op, 8, 10);
+                        }
+                        if (value ^ prev) & (1 << 4) != 0 && cfg0 & (1 << 4) != 0 {
+                            self.fault_ost_on[op] = true;
+                            self.apply_fault_action(op, 12, 14);
+                        }
+                        return;
+                    }
+                }
                 if idx < REG_WORDS {
                     self.regs[idx] = value;
                     // Timer sync: a SYNC_SW write reloads the counter with

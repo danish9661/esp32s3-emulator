@@ -2082,9 +2082,12 @@ fn rtc_reset_cause_poweron_then_deepsleep_after_wake() {
     assert_eq!(m.soc.read32(RESET_STATE) & 0x3F, 1, "PRO cause");
     assert_eq!((m.soc.read32(RESET_STATE) >> 6) & 0x3F, 1, "APP cause");
 
-    // Poke a sleep + wake like `deep_sleep_poke_wakes_with_timer_cause`.
+    // Poke a deep sleep + wake like `deep_sleep_poke_wakes_with_timer_cause`:
+    // mark it deep via DIG_PWC DG_WRAP_PD_EN (bit 31), as the esp-idf
+    // deep-sleep driver does (SLEEP_EN alone now means light/resume).
     m.soc.write32(RTC_CNTL_BASE + SLP_TIMER0_OFF, 0x100);
     m.soc.write32(RTC_CNTL_BASE + SLP_TIMER1_OFF, 0);
+    m.soc.write32(RTC_CNTL_BASE + 0x90, 1 << 31);
     let prev = m.soc.read32(RTC_CNTL_BASE + STATE0_OFF);
     m.soc
         .write32(RTC_CNTL_BASE + STATE0_OFF, prev | SLEEP_EN_BIT);
@@ -2156,6 +2159,50 @@ fn deep_sleep_ext0_wakes_with_ext0_cause() {
         "no wake while level unmet (still asleep)"
     );
     assert!(m.is_asleep(), "machine still fast-forwarding sleep");
+}
+
+/// Light sleep (SLEEP_EN with no DIG_PWC power-down bits) resumes in place:
+/// no reboot (DRAM marker and POWERON reset cause survive) with the stashed
+/// wakeup cause applied to the WAKEUP_CAUSE register.
+#[test]
+fn light_sleep_resumes_without_reboot() {
+    use esp32s3_soc::memmap::DRAM_BASE;
+    use esp32s3_soc::rtc::{
+        CAUSE_TIMER, RESET_CAUSE_POWERON, RESET_STATE_OFF, RTC_CNTL_BASE, SLEEP_EN_BIT,
+        SLP_TIMER0_OFF, SLP_TIMER1_OFF, SLP_WAKEUP_CAUSE_OFF, STATE0_OFF,
+    };
+    let mut m = Esp32S3::new();
+    // Retained marker (deep sleep would reboot and lose plain DRAM state
+    // set this way outside the image; light sleep keeps everything).
+    m.soc.write32(DRAM_BASE + 0x1000, 0x1234_5678);
+    m.soc.write32(RTC_CNTL_BASE + SLP_TIMER0_OFF, 0x100);
+    m.soc.write32(RTC_CNTL_BASE + SLP_TIMER1_OFF, 0);
+    // No DIG_PWC PD bits -> light (resume), unlike the deep tests above.
+    let prev = m.soc.read32(RTC_CNTL_BASE + STATE0_OFF);
+    m.soc
+        .write32(RTC_CNTL_BASE + STATE0_OFF, prev | SLEEP_EN_BIT);
+    for _ in 0..200_000 {
+        m.step();
+        if !m.is_asleep() {
+            break;
+        }
+    }
+    assert!(!m.is_asleep(), "light sleep woke");
+    assert_eq!(
+        m.soc.read32(RTC_CNTL_BASE + SLP_WAKEUP_CAUSE_OFF) & CAUSE_TIMER,
+        CAUSE_TIMER,
+        "timer wake cause applied"
+    );
+    assert_eq!(
+        m.soc.read32(DRAM_BASE + 0x1000),
+        0x1234_5678,
+        "DRAM retained (no reboot)"
+    );
+    assert_eq!(
+        m.soc.read32(RTC_CNTL_BASE + RESET_STATE_OFF) & 0x3F,
+        RESET_CAUSE_POWERON,
+        "reset cause still POWERON (no reboot)"
+    );
 }
 
 /// `RTC_CNTL_SLP_WAKEUP_CAUSE` (0x130, inside the ULP sub-region) must be served

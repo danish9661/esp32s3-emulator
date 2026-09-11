@@ -13,9 +13,15 @@
 #define SLP_TIMER0_REG (RTC_CNTL_BASE + 0x04)
 #define SLP_TIMER1_REG (RTC_CNTL_BASE + 0x08)
 #define STATE0_REG     (RTC_CNTL_BASE + 0x18)
+#define DIG_PWC_REG    (RTC_CNTL_BASE + 0x90)
 #define WAKEUP_CAUSE_REG (RTC_CNTL_BASE + 0x130)
 #define SLEEP_EN_BIT   (1u << 31)
 #define TIMER_WAKEUP_BIT (1u << 3)
+// Deep-sleep marker (matches the esp-idf deep-sleep driver, which programs
+// DIG_PWC = 0xC0020010): power down the digital core + WiFi in sleep
+// (DG_WRAP_PD_EN bit 31 tells the emulator the CPUs cannot resume, so it
+// must reboot on wake; light sleep leaves these clear and resumes).
+#define DIG_PWC_DEEP_BITS ((1u << 31) | (1u << 30))
 
 void setup() {
   Serial.begin(115200);
@@ -35,6 +41,9 @@ void setup() {
   // to carry a non-zero duration so the model records something).
   REG_WRITE(SLP_TIMER0_REG, 0x00001234);
   REG_WRITE(SLP_TIMER1_REG, 0x00000000);
+
+  // Mark this as a deep (power-down) sleep, like the esp-idf driver does.
+  REG_WRITE(DIG_PWC_REG, REG_READ(DIG_PWC_REG) | DIG_PWC_DEEP_BITS);
 
   // Trigger the power-down: set RTC_CNTL_SLEEP_EN in STATE0.
   REG_WRITE(STATE0_REG, REG_READ(STATE0_REG) | SLEEP_EN_BIT);
