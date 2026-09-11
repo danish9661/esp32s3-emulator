@@ -104,14 +104,24 @@ fn unmapped_page_aliases_flash_1to1() {
 }
 
 #[test]
-fn psram_beyond_capacity_reads_zero() {
+fn psram_round_trips_below_capacity() {
     let mut soc = Soc::new();
-    // PSRAM physical page 200 (200 * 64 KB = 12.8 MB) is past the modeled
-    // 8 MB capacity: reads 0, writes dropped.
+    // PSRAM physical page 200 (200 * 64 KB = 12.8 MB) is inside the
+    // modeled 16 MB capacity: reads back what was written.
     soc.write32(mmu_addr(0), psram_entry(200));
     soc.write32(FLASH_DATA_BASE, 0x1122_3344);
+    assert_eq!(soc.read32(FLASH_DATA_BASE), 0x1122_3344);
+    assert_eq!(PSRAM_SIZE, 0x100_0000, "16 MB modeled capacity");
+}
+
+#[test]
+fn psram_beyond_capacity_reads_zero() {
+    let mut soc = Soc::new();
+    // PSRAM physical page 300 (300 * 64 KB = 19.2 MB) is past the modeled
+    // 16 MB capacity: reads 0, writes dropped.
+    soc.write32(mmu_addr(0), psram_entry(300));
+    soc.write32(FLASH_DATA_BASE, 0x1122_3344);
     assert_eq!(soc.read32(FLASH_DATA_BASE), 0);
-    assert_eq!(PSRAM_SIZE, 0x80_0000, "8 MB default capacity");
 }
 
 #[test]

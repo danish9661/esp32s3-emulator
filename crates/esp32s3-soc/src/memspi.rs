@@ -90,8 +90,8 @@ const PSRAM_ID: [u8; 3] = [0x0D, 0x5D, 0x00];
 
 // PSRAM backing for the CS1 device (pattern/test traffic only — runtime
 // heap access goes through the cache MMU's own `psram` array, never SPI1).
-// Sized to the physical part (APM 64 Mb = 8 MB).
-const PSRAM_DEV_SIZE: usize = 0x0080_0000;
+// Sized to the largest modeled part (128 Mb = 16 MB, MR2[2:0] = 5).
+const PSRAM_DEV_SIZE: usize = 0x0100_0000;
 
 // CMD bits (esp32s3_spi.h SPI_MEM_CMD).  Special-command dispatch mask
 // keeps bits [31:19] (QEMU `command >> 19 << 19`).
@@ -451,6 +451,14 @@ impl Memspi {
         };
         self.tx_head = (self.tx_head + 1) & 15;
         self.tx_count += 1;
+    }
+
+    /// Override the PSRAM MR2 reset default (density: 1 = 32 Mb / 4 MB,
+    /// 3 = 64 Mb / 8 MB, 5 = 128 Mb / 16 MB). run_flash sets this from
+    /// PSRAM_MR2=<n> so a 16 MB part can be validated through the real OPI
+    /// sizing path (`esp_psram_impl_enable` reads MR2[2:0]).
+    pub fn set_mr2(&mut self, v: u8) {
+        self.psram_mr[2] = v;
     }
 
     pub fn read32(&self, off: u32) -> u32 {

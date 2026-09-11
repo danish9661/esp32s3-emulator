@@ -719,6 +719,12 @@ impl Soc {
         self.rtc.bod_inject(low);
     }
 
+    /// Override the PSRAM MR2 density nibble on the SPI1 PSRAM device
+    /// (host frontend for 16 MB validation; see `Memspi::set_mr2`).
+    pub fn psram_set_mr2(&mut self, v: u8) {
+        self.memspi[0].set_mr2(v);
+    }
+
 
     /// Snapshot of driven output-pin state (host LED visualization).  A
     /// pin whose FUNC_OUT_SEL selects a peripheral signal (LEDC 96..103)

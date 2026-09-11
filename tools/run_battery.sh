@@ -128,6 +128,7 @@ CASES=(
 "ota_slot||OTA SLOT TEST PASS|"
 "psram_qspi||PSRAM total=2097152;PSRAM RW OK;PSRAM PROBE PASS|"
 "psram_opi||PSRAM total=8388608;PSRAM RW OK;PSRAM PROBE PASS|"
+"psram_16m|PSRAM_MR2=5|PSRAM total=16777216;PSRAM HIGH OK;PSRAM PROBE PASS|"
 "mcpwm_fault||MCPWM FAULT trip=500/500;MCPWM FAULT PASS|"
 "dedic_gpio||DEDIC hi pad=1;DEDIC GPIO PASS|"
 "ee_dsp||EE DSP DOT OK;EE DSP VADDS OK;EE DSP CMUL OK;EE DSP LDF128 OK;EE DSP DONE|"
@@ -197,6 +198,7 @@ for c in "${CASES[@]}"; do
   case "$name" in
     psram_qspi) srcdir="$SK/esp32s3_psram"; fqbn="$fqbn:PSRAM=enabled"; bin="$srcdir/esp32s3_psram_qspi.merged.bin"; inobin="esp32s3_psram.ino.merged.bin";;
     psram_opi) srcdir="$SK/esp32s3_psram"; fqbn="$fqbn:PSRAM=opi"; bin="$srcdir/esp32s3_psram_opi.merged.bin"; inobin="esp32s3_psram.ino.merged.bin";;
+    psram_16m) srcdir="$SK/esp32s3_psram"; fqbn="$fqbn:PSRAM=opi"; bin="$srcdir/esp32s3_psram_16m.merged.bin"; inobin="esp32s3_psram.ino.merged.bin";;
   esac
   if [[ -n "$binrel" ]]; then
     bin="$SK/$binrel"

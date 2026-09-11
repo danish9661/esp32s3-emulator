@@ -3140,3 +3140,16 @@ Core design:
     IDF installs its own brownout ISR ("Brownout detector was
     triggered") — the INT sketch clears INT_ENA bit 9 and polls RAW so
     the two don't race (standard practice, documented in-sketch).
+  - 2026-09-11: **16MB PSRAM validated (was 8MB-capped)**. Backing
+    enlarged 8MB → 16MB in both places (`memmap.rs` `PSRAM_SIZE` for the
+    cache-MMU heap window, `memspi.rs` `PSRAM_DEV_SIZE` for CS1 init/test
+    traffic); smaller densities simply never map the upper pages. New
+    `PSRAM_MR2=<n>` run_flash env overrides the MR2 reset default so the
+    real OPI sizing path (`esp_psram_impl_enable` reads MR2[2:0]=5 →
+    128Mb) can be validated: `esp32s3_psram` sketch gains a 13MB high
+    malloc/pattern leg (first/last KB, proving the upper 8MB are mapped —
+    with an 8MB backing the high bytes read back zero), battery gains
+    `psram_16m` (`PSRAM=opi` + `PSRAM_MR2=5` → `total=16777216`,
+    `HIGH OK`, `PASS`). `tests/cache.rs` updated (page 200 = 12.8MB now
+    round-trips; page 300 = 19.2MB still reads 0). Battery 3/3
+    (qspi/opi/16m), workspace green.

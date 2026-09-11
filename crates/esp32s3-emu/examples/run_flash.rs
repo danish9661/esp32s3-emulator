@@ -98,6 +98,16 @@ fn main() {
         println!("[host] injected brownout condition");
     }
 
+    // PSRAM density override for 16 MB validation: PSRAM_MR2=<n> sets the
+    // MR2 reset default (3 = 64 Mb / 8 MB, 5 = 128 Mb / 16 MB) before the
+    // OPI sizing path runs at boot.
+    if let Ok(mr2) = env::var("PSRAM_MR2")
+        && let Ok(mr2) = mr2.parse::<u8>()
+    {
+        m.soc.psram_set_mr2(mr2);
+        println!("[host] PSRAM MR2 override ={mr2}");
+    }
+
     // UART1 RX injection (echo-sketch support): UART_INJECT=<text> is
     // pushed into UART1 RX as soon as the console shows the RXREADY marker.
     let uart1_inject: Option<Vec<u8>> = env::var("UART_INJECT").ok().map(|s| s.into_bytes());

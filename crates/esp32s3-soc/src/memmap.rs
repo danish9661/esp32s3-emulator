@@ -114,8 +114,10 @@ pub const FLASH_INST_BASE: u32 = 0x4200_0000;
 pub const FLASH_WINDOW_SIZE: u32 = 0x0200_0000;
 /// Physical flash size modeled (4 MB, ESP32-S3 flash is 2-16 MB).
 pub const FLASH_SIZE: u32 = 0x0040_0000;
-/// Physical PSRAM size modeled (8 MB, ESP32-S3 DevKit default).
-pub const PSRAM_SIZE: u32 = 0x0080_0000;
+/// Physical PSRAM size modeled (16 MB — covers both the 8 MB DevKit
+/// default (MR2=3) and 16 MB parts (MR2=5); smaller densities simply never
+/// map the upper pages).
+pub const PSRAM_SIZE: u32 = 0x0100_0000;
 /// Cache MMU virtual page size (64 KB, QEMU ESP32S3_PAGE_SIZE).
 pub const CACHE_PAGE_SIZE: u32 = 0x0001_0000;
 /// Shared cache MMU entry count (32 MB window / 64 KB page).
