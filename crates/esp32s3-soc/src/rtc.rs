@@ -54,6 +54,18 @@ const INT_ST_OFF: u32 = 0x48;
 const INT_CLR_OFF: u32 = 0x4C;
 const TOUCH_DONE_BIT: u32 = 1 << 6;
 const TOUCH_SCAN_DONE_BIT: u32 = 1 << 4;
+// Brown-out detector (rtc_cntl_reg.h RTC_CNTL_BROWN_OUT_REG @ +0xE8 and
+// INT_RAW bit 9): int_wait[13:4] ticks to the interrupt once the low-
+// voltage condition holds, rst_wait[25:16] more ticks to a chip reset
+// when rst_ena[26] is set; cnt_clr[29] clears the counter, ena[30]
+// enables the detector.
+const BROWN_OUT_OFF: u32 = 0xE8;
+const BOD_INT_BIT: u32 = 1 << 9;
+const BOD_INT_WAIT_SHIFT: u32 = 4;
+const BOD_RST_WAIT_SHIFT: u32 = 16;
+const BOD_RST_ENA: u32 = 1 << 26;
+const BOD_CNT_CLR: u32 = 1 << 29;
+const BOD_ENA: u32 = 1 << 30;
 // Sleep-event interrupt bits (rtc_cntl_reg.h INT_RAW): SLP_REJECT = bit 0,
 // SLP_WAKEUP = bit 1 (`rtc_sleep_start` spins on bits [1:0]).
 const SLP_WAKEUP_BIT: u32 = 1 << 1;
@@ -147,6 +159,17 @@ pub struct Rtc {
     /// (cleared by INT_CLR like the touch latch). SLP_REJECT is never
     /// raised (no rejected-sleep flow is modeled).
     sleep_raw: u32,
+    /// Latched brown-out interrupt (rtc_cntl_reg.h INT_RAW bit 9),
+    /// cleared by INT_CLR like the touch/sleep latches.
+    bod_raw: u32,
+    /// Brown-out detector counter (BROWN_OUT int_wait/rst_wait time base)
+    /// plus fired/reset latches. Trips only while the host injects the
+    /// low-voltage condition (`bod_inject`); nominal voltage never trips,
+    /// so enabling BOD (as the bootloader does) is boot-neutral.
+    bod_count: u64,
+    bod_fired: bool,
+    bod_reset: bool,
+    bod_low: bool,
     /// Generic backing store for the full RTC_CNTL page (0x000..0x400).  Most
     /// registers are simple stores; the special-cased ones below override this.
     regs: [u32; 0x400 / 4],
@@ -184,6 +207,11 @@ impl Default for Rtc {
             slp_timer_written: false,
             touch_raw: 0,
             sleep_raw: 0,
+            bod_raw: 0,
+            bod_count: 0,
+            bod_fired: false,
+            bod_reset: false,
+            bod_low: false,
             regs: [0u32; 0x400 / 4],
             ulp: crate::ulp::Ulp::default(),
             wdt_count: 0,
@@ -205,6 +233,43 @@ impl Rtc {
             self.count += 1;
         }
         self.tick_rwdt(cycles);
+        self.tick_bod(cycles);
+    }
+
+    /// Brown-out detector: while enabled (BROWN_OUT ena) and the host-
+    /// injected low-voltage condition holds, count up; latch the INT_RAW
+    /// brown-out bit at int_wait, and request a chip reset at
+    /// int_wait + rst_wait when rst_ena is set (close_flash_ena /
+    /// pd_rf_ena power actions are not modeled). With nominal voltage
+    /// (the default) the counter stays put, so enabling BOD is harmless.
+    fn tick_bod(&mut self, cycles: u64) {
+        let cfg = self.regs[BROWN_OUT_OFF as usize / 4];
+        if cfg & BOD_ENA == 0 || !self.bod_low {
+            if cfg & BOD_ENA == 0 {
+                self.bod_count = 0;
+                self.bod_fired = false;
+            }
+            return;
+        }
+        self.bod_count += cycles;
+        let int_wait = ((cfg >> BOD_INT_WAIT_SHIFT) & 0x3FF) as u64;
+        if !self.bod_fired && self.bod_count >= int_wait {
+            self.bod_fired = true;
+            self.bod_raw |= BOD_INT_BIT;
+        }
+        if cfg & BOD_RST_ENA != 0 {
+            let rst_wait = ((cfg >> BOD_RST_WAIT_SHIFT) & 0x3FF) as u64;
+            if self.bod_count >= int_wait + rst_wait {
+                self.bod_reset = true;
+            }
+        }
+    }
+
+    /// Host-injected voltage condition for the BOD (true = brownout).
+    /// run_flash sets this from BOD_INJECT=1; validation sketches enable
+    /// the detector via the BROWN_OUT register pokes.
+    pub fn bod_inject(&mut self, low: bool) {
+        self.bod_low = low;
     }
 
     /// RTC watchdog: counts up while WDT_EN (CONFIG0[31]); each stage fires
@@ -240,6 +305,7 @@ impl Rtc {
     /// True when an RWDT reset stage elapsed (machine reboots); cleared.
     pub fn consume_reset(&mut self) -> bool {
         core::mem::replace(&mut self.wdt_reset, false)
+            || core::mem::replace(&mut self.bod_reset, false)
     }
 
     /// True if firmware requested a sleep since the last call; returns the
@@ -306,7 +372,8 @@ impl Rtc {
     /// Masked RTC-core interrupt status (INT_ST = RAW & ENA), covering
     /// the latched touch DONE/SCAN_DONE bits.
     pub fn int_st(&self) -> u32 {
-        (self.regs[INT_RAW_OFF as usize / 4] | self.touch_raw) & self.regs[INT_ENA_OFF as usize / 4]
+        (self.regs[INT_RAW_OFF as usize / 4] | self.touch_raw | self.bod_raw)
+            & self.regs[INT_ENA_OFF as usize / 4]
     }
 
     pub fn read32(&mut self, offset: u32) -> u32 {
@@ -320,9 +387,14 @@ impl Rtc {
             EXT1_STATUS_OFF => self.ext1_status,
             // Interrupt status: live touch completion latched in
             // `touch_raw` ORed over the stored RAW; ST masks by ENA.
-            INT_RAW_OFF => self.regs[INT_RAW_OFF as usize / 4] | self.touch_raw | self.sleep_raw,
+            INT_RAW_OFF => {
+                self.regs[INT_RAW_OFF as usize / 4] | self.touch_raw | self.sleep_raw | self.bod_raw
+            }
             INT_ST_OFF => {
-                (self.regs[INT_RAW_OFF as usize / 4] | self.touch_raw | self.sleep_raw)
+                (self.regs[INT_RAW_OFF as usize / 4]
+                    | self.touch_raw
+                    | self.sleep_raw
+                    | self.bod_raw)
                     & self.regs[INT_ENA_OFF as usize / 4]
             }
             // ULP-RISC-V block lives at offset 0x100..0x200 of this page.
@@ -394,7 +466,20 @@ impl Rtc {
                 self.regs[INT_RAW_OFF as usize / 4] &= !value;
                 self.touch_raw &= !value;
                 self.sleep_raw &= !value;
+                self.bod_raw &= !value;
                 self.regs[offset as usize / 4] = value;
+            }
+            BROWN_OUT_OFF => {
+                self.regs[offset as usize / 4] = value;
+                // Any detector reconfiguration re-arms it (proven: the
+                // bootloader fires + clears BOD during boot with injection
+                // on, leaving bod_fired latched; without a re-arm the
+                // sketch's own enable would never fire again).
+                self.bod_fired = false;
+                // cnt_clr restarts the detector counter (TRM BROWN_OUT).
+                if value & BOD_CNT_CLR != 0 {
+                    self.bod_count = 0;
+                }
             }
             o if (ULP_OFF_START..ULP_OFF_END).contains(&o) => {
                 self.ulp.write32(RTC_CNTL_BASE + o, value);

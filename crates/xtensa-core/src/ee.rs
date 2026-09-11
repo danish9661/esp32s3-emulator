@@ -70,31 +70,52 @@ pub fn decode_ee(insn: u32) -> Opcode {
         if b3 == 0xE7 {
             return Opcode::OPCODE_EE_STXQ_32;
         }
-        if b3 == 0xE0 {
-            if b1 & 0x0F == 0x0D {
-                return Opcode::OPCODE_EE_LDXQ_32;
+        if (b3 & 0xFC) == 0xE0 {
+            // Fused complex-multiply + load (cmul.s16.ld.incp; GAS-captured:
+            // qu[0]=b2[3], qu[2:1]=b3[1:0], AR=b0[7:4], qx/qy split, sel=
+            // b1[1:0]). key2==0 separates it from LDXQ (key2==7) sharing
+            // nibble D, and no valu-fused entry uses key2 0. Dest rides
+            // b3[1:0], so the page spans E0-E3 (unlike the E0-exact arms
+            // below, which keep their exact match to preserve behavior).
+            if (b0 & 0x0E) == 0x0E && (b1 & 0x0C) == 0x0C && ((b2 >> 4) & 7) == 0 {
+                return Opcode::OPCODE_EE_CMUL_S16_LD_INCP;
             }
-            if b2 & 0xE0 == 0x00 && (b1 & 0x0F == 0x04 || b1 & 0x0F == 0x05 || b1 & 0x0F == 0x07) {
-                if b1 & 0x02 == 0 {
-                    return Opcode::OPCODE_EE_LDF_64_IP;
+            if b3 == 0xE0 {
+                if b1 & 0x0F == 0x0D {
+                    return Opcode::OPCODE_EE_LDXQ_32;
                 }
-                return Opcode::OPCODE_EE_STF_64_IP;
+                if b2 & 0xE0 == 0x00
+                    && (b1 & 0x0F == 0x04 || b1 & 0x0F == 0x05 || b1 & 0x0F == 0x07)
+                {
+                    if b1 & 0x02 == 0 {
+                        return Opcode::OPCODE_EE_LDF_64_IP;
+                    }
+                    return Opcode::OPCODE_EE_STF_64_IP;
+                }
+                // Fused vector-ALU + load (op,width) in (b1[1:0], b2[6:4]).
+                if b1 & 0x0F == 0x0C {
+                    return match ((b1 & 3), ((b2 >> 4) & 7)) {
+                        (0, 1) => Opcode::OPCODE_EE_VADDS_S8_LD_INCP,
+                        (1, 6) => Opcode::OPCODE_EE_VSUBS_S8_LD_INCP,
+                        (0, 4) => Opcode::OPCODE_EE_VMUL_S8_LD_INCP,
+                        (1, 2) => Opcode::OPCODE_EE_VADDS_S16_LD_INCP,
+                        (3, 2) => Opcode::OPCODE_EE_VMIN_S8_LD_INCP,
+                        (3, 1) => Opcode::OPCODE_EE_VMAX_S8_LD_INCP,
+                        (1, 3) => Opcode::OPCODE_EE_VADDS_S32_LD_INCP,
+                        (3, 3) => Opcode::OPCODE_EE_VMUL_S16_LD_INCP,
+                        (1, 4) => Opcode::OPCODE_EE_VSUBS_S16_LD_INCP,
+                        _ => Opcode::OPCODE_EE_UNIMPLEMENTED,
+                    };
+                }
             }
-            // Fused vector-ALU + load (op,width) in (b1[1:0], b2[6:4]).
-            if b1 & 0x0F == 0x0C {
-                return match ((b1 & 3), ((b2 >> 4) & 7)) {
-                    (0, 1) => Opcode::OPCODE_EE_VADDS_S8_LD_INCP,
-                    (1, 6) => Opcode::OPCODE_EE_VSUBS_S8_LD_INCP,
-                    (0, 4) => Opcode::OPCODE_EE_VMUL_S8_LD_INCP,
-                    (1, 2) => Opcode::OPCODE_EE_VADDS_S16_LD_INCP,
-                    (3, 2) => Opcode::OPCODE_EE_VMIN_S8_LD_INCP,
-                    (3, 1) => Opcode::OPCODE_EE_VMAX_S8_LD_INCP,
-                    (1, 3) => Opcode::OPCODE_EE_VADDS_S32_LD_INCP,
-                    (3, 3) => Opcode::OPCODE_EE_VMUL_S16_LD_INCP,
-                    (1, 4) => Opcode::OPCODE_EE_VSUBS_S16_LD_INCP,
-                    _ => Opcode::OPCODE_EE_UNIMPLEMENTED,
-                };
-            }
+        }
+        // Fused complex-multiply + store (cmul.s16.st.incp; GAS-captured:
+        // qu(mem src)=b2[6:4], qz(MAC dest)=b2[2:0], AR=b0[7:4],
+        // qx/qy split like ld, sel=b1[1:0], b3=0xE4 const, b2[3]=0
+        // const). b2[3]==0 separates it from valu-st (b2[3]==1 const
+        // across 7 probes with no operand mapped there).
+        if b3 == 0xE4 && (b0 & 0x0E) == 0x0E && (b1 & 0x0C) == 0x00 && (b2 & 0x08) == 0x00 {
+            return Opcode::OPCODE_EE_CMUL_S16_ST_INCP;
         }
         // Fused vector-ALU + store (b3 = 0xE4/0xE5).
         if b3 & 0xFC == 0xE4 && (b1 & 0x0F == 0x02 || b1 & 0x0F == 0x03) {
@@ -128,6 +149,21 @@ pub fn decode_ee(insn: u32) -> Opcode {
                 _ => Opcode::OPCODE_EE_UNIMPLEMENTED,
             };
         }
+        // 128-bit FPR load/store (ldf/stf.128.ip/xp; GAS-captured FPR
+        // scatter: pos1=[0]b2[3]+[3:1]b3[2:0], pos2=[0]b0[0]+[3:1]b2[2:0],
+        // pos3=b1[7:4], pos4=b2[7:4], AR=b0[7:4], ip-imm=b1[3:0]<<4 else
+        // ax=b1[3:0], st=b3[4], xp=b3[3]). b3 high nibble 8/9 is disjoint
+        // from every qup family (high nibbles 0-7,A-C across all 16
+        // GAS-probed arms) — placed before qup, which otherwise steals
+        // all four forms as S16_QACC_LD_XP_QUP.
+        if ((b3 & 0xF0) == 0x80 || (b3 & 0xF0) == 0x90) && (b0 & 0x0E) == 0x0E {
+            return match (b3 >> 3) & 3 {
+                0 => Opcode::OPCODE_EE_LDF_128_IP,
+                1 => Opcode::OPCODE_EE_LDF_128_XP,
+                2 => Opcode::OPCODE_EE_STF_128_IP,
+                _ => Opcode::OPCODE_EE_STF_128_XP,
+            };
+        }
         // Fused vector-MAC + Q-slide (b3[7:6] != 11, excluding the
         // cmul.st 0xA8 and ams.st 0xA0 pages; (uns,is8,qacc) in b3[6:4],
         // xp in b3[7]).
@@ -159,9 +195,20 @@ pub fn decode_ee(insn: u32) -> Opcode {
     if b0 & 0x0F == 4 && b1 & 0x0F == 4 && b2 & 0x0F == 0x0C {
         return Opcode::OPCODE_EE_FFT_R2BF_S16;
     }
-    // FFT AMS + load (b3 top 6 bits 110100).
-    if b3 & 0xFC == 0xD0 && (b0 & 0x0E) == 0x0E {
-        return Opcode::OPCODE_EE_FFT_AMS_S16_LD_INCP;
+    // FFT AMS + load (b3 top 5 bits 11010; mode in b3[3:1]: 000 =
+    // incp, 010 = incp.uaup (unaligned update), 100 = r32.decp;
+    // qz1[2] rides b3[0]. Other modes trap loud. Matched explicitly
+    // (not masked) so the DC/DD cmul-ld.xp words sharing the D-page
+    // keep routing below.
+    if ((b3 == 0xD0 || b3 == 0xD1) || (b3 == 0xD4 || b3 == 0xD5) || (b3 == 0xD8 || b3 == 0xD9))
+        && (b0 & 0x0E) == 0x0E
+    {
+        return match (b3 >> 1) & 7 {
+            0 => Opcode::OPCODE_EE_FFT_AMS_S16_LD_INCP,
+            2 => Opcode::OPCODE_EE_FFT_AMS_S16_LD_INCP_UAUP,
+            4 => Opcode::OPCODE_EE_FFT_AMS_S16_LD_R32_DECP,
+            _ => Opcode::OPCODE_EE_UNIMPLEMENTED,
+        };
     }
     // FFT AMS store (b3[7:2] == 101000; sel2 and qz1[2:1] live in
     // b3[3:0]; disjoint from cmul.st's 10101x page and qup below).
@@ -766,6 +813,55 @@ fn ee_cmul(cpu: &mut Cpu, raw: u32, op: u8, sar: u32) {
     }
 }
 
+/// FFT complex multiply + fused 128-bit load/store with pointer
+/// increment (QEMU-analogous `cmul_s3` single-pair form + incp memory op;
+/// GAS-captured operand map, see decode_ee): MAC on the sel-selected s16
+/// pair first (sel = quadrant 0-3, standard non-conjugate form per the
+/// ESP32-P4 PIE reference `real = (a.re*b.re-a.im*b.im)>>SAR`), then
+/// mem128 into qu (ld) or qu into mem128 (st), then AR += 16.
+/// Both forms: qz(MAC dest)=raw[18:16], AR=raw[7:4],
+/// qx=raw[14]++raw[15]<<1++raw[0]<<2, qy=raw[23]++raw[12]<<1++raw[13]<<2,
+/// sel=raw[9:8]. qu (mem reg) differs: ld qu[0]=raw[19], qu[2:1]=
+/// raw[25:24]; st qu=raw[22:20]. (b2[3] is 0-const in st form, which is
+/// what separates it from valu-st's b2[3]==1 const.)
+fn ee_cmul_fused<B: Bus>(cpu: &mut Cpu, bus: &mut B, raw: u32, is_st: bool) {
+    let qu = if is_st {
+        ((raw >> 20) & 7) as usize
+    } else {
+        ((((raw >> 19) & 1) | (((raw >> 24) & 1) << 1) | (((raw >> 25) & 1) << 2)) & 7) as usize
+    };
+    let qz = ((raw >> 16) & 7) as usize;
+    let qx = ((((raw >> 14) & 1) | (((raw >> 15) & 1) << 1) | ((raw & 1) << 2)) & 7) as usize;
+    let qy =
+        ((((raw >> 23) & 1) | (((raw >> 12) & 1) << 1) | (((raw >> 13) & 1) << 2)) & 7) as usize;
+    let sel = ((raw >> 8) & 3) as usize;
+    let sar = std_sar(cpu).min(31);
+    let base = sel * 2;
+    let (ar, ai) = (q_s16(cpu, qx, base) as i32, q_s16(cpu, qx, base + 1) as i32);
+    let (br, bi) = (q_s16(cpu, qy, base) as i32, q_s16(cpu, qy, base + 1) as i32);
+    let (re, im) = (ar * br - ai * bi, ar * bi + ai * br);
+    set_q_u16(cpu, qz, base, re.wrapping_shr(sar) as u16);
+    set_q_u16(cpu, qz, base + 1, im.wrapping_shr(sar) as u16);
+    let a = ar_t(raw);
+    let abase = cpu.reg(a);
+    let aligned = abase & !15;
+    if is_st {
+        let b = cpu.qregs[qu & 7];
+        ee_st64(bus, aligned, u64::from_le_bytes(b[..8].try_into().unwrap()));
+        ee_st64(
+            bus,
+            aligned.wrapping_add(8),
+            u64::from_le_bytes(b[8..].try_into().unwrap()),
+        );
+    } else {
+        let lo = ee_ld64(bus, aligned);
+        let hi = ee_ld64(bus, aligned.wrapping_add(8));
+        cpu.qregs[qu & 7][..8].copy_from_slice(&lo.to_le_bytes());
+        cpu.qregs[qu & 7][8..].copy_from_slice(&hi.to_le_bytes());
+    }
+    cpu.set_reg(a, abase.wrapping_add(16));
+}
+
 /// Zero Q / QACC / ACCX (QEMU `zero_s3`).
 fn ee_zero(cpu: &mut Cpu, raw: u32, kind: u8) {
     match kind {
@@ -1140,6 +1236,10 @@ pub fn exec_ee<B: Bus>(cpu: &mut Cpu, bus: &mut B, opc: Opcode, raw: u32) -> boo
         ee_fused_vmul(cpu, bus, raw, Width::S8, true);
     } else if name == "ee_fft_ams_s16_ld_incp" {
         ee_ams_ld(cpu, bus, raw);
+    } else if name == "ee_fft_ams_s16_ld_incp_uaup" {
+        ee_ams_ld_uaup(cpu, bus, raw);
+    } else if name == "ee_fft_ams_s16_ld_r32_decp" {
+        ee_ams_ld_r32_decp(cpu, bus, raw);
     } else if name == "ee_fft_ams_s16_st_incp" {
         ee_ams_st(cpu, bus, raw);
     } else if name.starts_with("ee_vmulas_") && name.contains("_ldbc_") {
@@ -1325,6 +1425,10 @@ pub fn exec_ee<B: Bus>(cpu: &mut Cpu, bus: &mut B, opc: Opcode, raw: u32) -> boo
         ee_ldf(cpu, bus, raw, false, name.ends_with("_ip"));
     } else if name.starts_with("ee_stf_64_") {
         ee_ldf(cpu, bus, raw, true, name.ends_with("_ip"));
+    } else if name.starts_with("ee_ldf_128_") {
+        ee_ldf128(cpu, bus, raw, false, name.ends_with("_ip"));
+    } else if name.starts_with("ee_stf_128_") {
+        ee_ldf128(cpu, bus, raw, true, name.ends_with("_ip"));
     } else if name == "ee_ld_ua_state_ip" {
         ee_ua_mem(cpu, bus, raw, false);
     } else if name == "ee_st_ua_state_ip" {
@@ -1341,6 +1445,10 @@ pub fn exec_ee<B: Bus>(cpu: &mut Cpu, bus: &mut B, opc: Opcode, raw: u32) -> boo
         ee_cmul_ld(cpu, bus, raw);
     } else if name == "ee_fft_cmul_s16_st_xp" {
         ee_cmul_st(cpu, bus, raw);
+    } else if name == "ee_cmul_s16_ld_incp" {
+        ee_cmul_fused(cpu, bus, raw, false);
+    } else if name == "ee_cmul_s16_st_incp" {
+        ee_cmul_fused(cpu, bus, raw, true);
     } else if name == "ee_fft_vst_r32_decp" {
         ee_vst_decp(cpu, bus, raw);
     } else {
@@ -1739,6 +1847,38 @@ fn ee_ldf<B: Bus>(cpu: &mut Cpu, bus: &mut B, raw: u32, is_st: bool, is_ip: bool
     }
 }
 
+/// 128-bit FPR load/store (QEMU-analogous `ldf_128`/`stf_128_s3`, GAS-
+/// captured FPR scatter): four singles move as two swapped pairs (the
+/// ldf64 half-swap extended: mem[0..4]<->fb, mem[4..8]<->fa,
+/// mem[8..12]<->fd, mem[12..16]<->fc), so stf128-then-ldf128 round-trips
+/// exactly. `.ip` adds b1[3:0]<<4, `.xp` adds AR[b1[3:0]].
+fn ee_ldf128<B: Bus>(cpu: &mut Cpu, bus: &mut B, raw: u32, is_st: bool, is_ip: bool) {
+    let fa = (((raw >> 24) & 7) << 1) | ((raw >> 19) & 1);
+    let fb = (((raw >> 16) & 7) << 1) | (raw & 1);
+    let fc = (raw >> 12) & 0xF;
+    let fd = (raw >> 20) & 0xF;
+    let a = ar_t(raw);
+    let base = cpu.reg(a);
+    let aligned = base & !15;
+    if is_st {
+        bus.write32(aligned, cpu.freg(fb).to_bits());
+        bus.write32(aligned.wrapping_add(4), cpu.freg(fa).to_bits());
+        bus.write32(aligned.wrapping_add(8), cpu.freg(fd).to_bits());
+        bus.write32(aligned.wrapping_add(12), cpu.freg(fc).to_bits());
+    } else {
+        cpu.set_freg(fb, f32::from_bits(bus.read32(aligned)));
+        cpu.set_freg(fa, f32::from_bits(bus.read32(aligned.wrapping_add(4))));
+        cpu.set_freg(fd, f32::from_bits(bus.read32(aligned.wrapping_add(8))));
+        cpu.set_freg(fc, f32::from_bits(bus.read32(aligned.wrapping_add(12))));
+    }
+    if is_ip {
+        cpu.set_reg(a, base.wrapping_add(((raw >> 8) & 0xF) << 4));
+    } else {
+        let ax = cpu.reg((raw >> 8) & 0xF);
+        cpu.set_reg(a, base.wrapping_add(ax));
+    }
+}
+
 /// 128-bit UA_STATE spill/fill; as at t, post-increment b1<<4.
 fn ee_ua_mem<B: Bus>(cpu: &mut Cpu, bus: &mut B, raw: u32, is_st: bool) {
     let a = ar_t(raw);
@@ -2119,6 +2259,62 @@ fn ee_vmulas_ldbc<B: Bus>(cpu: &mut Cpu, bus: &mut B, raw: u32, w: Width) {
 /// [0] = raw[20],[2] = raw[22], else [2] = raw[18],[0] = raw[16]&~[2]),
 /// qm = raw[18:16], sel2 = raw[25], SAR = standard SAR.
 fn ee_ams_ld<B: Bus>(cpu: &mut Cpu, bus: &mut B, raw: u32) {
+    ee_ams_math(cpu, raw);
+    // Load + postupdate.
+    let qu = ((raw >> 8) & 7) as usize;
+    let a = ar_t(raw);
+    let base = cpu.reg(a);
+    let aligned = base & !15;
+    let lo = ee_ld64(bus, aligned);
+    let hi = ee_ld64(bus, aligned.wrapping_add(8));
+    cpu.qregs[qu & 7][..8].copy_from_slice(&lo.to_le_bytes());
+    cpu.qregs[qu & 7][8..].copy_from_slice(&hi.to_le_bytes());
+    cpu.set_reg(a, base.wrapping_add(16));
+}
+
+/// FFT AMS + unaligned-update load (QEMU-analogous `fft_ams_s16` math +
+/// ESP32-P4 PIE reference "load with unaligned update"): same math and
+/// aligned 128-bit load as `ee_ams_ld`, but the address low nibble is
+/// also snapshotted into SAR_BYTE (LD.USAR precedent) so a following
+/// src.q slide aligns correctly; AR += 16.
+fn ee_ams_ld_uaup<B: Bus>(cpu: &mut Cpu, bus: &mut B, raw: u32) {
+    ee_ams_math(cpu, raw);
+    let qu = ((raw >> 8) & 7) as usize;
+    let a = ar_t(raw);
+    let base = cpu.reg(a);
+    let aligned = base & !15;
+    let lo = ee_ld64(bus, aligned);
+    let hi = ee_ld64(bus, aligned.wrapping_add(8));
+    cpu.qregs[qu & 7][..8].copy_from_slice(&lo.to_le_bytes());
+    cpu.qregs[qu & 7][8..].copy_from_slice(&hi.to_le_bytes());
+    cpu.sar_byte = (base & 0xF) as u8;
+    cpu.set_reg(a, base.wrapping_add(16));
+}
+
+/// FFT AMS + reversed-32 load with pointer decrement (QEMU-analogous
+/// `fft_ams_s16` math + `vst_r32_decp`-mirrored lane order): qu fills
+/// with u32-reversed lanes ([m3,m2,m1,m0], the inverse of the r32 store
+/// arrangement), then AR -= 16 (decp precedent: `ee_vst_decp`).
+fn ee_ams_ld_r32_decp<B: Bus>(cpu: &mut Cpu, bus: &mut B, raw: u32) {
+    ee_ams_math(cpu, raw);
+    let qu = ((raw >> 8) & 7) as usize;
+    let a = ar_t(raw);
+    let base = cpu.reg(a);
+    let aligned = base & !15;
+    let mut w = [0u32; 4];
+    for (i, slot) in w.iter_mut().enumerate() {
+        *slot = bus.read32(aligned.wrapping_add(4 * i as u32));
+    }
+    cpu.qregs[qu & 7][..4].copy_from_slice(&w[3].to_le_bytes());
+    cpu.qregs[qu & 7][4..8].copy_from_slice(&w[2].to_le_bytes());
+    cpu.qregs[qu & 7][8..12].copy_from_slice(&w[1].to_le_bytes());
+    cpu.qregs[qu & 7][12..].copy_from_slice(&w[0].to_le_bytes());
+    cpu.set_reg(a, base.wrapping_sub(16));
+}
+
+/// Shared AMS butterfly math (QEMU `fft_ams_s16`, lanes 2,3 only); the
+/// ld/uaup/decp tails differ only in the memory op + AR update.
+fn ee_ams_math(cpu: &mut Cpu, raw: u32) {
     let qz = (((raw >> 12) & 3) << 1) as usize;
     let qz1 = (((raw >> 11) & 1) | (((raw >> 24) & 1) << 2)) as usize;
     let qx = (((raw >> 15) & 1) << 1 | ((raw) & 1) << 2) as usize;
@@ -2155,16 +2351,6 @@ fn ee_ams_ld<B: Bus>(cpu: &mut Cpu, bus: &mut B, raw: u32) {
     set_q_u16(cpu, qz, 3, temp1.wrapping_add(temp3) as u16);
     set_q_u16(cpu, qz1, 2, temp0.wrapping_sub(temp2) as u16);
     set_q_u16(cpu, qz1, 3, temp3.wrapping_sub(temp1) as u16);
-    // Load + postupdate.
-    let qu = ((raw >> 8) & 7) as usize;
-    let a = ar_t(raw);
-    let base = cpu.reg(a);
-    let aligned = base & !15;
-    let lo = ee_ld64(bus, aligned);
-    let hi = ee_ld64(bus, aligned.wrapping_add(8));
-    cpu.qregs[qu & 7][..8].copy_from_slice(&lo.to_le_bytes());
-    cpu.qregs[qu & 7][8..].copy_from_slice(&hi.to_le_bytes());
-    cpu.set_reg(a, base.wrapping_add(16));
 }
 
 /// Fused Q-slide + 128-bit load (QEMU `translate_src_q_s3` with

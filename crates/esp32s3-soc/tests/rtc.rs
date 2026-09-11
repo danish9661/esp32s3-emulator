@@ -84,3 +84,50 @@ fn rwdt_reset_fires_once_then_feeds_clear() {
     r.tick(50);
     assert!(!r.consume_reset(), "fed, quiet");
 }
+
+/// BOD: enabled + injected brownout latches INT_RAW bit 9 after int_wait
+/// (cleared by INT_CLR); with rst_ena a chip reset follows after rst_wait.
+/// Disabled or nominal voltage never trips (bootloader enables BOD).
+#[test]
+fn bod_interrupt_then_reset() {
+    use esp32s3_soc::rtc::Rtc;
+    let mut r = Rtc::default();
+    // Enabled but nominal voltage: no trip, ever.
+    r.write32(0xE8, (1 << 30) | (10 << 4));
+    r.tick(10000);
+    assert_eq!(r.read32(0x44) & (1 << 9), 0, "no trip at nominal voltage");
+    assert!(!r.consume_reset());
+    // Inject brownout: interrupt after int_wait=10, no reset (rst_ena=0).
+    r.bod_inject(true);
+    r.tick(9);
+    assert_eq!(r.read32(0x44) & (1 << 9), 0, "not yet");
+    r.tick(1);
+    assert_ne!(r.read32(0x44) & (1 << 9), 0, "BOD INT latched");
+    assert_eq!(r.read32(0x48) & (1 << 9), 0, "INT_ST gated by ENA");
+    r.write32(0x40, 1 << 9);
+    assert_ne!(r.read32(0x48) & (1 << 9), 0, "INT_ST = RAW & ENA");
+    assert!(!r.consume_reset(), "no reset without rst_ena");
+    r.write32(0x4C, 1 << 9);
+    assert_eq!(r.read32(0x44) & (1 << 9), 0, "INT_CLR clears");
+    // Arm reset: rst_ena + rst_wait=20 from the same counter (already 10).
+    r.write32(0xE8, (1 << 30) | (1 << 26) | (20 << 16) | (10 << 4));
+    assert!(!r.consume_reset(), "needs int_wait + rst_wait = 30");
+    r.tick(20);
+    assert!(r.consume_reset(), "BOD reset fires");
+    assert!(!r.consume_reset(), "single-shot");
+}
+
+/// BOD cnt_clr restarts the detector counter without the interrupt.
+#[test]
+fn bod_cnt_clr_restarts_counter() {
+    use esp32s3_soc::rtc::Rtc;
+    let mut r = Rtc::default();
+    r.bod_inject(true);
+    r.write32(0xE8, (1 << 30) | (100 << 4));
+    r.tick(90);
+    r.write32(0xE8, (1 << 30) | (100 << 4) | (1 << 29)); // cnt_clr
+    r.tick(90);
+    assert_eq!(r.read32(0x44) & (1 << 9), 0, "counter restarted");
+    r.tick(10);
+    assert_ne!(r.read32(0x44) & (1 << 9), 0, "fires after full wait");
+}

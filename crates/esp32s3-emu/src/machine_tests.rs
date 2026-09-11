@@ -2908,6 +2908,47 @@ fn wdt_reset_reboots_machine() {
     );
 }
 
+#[test]
+fn bod_reset_reboots_machine() {
+    use crate::asm::Asm;
+    use crate::rom_stub::APP_FLASH_OFFSET;
+
+    // App (single IRAM segment): print 'B' (UART0 FIFO), arm BOD reset
+    // (BROWN_OUT ena + rst_ena, short waits), then loop forever.  Each BOD
+    // timeout reboots the machine, re-printing 'B'.  The host injects the
+    // low-voltage condition (nominal voltage never trips).
+    const APP_ENTRY: u32 = IRAM_BASE;
+    let mut a = Asm::new(IRAM_BASE);
+    a.li(2, 0x6000_0000);
+    a.movi_n(3, 0x42); // 'B'
+    a.s32i(3, 2, 0); // UART0 FIFO <- 'B'
+    a.li(2, 0x6000_8000); // RTC_CNTL page
+    // BROWN_OUT = ena + rst_ena + int_wait=4 + rst_wait=4.
+    a.li(3, 0x4444_0040u32 as i32);
+    a.s32i(3, 2, 0xE8);
+    let here = a.pc();
+    a.j(here); // loop forever (BOD will reset)
+    let app = a.bytes().to_vec();
+
+    let img = esp_app_image(IRAM_BASE, APP_ENTRY, &app);
+    let mut flash = std::vec![0xFFu8; 0x200_000];
+    flash[APP_FLASH_OFFSET as usize..APP_FLASH_OFFSET as usize + img.len()].copy_from_slice(&img);
+
+    let mut m = Esp32S3::new();
+    m.boot_from_flash(&flash);
+    m.soc.bod_inject(true);
+    let mut out = std::vec::Vec::new();
+    for _ in 0..5000 {
+        m.step();
+        out.extend(m.take_uart_tx(0));
+    }
+    let b_count = out.iter().filter(|&&b| b == b'B').count();
+    assert!(
+        b_count >= 2,
+        "BOD reset must reboot the machine (>=2 'B's), got {b_count} (out={out:?})"
+    );
+}
+
 /// Cross-core interrupt (FROM_CPU_INTR1, source 80): core 0 writes
 /// SYSTEM.CPU_INT_FROM_CPU_1 to assert an interrupt on core 1; the interrupt
 /// matrix maps source 80 to core 1's line 15; core 1's level-3 ISR must run

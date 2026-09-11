@@ -90,6 +90,14 @@ fn main() {
         println!("[host] injected touch pad {pad} = {val}");
     }
 
+    // Brown-out injection for BOD sketches: BOD_INJECT=1 holds the
+    // low-voltage condition so an enabled detector trips (interrupt
+    // after int_wait, chip reset after rst_wait with rst_ena).
+    if env::var("BOD_INJECT").is_ok() {
+        m.soc.bod_inject(true);
+        println!("[host] injected brownout condition");
+    }
+
     // UART1 RX injection (echo-sketch support): UART_INJECT=<text> is
     // pushed into UART1 RX as soon as the console shows the RXREADY marker.
     let uart1_inject: Option<Vec<u8>> = env::var("UART_INJECT").ok().map(|s| s.into_bytes());

@@ -712,6 +712,14 @@ impl Soc {
         self.touch.inject(pad, value);
     }
 
+    /// Inject the BOD low-voltage condition (host frontend — with the
+    /// detector enabled the interrupt fires after int_wait and, with
+    /// rst_ena, a chip reset after rst_wait more ticks).
+    pub fn bod_inject(&mut self, low: bool) {
+        self.rtc.bod_inject(low);
+    }
+
+
     /// Snapshot of driven output-pin state (host LED visualization).  A
     /// pin whose FUNC_OUT_SEL selects a peripheral signal (LEDC 96..103)
     /// follows that signal instead of GPIO_OUT (TRM GPIO matrix).

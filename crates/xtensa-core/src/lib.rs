@@ -2282,6 +2282,186 @@ mod cpu_tests {
     }
 
     #[test]
+    #[test]
+    fn ee_cmul_fused_ld_pair_then_load() {
+        // ee.cmul.s16.ld.incp q0, a2, q1, q2, q3, 0 = e0 81 9c 2e
+        // (GAS-captured): sel0 pair0 (3+4i)(1+0i)>>1 = (1,2) into q1[0,1],
+        // then mem128 into q0, AR += 16.
+        let (cpu, _) = ee_run_mem(0xE081_9C2E, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            c.set_sreg(crate::cpu::SR_SAR, 1);
+            c.qregs[2] = [3, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            c.qregs[3] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 30 + i as u32);
+            }
+        });
+        assert_eq!(cpu.qregs[1][0], 1);
+        assert_eq!(cpu.qregs[1][1], 0);
+        assert_eq!(cpu.qregs[1][2], 2);
+        assert_eq!(cpu.qregs[1][3], 0);
+        for i in 0..16 {
+            assert_eq!(cpu.qregs[0][i], 30 + i as u8);
+        }
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+    }
+
+    #[test]
+    fn ee_cmul_fused_ld_quadrant1_signed() {
+        // ee.cmul.s16.ld.incp q0, a2, q1, q2, q3, 1 = e0 81 9d 2e: sel1
+        // pair1 (5+6i)(1+2i)>>1 = (-4,8) into q1[2,3] (wrapping_shr).
+        let (cpu, _) = ee_run_mem(0xE081_9D2E, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            c.set_sreg(crate::cpu::SR_SAR, 1);
+            c.qregs[2] = [0, 0, 0, 0, 5, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            c.qregs[3] = [0, 0, 0, 0, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, i as u32);
+            }
+        });
+        assert_eq!(cpu.qregs[1][4], 0xFC);
+        assert_eq!(cpu.qregs[1][5], 0xFF);
+        assert_eq!(cpu.qregs[1][6], 8);
+        assert_eq!(cpu.qregs[1][7], 0);
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+    }
+
+    #[test]
+    fn ee_cmul_fused_st_pair_then_store() {
+        // ee.cmul.s16.st.incp q0, a2, q1, q2, q3, 0 = e4 81 90 2e: sel0
+        // pair0 into q1[0,1], qu=q0 stored, AR += 16.
+        let (cpu, mut bus) = ee_run_mem(0xE481_902E, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            c.set_sreg(crate::cpu::SR_SAR, 1);
+            c.qregs[0] = [
+                50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65,
+            ];
+            c.qregs[2] = [3, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            c.qregs[3] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        });
+        assert_eq!(cpu.qregs[1][0], 1);
+        assert_eq!(cpu.qregs[1][2], 2);
+        for i in 0..16 {
+            assert_eq!(bus.read8(0x4000_2000 + i as u32), 50 + i as u32);
+        }
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+    }
+
+    #[test]
+    fn ee_cmul_fused_st_quarter2_signed_store() {
+        // ee.cmul.s16.st.incp q1, a2, q3, q0, q0, 2 = e4 13 02 2e
+        // (GAS-captured): sel2 pair2 (5+6i)(5+6i)>>1 = (-6,30) into
+        // q3[4,5] (wrapping_shr), qu=q1 stored, AR += 16. (Covers the
+        // odd-qu / nonzero-imm corner of the st map.)
+        let (cpu, mut bus) = ee_run_mem(0xE413_022E, 4, |c, _| {
+            c.set_reg(2, 0x4000_2000);
+            c.set_sreg(crate::cpu::SR_SAR, 1);
+            c.qregs[0] = [0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 6, 0, 0, 0, 0, 0];
+            c.qregs[1] = [
+                70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85,
+            ];
+        });
+        assert_eq!(cpu.qregs[3][8], 0xFA);
+        assert_eq!(cpu.qregs[3][9], 0xFF);
+        assert_eq!(cpu.qregs[3][10], 30);
+        assert_eq!(cpu.qregs[3][11], 0);
+        for i in 0..16 {
+            assert_eq!(bus.read8(0x4000_2000 + i as u32), 70 + i as u32);
+        }
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+    }
+
+    #[test]
+    fn ee_ams_uaup_sets_sar_byte() {
+        // ee.fft.ams.s16.ld.incp.uaup q0, a2, q2, q4, q0, q0, q0, 0
+        // = 2e 10 00 d5: same math as the incp KAT (q2[2]=4, q2[3]=6,
+        // q4[2]=8, q4[3]=6) plus SAR_BYTE capture from the base.
+        let (cpu, _) = ee_run_mem(0xD500_102E, 4, |c, b| {
+            c.set_reg(2, 0x4000_2004);
+            c.qregs[0] = [0, 0, 0, 0, 3, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            c.qregs[1] = [77; 16];
+            c.qregs[3] = [0; 16];
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 20 + i as u32);
+            }
+        });
+        let s16 = |q: &[u8; 16], i: usize| i16::from_le_bytes([q[2 * i], q[2 * i + 1]]);
+        assert_eq!(s16(&cpu.qregs[2], 2), 4);
+        assert_eq!(s16(&cpu.qregs[2], 3), 6);
+        assert_eq!(s16(&cpu.qregs[4], 2), 8);
+        assert_eq!(s16(&cpu.qregs[4], 3), 6);
+        for i in 0..16 {
+            assert_eq!(cpu.qregs[0][i], 20 + i as u8);
+        }
+        assert_eq!(cpu.sar_byte, 4);
+        assert_eq!(cpu.reg(2), 0x4000_2014);
+    }
+
+    #[test]
+    fn ee_ams_r32_decp_reverses_and_decrements() {
+        // ee.fft.ams.s16.ld.r32.decp q0, a2, q2, q4, q0, q0, q0, 0
+        // = 2e 10 00 d9: same math, qu fills u32-reversed ([m3,m2,m1,m0]),
+        // AR -= 16.
+        let (cpu, _) = ee_run_mem(0xD900_102E, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            c.qregs[0] = [0, 0, 0, 0, 3, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            c.qregs[1] = [77; 16];
+            c.qregs[3] = [0; 16];
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 20 + i as u32);
+            }
+        });
+        let s16 = |q: &[u8; 16], i: usize| i16::from_le_bytes([q[2 * i], q[2 * i + 1]]);
+        assert_eq!(s16(&cpu.qregs[2], 2), 4);
+        assert_eq!(s16(&cpu.qregs[4], 3), 6);
+        assert_eq!(&cpu.qregs[0][0..4], &[32, 33, 34, 35]);
+        assert_eq!(&cpu.qregs[0][4..8], &[28, 29, 30, 31]);
+        assert_eq!(&cpu.qregs[0][8..12], &[24, 25, 26, 27]);
+        assert_eq!(&cpu.qregs[0][12..16], &[20, 21, 22, 23]);
+        assert_eq!(cpu.reg(2), 0x4000_1FF0);
+    }
+
+    #[test]
+    fn ee_ldf128_stf128_pairwise_swap_round_trip() {
+        // ee.stf.128.ip f0, f1, f2, f3, a2, 0 = 2f 20 30 90 then
+        // ee.ldf.128.ip f4, f5, f6, f7, a2, 0 = 2f 60 72 82 (both
+        // GAS-captured): pairs swap halves like ldf64, so the round trip
+        // reproduces every lane exactly.
+        let (cpu, mut bus) = ee_run_mem(0x9030_202F, 4, |c, _| {
+            c.set_reg(2, 0x4000_2000);
+            c.set_freg(0, f32::from_bits(0x3F80_0000));
+            c.set_freg(1, f32::from_bits(0x4000_0000));
+            c.set_freg(2, f32::from_bits(0x4040_0000));
+            c.set_freg(3, f32::from_bits(0x4080_0000));
+        });
+        assert_eq!(bus.read32(0x4000_2000), 0x4000_0000);
+        assert_eq!(bus.read32(0x4000_2004), 0x3F80_0000);
+        assert_eq!(bus.read32(0x4000_2008), 0x4080_0000);
+        assert_eq!(bus.read32(0x4000_200C), 0x4040_0000);
+        assert_eq!(cpu.reg(2), 0x4000_2000);
+    }
+
+    #[test]
+    fn ee_ldf128_loads_swapped_pairs() {
+        // ee.ldf.128.ip f4, f5, f6, f7, a2, 0 = 2f 60 72 82: mem[0..4]
+        // lands in f5, [4..8] in f4, [8..12] in f7, [12..16] in f6.
+        let (cpu, _) = ee_run_mem(0x8272_602F, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            for (i, v) in [0x3F80_0000u32, 0x4000_0000, 0x4040_0000, 0x4080_0000]
+                .iter()
+                .enumerate()
+            {
+                b.write32(0x4000_2000 + 4 * i as u32, *v);
+            }
+        });
+        assert_eq!(cpu.freg(4).to_bits(), 0x4000_0000);
+        assert_eq!(cpu.freg(5).to_bits(), 0x3F80_0000);
+        assert_eq!(cpu.freg(6).to_bits(), 0x4080_0000);
+        assert_eq!(cpu.freg(7).to_bits(), 0x4040_0000);
+        assert_eq!(cpu.reg(2), 0x4000_2000);
+    }
+
+    #[test]
     fn ee_dsp_dot_product_vehicle() {
         // End-to-end DSP path: two post-increment 128-bit loads feed a
         // vector MAC. A = B = [1..16], dot = sum(i^2) = 1496.

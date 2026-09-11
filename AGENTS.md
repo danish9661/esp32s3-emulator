@@ -3090,3 +3090,53 @@ Core design:
     - 38/38 suites green, battery 14/14 (4 new + neighbors incl. sdfat),
       fmt clean, my-files clippy-clean (xtensa-core ua_state deny is
       pre-existing toolchain drift, untouched).
+  - 2026-09-11: **ee.* tail closed: 217/218 mnemonics execute (was ~155);
+    only `ee_srs_accx` traps (proven unencodable)**. New: cmul-fused
+    ld/st (`ee_cmul_s16_ld/st_incp`: single-pair MAC sel=quadrant,
+    standard form, mem128, AR+=16), ams tails (`ld_incp_uaup` =
+    AMS + aligned load + SAR_BYTE capture (USAR-analogous, "unaligned
+    update"); `ld_r32_decp` = AMS + u32-reversed qu fill + AR-=16
+    (vst_r32_decp-mirrored)), ldf/stf.128 (pairwise-swapped FPR
+    quad-move, ldf64 analogy). Ground truth: GAS probes (operand order
+    confirmed vs binutils `match_opcode_xespv2p1.c`:
+    qu,ar,qz,qx,qy,sel) + ESP32-P4 PIE reference (fused semantics:
+    "CMUL + load 16 bytes, rs1 += 16"; UAUP = "load with unaligned
+    update"; R32 = "load 32-bit"). Hard parts: (1) ldf128 words were
+    SILENTLY misdecoded as qup (all four forms) — mandatory fix, proven
+    disjoint by GAS-probing all 16 qup arms (high nibbles 0-7,A-C, never
+    8/9); (2) cmul-st b2[3]==0 separates from valu-st's b2[3]==1 const
+    (an early wrong dest map briefly suggested overlap — resolved by
+    single-change probes proving qu=b2[6:4], qz=b2[2:0]); (3) cmul-ld
+    shares nibble D with LDXQ — separated by key2 (0 vs 7, probed
+    const); (4) FPR scatter mapped (pos1=[0]b2[3]+[3:1]b3[2:0],
+    pos2=[0]b0[0]+[3:1]b2[2:0], pos3=b1[7:4], pos4=b2[7:4]) with
+    all-distinct GAS dup constraints. 9 new lib KATs (102 lib green) +
+    `esp32s3_ee_dsp` extended (`CMUL h0=1 OK`, `LDF128 t0=3F800000 OK`).
+    Cautionary tales: objdump prints the value MSB-first (b0 = LAST
+    pair — mis-split twice); display-order ≠ LE u32 (several KAT words
+    initially reversed); duplicate-Q probe combos get GAS-renamed
+    (keep Qs distinct); my widened AMS mask briefly stole cmul_ld_xp
+    (explicit D0/D1/D4/D5/D8/D9 match instead). Full workspace green,
+    fmt/clippy clean, battery ee_dsp green.
+  - 2026-09-11: **BOD brown-out detector validated (P5)**. `rtc.rs` models
+    RTC_CNTL BROWN_OUT (@0xE8: int_wait[13:4], rst_wait[25:16],
+    rst_ena[26], cnt_clr[29], ena[30]) + INT_RAW/ST/CLR bit 9 (source 39
+    via the existing RTC overlay): enabled + host-injected brownout
+    (`bod_inject`, `BOD_INJECT=1`) latches INT after int_wait and
+    requests a chip reset after rst_wait with rst_ena (flows through the
+    shared `consume_reset`, proven by machine test
+    `bod_reset_reboots_machine`). Nominal voltage never trips (bootloader
+    enabling BOD stays boot-neutral — hello+inject boots clean). 2 unit
+    tests + sketches `esp32s3_bod_int` (`BOD INT OK`/`BOD PASS`) +
+    `esp32s3_bod_reset` (reboot loop, marker entry like rwdt_reset).
+    Cautionary tales: (1) the first sketch died with no output — a 20M
+    poll exceeded the 96M-step budget, not a model bug (shortened to
+    2M); (2) the deep one: unit + machine probes fired but the sketch
+    saw MISSING — the bootloader fires + clears BOD during boot under
+    injection, latching my single-shot `bod_fired` forever, so the
+    sketch's re-enable never refired. Fixed by re-arming on any
+    BROWN_OUT write (proven via temporary fire/clear/write counters +
+    resets counter, all since removed); (3) bonus find along the way:
+    IDF installs its own brownout ISR ("Brownout detector was
+    triggered") — the INT sketch clears INT_ENA bit 9 and polls RAW so
+    the two don't race (standard practice, documented in-sketch).
