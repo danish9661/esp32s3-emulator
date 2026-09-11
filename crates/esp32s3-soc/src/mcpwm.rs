@@ -85,6 +85,29 @@ const CAPN_PRESCALE_SHIFT: u32 = 3; // [10:3], divide by prescale+1
 const CAPN_INVERT: u32 = 1 << 11;
 // Capture-channel interrupt bits (INT_ENA/RAW/ST/CLR).
 const CAP_INT_BASE: u32 = 27;
+// Timer/operator event interrupt bits (mcpwm_reg.h INT_ENA: TIMERt_STOP
+// 0-2, TIMERt_TEZ 3-5, TIMERt_TEP 6-8, OPn_TEA 15-17, OPn_TEB 18-20).
+const TEZ_INT_BASE: u32 = 3;
+const TEP_INT_BASE: u32 = 6;
+const OP_TEA_INT_BASE: u32 = 15;
+const OP_TEB_INT_BASE: u32 = 18;
+// Timer sync input (mcpwm_timer_sync_reg_t @ timer stride + 0x0C):
+// SYNCI_EN[0] arms the external SYNCt_IN reload (timer t listens to
+// SYNCt, group 0 = 160..162, group 1 = 169..171, gpio_sig_map.h
+// PWMx_SYNCn_IN_IDX). SYNC_SW[1]/PHASE[19:4] already modeled.
+// Dead-time output swap (mcpwm_dt_cfg_reg_t @ DT_BASE0 + op*0x38):
+// A_OUTSWAP[9] / B_OUTSWAP[10] (S6/S7) swap the generator outputs
+// post-dead-time (applied pre-carrier, same documented ordering class
+// as the fault force). INSEL/DEB_MODE need the TRM S1-S8 switch table
+// figure and stay unmodeled (reset = symmetric bypass, as modeled).
+// Timer sync input arm (mcpwm_timer_sync_reg_t @ timer stride + 0x0C):
+// SYNCI_EN[0] arms the external SYNCt_IN reload (timer t listens to
+// SYNCt, group 0 = 160..162, group 1 = 169..171, gpio_sig_map.h
+// PWMx_SYNCn_IN_IDX). SYNC_SW[1]/PHASE[19:4] already modeled.
+const SYNCI_EN: u32 = 1 << 0;
+const DT_CFG: u32 = 0x00;
+const DT_A_OUTSWAP: u32 = 1 << 9;
+const DT_B_OUTSWAP: u32 = 1 << 10;
 
 // Fault submodule (mcpwm_fault_detect_reg_t @0xE4 + per-operator FH regs):
 // FAULT_DETECT: F0/1/2_EN[2:0], F0/1/2_POLE[5:3] (1 = high-active),
@@ -157,6 +180,8 @@ pub struct Mcpwm {
     regs: [u32; REG_WORDS],
     /// Live timer counter for each timer (TRM timer_status).
     timer_count: [u32; NTIMER],
+    /// Previous SYNC0..2 input levels (rising-edge reload).
+    prev_sync: [u32; 3],
     /// Per-timer prescale accumulator (advance the counter every prescale+1 ticks).
     timer_prescale_cnt: [u32; NTIMER],
     /// Up-down direction: 0 = counting up, 1 = counting down.
@@ -212,6 +237,7 @@ impl Mcpwm {
         Self {
             regs: [0; REG_WORDS],
             timer_count: [0; NTIMER],
+            prev_sync: [0; 3],
             timer_prescale_cnt: [0; NTIMER],
             timer_dir: [0; NTIMER],
             gen_level: [[0; 2]; NOPER],
@@ -310,9 +336,15 @@ impl Mcpwm {
             let old = self.timer_count[t];
             let (new, tez) = match mode {
                 1 => {
-                    // Up / increment: wrap period-1 -> 0.
+                    // Up / increment: wrap period-1 -> 0. The period
+                    // boundary is both TEP (count == period) and TEZ.
                     let n = old + 1;
-                    if n >= period { (0, true) } else { (n, false) }
+                    if n >= period {
+                        self.int_raw |= 1 << (TEP_INT_BASE + t as u32);
+                        (0, true)
+                    } else {
+                        (n, false)
+                    }
                 }
                 2 => {
                     // Down / decrement.
@@ -327,6 +359,8 @@ impl Mcpwm {
                     if self.timer_dir[t] == 0 {
                         if old + 1 >= period {
                             self.timer_dir[t] = 1;
+                            // Peak (count == period): TEP, not TEZ.
+                            self.int_raw |= 1 << (TEP_INT_BASE + t as u32);
                             (period - 1, false)
                         } else {
                             (old + 1, false)
@@ -342,7 +376,9 @@ impl Mcpwm {
             };
             self.timer_count[t] = new;
             if tez {
-                // TEZ (count == 0): apply the zero-event action selectors.
+                // TEZ (count == 0): latch TIMERt_TEZ, apply the zero-event
+                // action selectors.
+                self.int_raw |= 1 << (TEZ_INT_BASE + t as u32);
                 for op in 0..NOPER {
                     if self.op_timer_sel(op) == t {
                         self.apply_action(op, GEN_UTEZ);
@@ -358,10 +394,12 @@ impl Mcpwm {
                     let cmpa = self.gen_reg(op, GEN_TSTMP_A) & 0xFFFF;
                     let cmpb = self.gen_reg(op, GEN_TSTMP_B) & 0xFFFF;
                     if new == cmpa {
+                        self.int_raw |= 1 << (OP_TEA_INT_BASE + op as u32);
                         self.apply_action(op, GEN_UTEA);
                         self.apply_action(op, GEN_DTEA);
                     }
                     if new == cmpb {
+                        self.int_raw |= 1 << (OP_TEB_INT_BASE + op as u32);
                         self.apply_action(op, GEN_UTEB);
                         self.apply_action(op, GEN_DTEB);
                     }
@@ -520,6 +558,9 @@ impl Mcpwm {
     fn fh_cfg0(&self, op: usize) -> u32 {
         self.regs[(FH_CFG0_BASE as usize + op * FH_STRIDE as usize) / 4]
     }
+    /// Paired with `fh_cfg0` (fault-CFG1 fields are currently unread by the
+    /// model, which consumes the combined fault state elsewhere).
+    #[allow(dead_code)]
     fn fh_cfg1(&self, op: usize) -> u32 {
         self.regs[(FH_CFG0_BASE as usize + op * FH_STRIDE as usize) / 4 + 1]
     }
@@ -562,6 +603,28 @@ impl Mcpwm {
         }
         if self.fault_cbc_on[op] {
             self.apply_fault_action(op, 8, 10);
+        }
+    }
+
+    /// True when any timer arms the external sync input (tick gate).
+    pub fn sync_armed(&self) -> bool {
+        (0..NTIMER).any(|t| self.regs[(t * TIMER_STRIDE) + TIMER_SYNC as usize / 4] & SYNCI_EN != 0)
+    }
+
+    /// Advance the timer-sync submodule by one SoC step: sample the SYNC0..2
+    /// matrix inputs (`sync_base` + t, group 0 = 160, group 1 = 169,
+    /// gpio_sig_map.h PWMx_SYNCn_IN_IDX); a rising edge with SYNCI_EN
+    /// reloads timer t with PHASE (same load as SYNC_SW). Sampled even with
+    /// the timers stopped, like the fault inputs.
+    pub fn tick_sync<F: Fn(u32) -> u32>(&mut self, sync_base: u32, input: &F) {
+        for t in 0..NTIMER {
+            let lvl = input(sync_base + t as u32) & 1;
+            let rising = lvl == 1 && self.prev_sync[t] == 0;
+            self.prev_sync[t] = lvl;
+            if rising && self.regs[(t * TIMER_STRIDE) + TIMER_SYNC as usize / 4] & SYNCI_EN != 0 {
+                let sync = self.regs[(t * TIMER_STRIDE) + TIMER_SYNC as usize / 4];
+                self.timer_count[t] = (sync >> PHASE_SHIFT) & 0xFFFF;
+            }
         }
     }
 
@@ -641,6 +704,24 @@ impl Mcpwm {
                 self.gen_level[op][g]
             } else {
                 self.dt_out[op][g]
+            };
+            // S6/S7 output swap (post-dead-time, pre-carrier ordering).
+            let cfg = self.regs[(DT_BASE0 + op as u32 * DT_STRIDE + DT_CFG) as usize / 4];
+            let swapped = if cfg & DT_A_OUTSWAP != 0 && cfg & DT_B_OUTSWAP != 0 {
+                1 - g
+            } else if cfg & DT_A_OUTSWAP != 0 && g == 0 {
+                1
+            } else if cfg & DT_B_OUTSWAP != 0 && g == 1 {
+                0
+            } else {
+                g
+            };
+            let base = if swapped == g {
+                base
+            } else if fed == 0 && red == 0 {
+                self.gen_level[op][swapped]
+            } else {
+                self.dt_out[op][swapped]
             };
             self.carrier_out(op, g, base)
         } else {
@@ -731,11 +812,11 @@ impl Mcpwm {
                 if idx < REG_WORDS {
                     self.regs[idx] = value;
                     // Timer sync: a SYNC_SW write reloads the counter with
-                    // PHASE (SYNCI_EN external input is not modeled; the
+                    // PHASE (external SYNCI_EN reloads via tick_sync; the
                     // level-triggered write matches what the driver emits).
                     if offset >= TIMER_SYNC
                         && offset < TIMER_SYNC + NTIMER as u32 * TIMER_STRIDE as u32
-                        && (offset - TIMER_SYNC) % TIMER_STRIDE as u32 == 0
+                        && (offset - TIMER_SYNC).is_multiple_of(TIMER_STRIDE as u32)
                         && value & SYNC_SW != 0
                     {
                         let t = ((offset - TIMER_SYNC) / TIMER_STRIDE as u32) as usize;

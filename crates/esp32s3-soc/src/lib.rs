@@ -46,6 +46,7 @@ pub mod timg;
 pub mod touch;
 pub mod twai;
 pub mod uart;
+pub mod uhci;
 pub mod ulp;
 pub mod usb_otg;
 pub mod usb_serial_jtag;

@@ -34,6 +34,9 @@ static volatile gdma_desc_t g_lcd_desc;
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C001C) |= (1u << 8);
+  *(volatile uint32_t*)(0x600C001C) |= (1u << 6);
   delay(80);
 
   REG_WRITE(LC_INT_ENA, TRANS_DONE);   // enable TRANS_DONE interrupt

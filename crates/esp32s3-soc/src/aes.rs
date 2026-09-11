@@ -226,6 +226,93 @@ pub(crate) fn aes256_cbc_decrypt(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> 
     out
 }
 
+/// XTS-AES-128 tweakable block cipher (flash-encryption primitive).
+/// Key split matches mbedtls (`mbedtls_aes_xts_setkey_enc(key, 256)`):
+/// K1 = key[0..16] (data), K2 = key[16..32] (tweak). Tweak T = E_K2(IV);
+/// out = E_K1(in ^ T) ^ T (encrypt) or the inverse. The flash pipeline
+/// uses IV = LE128(absolute flash byte offset of the 16-byte block), so
+/// every block is independently addressable (random-access, like IEEE
+/// P1619 single-block units). This is a fixture convention — no firmware
+/// observes it (the transparent HW hides it); IDF uses address-derived
+/// IVs the same way.
+pub(crate) fn xts_key(key: &[u8; 32]) -> (Vec<u32>, Vec<u32>) {
+    (key_expansion(&key[..16], 4), key_expansion(&key[16..], 4))
+}
+
+/// XTS tweak for an IV: T = E_K2(IV).
+pub(crate) fn xts_tweak(k2w: &[u32], iv: &[u8; 16]) -> [u8; 16] {
+    let mut ivb = [0u8; 16];
+    ivb.copy_from_slice(iv);
+    aes_encrypt_block(&ivb, k2w, 10)
+}
+
+/// One XTS block with a ready tweak: out = E_K1(in ^ T) ^ T (or inverse).
+pub(crate) fn xts_block(k1w: &[u32], t: &[u8; 16], blk: &[u8; 16], encrypt: bool) -> [u8; 16] {
+    let mut x = [0u8; 16];
+    for i in 0..16 {
+        x[i] = blk[i] ^ t[i];
+    }
+    x = if encrypt {
+        aes_encrypt_block(&x, k1w, 10)
+    } else {
+        aes_decrypt_block(&x, k1w, 10)
+    };
+    for i in 0..16 {
+        x[i] ^= t[i];
+    }
+    x
+}
+
+/// `esp_gf128mul_x_ble` (mbedtls tweak chaining): multiply the LE128
+/// value by x (shift left one bit; reduce an overflow out of bit 127 with
+/// 0x87 folded into the low word). Test-anchored (the firmware XTS KAT
+/// below chains through it); no production path needs it because flash
+/// blocks use directly-computed tweaks (random access).
+#[cfg(test)]
+pub(crate) fn gf128_x_ble(t: &mut [u8; 16]) {
+    let mut lo = u64::from_le_bytes([t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]]);
+    let mut hi = u64::from_le_bytes([t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15]]);
+    let carry = hi >> 63;
+    hi = (hi << 1) | (lo >> 63);
+    lo <<= 1;
+    if carry != 0 {
+        lo ^= 0x87;
+    }
+    t[0..8].copy_from_slice(&lo.to_le_bytes());
+    t[8..16].copy_from_slice(&hi.to_le_bytes());
+}
+
+/// 128-bit LE tweak IV for the absolute flash byte offset of a 16-byte
+/// block (fixture convention: full offset in the low word).
+pub(crate) fn flash_xts_iv(byte_off: u32) -> [u8; 16] {
+    let mut iv = [0u8; 16];
+    iv[0..4].copy_from_slice(&byte_off.to_le_bytes());
+    iv
+}
+
+/// Decrypt one 16-byte flash block at absolute offset `byte_off` (16-byte
+/// aligned) with the eFuse XTS key. Physically-erased blocks (all 0xFF)
+/// read back 0xFF: that is what firmware observes on silicon (every
+/// empty-check in NVS/otadata/partition code depends on it), so the model
+/// bypasses the cipher there rather than returning decrypt(FF) garbage.
+pub(crate) fn flash_xts_decrypt(key: &[u8; 32], byte_off: u32, blk: &[u8; 16]) -> [u8; 16] {
+    if blk == &[0xFF; 16] {
+        return [0xFF; 16];
+    }
+    let (k1w, k2w) = xts_key(key);
+    let t = xts_tweak(&k2w, &flash_xts_iv(byte_off));
+    xts_block(&k1w, &t, blk, false)
+}
+
+/// Encrypt one 16-byte flash block (program path). No erased-bypass:
+/// decrypt(encrypt(x)) == x round-trips regardless (the bypass only fires
+/// on physically-stored 0xFF, which real ciphertext never collides with).
+pub(crate) fn flash_xts_encrypt(key: &[u8; 32], byte_off: u32, blk: &[u8; 16]) -> [u8; 16] {
+    let (k1w, k2w) = xts_key(key);
+    let t = xts_tweak(&k2w, &flash_xts_iv(byte_off));
+    xts_block(&k1w, &t, blk, true)
+}
+
 /// AES peripheral register-block base (`DR_REG_AES_BASE`, soc/reg_base.h).
 pub const AES_BASE: u32 = 0x6003_A000;
 /// AES ciphertext output registers (source for the GDMA `in` channel).
@@ -569,5 +656,75 @@ impl Aes {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn xts_block1_with_explicit_tweak() {
+        let key = hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        let mut key32 = [0u8; 32];
+        key32.copy_from_slice(&key);
+        let pt1 = hex("112233445566778899aabbccddeeff00");
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&pt1);
+        let t1 = hex("da4761f21dd8a3d9007cbe60379fe7b1");
+        let mut tt = [0u8; 16];
+        tt.copy_from_slice(&t1);
+        let (k1w, _) = xts_key(&key32);
+        let ct = xts_block(&k1w, &tt, &b, true);
+        assert_eq!(ct, hex("0f46d50a7bad5aa2a36c3a14bb4617d5")[..]);
+    }
+
+    #[test]
+    fn gf128_x_ble_advances_tweak() {
+        let t = hex("eda330f90eecd16c003e5fb09bcff358");
+        let mut tt = [0u8; 16];
+        tt.copy_from_slice(&t);
+        gf128_x_ble(&mut tt);
+        assert_eq!(tt, hex("da4761f21dd8a3d9007cbe60379fe7b1")[..]);
+    }
+
+    /// Host XTS matches the firmware-proven vector (`esp32s3_aes` sketch:
+    /// `mbedtls_aes_crypt_xts`, key 00..1f, 2 blocks, zero tweak, chained
+    /// via `esp_gf128mul_x_ble`). This ties the flash pipeline's cipher to
+    /// the silicon tweak convention end to end.
+    #[test]
+    fn xts_matches_firmware_kat() {
+        let key = hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        let pt = hex("00112233445566778899aabbccddeeff112233445566778899aabbccddeeff00");
+        let want = hex("171c69724dcf733f9aa6317d795153e40f46d50a7bad5aa2a36c3a14bb4617d5");
+        let mut key32 = [0u8; 32];
+        key32.copy_from_slice(&key);
+        let (k1w, k2w) = xts_key(&key32);
+        let mut t = xts_tweak(&k2w, &[0u8; 16]);
+        let mut out = Vec::new();
+        for blk in pt.chunks_exact(16) {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(blk);
+            out.extend_from_slice(&xts_block(&k1w, &t, &b, true));
+            gf128_x_ble(&mut t);
+        }
+        assert_eq!(out, want);
+        // Round-trip back through decrypt.
+        let mut t = xts_tweak(&k2w, &[0u8; 16]);
+        let mut back = Vec::new();
+        for blk in out.chunks_exact(16) {
+            let mut b = [0u8; 16];
+            b.copy_from_slice(blk);
+            back.extend_from_slice(&xts_block(&k1w, &t, &b, false));
+            gf128_x_ble(&mut t);
+        }
+        assert_eq!(back, pt);
     }
 }

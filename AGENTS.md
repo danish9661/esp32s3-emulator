@@ -96,6 +96,12 @@ Core design:
 - [ ] WiFi/BLE: OUT OF SCOPE for now (months of work; not required for the
       core milestone).
 
+Scope updates (2026-09-12): Touch validated after all (see status log);
+`ee.*` now 218/218 executing (incl. `ee_srs_accx`); eMMC simulated card,
+flash-encryption pipeline, and USB-OTG host enumeration landed (see status
+log). Still out: WiFi/BLE, USB-OTG device-mode enumeration (external host),
+IDF-driver MMC mount, `ee.*` unmapped patterns (loud trap, correct).
+
 ## Validation strategy
 
 1. **Unit tests** in each crate (instruction-level, known-answer tests).
@@ -3197,3 +3203,349 @@ Core design:
     class drivers) — out of scope; zero in-tree firmware needs it (all
     `Serial` flows through validated USB-Serial-JTAG), and Arduino "USB
     CDC On Boot" (Serial-via-OTG) is consequently unsupported.
+  - 2026-09-11: **Light-sleep wakeup-cause flag fixed (battery SKIP retired,
+    0 skips remain)**. Root cause was a SWAPPED bit pair, not firmware
+    state: our `SLP_WAKEUP_BIT` was `1<<1`, but `rtc_cntl_reg.h` assigns
+    `SLP_WAKEUP_INT_RAW` = bit 0 and `SLP_REJECT_INT_RAW` = bit 1. The
+    chain, verified by single-stepping the resume path with pc triggers
+    (temporary `lsdbg` example, since removed): `rtc_sleep_start` returns
+    `INT_RAW[1]` (0x40378f60 `extui`) = 1 with the old bit → preserved
+    through `sleep_start_safe`/`mspi_sync` (STORE4=0 fast path) into the
+    resume tail's `movnez` (0x42009743), which normalizes it to 0x103, so
+    `esp_light_sleep_start` bails before `s_light_sleep_wakeup` is set.
+    On silicon the same read yields 0 (REJECT never fires), the helper
+    returns 0, and the flag is set — no model gap beyond the swapped
+    constant. One-line fix in `rtc.rs` (+ corrected comments). Validated:
+    `LIGHTSLEEP ... flag=1 cause=4 marker=1234` → `LIGHTSLEEP PASS`;
+    `light_sleep_resumes_without_reboot` + all sleep neighbors
+    (deepsleep/*, touch/*) still green. Cautionary tale: ~40 earlier
+    probes chased firmware-internal state (vddsdio scratch, UART helper
+    inputs) because pc-trigger sampling misses mid-block pcs and objdump
+    desyncs in this region — ground truth came from stepping with our own
+    decoder plus the header's `_S` (shift) constants, which directly
+    contradicted the old comment.
+  - 2026-09-11: **End-to-end OTA update validated (was write-untested)**.
+    New sketches `esp32s3_ota_slot1` (prints `OTA SLOT1 ALIVE/DONE`) +
+    `esp32s3_ota_update` (embeds the slot-1 app via new two-pass
+    `tools/build_ota.sh`, then real `esp_ota_begin/write/end/
+    set_boot_partition/esp_restart`) → `OTA BEGIN 0` / `WROTE 285792` /
+    `END 0` / `SETBOOT 0` / `UPDATE DONE` → reboot boots ota_1 →
+    `OTA SLOT1 ALIVE` / `SLOT1 DONE` (battery entry `ota_update`, 350M
+    STEPS, works both plain and `--build`). Four stacked model gaps fixed,
+    each verified against disassembly, not guessed:
+    (1) **Stale legacy flash size**: `boot_from_flash` now patches the ROM
+    snapshot's legacy `chip_size` (0x3FCEF6A8) with the image size — the
+    blob's baked-in 2MB made `esp_ota_begin` fail 0x102 (erase bounds).
+    Bisected to `load_image(rom_data)` (blob is 164KB, not 32KB).
+    (2) **Resets lost flash writes**: `reset()` snapshots the live MEMSPI
+    backing into `self.flash` (new `Soc::flash_image`) — silicon flash is
+    non-volatile; without it the reboot lost app1+otadata.
+    (3) **`esp_restart` hung**: real ROM `software_reset_cpu` (blob body
+    @0x44684 via the 0x6E4 slot — our 0x6E4 stub assembly is dead
+    reference, reverted an edit that wrongly "fixed" it) sets OPTIONS0
+    BIT5 (PRO) / BIT4 (APP); `rtc.rs` latches BIT5 (+BIT31) into the reset
+    flag. BIT4 intentionally unlatched (PROCPU_RST follows in the same
+    call stack). The `wdt_hal_*` RTC-WDT backup needs no modeling.
+    (4) **OTA selection rewritten to the real layout**: two sectors
+    (driver erases/writes 0xF000, traced `SE @ 0xF000`), 32B entries
+    (seq/state/crc), CRC = `esp_rom_crc32_le(-1, seq, 4)` = raw-init-0 +
+    xorout (live vectors seq1→0x4743989A, seq2→0x55F63774 — note the ROM
+    pre-xors its init arg, a plain init-FF impl gives the wrong answer),
+    invalid = seq FF or state 3/4, slot = (seq-1)%count. Real-image
+    fixture test pins the table bytes.
+    Cautionary tales: (a) **partition magic is 0x50AA, not 0xAA50** —
+    synthetic tests wrote the swapped bytes so the parser never parsed a
+    real table (always factory fallback); likewise the old seq layout and
+    misplaced test labels were masked by the 0x39-subtype fallback (real
+    otadata subtype is 0x00). (b) **flashread HIGH-ODD was vacuous**: at
+    2MB the driver bounds-rejected every HIGH transaction so the sketch
+    compared its buffer to itself; with the correct 4MB size the
+    overlapping writes (no intermediate erase) genuinely AND-fail on any
+    correct model — sketch now re-erases before the odd write (in-sketch
+    comment). (c) Windowed-ABI reads need care: callee-a2 = caller-a10,
+    returns land in caller-a10 (misread `ota_select_valid` until
+    re-derived). (d) Stale `run_flash` binaries and `windows(N)` patterns
+    shorter than N (never match) caused several phantom verdicts; a sticky
+    diag wiped by `Soc::new()` faked a "reset without cause".
+    Battery 88/0/0, workspace + wasm32 green, fmt clean (xtensa-core
+    `--all-targets` ua_state deny is still pre-existing drift).
+    REMAINING per user directive: `ee_srs_accx` workaround proof, eMMC
+    simulated card, flash-encryption pipeline, USB-OTG host enumeration.
+  - 2026-09-12: **ee.srs.accx implemented (was the lone trap, now 218/218
+    execute)**. The old "shift-AR unencodable (identical words for different
+    ARs)" note was simply wrong — a GAS sweep proves all 15 ARs x sel 0/1
+    encode distinctly (rd=[11:8], rs=[7:4], sel=bit 14; word =
+    0x7E1004|rd<<8|rs<<4|sel<<14, verified a1,a2,0=0x7E1124 /
+    a6,a9,0=0x7E1694 / a1,a2,1=0x7E5124). Semantics from the ESP32-P4 PIE
+    twin (`ESP.SRS.S/U.XACC`, same instruction renamed): arithmetic (sel=0)
+    or logical (sel=1) right shift of the 40-bit ACCX by rs[5:0], 40-bit
+    result written back, rd = saturated s32/u32. Matches esp-nn/esp-dl
+    quantized-dot-product epilogue usage (`movi a9, 0;
+    ee.srs.accx a6, a9, 0`). 4 lib KATs (word map, S shift/sat, U
+    shift/sat, dot+epilogue vehicle) + `esp32s3_ee_dsp` test 5
+    (`SRS a=374 b=374`, proving the write-back: second srs sees 374 not
+    1496) → `EE DSP SRS OK` (battery markers extended). The trap unit test
+    now uses an unmapped word (0xEF00000E → EE_UNIMPLEMENTED, still loud).
+    Cautionary tale: my first U-sat KAT used a 41-bit value (bit 40 set)
+    past the 40-bit ACCX domain — keep KATs in-domain (the WUR 44-bit mask
+    is a separate pre-existing quirk).
+  - 2026-09-12: **eMMC simulated card (was documented out-of-scope)**.
+    `sdmmc.rs` gains an MMC personality: the first MMC-only CMD1
+    (SEND_OP_COND — no SD flow ever sends it) switches modes (sticky until
+    CMD0). MMC init CMD0→CMD1 (OCR busy→ready+HCS)→CMD2→CMD3
+    (host-assigned RCA)→CMD7→CMD9 (MMC CSD v1.2)→CMD8 (512 B EXT_CSD:
+    rev 1.8, SDR52 card type, SEC_COUNT=8192, bus-width/timing, erase-group-
+    def)→CMD6 SWITCH (write-byte applies index/value into the EXT_CSD
+    shadow)→CMD16/17/24. Block I/O, erase and IDMAC shared with the SD
+    path (sector addressing throughout). 6 unit tests + `esp32s3_emmc`
+    poke sketch (`EXTCSD rev=8 type=7 sec=8192` → `EMMC PASS`, battery
+    entry). Arduino `SD_MMC` always takes the SD path (ACMD41 succeeds),
+    so IDF-driver MMC mount stays unreachable — poke-level per precedent.
+  - 2026-09-12: **Flash-encryption pipeline (was out-of-scope)**. Uniform
+    XTS-AES-128 over the whole image (tweak IV = LE128(absolute block
+    offset), random-access like P1619 single-block units; K1/K2 split per
+    mbedtls). Host XTS tied to the firmware-proven vector (aes sketch
+    2-block zero-tweak ct `171c…4617d5` reproduces exactly, incl. the
+    `gf128mul_x_ble` chain — caught live: passing the chained tweak back
+    through the IV-encrypting entry double-encrypts; tweak/block split
+    into `xts_tweak`/`xts_block`). eFuse gate matches
+    `efuse_hal_flash_encryption_enabled` exactly (crypt_cnt bits [20:18]
+    @ 0x34, odd parity — disassembled). Model: `flash_byte` XIP decrypt
+    (1-entry block cache), MEMSPI decrypt-on-read + RMW encrypt-on-write
+    (own block cache, invalidated on erase), erased reads FF (bypass —
+    silicon-observable: every empty-check depends on it), `flashenc_
+    provision/encrypt_region` fixture API, eFuse preserved across resets
+    (OTP-true), boot parses a decrypted view (backing stays ciphertext).
+    Validated: soc integration tests, `flashenc_encrypted_app_boots_
+    and_runs` machine test (IRAM+XIP execution from ciphertext), and real
+    Arduino hello booting fully encrypted via `FLASHENC_KEY` →
+    `Hello`/`boot OK` (battery `flashenc` entry). Cautionary tales: (a)
+    two stacked test bugs (literal-pool patch applied post-clone so l32r
+    read 0; entry aimed at the pool so data executed as code and wandered
+    through qsort into the scratch window) — the model was right both
+    times, proven by pc traces; (b) MMU maps whole 64 KB pages, so synthetic
+    XIP segments must carry the file's intra-page offset in their load
+    address.
+  - 2026-09-12: **USB-OTG host enumeration (was "weeks of work")**.
+    `usb_otg.rs` gains host mode + a simulated FS device (Espressif VID
+    0x303A): HPRT power connects (ConnSts/ConnDet/SPD=FS), port reset
+    enables (self-clearing Rst, Ena/EnChng, W1C clears), 8 channels
+    (HCCHAR/HCINT-W1C/HCINTMSK/HCTSIZ) execute control transfers
+    synchronously on ChEna — SETUP consumes DFIFO-staged bytes (GET_
+    DESCRIPTOR stages IN data truncated to wLength, SET_ADDRESS applies
+    at status completion, SET_CONFIGURATION recorded, else STALL), IN
+    fills RXFIFO (GRXSTSP meta + DFIFO pops + RXFLVL), OUT consumes
+    staged bytes; address mismatches STALL. GINTSTS reports live RXFLVL/
+    HPRTINT/HCINTR (source 38 wiring untouched), HAINT summarizes masked
+    channels. 4 unit tests (port, device-desc, addr+config incl. stale-addr
+    STALL) + `esp32s3_usb_host` sketch (port reset, VID 303A, cfg total
+    32, address/config assignment → `USB HOST ENUM PASS`, battery entry).
+    Approximations: instant completion (no SOF/HFNUM advance), R1b-busy
+    synchronous, PID toggle accepted-not-enforced, non-control types
+    complete empty, no DMA/disconnect. Device-mode enumeration (external
+    host) stays out, as does WiFi/BLE.
+  - 2026-09-12: **Gallery refresh + clippy gate green + dead-probe removal
+    (audit leftovers)**. (1) Gallery 23→33 entries: ota_update, emmc,
+    usb_host, ee_dsp, temp, psram_opi, mcpwm_fault, dedic_gpio, lightsleep
+    bins copied to `web/firmware/` + manifest entries; new `flashenc` demo
+    entry reuses the hello bin with a `key` field, served by a new
+    `Emulator::load_flash_encrypted` bridge API (provision + uniform
+    encrypt + boot, mirroring `FLASHENC_KEY`) with `keyHex` plumbed through
+    `loadFlash`/`loadFromUrl`/gallery-select/Reset. Touch excluded (needs
+    `TOUCH_INJECT`, which the browser cannot provide — verified FAIL
+    without it). `web/pkg` rebuilt via wasm-pack; validated in-wasm with a
+    temporary node harness (since removed): hello, hello-encrypted, emmc,
+    usb_host, ota_update (incl. slot-1 reboot) all PASS. Cautionary tale:
+    the first harness run failed everything on a 4.8M-insn budget vs the
+    ~80M needed — harness bug, not a model regression. (2) Clippy gate
+    green again: fixed the pre-existing `ua_state` erasing_op drift
+    (`4*0`→`0`, mechanical) plus ~30 surfaced lints the red gate had been
+    hiding (identity-ops, dup attributes, need_index loops, doc-lazy-
+    continuations, `map_or`→`is_none_or`, `repeat().take()`→`repeat_n`,
+    collapsed ifs, unused imports/consts/mut). Register-map consts kept
+    with targeted `#[allow(dead_code)]` (hmac.rs precedent); test-only
+    `gf128_x_ble` gated `#[cfg(test)]`. (3) Removed the abandoned
+    `flash_backing`/`psram_backing[_mut]` TEMP probes (zero users;
+    `flash_image` is the kept accessor). Battery 91/0/0, workspace +
+    wasm32 green, fmt clean.
+  - 2026-09-12: **SYSCON peripheral clock-gating modeled (was ungated)**.
+    `Soc` gains `sys_clk_en0/en1` (SYSTEM_PERIP_CLK_EN0/1 @ 0x600C0018/1C,
+    RMW-able words in the SYSTEM dispatch, seeded to the silicon reset
+    defaults `0xF9C1_E06F`/`0x0000_0600` — every bit verified against
+    `esp32s3-libs/.../system_reg.h`, including the all-correct EN0/EN1
+    assignments and the dflt-0 RMT/LEDC/MCPWM/I2S/UHCI/DMA/crypto bits).
+    `clk_on(en1,bit)` freezes `tick_timers` per peripheral (TIMG0/1 13/15,
+    SYSTIMER 29, LEDC 11, UART0/1/2 2/5/EN1.9, SPI2/3 6/16, I2C0/1 7/18,
+    APB_SARADC 28, RMT 9, MCPWM0/1 17/20, LCD_CAM EN1.8, I2S0/1 4/21,
+    PCNT 10, USB_DEVICE EN1.10, GDMA DMA EN1.6) and masks engine triggers
+    (SHA EN1.2/AES EN1.1/RSA EN1.3/HMAC EN1.5/DS EN1.4, SPI USR, I2C
+    TRANS_START, TWAI TR/SRR, LCD/CAM START, SDMMC CMD START); registers
+    still round-trip while gated, and the GDMA engine walks are additionally
+    gated on the DMA clock. Also landed alongside: SHA done-interrupt
+    (source 78, INT_RAW latch on `process()` + CLEAR @0x24/ENA @0x28 +
+    `int_st`, machine vector test), ADC done-interrupt (source 65,
+    `APB_ADC_INTR_SOURCE`, machine vector test), and UHCI0 UART-DMA
+    (`uhci.rs` + `uart.take_rx` + GDMA peri_sel 2 OUT/IN + source 14 +
+    machine test + `esp32s3_uhci` sketch/battery entry). 22 machine tests
+    gained enables via a `syscon_clk` helper and ~27 sketches enable their
+    clocks with `periph_module_enable`-equivalent RMWs (verified in the
+    linked ELF, not just the .ino). Two real process bugs found en route:
+    (1) the helper initially wrote SYSCON_BASE (0x60026000 regstore) instead
+    of SYSTEM_BASE (0x600C0000) — all machine-test enables were no-ops;
+    (2) a manual `build/*.bin` merge glob matched both the app bin and
+    arduino's own merged image, flashing stale apps (phantom RMT TIMEOUT
+    with zero EN0 writes in the trace log) — merges must use explicit
+    filenames (battery already does). IDF's `esp_perip_clk_init` provably
+    disables SPI2/UART1/USB/etc. at startup (traced EN0=0x7100E007), so
+    spi_dma/virtual_demo needed their SPI2 enables added explicitly.
+    Battery 92/0/0 (+uhci), workspace + wasm32 green, clippy `-D warnings`
+    clean, fmt clean.
+  - 2026-09-12: **Clock-gating audit: 2 real gaps closed (UHCI SYSTEM gate,
+    USB-OTG engine gating)**. Systematic audit of every tick/trigger path vs
+    its gate bit proved all other peripherals non-vacuous (any passing test
+    must have the clock on: ticks frozen + triggers masked when gated; IDF
+    drivers self-enable via `periph_module_enable`, poke sketches enable
+    manually — verified in linked ELFs). Gaps found:
+    (1) **UHCI missed its SYSTEM clock**: `Uhci::clk_on()` checked only CONF
+    CLK_EN, not SYSTEM EN0.8 — transfers ran with the module clock off. Fixed
+    at both GDMA-walk sites (`uhci.clk_on() && clk_on(false,8)`); the uhci
+    sketch already enables EN0.8 so it stays green (verified with the proper
+    `UART_INJECT=UHCI-DMA-RX` env — a bare run FAILs on empty RX, harness
+    error not a model break).
+    (2) **USB-OTG had no gate at all**: `usb_host`/`usb_otg` poke sketches
+    passed vacuously (IDF disables EN0.23 at startup, traced). Fixed: soc-level
+    masking of GRSTCTL CSFTRST + HPRT PWR/RST + HCCHAR ChEna/ChDis while
+    gated (new `pub(crate)` consts in `usb_otg.rs`), + `EN0 |= (1<<23)` in both
+    sketches (rebuilt + re-merged). Negative control proven: pre-enable bins
+    fail exactly on the gated actions (`OTG RESET MISMATCH`, `USB HOST NO
+    CONNECT`/`XFER TIMEOUT` → FAIL bits); post-enable bins PASS
+    (`OTG PASS`, `USB HOST ENUM PASS`). Deliberately ungated (documented):
+    ECDSA (no gate bit exists in `system_reg.h`), eFuse/SPI01-flash
+    (boot-critical, always on in practice), WDG bit3 (TIMG-gated only —
+    MWDT shares the TIMG tick; requiring bit3 is unverifiable offline),
+    SDM/touch/RTC/GPIO (no gate bits / RTC domain), console FIFO capture
+    while gated (memory-like writes land; shift needs the clock).
+    Battery 92/0/0, workspace + wasm32 green, clippy `-D warnings` clean
+    (0), fmt clean.
+  - 2026-09-12: **GDB + MicroPython + CPU-completeness audit (user: "lot of
+    gap" — audited all three, 1 real CPU bug)**.
+    - **GDB: no gaps.** Packet audit of `gdbstub.rs`: `?`→S05, qSupported/
+      qfThreadInfo/qsThreadInfo/qAttached/qC/H, g/p/P/m/M, c/s, Z0/Z1+z0/z1
+      (watchpoint types refuse with "" — correct), qXfer target.xml with
+      proper m/l chunking, D/k/!/Ctrl-C. Harness re-green (`GDB HARNESS
+      PASS`); only documented limits stand (custom 19-reg layout needs the
+      served target.xml; whole-machine lockstep).
+    - **MicroPython: re-validated on current tree.** Downloaded real
+      v1.29.0 GENERIC_S3 (`ESP32_GENERIC_S3-20260824-v1.29.0.bin`, 1.78MB,
+      magic E9; old date-guess URL 404s with a 162B HTML page — get the
+      dated name from `/download/ESP32_GENERIC_S3/`). vfs-append recipe
+      re-derived from scratch (MD5-over-records rule re-proven against the
+      pristine table): `Performing initial setup` → banner → `>>> `;
+      `print(6*7)`→`42`; `print(0.5)`→`0.5`, `print(1.0/3.0)`→`0.33333334`,
+      `print(0.1+0.2)`→`0.3`. Committed as `tools/micropython_repl.sh`
+      (manual, NOT battery: external image + ~300M steps) → `MP REPL PASS`.
+    - **CPU: 1 real bug (WSR_MMID aliased LBEG).** Static enumeration:
+      all 751 decoder variants have exec arms (533 non-EE + 218 EE, zero
+      missing); exec returns Unimplemented only via the ee-false/catch-all
+      arms; all 218 named `ee.*` execute (only unknown patterns trap loud).
+      Special-reg audit (200 RSR/WSR/XSR variants vs `sr_of`) found exactly
+      one unmapped: **WSR_MMID** — in the generic WSR arm, so a write stored
+      to SR 0 (LBEG!), same class as the old PRID/WINDOWBASE bugs. Fixed as
+      an explicit no-op (S3 is MMU-less; no RSR_MMID decodes so it is
+      unobservable) + regression test `wsr_mmid_does_not_clobber_lbeg`
+      (fails-without verified via stash). RSR side fully mapped (68 arms).
+      Dynamic cover stands: 92/0/0 battery halts loud on Unimplemented, and
+      the 1.78MB MP interpreter runs trap-free. Known approximations kept:
+      FPU div/sqrt step NOPs (libgcc-sequence validated), `ee.*` unmapped
+      patterns (loud trap), WDG bit3 (TIMG-gated only).
+    Workspace + wasm32 green, clippy `-D warnings` clean (0), fmt clean.
+  - 2026-09-12: **Residual-gap sweep: "finish everything" (all but WiFi/BLE)**.
+    Audited every documented limitation +[A5328] unmodeled paths; closed what is
+    validatable, documented what is unreachable-or-fiction. Battery 95/0/0
+    (+uart_flow, +lightsleep_gpio, +lightsleep_uart).
+    - **MCPWM**: external SYNC (timer t ← SYNCt 160-162/169-171, PHASE reload
+      on rising edge, sampled stopped-or-running like fault) + TEZ/TEP/OP-TEA/
+      OP-TEB INT latches (header bits 3/6/15/18 per timer/op; TEP at up-wrap
+      + up-down peak) + DT OUTSWAP S6/S7 (post-DT pre-carrier ordering).
+      5 unit tests + `mcpwm_tez` vector test + sketch SYNC leg (`cnt=29`).
+      Cautionary tale: period-16 TEZ refires faster than the ISR exits —
+      vector-test livelock by design, use period 500. INSEL/DEB/shadow stay
+      latched-bypass (need the TRM S1-S8 figure; reset defaults as modeled).
+    - **UART HW flow control**: TX hold on CTSn-high (TXFIFO_CNT live,
+      EMPTY/DONE low until flush, 128B cap), CTS_CHG edge int, RX RTSn from
+      RX level vs RX_FLOW_THRHD, U_CTS/RTS matrix routing (13/16/19),
+      STATUS live arm + modem-idle bits 30/31 fix. Validated: 2 unit tests +
+      machine GPIO-loopback test + `esp32s3_uart_flow` sketch
+      (`cnt=1 empty=0`, DONE on flush, RTS ready→stop via RS485-echo fill).
+      Lesson: EMPTY is level-vs-threshold (1 held byte still reads EMPTY at
+      thrhd 96 — silicon-true, set thrhd 1 to observe it); third stale-binary
+      incident this file (rebuild run_flash after soc edits!).
+    - **TWAI RX inject** (`twai_inject_rx` virtual second node: filter,
+      overrun, RRB) + machine test. **GPIO hold** across deep sleep
+      (DIG_PAD_HOLD snapshot/restore in wake()) + machine test (held drives,
+      unheld resets). **USB-console hold** while EN1.10 off (endpoint FIFO +
+      tick flush) + machine test. (UART console already held via tx_hold.)
+    - **eFuse**: PGM burn to ALL exact-mirror blocks (BLK0 6 words — BLK0 is
+      WR_DIS+REPEAT0..4, the MAC_SPI mirrors belong to BLK1: burning staged
+      zeros over the seeded MAC trips the driver's read-back verify, found
+      live via `BURN BLOCK0 - ERROR`), KEY0..5, BLK10; WR_DIS direct-PGM
+      enforcement (driver-side refusal exact via stored value); RD_DIS
+      masking on KEY/SYS_PART2 mirrors + hmac_key; 3 unit tests.
+      `esp32s3_efuse_burn` extended (WR_DIS burn rc=0 cnt=1, reburn refused
+      rc=5635, pattern intact → `EFUSE WRDIS PASS`).
+    - **Secure boot**: fail-closed gate (SECURE_BOOT_EN bit, ROM stub does no
+      signature verify → deny + parked CPUs + accessor; default boots) +
+      machine test. Signed-image boot needs the espsecure pipeline (no
+      offline producer).
+    - **Sleep wakeups**: GPIO (RTCIO PINn WAKEUP_ENABLE+INT_TYPE, BIT2) +
+      UART0/1 (BIT6/7, RX-pending OR sticky pre-entry edge — the driver's
+      entry FIFO reset drains the level, silicon wakes on the START-bit
+      edge) + RISCV_TRAP (BIT13, ULP-halt watch; decodes to enum 13
+      COCPU_TRAP_TRIG, verified in disassembly). Machine tests all three;
+      `esp32s3_lightsleep_gpio` (`cause=7 PASS`) + `esp32s3_lightsleep_uart`
+      (`cause=8 rx=00 PASS` — rx==0 PROVES the edge path) battery entries
+      (50M/55M STEPS). War stories: (1) `UART_INJECT` feeds UART1 —
+      UART0 needs `UART0_INJECT` (hours lost to a `None` injector);
+      (2) timeout-kills lose block-buffered logs (nothing printed ≠ hung
+      early — use file+`stdbuf`-proof progress or short budgets);
+      (3) idle sleeps never consume STEPS (u64::MAX budget + STUCK/IDLE
+      skipped while asleep = silent infinite — needs a wake source).
+    - **USB-OTG**: string descriptors (indexes 1-3 + LANGID, sketch asserts
+      "Espressif"), SOF frame counter + HFNUM (tick-gated EN0.23),
+      host_disconnect API (machine test), engine gating proven
+      non-vacuous. Isochronous stays complete-empty (no endpoint/source).
+    - **UHCI SLIP** (esptool-compatible C0 framing + DB/DC + DB/DD escapes,
+      custom chars from ESCAPE_CONF, split-pair carry, RX_RST clears it;
+      HEAD_EN accepted-no-op): 4 codec unit tests + GDMA machine test both
+      directions. Sketch raw leg already clears framing bits (full-word
+      CONF0 store).
+    - **LCD_CAM GDMA-RX**: streaming pump (cursor + LCD/DMA clock gates,
+      owner-clear single-shot, per-descriptor EOF) + CAM_STOP_EN (stop on
+      full staging, else stall-retry) + freshness-guarded retro arm (a stale
+      IN link must not re-arm polling captures) + capture-over park.
+      Cautionary tale: the park check as first written killed freshly-armed
+      cursors pre-START (GDMA TIMEOUT + starved polling legs); the freshness
+      guard alone orders everything. 3 unit tests + machine test +
+      `esp32s3_camcap` GDMA leg (harness primes 3 frames, asserts 8 DRAM
+      words + GDMA PASS).
+    - **I2S PDM RX**: SINC^1 OSR-64 decimator (full-scale/half-density KATs
+      through tick→FIFO→rx_done); RX_PDM2PCM_EN kept map-only (both
+      front-ends host-driven, no observable hook — hmac.rs precedent).
+    - **eMMC RPMB**: full frame engine (provision/counter/write/read, HMAC
+      over the 284B JESD84 input, counter anti-replay, address/range checks,
+      multi-block writes, PARTITION_CONFIG select, SIZE_MULT=1): 2 unit
+      tests (round-trip + NO_KEY/AUTH/COUNTER/ADDR rejects) + `esp32s3_emmc`
+      leg with in-sketch mbedTLS HMAC (`EMMC RPMB PASS`, counter 0→1).
+    - **CPU**: WSR_MMID no-op fix (aliased LBEG) + regression test.
+    - **Deliberately unchanged** (evaluated, documented): clock-tree remodel
+      (breaks all budgets, zero observable gain), WDG bit3 (unverifiable),
+      RNG determinism (feature), eFuse BLK1/2 PGM (partial mirrors, no
+      flow), SHA-512_t (no register semantics/driver), I2C stretch (no slow
+      slave possible), OPI flash (no producer), LP bus FSMs (no
+      counterparty), SDIO/ETM/touch-ISR/dedic-IRQ (no silicon source),
+      TWAI error frames (single node), PMS/WCL enforcement (world-based, no
+      reachable flow; stores round-trip), GPIO-hold pins 32+ (32-bit mask),
+      secure-boot verify + NVS-encryption (no offline producer), device-mode
+      USB classes (no host), CAM+POLL mixing per capture, short-frame GDMA
+      tails (no eof without full length).
+    Workspace + wasm32 green, clippy `-D warnings` clean (0), fmt clean.

@@ -51,10 +51,13 @@ cargo build --release -p esp32s3-emu --example run_flash 2>&1 | grep -E "^error"
 #   need JS-side devices); the sketch .merged.bin is passed as argv[1].
 CASES=(
 "hello||Hello from ESP32-S3!;boot OK|"
+"flashenc|FLASHENC_KEY=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f|Hello from ESP32-S3!;boot OK|"
 "periph|ADC_INJECT_MV=825|boot OK|"
 "uart_echo|UART_INJECT=hello|[uart1] rx 'h'|"
 "uart_tout|UART_INJECT=Z|UART TOUT OK|"
+"uhci|UART_INJECT=UHCI-DMA-RX|UHCI-DMA-TX-42;[UHCI-DMA-RX];ST=3;DONE|"
 "uart_rs485||UART RS485 PASS|"
+"uart_flow||UART FLOW PASS|"
 "uart_multi||MULTI_UART PASS|"
 "usb_serial||USB TEST|"
 "usb_otg||OTG RESET OK;OTG CFG OK;OTG EP0 OK;OTG FIFO OK;OTG PASS|"
@@ -94,7 +97,7 @@ CASES=(
 "ledc||LEDC PASS|"
 "sigmadelta||SIGMADELTA PASS|"
 "efuse||EFUSE DONE|"
-"efuse_burn||EFUSE BURN PASS;EFUSE BURN DONE|"
+"efuse_burn||EFUSE BURN PASS;EFUSE WRDIS PASS;EFUSE BURN DONE|"
 "rng||RNG PASS|"
 "rtcio||RTCIO PASS|"
 "lpi2c||LP I2C POKE PASS|"
@@ -102,15 +105,19 @@ CASES=(
 "ulp||ULP POKE PASS|"
 "sdmmc||SDMMC PASS|"
 "sdfat||SD BEGIN OK;SD FAT READ PASS;SD FAT WRITE PASS;SD DONE|60000000"
+"emmc||EMMC RPMB PASS;EMMC PASS;EMMC DONE|"
+"usb_host||USB HOST PORT OK;USB HOST DESC OK;USB HOST CFG OK;USB HOST STR OK;USB HOST SOF OK;USB HOST ENUM PASS;USB HOST DONE|"
 "deepsleep_poke||DEEPSLEEP PASS|"
 "deepsleep||DEEPSLEEP START;DEEPSLEEP WOKE;DEEPSLEEP PASS|50000000"
 "deepsleep_ext0||DEEPSLEEP EXT0 START;DEEPSLEEP EXT0 WOKE;DEEPSLEEP EXT0 PASS|50000000"
 "deepsleep_ext1||DEEPSLEEP EXT1 START;DEEPSLEEP EXT1 WOKE;DEEPSLEEP EXT1 PASS|50000000"
 "deepsleep_ulp||DEEPSLEEP ULP START;DEEPSLEEP ULP WOKE;DEEPSLEEP ULP PASS|80000000"
 "deepsleep_touch|TOUCH_INJECT=3:1877|DEEPSLEEP TOUCH START;DEEPSLEEP TOUCH WOKE;DEEPSLEEP TOUCH SLP=1877;DEEPSLEEP TOUCH PASS|50000000"
-"lightsleep|SKIP:resume works but s_light_sleep_wakeup flag stays 0 (inner helper returns 0x103), so get_wakeup_cause reads 0 not TIMER (see AGENTS.md)"
-"hmac||HMAC DONE|"
-"ds||DS DONE|"
+"lightsleep||LIGHTSLEEP WOKE;LIGHTSLEEP RETAINED;LIGHTSLEEP PASS|"
+"lightsleep_gpio||LIGHTSLEEP GPIO PASS|50000000"
+"lightsleep_uart|UART0_INJECT=Z UART0_MARKER=UART-SLEEP-ARMED|LIGHTSLEEP UART PASS|55000000"
+"hmac||HMAC DONE;OK|"
+"ds||DS DONE;OK|"
 "rsa||RSA POKE PASS||esp32s3_rsa/esp32s3_rsa_poke/esp32s3_rsa_poke.merged.bin"
 "ecdsa||ECDSA DONE|"
 "i2s||I2S POKE PASS|"
@@ -128,12 +135,13 @@ CASES=(
 "gdma_m2m||GDMA M2M PASS|"
 "full_load||FULL_LOAD PASS|150000000"
 "ota_slot||OTA SLOT TEST PASS|"
+"ota_update||OTA BEGIN 0;OTA WROTE 285792;OTA END 0;OTA SETBOOT 0;OTA SLOT1 ALIVE;OTA SLOT1 DONE|350000000"
 "psram_qspi||PSRAM total=2097152;PSRAM RW OK;PSRAM PROBE PASS|"
 "psram_opi||PSRAM total=8388608;PSRAM RW OK;PSRAM PROBE PASS|"
 "psram_16m|PSRAM_MR2=5|PSRAM total=16777216;PSRAM HIGH OK;PSRAM PROBE PASS|"
 "mcpwm_fault||MCPWM FAULT trip=500/500;MCPWM FAULT PASS|"
 "dedic_gpio||DEDIC hi pad=1;DEDIC GPIO PASS|"
-"ee_dsp||EE DSP DOT OK;EE DSP VADDS OK;EE DSP CMUL OK;EE DSP LDF128 OK;EE DSP DONE|"
+"ee_dsp||EE DSP DOT OK;EE DSP VADDS OK;EE DSP CMUL OK;EE DSP LDF128 OK;EE DSP SRS OK;EE DSP DONE|"
 "virtual_demo|NODE:tools/virtual_demo_harness.mjs|VIRTUAL DEMO HARNESS PASS|"
 "camcap|NODE:tools/camcap_harness.mjs|CAMCAP HARNESS PASS|"
 "gdb|NODE:tools/gdb_harness.mjs|GDB HARNESS PASS||esp32s3_hello/esp32s3_hello.merged.bin"
@@ -202,6 +210,7 @@ for c in "${CASES[@]}"; do
     psram_opi) srcdir="$SK/esp32s3_psram"; fqbn="$fqbn:PSRAM=opi"; bin="$srcdir/esp32s3_psram_opi.merged.bin"; inobin="esp32s3_psram.ino.merged.bin";;
     psram_16m) srcdir="$SK/esp32s3_psram"; fqbn="$fqbn:PSRAM=opi"; bin="$srcdir/esp32s3_psram_16m.merged.bin"; inobin="esp32s3_psram.ino.merged.bin";;
     touch_denoise) srcdir="$SK/esp32s3_touch"; bin="$srcdir/esp32s3_touch.merged.bin"; inobin="esp32s3_touch.ino.merged.bin";;
+    flashenc) srcdir="$SK/esp32s3_hello"; bin="$srcdir/esp32s3_hello.merged.bin"; inobin="esp32s3_hello.ino.merged.bin";;
   esac
   if [[ -n "$binrel" ]]; then
     bin="$SK/$binrel"
@@ -215,10 +224,16 @@ for c in "${CASES[@]}"; do
     fi
   fi
   if [[ $BUILD == 1 ]]; then
-    if ! arduino-cli compile --fqbn "$fqbn" --build-path "$srcdir/build" "$srcdir" >/tmp/battery_build.log 2>&1; then
+    if [[ "$name" == "ota_update" ]]; then
+      # Two-pass build (slot-1 image embedded into the updater).
+      if ! "$ROOT/tools/build_ota.sh" >/tmp/battery_build.log 2>&1; then
+        echo "FAIL $name (compile)"; tail -3 /tmp/battery_build.log; fail=$((fail+1)); continue
+      fi
+    elif ! arduino-cli compile --fqbn "$fqbn" --build-path "$srcdir/build" "$srcdir" >/tmp/battery_build.log 2>&1; then
       echo "FAIL $name (compile)"; tail -3 /tmp/battery_build.log; fail=$((fail+1)); continue
+    else
+      cp "$srcdir/build/$inobin" "$bin"
     fi
-    cp "$srcdir/build/$inobin" "$bin"
   fi
   if [[ ! -f "$bin" ]]; then echo "FAIL $name (no binary $bin)"; fail=$((fail+1)); continue; fi
   log=$(STEPS=$steps env $envstr timeout 300 "$EMU" "$bin" 2>&1 | tr -d '\0')

@@ -12,7 +12,9 @@
 //! space during boot).
 
 use alloc::boxed::Box;
+use alloc::vec;
 use alloc::vec::Vec;
+use core::cell::Cell;
 use xtensa_core::Bus;
 use xtensa_core::generated::{Opcode, decode_inst, decode_inst16a, decode_inst16b, insn_len};
 
@@ -51,8 +53,9 @@ use crate::timg::{INT_T0, INT_T1, INT_WDT, Timg};
 use crate::touch::Touch;
 use crate::twai::{TWAI_BASE, Twai};
 use crate::uart::Uart;
+use crate::uhci::{UHCI0_BASE, Uhci};
 use crate::ulp::{ULP_OFF_END, ULP_OFF_START, Ulp};
-use crate::usb_otg::{USB_OTG_BASE, USB_OTG_FIFO_PAGE, USB_OTG_INTR_SOURCE, UsbOtg};
+use crate::usb_otg::{USB_OTG_BASE, USB_OTG_FIFO_PAGE, UsbOtg};
 use crate::usb_serial_jtag::{USB_SERIAL_JTAG_INTR_SOURCE, UsbSerialJtag};
 
 /// A host-observable emulator event, drained once per animation frame and
@@ -98,6 +101,16 @@ pub struct RtcRetain {
 /// byte frames through a 16-word TX/RX FIFO, so descriptors are consumed
 /// gradually as FIFO space/data allow (not dumped synchronously). One pass
 /// per link-start; stops at unowned/null/eof descriptors like the sync walk.
+/// LCD_CAM GDMA-RX streaming cursor (camera capture into IN
+/// descriptors): like `I2sDma` but single-direction (capture only).
+#[derive(Clone, Copy, Default)]
+struct CamDma {
+    active: bool,
+    ch: usize, // GDMA channel pair carrying the IN link
+    desc: u32, // current descriptor address (0 = none)
+    off: u32,  // bytes already moved in the current descriptor
+}
+
 #[derive(Clone, Copy, Default)]
 struct I2sDma {
     active: bool,
@@ -206,6 +219,11 @@ pub struct Soc {
     irom: Box<[u8; IROM_SIZE as usize]>,
     /// SPI flash backing store (read-only via the XIP cache windows).
     flash: Box<[u8; FLASH_SIZE as usize]>,
+    /// Last decrypted 16-byte flash block (decrypt-on-read cache for
+    /// `flash_byte`: XTS works on 16-byte units; instruction fetch is
+    /// sequential/loopy so one entry hits ~always; invalidated by
+    /// invalid base = u32::MAX and after every MEMSPI write).
+    flashenc_last: Cell<(u32, [u8; 16])>,
     /// PSRAM backing store (read-write through MMU-mapped cache pages).
     psram: Box<[u8; PSRAM_SIZE as usize]>,
     rtc_slow: Box<[u8; RTC_SLOW_SIZE as usize]>,
@@ -219,6 +237,8 @@ pub struct Soc {
     /// ULP-RISC-V coprocessor (its own rv32im core; runs from RTC_SLOW_MEM).
     ulp: Ulp,
     uarts: [Uart; 3],
+    /// UHCI0 DMA bridge (UART0/1/2 <-> GDMA peri_sel 2).
+    uhci: Uhci,
     gpio: Gpio,
     ledc: Lcdc,
     mcpwm: Mcpwm,
@@ -263,6 +283,12 @@ pub struct Soc {
     /// I2S GDMA streaming cursors (OUT = TX, IN = RX) per I2S port.
     i2s_dma_out: [I2sDma; 2],
     i2s_dma_in: [I2sDma; 2],
+    cam_dma_in: CamDma,
+    /// IN-link freshness for the retroactive CAM arm: set when an IN link
+    /// for the camera peri starts, consumed when a capture uses it (retro
+    /// arm) or the pump parks the cursor — so a later CAM_START for a
+    /// polling-mode capture can't re-arm off the stale link.
+    cam_link_fresh: bool,
     rng: Rng,
     sdmmc: Sdmmc,
     sdm: Sdm,
@@ -282,7 +308,8 @@ pub struct Soc {
     wcl: RegStore,
     /// PERI_BACKUP (retention registers, DR_REG_PERI_BACKUP_BASE 0x6002A000).
     peri_backup: RegStore,
-    /// SYSCON (= peripheral clock/reset control, "PCR" on S3, 0x60026000).
+    /// SYSCON (sysclk/tick/clock-out config, 0x60026000; NOT peripheral
+    /// clocks — those are SYSTEM_PERIP_CLK_EN0/1, see sys_clk_en* below).
     syscon: RegStore,
     /// ASSIST_DEBUG (watchpoint/breakpoint unit, DR_REG_ASSIST_DEBUG_BASE
     /// 0x600CE000).
@@ -310,6 +337,12 @@ pub struct Soc {
     /// CORE1_WAIT stub) jumps to it.  The rest of the SYSTEM page is not
     /// modeled (dropped writes, reads 0).
     appcpu_ctrl_a: u32,
+    /// SYSTEM.PERIP_CLK_EN0/1 (0x600C0018/1C): peripheral clock gates.
+    /// Seeded with the system_reg.h reset defaults (every clock that
+    /// matters is on out of reset); drivers RMW individual bits.
+    /// `clk_on` below gates frozen peripherals on these (see there).
+    sys_clk_en0: u32,
+    sys_clk_en1: u32,
 
     /// SYSTEM.CPU_INT_FROM_CPU_0..3 (0x600C0030/4/8/C): cross-core
     /// interrupt registers.  +0x30 asserts FROM_CPU_INTR0 (source 79, used
@@ -382,11 +415,13 @@ impl Soc {
             iram0: Box::new([0; SRAM0_SIZE as usize]),
             irom: Box::new([0; IROM_SIZE as usize]),
             flash: Box::new([0; FLASH_SIZE as usize]),
+            flashenc_last: Cell::new((u32::MAX, [0; 16])),
             psram: Box::new([0; PSRAM_SIZE as usize]),
             rtc_slow: Box::new([0; RTC_SLOW_SIZE as usize]),
             rtc_fast: Box::new([0; RTC_FAST_SIZE as usize]),
             rom_data: Box::new([0; ROM_DATA_SIZE as usize]),
             uarts: [Uart::new(), Uart::new(), Uart::new()],
+            uhci: Uhci::new(),
             usb: UsbSerialJtag::new(),
             ulp: Ulp::new(),
             gpio: Gpio::new(),
@@ -422,6 +457,8 @@ impl Soc {
             sleep_ulp_watch: 0,
             i2s_dma_out: [I2sDma::default(); 2],
             i2s_dma_in: [I2sDma::default(); 2],
+            cam_dma_in: CamDma::default(),
+            cam_link_fresh: false,
             rng: Rng::new(),
             sdmmc: Sdmmc::new(),
             sdm: Sdm::new(),
@@ -437,6 +474,8 @@ impl Soc {
             usb_wrap: RegStore::new(0x1000),
             lcd_cam: LcdCam::new(),
             appcpu_ctrl_a: 0,
+            sys_clk_en0: 0xF9C1_E06F,
+            sys_clk_en1: 0x0000_0600,
             cpu_int_from_cpu: [0, 0, 0, 0],
             rom_boot_mode: false,
             loader_scratch_len: 0x6_0000,
@@ -469,6 +508,134 @@ impl Soc {
         self.flash[start..end].copy_from_slice(&bytes[..end - start]);
     }
 
+    /// Peripheral clock gate (SYSTEM PERIP_CLK_EN0 @ +0x18 / EN1 @ +0x1C,
+    /// reset defaults per system_reg.h — everything validated runs
+    /// clocked). `en1` selects EN1, else EN0. A gated peripheral is frozen:
+    /// its tick stops and triggered transfers/engines don't start (no
+    /// completion events — firmware hangs like silicon). Plain register
+    /// reads/writes still round-trip (documented leniency, so init
+    /// sequences that program before enabling keep working).
+    fn clk_on(&self, en1: bool, bit: u32) -> bool {
+        if en1 {
+            self.sys_clk_en1 & (1 << bit) != 0
+        } else {
+            self.sys_clk_en0 & (1 << bit) != 0
+        }
+    }
+
+    /// Current SPI flash contents, including MEMSPI program/erase writes.
+    /// Silicon flash is non-volatile: the machine snapshots this across
+    /// resets (OTA updates, NVS) instead of rebooting from the original
+    /// image.
+    pub fn flash_image(&self) -> &[u8] {
+        &self.flash[..]
+    }
+
+    /// Owned plaintext view of the whole flash image (block-decrypted when
+    /// encryption is enabled, else a copy). Boot parsing (partition table,
+    /// app headers) reads from this — the ROM bootloader sees decrypted
+    /// bytes through the hardware transparently.
+    pub fn flash_image_decrypted(&self) -> Vec<u8> {
+        if !self.flash_enc_enabled() {
+            return self.flash.to_vec();
+        }
+        let key = self.flash_xts_key();
+        let mut out = vec![0u8; self.flash.len()];
+        for (b, dst) in out.chunks_exact_mut(16).enumerate() {
+            let off = (b * 16) as u32;
+            let mut blk = [0u8; 16];
+            blk.copy_from_slice(&self.flash[b * 16..b * 16 + 16]);
+            dst.copy_from_slice(&crate::aes::flash_xts_decrypt(&key, off, &blk));
+        }
+        out
+    }
+
+    /// Secure-boot gate: eFuse RD_REPEAT_DATA4 SECURE_BOOT_EN
+    /// (efuse_reg.h bit 20). The mask-ROM verifies the bootloader signature
+    /// when set; the emulator's ROM stub performs no signature verification,
+    /// so a secure-enabled boot is fail-closed (see `boot_from_flash`).
+    /// Resets 0 (disabled) like silicon.
+    pub fn secure_boot_enabled(&self) -> bool {
+        self.efuse.secure_boot_enabled()
+    }
+
+    /// Flash-encryption gate: SPI_BOOT_CRYPT_CNT (eFuse RD_REPEAT_DATA1
+    /// bits [20:18]) has odd parity. Matches
+    /// `efuse_hal_flash_encryption_enabled` exactly (disassembled ground
+    /// truth); resets 0 (disabled) like silicon.
+    pub fn flash_enc_enabled(&self) -> bool {
+        self.efuse.crypt_cnt().count_ones() & 1 == 1
+    }
+
+    /// XTS key bytes from eFuse BLOCK_KEY0 (the flash-encryption key
+    /// block; same big-endian-per-word layout `hmac_key` reads).
+    fn flash_xts_key(&self) -> [u8; 32] {
+        self.efuse.hmac_key(0)
+    }
+
+    /// Host-provision a factory-encrypted device fixture: install the
+    /// 256-bit XTS key into BLOCK_KEY0's mirror and set SPI_BOOT_CRYPT_CNT
+    /// (one-way, like a burn), then mirror into both MEMSPI controllers.
+    /// Real burn flows are validated separately (efuse_burn sketch).
+    pub fn flashenc_provision(&mut self, key: &[u8; 32]) {
+        for i in 0..8 {
+            let w = ((key[4 * i] as u32) << 24)
+                | ((key[4 * i + 1] as u32) << 16)
+                | ((key[4 * i + 2] as u32) << 8)
+                | (key[4 * i + 3] as u32);
+            self.efuse.write32(0x9C + 4 * i as u32, w);
+        }
+        self.efuse.write32(0x34, 1 << 18);
+        self.refresh_flashenc_mirror();
+    }
+
+    /// Mirror the eFuse flash-encryption state into both MEMSPI controllers
+    /// (key when enabled, else plaintext) and drop the XIP decrypt cache.
+    /// Called after provisioning and after every eFuse MMIO write, so the
+    /// mirror can never go stale (firmware provisions HMAC keys at
+    /// runtime through the same registers).
+    fn refresh_flashenc_mirror(&mut self) {
+        let key = self.flash_enc_enabled().then(|| self.flash_xts_key());
+        for m in self.memspi.iter_mut() {
+            m.set_flashenc(key);
+        }
+        self.flashenc_last.set((u32::MAX, [0; 16]));
+    }
+
+    /// XTS-encrypt `len` bytes of backing at `off` in place (fixture
+    /// encryption; both must be 16-byte multiples — the whole image is,
+    /// and so is every flash transaction). Tweak per block =
+    /// LE128(absolute flash offset), so blocks stay independently
+    /// addressable. No-op unless provisioned.
+    pub fn flashenc_encrypt_region(&mut self, off: u32, len: u32) {
+        if !self.flash_enc_enabled() {
+            return;
+        }
+        let key = self.flash_xts_key();
+        let end = ((off + len) as usize).min(self.flash.len());
+        let mut b = (off as usize) & !15;
+        while b + 16 <= end {
+            let mut blk = [0u8; 16];
+            blk.copy_from_slice(&self.flash[b..b + 16]);
+            let enc = crate::aes::flash_xts_encrypt(&key, b as u32, &blk);
+            self.flash[b..b + 16].copy_from_slice(&enc);
+            b += 16;
+        }
+        self.refresh_flashenc_mirror();
+    }
+
+    /// Snapshot eFuse OTP state across a chip reset (eFuse is non-volatile
+    /// silicon; without this an encrypted device loses its key on reboot).
+    pub fn efuse_snapshot(&self) -> Efuse {
+        self.efuse.clone()
+    }
+
+    /// Restore eFuse OTP state after a chip reset (see `efuse_snapshot`).
+    pub fn restore_efuse(&mut self, e: Efuse) {
+        self.efuse = e;
+        self.refresh_flashenc_mirror();
+    }
+
     /// Parse an ESP-IDF app image at flash offset `app_flash_off` and program
     /// the cache MMU so the firmware can run:
     ///
@@ -485,19 +652,24 @@ impl Soc {
     ///    copying them to RAM (esp_image_format.h; ESP32-S3 TRM cache MMU).
     ///
     /// The app's own cache init later re-programs the same segment mappings.
-    pub fn map_app_flash_segments(&mut self, app_flash_off: u32) {
+    ///
+    /// `img` is the flash image bytes the headers/segments are parsed from:
+    /// normally the raw backing, or the decrypted view on encrypted devices
+    /// (the MMU still maps the raw backing pages — reads decrypt on the
+    /// fly — and RTC preloads land as plaintext either way).
+    pub fn map_app_flash_segments(&mut self, img: &[u8], app_flash_off: u32) {
         let base = app_flash_off as usize;
-        if base + 24 > FLASH_SIZE as usize || self.flash[base] != ESP_IMAGE_MAGIC {
+        if base + 24 > img.len() || img[base] != ESP_IMAGE_MAGIC {
             return;
         }
-        let nseg = self.flash[base + 1] as usize;
+        let nseg = img[base + 1] as usize;
         // Walk once to find the image end (segments are back-to-back).
         let mut end = base + 24; // esp_image_header_t is 24 bytes
         for _ in 0..nseg {
-            if end + 8 > FLASH_SIZE as usize {
+            if end + 8 > img.len() {
                 break;
             }
-            let len = u32::from_le_bytes(self.flash[end + 4..end + 8].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(img[end + 4..end + 8].try_into().unwrap()) as usize;
             end += 8 + len;
         }
         // 1. Loader scratch: map every flash page the app image spans.
@@ -512,11 +684,11 @@ impl Soc {
         // 2. Flash-mapped segments.
         let mut pos = base + 24;
         for _ in 0..nseg {
-            if pos + 8 > FLASH_SIZE as usize {
+            if pos + 8 > img.len() {
                 break;
             }
-            let load = u32::from_le_bytes(self.flash[pos..pos + 4].try_into().unwrap());
-            let len = u32::from_le_bytes(self.flash[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            let load = u32::from_le_bytes(img[pos..pos + 4].try_into().unwrap());
+            let len = u32::from_le_bytes(img[pos + 4..pos + 8].try_into().unwrap()) as usize;
             let data = pos + 8;
             if in_range!(load, FLASH_DATA_BASE, FLASH_WINDOW_SIZE)
                 || in_range!(load, FLASH_INST_BASE, FLASH_WINDOW_SIZE)
@@ -533,22 +705,22 @@ impl Soc {
             } else if in_range!(load, RTC_SLOW_BASE, RTC_SLOW_SIZE) {
                 // RTC slow-memory segment (e.g. ULP init data): the ROM stub
                 // loader skips every load >= 0x42000000, so preload host-side.
-                let src_end = (data + len).min(FLASH_SIZE as usize);
+                let src_end = (data + len).min(img.len());
                 let room = (RTC_SLOW_SIZE - (load - RTC_SLOW_BASE)) as usize;
                 let n = (src_end - data).min(room);
                 for i in 0..n {
-                    let b = self.flash[data + i];
+                    let b = img[data + i];
                     self.rtc_slow[(load - RTC_SLOW_BASE) as usize + i] = b;
                 }
             } else if in_range!(load, RTC_FAST_BASE, RTC_FAST_SIZE) {
                 // RTC fast-memory segment (linker rtc_iram_seg @ 0x600FE000:
                 // IPC/sleep helpers core 1 executes). Skipped by the stub
                 // loader like the slow segment above — preload host-side.
-                let src_end = (data + len).min(FLASH_SIZE as usize);
+                let src_end = (data + len).min(img.len());
                 let room = (RTC_FAST_SIZE - (load - RTC_FAST_BASE)) as usize;
                 let n = (src_end - data).min(room);
                 for i in 0..n {
-                    let b = self.flash[data + i];
+                    let b = img[data + i];
                     self.rtc_fast[(load - RTC_FAST_BASE) as usize + i] = b;
                 }
             }
@@ -689,6 +861,18 @@ impl Soc {
     /// Push one received byte into UART `n`'s RX FIFO (host console input).
     pub fn uart_inject_rx(&mut self, n: usize, byte: u8) {
         self.uarts[n].inject_rx(byte);
+    }
+
+    /// Simulate a USB host-observed device disconnect on the OTG port
+    /// (test/host frontend for removal-event paths).
+    pub fn usb_otg_disconnect(&mut self) {
+        self.usb_otg.host_disconnect();
+    }
+
+    /// Deliver one peer CAN frame into the TWAI RX buffer (virtual second
+    /// node; acceptance-filtered, RRB-released like a bus reception).
+    pub fn twai_inject_rx(&mut self, frame: [u8; crate::twai::FRAME_LEN]) {
+        self.twai.inject_rx(frame);
     }
 
     /// Push one received byte into the USB-Serial-JTAG RX FIFO (host console input).
@@ -987,16 +1171,51 @@ impl Soc {
                 ulp.step(&mut *self);
                 self.ulp = ulp;
             }
-            self.timg[0].tick(1);
-            self.timg[1].tick(1);
-            self.systimer.tick(1);
-            self.ledc.tick();
+            // Peripheral clock gates (SYSCON): a gated peripheral freezes
+            // (see `clk_on`). TIMERGROUP0/1 bits 13/15, SYSTIMER bit 29,
+            // LEDC bit 11.
+            if self.clk_on(false, 13) {
+                self.timg[0].tick(1);
+            }
+            if self.clk_on(false, 15) {
+                self.timg[1].tick(1);
+            }
+            if self.clk_on(false, 29) {
+                self.systimer.tick(1);
+            }
+            if self.clk_on(false, 11) {
+                self.ledc.tick();
+            }
             // UART RX-timeout counters (no-op unless RX data is pending with
-            // rx_tout_en set).
-            self.uarts[0].tick(1);
-            self.uarts[1].tick(1);
-            self.uarts[2].tick(1);
-            self.spi[0].tick(1);
+            // rx_tout_en set). Clocks: UART0 bit 2, UART1 bit 5 (EN0),
+            // UART2 bit 9 (EN1).
+            // UART CTS inputs (UnCTS_IN = 13/16/19): resolved through
+            // the matrix input routing against the pad readback (loopback
+            // sketches drive CTS from a GPIO). Reset routing reads GPIO0
+            // (strap-high = stop), like silicon's pulled CTS pin: firmware
+            // must route CTS to use TX flow control.
+            let rb = self.gpio_in_readback();
+            for (n, sig) in [(0u32, 13u32), (1, 16), (2, 19)] {
+                let cts = match self.gpio.in_sel(sig) {
+                    Some((pin, inv)) if pin < 32 => ((rb >> pin) & 1) ^ (inv as u32),
+                    Some((pin, inv)) => self.gpio.pin_level(pin) ^ (inv as u32),
+                    None => 1,
+                };
+                self.uarts[n as usize].set_cts(cts);
+            }
+            if self.clk_on(false, 2) {
+                self.uarts[0].tick(1);
+            }
+            if self.clk_on(false, 5) {
+                self.uarts[1].tick(1);
+            }
+            if self.clk_on(true, 9) {
+                self.uarts[2].tick(1);
+            }
+            // SPI bit clocks: SPI2 bit 6, SPI3 bit 16 (EN0).
+            if self.clk_on(false, 6) {
+                self.spi[0].tick(1);
+            }
             if let Some(tx) = self.spi[0].take_last_tx() {
                 self.pending_spi_tx[0] = tx;
                 self.events.push(EmuEvent {
@@ -1005,7 +1224,9 @@ impl Soc {
                     b: self.pending_spi_tx[0].len() as u32,
                 });
             }
-            self.spi[1].tick(1);
+            if self.clk_on(false, 16) {
+                self.spi[1].tick(1);
+            }
             if let Some(tx) = self.spi[1].take_last_tx() {
                 self.pending_spi_tx[1] = tx;
                 self.events.push(EmuEvent {
@@ -1016,29 +1237,35 @@ impl Soc {
             }
             // I2C bus: skip entirely when idle (common case during boot);
             // when active, batch the remaining cycles to avoid per-step
-            // function-call overhead on the hot path.
-            if !self.i2c[0].is_idle() {
+            // function-call overhead on the hot path. Clocks: I2C_EXT0
+            // bit 7, I2C_EXT1 bit 18 (EN0).
+            if !self.i2c[0].is_idle() && self.clk_on(false, 7) {
                 let n = self.i2c[0].remaining_cycles().max(1);
                 self.i2c[0].tick(n);
                 if self.i2c[0].has_events() {
                     self.events.extend(self.i2c[0].drain_events());
                 }
             }
-            if !self.i2c[1].is_idle() {
+            if !self.i2c[1].is_idle() && self.clk_on(false, 18) {
                 let n = self.i2c[1].remaining_cycles().max(1);
                 self.i2c[1].tick(n);
                 if self.i2c[1].has_events() {
                     self.events.extend(self.i2c[1].drain_events());
                 }
             }
-            self.adc.tick(1);
+            // APB_SARADC clock bit 28 (EN0); the SENS oneshot path is RTC
+            // domain and needs no gate.
+            if self.clk_on(false, 28) {
+                self.adc.tick(1);
+            }
             // Touch proximity counters (no-op unless approach pads armed).
             self.touch.tick(1);
             // Waveform peripherals: skip the tick while idle. Each gate
             // mirrors its tick's own early-out (inactive RMT channels /
             // stopped MCPWM timers / non-busy LCD / non-busy I2S), so a
-            // skipped tick would have no-opped identically.
-            if self.rmt.is_active() {
+            // skipped tick would have no-opped identically. Clock gates:
+            // RMT bit 9, MCPWM0/1 bits 17/20 (EN0).
+            if self.rmt.is_active() && self.clk_on(false, 9) {
                 self.rmt.tick();
             }
             // RMT RX sampling: skipped unless a capture is armed/running.
@@ -1047,7 +1274,7 @@ impl Soc {
             // unrouted inputs read pull-up high. Pins 32+ are out of the
             // u32 readback word and also read high (same limit as the GPIO
             // edge sampler).
-            if self.rmt.rx_pending() {
+            if self.rmt.rx_pending() && self.clk_on(false, 9) {
                 let rb = self.gpio_in_readback();
                 let rmt_rx = |sig: u32| -> u32 {
                     match self.gpio.in_sel(sig) {
@@ -1059,10 +1286,10 @@ impl Soc {
                 };
                 self.rmt.tick_rx(&rmt_rx);
             }
-            if self.mcpwm.is_active() {
+            if self.mcpwm.is_active() && self.clk_on(false, 17) {
                 self.mcpwm.tick();
             }
-            if self.mcpwm1.is_active() {
+            if self.mcpwm1.is_active() && self.clk_on(false, 20) {
                 self.mcpwm1.tick();
             }
             // MCPWM capture samples its channel inputs via the GPIO-matrix
@@ -1071,7 +1298,7 @@ impl Soc {
             // come from the pad readback (not pin_level: an output-enabled
             // peripheral-driven pin reads GPIO_OUT there, not the driven
             // signal).
-            if self.mcpwm.cap_timer_enabled() {
+            if self.mcpwm.cap_timer_enabled() && self.clk_on(false, 17) {
                 let rb = self.gpio_in_readback();
                 let cap_in = |sig: u32| -> u32 {
                     match self.gpio.in_sel(sig) {
@@ -1082,7 +1309,7 @@ impl Soc {
                 };
                 self.mcpwm.tick_capture(166, &cap_in);
             }
-            if self.mcpwm1.cap_timer_enabled() {
+            if self.mcpwm1.cap_timer_enabled() && self.clk_on(false, 20) {
                 let rb = self.gpio_in_readback();
                 let cap_in = |sig: u32| -> u32 {
                     match self.gpio.in_sel(sig) {
@@ -1097,7 +1324,7 @@ impl Soc {
             // 163..165, group 1 = 172..174, gpio_sig_map.h PWMx_Fn_IN_IDX),
             // sampled even with every timer stopped. Unrouted inputs read
             // low so an enabled-but-unconnected detector never trips.
-            if self.mcpwm.fault_active() {
+            if self.mcpwm.fault_active() && self.clk_on(false, 17) {
                 let rb = self.gpio_in_readback();
                 let fault_in = |sig: u32| -> u32 {
                     match self.gpio.in_sel(sig) {
@@ -1108,7 +1335,7 @@ impl Soc {
                 };
                 self.mcpwm.tick_fault(163, &fault_in);
             }
-            if self.mcpwm1.fault_active() {
+            if self.mcpwm1.fault_active() && self.clk_on(false, 20) {
                 let rb = self.gpio_in_readback();
                 let fault_in = |sig: u32| -> u32 {
                     match self.gpio.in_sel(sig) {
@@ -1119,26 +1346,61 @@ impl Soc {
                 };
                 self.mcpwm1.tick_fault(172, &fault_in);
             }
+            // MCPWM timer sync: SYNC0..2 external inputs (group 0 =
+            // 160..162, group 1 = 169..171) reload PHASE on rising edges
+            // when SYNCI_EN is set. Sampled even with timers stopped.
+            if self.mcpwm.sync_armed() && self.clk_on(false, 17) {
+                let rb = self.gpio_in_readback();
+                let sync_in = |sig: u32| -> u32 {
+                    match self.gpio.in_sel(sig) {
+                        Some((pin, inv)) if pin < 32 => ((rb >> pin) & 1) ^ (inv as u32),
+                        Some((pin, inv)) => self.gpio.pin_level(pin) ^ (inv as u32),
+                        None => 0,
+                    }
+                };
+                self.mcpwm.tick_sync(160, &sync_in);
+            }
+            if self.mcpwm1.sync_armed() && self.clk_on(false, 20) {
+                let rb = self.gpio_in_readback();
+                let sync_in = |sig: u32| -> u32 {
+                    match self.gpio.in_sel(sig) {
+                        Some((pin, inv)) if pin < 32 => ((rb >> pin) & 1) ^ (inv as u32),
+                        Some((pin, inv)) => self.gpio.pin_level(pin) ^ (inv as u32),
+                        None => 0,
+                    }
+                };
+                self.mcpwm1.tick_sync(169, &sync_in);
+            }
             if self.sdm.is_active() {
                 self.sdm.tick();
             }
-            if self.lcd_cam.is_active() {
+            if self.lcd_cam.is_active() && self.clk_on(true, 8) {
                 self.lcd_cam.tick();
             }
-            if self.i2s[0].is_active() {
+            if self.i2s[0].is_active() && self.clk_on(false, 4) {
                 self.i2s[0].tick();
             }
-            if self.i2s[1].is_active() {
+            if self.i2s[1].is_active() && self.clk_on(false, 21) {
                 self.i2s[1].tick();
             }
             // I2S GDMA streaming pump: trickle words between owned DMA
             // descriptors and the TX/RX FIFOs as space/data allow (the
             // esp-idf driver streams multi-hundred-byte frames through a
             // 16-word FIFO; a synchronous dump would overflow it). Gated on
-            // any armed link (cold otherwise).
-            if self.i2s_dma_out.iter().any(|d| d.active) || self.i2s_dma_in.iter().any(|d| d.active)
+            // any armed link (cold otherwise) plus the GDMA DMA clock
+            // (EN1 bit 6): with the DMA clock off the walks below never
+            // run, so the pump must idle too.
+            if (self.i2s_dma_out.iter().any(|d| d.active)
+                || self.i2s_dma_in.iter().any(|d| d.active))
+                && self.clk_on(true, 6)
             {
                 self.poll_i2s_dma();
+            }
+            // Camera-capture GDMA pump: trickle staged words into owned IN
+            // descriptors (the LCD clock feeds the tick streamer, the DMA
+            // clock feeds the walks below — both on, like the I2S pump).
+            if self.cam_dma_in.active && self.clk_on(true, 8) && self.clk_on(true, 6) {
+                self.poll_cam_dma();
             }
             // GPIO edge/level sampling: skipped unless a pin interrupt is
             // armed (the common case). Levels come from the pad readback so
@@ -1151,7 +1413,7 @@ impl Soc {
             // input routing (FUNC_IN_SEL_CFG); resolve each signal index to the
             // GPIO pin's current level. Skipped while no unit is counting
             // (and after the one-time prev-level sampling) — the common case.
-            if !self.pcnt.is_init() || self.pcnt.is_counting() {
+            if (!self.pcnt.is_init() || self.pcnt.is_counting()) && self.clk_on(false, 10) {
                 let pcnt_input = |sig: u32| -> u32 {
                     match self.gpio.in_sel(sig) {
                         Some((pin, inv)) => self.gpio.pin_level(pin) ^ (inv as u32),
@@ -1162,8 +1424,15 @@ impl Soc {
             }
             // USB-Serial-JTAG: re-assert serial_in_empty_int when the
             // ISR cleared it but the FIFO is still empty (level-triggered
-            // host-poll behavior).
-            self.usb.tick();
+            // host-poll behavior). USB_DEVICE clock bit 10 (EN1).
+            if self.clk_on(true, 10) {
+                self.usb.tick();
+            }
+            // USB-OTG SOF frame counter (USB controller clock bit 23,
+            // EN0): free-running while clocked (see HFNUM).
+            if self.clk_on(false, 23) {
+                self.usb_otg.tick();
+            }
         }
         self.rtc.tick(cycles);
         self.pll.tick(cycles);
@@ -1188,28 +1457,32 @@ impl Soc {
     }
 
     /// Flash byte at a physical flash offset (past the 4 MB end -> 0 like an
-    /// unmapped flash region).
+    /// unmapped flash region). With flash encryption enabled, decrypts the
+    /// 16-byte block through a one-entry cache (XTS units are 16 bytes;
+    /// instruction fetch is sequential/loopy so this hits ~always).
     fn flash_byte(&self, off: u32) -> u8 {
         if off >= FLASH_SIZE {
             0
+        } else if self.flash_enc_enabled() {
+            let base = off & !15;
+            let (cb, blk) = self.flashenc_last.get();
+            let blk = if cb == base {
+                blk
+            } else {
+                let mut raw = [0xFFu8; 16];
+                for (i, slot) in raw.iter_mut().enumerate() {
+                    if let Some(v) = self.flash.get(base as usize + i) {
+                        *slot = *v;
+                    }
+                }
+                let dec = crate::aes::flash_xts_decrypt(&self.flash_xts_key(), base, &raw);
+                self.flashenc_last.set((base, dec));
+                dec
+            };
+            blk[(off & 15) as usize]
         } else {
             self.flash[off as usize]
         }
-    }
-
-    /// TEMPORARY PROBE (remove): raw flash backing for snapshots.
-    pub fn flash_backing(&self) -> &[u8] {
-        &self.flash[..]
-    }
-
-    /// TEMPORARY PROBE (remove): raw PSRAM backing for aliasing scans.
-    pub fn psram_backing(&self) -> &[u8] {
-        &self.psram[..]
-    }
-
-    /// TEMPORARY PROBE (remove): raw PSRAM backing, mutable.
-    pub fn psram_backing_mut(&mut self) -> &mut [u8] {
-        &mut self.psram[..]
     }
 
     /// Byte read through a cache window (data or instruction), translated by
@@ -1343,6 +1616,14 @@ impl Soc {
         } else if (28..=32).contains(&sig) {
             // I2S1 output signals (BCK/WS/SD + RX BCK/WS).
             self.i2s[1].signal_level(sig)
+        } else if matches!(sig, 13 | 16 | 19) {
+            // UART RTS outputs (UnRTS_OUT, active-low ready).
+            let n = match sig {
+                13 => 0,
+                16 => 1,
+                _ => 2,
+            };
+            self.uarts[n].rts_level()
         } else if matches!(sig, 54 | 129..=131 | 252..=255) {
             // Dedicated-GPIO OUT channels 0..2/3..6/7 (CORE1_GPIO_OUTx).
             let ch = match sig {
@@ -1382,6 +1663,16 @@ impl Soc {
                     0
                 } else {
                     self.uarts[n].read32(off)
+                }
+            }
+            UHCI0_BASE => {
+                // UHCI0 DMA bridge (CONF0 + INT block; framing codec not
+                // modeled, see uhci.rs).
+                if is_write {
+                    self.uhci.write32(off, value);
+                    0
+                } else {
+                    self.uhci.read32(off)
                 }
             }
             GPIO_BASE => {
@@ -1442,7 +1733,16 @@ impl Soc {
                 } else {
                     let n = if dev == SPI2_BASE { 0 } else { 1 };
                     if is_write {
-                        self.spi[n].write32(off, value);
+                        // SPI peripheral clock (EN0 bits 6/16): a USR
+                        // transfer doesn't start gated (its CMD bit is
+                        // masked out; every other register processes).
+                        let bit = if n == 0 { 6 } else { 16 };
+                        let v = if !self.clk_on(false, bit) && off == 0x00 {
+                            value & !(1u32 << 24)
+                        } else {
+                            value
+                        };
+                        self.spi[n].write32(off, v);
                         0
                     } else {
                         self.spi[n].read32(off)
@@ -1455,6 +1755,9 @@ impl Soc {
                 let n = if dev == SPI1_BASE { 0 } else { 1 };
                 if is_write {
                     self.memspi[n].write32(&mut self.flash[..], off, value);
+                    // A programmed transaction may have rewritten backing
+                    // under the XIP decrypt cache (encrypted devices).
+                    self.flashenc_last.set((u32::MAX, [0; 16]));
                     0
                 } else {
                     self.memspi[n].read32(off)
@@ -1463,7 +1766,15 @@ impl Soc {
             I2C0_BASE | I2C1_BASE => {
                 let n = if dev == I2C0_BASE { 0 } else { 1 };
                 if is_write {
-                    self.i2c[n].write32(off, value);
+                    // I2C peripheral clock (EN0 bits 7/18): TRANS_START
+                    // doesn't fire gated (bit masked out, rest processes).
+                    let bit = if n == 0 { 7 } else { 18 };
+                    let v = if !self.clk_on(false, bit) && off == 0x04 {
+                        value & !(1u32 << 5)
+                    } else {
+                        value
+                    };
+                    self.i2c[n].write32(off, v);
                     0
                 } else {
                     self.i2c[n].read32(off)
@@ -1488,340 +1799,418 @@ impl Soc {
             GDMA_BASE => {
                 if is_write {
                     // A write that starts an OUT (TX) or IN (RX) channel transfer
-                    // triggers the descriptor-walk copy.
+                    // triggers the descriptor-walk copy — gated on the GDMA
+                    // DMA clock (EN1 bit 6): with the clock off the link
+                    // stays armed but nothing moves and no done raises
+                    // (firmware hangs like silicon until it enables it).
                     if let Some((ch, is_out)) = self.gdma.write32(off, value) {
-                        let link_addr = if is_out {
-                            self.gdma.out_link_addr(ch)
-                        } else {
-                            self.gdma.in_link_addr(ch)
-                        };
-                        let peri = if is_out {
-                            self.gdma.out_peri_sel(ch)
-                        } else {
-                            self.gdma.in_peri_sel(ch)
-                        };
-                        // Walk the descriptor chain. Descriptor addresses are
-                        // in DRAM; the link register holds the 20 LSBs
-                        // (GDMA_DESC_BASE), buffer/next are full 32-bit
-                        // addresses. Copy `length` bytes between each frame and
-                        // the connected peripheral.
-                        // SPI DMA transfers trigger once per OUT-link start
-                        // (all descriptors staged first); see below.
-                        let mut spi_dma_pending: Option<usize> = None;
-                        let mut desc = link_addr;
-                        // SPI slave DMA links arm only: the host-driven
-                        // exchange (spi_slave_inject_write/take_read) walks
-                        // the descriptors and raises completion when the
-                        // external master actually clocks. A master-style
-                        // walk here would stage phantom TX bytes (and even
-                        // fire a master dma_trigger) or consume the RX
-                        // descriptor setup with zeros before the exchange.
-                        let slave_arm_only = if peri == crate::gdma::GDMA_SPI2_PERIPH
-                            || peri == crate::gdma::GDMA_SPI3_PERIPH
-                        {
-                            let idx = if peri == crate::gdma::GDMA_SPI2_PERIPH {
-                                0
+                        if self.clk_on(true, 6) {
+                            let link_addr = if is_out {
+                                self.gdma.out_link_addr(ch)
                             } else {
-                                1
+                                self.gdma.in_link_addr(ch)
                             };
-                            self.spi[idx].is_slave()
-                        } else {
-                            false
-                        };
-                        // I2S GDMA streams through the per-tick pump (its
-                        // frames dwarf the 16-word FIFO); arm the cursor and
-                        // skip the synchronous walk. All other peripherals
-                        // keep the immediate walk below.
-                        //
-                        // Memory-to-memory (IN_CONF0 mem_trans_en, TRM
-                        // gdma_struct.h bit 4): the OUT-link descriptors
-                        // source DRAM bytes the IN-link descriptors sink on
-                        // the same channel pair. The copy runs once BOTH
-                        // links are started (order-independent: a lone start
-                        // only arms — without this gate the first start
-                        // would fall into the normal peri walk and consume
-                        // the source descriptors) and hands both descriptor
-                        // chains back with OUT + IN done raised. Descriptor
-                        // pairs advance lockstep 1:1 (a longer side's excess
-                        // bytes are dropped) — validation uses exact pairs.
-                        let m2m_armed = self.gdma.in_mem_trans_en(ch);
-                        let m2m_ready = m2m_armed
-                            && self.gdma.out_link_started(ch)
-                            && self.gdma.in_link_started(ch);
-                        if m2m_ready {
-                            let mut odesc = self.gdma.out_link_addr(ch);
-                            let mut idesc = self.gdma.in_link_addr(ch);
-                            loop {
-                                let odw0 = self.read32(odesc);
-                                let obuf = self.read32(odesc + 4);
-                                let onext = self.read32(odesc + 8);
-                                let olen = ((odw0 >> 12) & 0xFFF) as usize;
-                                let oeof = (odw0 >> 30) & 1;
-                                if (odw0 >> 31) & 1 == 0 {
-                                    break;
-                                }
-                                let idw0 = self.read32(idesc);
-                                let ibuf = self.read32(idesc + 4);
-                                let inext = self.read32(idesc + 8);
-                                let ilen = ((idw0 >> 12) & 0xFFF) as usize;
-                                let ieof = (idw0 >> 30) & 1;
-                                if (idw0 >> 31) & 1 == 0 {
-                                    break;
-                                }
-                                let n = olen.min(ilen);
-                                for k in 0..n {
-                                    let b = self.read8(obuf + k as u32);
-                                    self.write8(ibuf + k as u32, b);
-                                }
-                                self.write32(odesc, odw0 & !(1u32 << 31));
-                                self.write32(idesc, idw0 & !(1u32 << 31));
-                                self.gdma.set_out_eof_des_addr(ch, odesc);
-                                if onext == 0 || oeof == 1 || inext == 0 || ieof == 1 {
-                                    break;
-                                }
-                                odesc = onext;
-                                idesc = inext;
-                            }
-                            self.gdma.raise_out_done(ch);
-                            self.gdma.raise_in_done(ch);
-                        } else if m2m_armed {
-                            // Lone M2M start: arm only (see above).
-                        } else if slave_arm_only {
-                        } else if is_out
-                            && (peri == crate::gdma::GDMA_I2S0_PERIPH
-                                || peri == crate::gdma::GDMA_I2S1_PERIPH)
-                        {
-                            let p = (peri - crate::gdma::GDMA_I2S0_PERIPH) as usize;
-                            self.i2s_dma_out[p] = I2sDma {
-                                active: true,
-                                ch,
-                                desc: link_addr,
-                                off: 0,
+                            let peri = if is_out {
+                                self.gdma.out_peri_sel(ch)
+                            } else {
+                                self.gdma.in_peri_sel(ch)
                             };
-                            self.i2s[p].set_tx_dma_pending(true);
-                        } else if !is_out
-                            && (peri == crate::gdma::GDMA_I2S0_PERIPH
-                                || peri == crate::gdma::GDMA_I2S1_PERIPH)
-                        {
-                            let p = (peri - crate::gdma::GDMA_I2S0_PERIPH) as usize;
-                            self.i2s_dma_in[p] = I2sDma {
-                                active: true,
-                                ch,
-                                desc: link_addr,
-                                off: 0,
+                            // Walk the descriptor chain. Descriptor addresses are
+                            // in DRAM; the link register holds the 20 LSBs
+                            // (GDMA_DESC_BASE), buffer/next are full 32-bit
+                            // addresses. Copy `length` bytes between each frame and
+                            // the connected peripheral.
+                            // SPI DMA transfers trigger once per OUT-link start
+                            // (all descriptors staged first); see below.
+                            let mut spi_dma_pending: Option<usize> = None;
+                            let mut desc = link_addr;
+                            // SPI slave DMA links arm only: the host-driven
+                            // exchange (spi_slave_inject_write/take_read) walks
+                            // the descriptors and raises completion when the
+                            // external master actually clocks. A master-style
+                            // walk here would stage phantom TX bytes (and even
+                            // fire a master dma_trigger) or consume the RX
+                            // descriptor setup with zeros before the exchange.
+                            let slave_arm_only = if peri == crate::gdma::GDMA_SPI2_PERIPH
+                                || peri == crate::gdma::GDMA_SPI3_PERIPH
+                            {
+                                let idx = if peri == crate::gdma::GDMA_SPI2_PERIPH {
+                                    0
+                                } else {
+                                    1
+                                };
+                                self.spi[idx].is_slave()
+                            } else {
+                                false
                             };
-                        } else {
-                            loop {
-                                let dw0 = self.read32(desc);
-                                let buf = self.read32(desc + 4);
-                                let next = self.read32(desc + 8);
-                                let len = (dw0 >> 12) & 0xFFF;
-                                let eof = (dw0 >> 30) & 1;
-                                let owner = (dw0 >> 31) & 1;
-                                if owner == 0 {
-                                    break;
+                            // I2S GDMA streams through the per-tick pump (its
+                            // frames dwarf the 16-word FIFO); arm the cursor and
+                            // skip the synchronous walk. All other peripherals
+                            // keep the immediate walk below.
+                            //
+                            // Memory-to-memory (IN_CONF0 mem_trans_en, TRM
+                            // gdma_struct.h bit 4): the OUT-link descriptors
+                            // source DRAM bytes the IN-link descriptors sink on
+                            // the same channel pair. The copy runs once BOTH
+                            // links are started (order-independent: a lone start
+                            // only arms — without this gate the first start
+                            // would fall into the normal peri walk and consume
+                            // the source descriptors) and hands both descriptor
+                            // chains back with OUT + IN done raised. Descriptor
+                            // pairs advance lockstep 1:1 (a longer side's excess
+                            // bytes are dropped) — validation uses exact pairs.
+                            let m2m_armed = self.gdma.in_mem_trans_en(ch);
+                            let m2m_ready = m2m_armed
+                                && self.gdma.out_link_started(ch)
+                                && self.gdma.in_link_started(ch);
+                            if m2m_ready {
+                                let mut odesc = self.gdma.out_link_addr(ch);
+                                let mut idesc = self.gdma.in_link_addr(ch);
+                                loop {
+                                    let odw0 = self.read32(odesc);
+                                    let obuf = self.read32(odesc + 4);
+                                    let onext = self.read32(odesc + 8);
+                                    let olen = ((odw0 >> 12) & 0xFFF) as usize;
+                                    let oeof = (odw0 >> 30) & 1;
+                                    if (odw0 >> 31) & 1 == 0 {
+                                        break;
+                                    }
+                                    let idw0 = self.read32(idesc);
+                                    let ibuf = self.read32(idesc + 4);
+                                    let inext = self.read32(idesc + 8);
+                                    let ilen = ((idw0 >> 12) & 0xFFF) as usize;
+                                    let ieof = (idw0 >> 30) & 1;
+                                    if (idw0 >> 31) & 1 == 0 {
+                                        break;
+                                    }
+                                    let n = olen.min(ilen);
+                                    for k in 0..n {
+                                        let b = self.read8(obuf + k as u32);
+                                        self.write8(ibuf + k as u32, b);
+                                    }
+                                    self.write32(odesc, odw0 & !(1u32 << 31));
+                                    self.write32(idesc, idw0 & !(1u32 << 31));
+                                    self.gdma.set_out_eof_des_addr(ch, odesc);
+                                    if onext == 0 || oeof == 1 || inext == 0 || ieof == 1 {
+                                        break;
+                                    }
+                                    odesc = onext;
+                                    idesc = inext;
+                                }
+                                self.gdma.raise_out_done(ch);
+                                self.gdma.raise_in_done(ch);
+                            } else if m2m_armed {
+                                // Lone M2M start: arm only (see above).
+                            } else if slave_arm_only {
+                            } else if is_out
+                                && (peri == crate::gdma::GDMA_I2S0_PERIPH
+                                    || peri == crate::gdma::GDMA_I2S1_PERIPH)
+                            {
+                                let p = (peri - crate::gdma::GDMA_I2S0_PERIPH) as usize;
+                                self.i2s_dma_out[p] = I2sDma {
+                                    active: true,
+                                    ch,
+                                    desc: link_addr,
+                                    off: 0,
+                                };
+                                self.i2s[p].set_tx_dma_pending(true);
+                            } else if !is_out
+                                && (peri == crate::gdma::GDMA_I2S0_PERIPH
+                                    || peri == crate::gdma::GDMA_I2S1_PERIPH)
+                            {
+                                let p = (peri - crate::gdma::GDMA_I2S0_PERIPH) as usize;
+                                self.i2s_dma_in[p] = I2sDma {
+                                    active: true,
+                                    ch,
+                                    desc: link_addr,
+                                    off: 0,
+                                };
+                            } else if !is_out && peri == crate::gdma::GDMA_LCD_PERIPH {
+                                // Camera capture into IN descriptors: arm the
+                                // streaming cursor (the tick streamer feeds
+                                // it; done raises per filled descriptor).
+                                // LCD-TX shares peri 5 but is OUT direction.
+                                self.cam_dma_in = CamDma {
+                                    active: true,
+                                    ch,
+                                    desc: link_addr,
+                                    off: 0,
+                                };
+                                self.lcd_cam.set_dma_active(true);
+                                self.cam_link_fresh = true;
+                            } else {
+                                loop {
+                                    let dw0 = self.read32(desc);
+                                    let buf = self.read32(desc + 4);
+                                    let next = self.read32(desc + 8);
+                                    let len = (dw0 >> 12) & 0xFFF;
+                                    let eof = (dw0 >> 30) & 1;
+                                    let owner = (dw0 >> 31) & 1;
+                                    if owner == 0 {
+                                        break;
+                                    }
+                                    if is_out {
+                                        if peri == crate::gdma::GDMA_RMT_PERIPH {
+                                            let dst = crate::rmt::RMTMEM_BASE + (ch as u32) * 0x100;
+                                            // Copy in 32-bit words. RMT items are
+                                            // word-aligned and the item buffer length is a
+                                            // multiple of 4; a byte-wise copy would clobber
+                                            // whole words because RMTMEM writes via
+                                            // write32 store the full word (see Rmt::write32).
+                                            let mut k = 0u32;
+                                            while k + 4 <= len {
+                                                let w = self.read32(buf + k);
+                                                self.write32(dst + k, w);
+                                                k += 4;
+                                            }
+                                            self.gdma.set_out_eof_des_addr(ch, desc);
+                                        } else if peri == crate::gdma::GDMA_SHA_PERIPH {
+                                            // SHA: copy the descriptor's message bytes into
+                                            // the SHA engine's message buffer (reconstructed
+                                            // LSB-first per 32-bit word, the byte order the
+                                            // SHA engine consumes). The driver passes an
+                                            // already-padded, complete 64-byte block.
+                                            let mut k = 0u32;
+                                            while k + 4 <= len {
+                                                let w = self.read32(buf + k);
+                                                self.sha.feed_byte((w & 0xFF) as u8);
+                                                self.sha.feed_byte(((w >> 8) & 0xFF) as u8);
+                                                self.sha.feed_byte(((w >> 16) & 0xFF) as u8);
+                                                self.sha.feed_byte(((w >> 24) & 0xFF) as u8);
+                                                k += 4;
+                                            }
+                                            self.gdma.set_out_eof_des_addr(ch, desc);
+                                        } else if peri == crate::gdma::GDMA_AES_PERIPH {
+                                            // AES: copy the descriptor's plaintext into the
+                                            // AES TEXT_IN buffer (LSB-first per word), then
+                                            // run the transform. In DMA mode the engine
+                                            // auto-pushes the ciphertext to the paired GDMA
+                                            // `in` channel, so walk that channel's
+                                            // descriptors and copy TEXT_OUT -> DRAM here.
+                                            let mut k = 0u32;
+                                            while k + 4 <= len {
+                                                let w = self.read32(buf + k);
+                                                self.aes.feed_text_in_byte((w & 0xFF) as u8);
+                                                self.aes.feed_text_in_byte(((w >> 8) & 0xFF) as u8);
+                                                self.aes
+                                                    .feed_text_in_byte(((w >> 16) & 0xFF) as u8);
+                                                self.aes
+                                                    .feed_text_in_byte(((w >> 24) & 0xFF) as u8);
+                                                k += 4;
+                                            }
+                                            self.aes.transform();
+                                            self.gdma.set_out_eof_des_addr(ch, desc);
+                                            // Auto-push ciphertext through the AES RX
+                                            // channel. The esp-idf AES driver allocates a
+                                            // SEPARATE GDMA channel for the ciphertext `in`
+                                            // link (crypto_shared_gdma_new_channel is called
+                                            // twice: TX then RX), so the RX channel index is
+                                            // not the same as this TX channel. Find the
+                                            // channel whose `in` block is wired to AES and
+                                            // copy TEXT_OUT -> its descriptor buffers.
+                                            for rx in 0..crate::gdma::NCH {
+                                                if self.gdma.in_peri_sel(rx)
+                                                    == crate::gdma::GDMA_AES_PERIPH
+                                                {
+                                                    let mut idesc = self.gdma.in_link_addr(rx);
+                                                    loop {
+                                                        let dw0 = self.read32(idesc);
+                                                        let ibuf = self.read32(idesc + 4);
+                                                        let inext = self.read32(idesc + 8);
+                                                        let ilen = (dw0 >> 12) & 0xFFF;
+                                                        let ieof = (dw0 >> 30) & 1;
+                                                        let iowner = (dw0 >> 31) & 1;
+                                                        if iowner == 0 {
+                                                            break;
+                                                        }
+                                                        let mut k = 0u32;
+                                                        while k + 4 <= ilen {
+                                                            let w = self.aes.out_word_at(k);
+                                                            self.write32(ibuf + k, w);
+                                                            k += 4;
+                                                        }
+                                                        // DMA hands the descriptor back: clear owner
+                                                        // (the driver polls owner / reads length/suc_eof).
+                                                        self.write32(idesc, dw0 & !(1u32 << 31));
+                                                        if inext == 0 || ieof == 1 {
+                                                            break;
+                                                        }
+                                                        idesc = inext;
+                                                    }
+                                                    self.gdma.raise_in_done(rx);
+                                                    break;
+                                                }
+                                            }
+                                        } else if peri == crate::gdma::GDMA_SPI2_PERIPH
+                                            || peri == crate::gdma::GDMA_SPI3_PERIPH
+                                        {
+                                            // SPI master DMA: stage the descriptor's
+                                            // bytes (address order) for one DMA-backed
+                                            // transfer, triggered after the walk (see
+                                            // below) so multi-descriptor chains send
+                                            // once. The transfer runs like a USR op
+                                            // (waveform + trans_done); start the IN
+                                            // link after trans_done latches.
+                                            let idx = if peri == crate::gdma::GDMA_SPI2_PERIPH {
+                                                0
+                                            } else {
+                                                1
+                                            };
+                                            let mut k = 0u32;
+                                            while k + 4 <= len {
+                                                let w = self.read32(buf + k);
+                                                self.spi[idx].spi_dma_feed(&w.to_le_bytes());
+                                                k += 4;
+                                            }
+                                            if k < len {
+                                                let w = self.read32(buf + k);
+                                                let tail = &w.to_le_bytes()[..(len - k) as usize];
+                                                self.spi[idx].spi_dma_feed(tail);
+                                            }
+                                            self.gdma.set_out_eof_des_addr(ch, desc);
+                                            spi_dma_pending = Some(idx);
+                                        } else if peri == crate::gdma::GDMA_LCD_PERIPH {
+                                            // LCD_CAM DMA: stream the descriptor's
+                                            // words through the TX FIFO as one
+                                            // synchronous 8080 transfer (word-aligned
+                                            // lengths; a partial tail word is dropped).
+                                            let mut words =
+                                                alloc::vec::Vec::with_capacity((len / 4) as usize);
+                                            let mut k = 0u32;
+                                            while k + 4 <= len {
+                                                words.push(self.read32(buf + k));
+                                                k += 4;
+                                            }
+                                            self.lcd_cam.dma_transfer(&words);
+                                            self.gdma.set_out_eof_des_addr(ch, desc);
+                                        } else if peri == crate::gdma::GDMA_UHCI0_PERIPH {
+                                            // UHCI TX: move descriptor bytes into
+                                            // the UHCI-selected UART's TX FIFO
+                                            // (framing-off passthrough; dropped
+                                            // when the UHCI clock is off).
+                                            let mut k = 0u32;
+                                            let mut bytes =
+                                                alloc::vec::Vec::with_capacity(len as usize);
+                                            while k + 4 <= len {
+                                                let w = self.read32(buf + k);
+                                                bytes.extend_from_slice(&w.to_le_bytes());
+                                                k += 4;
+                                            }
+                                            if k < len {
+                                                let w = self.read32(buf + k);
+                                                bytes.extend_from_slice(
+                                                    &w.to_le_bytes()[..(len - k) as usize],
+                                                );
+                                            }
+                                            if self.uhci.clk_on()
+                                                && self.clk_on(false, 8)
+                                                && let Some(n) = self.uhci.uart_sel()
+                                            {
+                                                // SLIP-framed when SEPER_EN is set.
+                                                let wire = self.uhci.slip_encode(&bytes);
+                                                self.uarts[n].push_tx(&wire);
+                                            }
+                                            self.uhci.latch_tx_start();
+                                            self.gdma.set_out_eof_des_addr(ch, desc);
+                                        }
+                                    } else {
+                                        // IN (RX) channel: copy from the peripheral's data
+                                        // registers into the descriptor's DRAM buffer.
+                                        if peri == crate::gdma::GDMA_AES_PERIPH {
+                                            // AES ciphertext out -> DRAM.
+                                            let mut k = 0u32;
+                                            while k + 4 <= len {
+                                                let w = self.aes.out_word_at(k);
+                                                self.write32(buf + k, w);
+                                                k += 4;
+                                            }
+                                            // The AES engine has already transformed the
+                                            // block (the TX `out` write fed plaintext and
+                                            // ran the cipher); raise the RX done so the
+                                            // driver's completion ISR fires regardless of
+                                            // whether the RX link was started before or
+                                            // after the TX link.
+                                            self.gdma.enable_in_int_all(ch);
+                                            self.gdma.raise_in_done(ch);
+                                        } else if peri == crate::gdma::GDMA_SPI2_PERIPH
+                                            || peri == crate::gdma::GDMA_SPI3_PERIPH
+                                        {
+                                            // SPI RX: copy the last DMA transfer's
+                                            // captured bytes into the descriptor's DRAM
+                                            // buffer (zeros beyond the capture; start
+                                            // this link after trans_done latches).
+                                            let idx = if peri == crate::gdma::GDMA_SPI2_PERIPH {
+                                                0
+                                            } else {
+                                                1
+                                            };
+                                            let mut k = 0u32;
+                                            while k + 4 <= len {
+                                                let w = self.spi[idx].dma_rx_word(k);
+                                                self.write32(buf + k, w);
+                                                k += 4;
+                                            }
+                                            self.gdma.raise_in_done(ch);
+                                        } else if peri == crate::gdma::GDMA_ADC_PERIPH {
+                                            // ADC digital DMA: drain staged conversion
+                                            // results to DRAM (zeros once the queue
+                                            // runs dry).
+                                            let mut k = 0u32;
+                                            while k + 4 <= len {
+                                                let w = self.adc.dma_pop().unwrap_or(0);
+                                                self.write32(buf + k, w);
+                                                k += 4;
+                                            }
+                                            self.gdma.raise_in_done(ch);
+                                        } else if peri == crate::gdma::GDMA_UHCI0_PERIPH {
+                                            // UHCI RX: drain the selected UART's RX
+                                            // FIFO to DRAM (zeros once it runs dry;
+                                            // empty when the UHCI clock is off).
+                                            let mut k = 0u32;
+                                            while k + 4 <= len {
+                                                let mut w = [0u8; 4];
+                                                if self.uhci.clk_on()
+                                                    && self.clk_on(false, 8)
+                                                    && let Some(n) = self.uhci.uart_sel()
+                                                {
+                                                    // Deframed when SEPER_EN is set (loop
+                                                    // while separators compress the yield).
+                                                    let mut data = alloc::vec::Vec::new();
+                                                    while data.len() < 4 {
+                                                        let raw = self.uarts[n].take_rx(4);
+                                                        if raw.is_empty() {
+                                                            break;
+                                                        }
+                                                        data.extend(self.uhci.slip_decode(&raw));
+                                                    }
+                                                    data.truncate(4);
+                                                    w[..data.len()].copy_from_slice(&data);
+                                                }
+                                                self.write32(buf + k, u32::from_le_bytes(w));
+                                                k += 4;
+                                            }
+                                            self.uhci.latch_rx_start();
+                                            self.gdma.raise_in_done(ch);
+                                        }
+                                    }
+                                    // DMA hands the descriptor back: clear owner.
+                                    self.write32(desc, dw0 & !(1u32 << 31));
+                                    if next == 0 || eof == 1 {
+                                        break;
+                                    }
+                                    desc = next;
+                                }
+                                if let Some(idx) = spi_dma_pending {
+                                    // One DMA-backed SPI transfer per OUT-link start.
+                                    self.spi[idx].dma_trigger();
                                 }
                                 if is_out {
-                                    if peri == crate::gdma::GDMA_RMT_PERIPH {
-                                        let dst = crate::rmt::RMTMEM_BASE + (ch as u32) * 0x100;
-                                        // Copy in 32-bit words. RMT items are
-                                        // word-aligned and the item buffer length is a
-                                        // multiple of 4; a byte-wise copy would clobber
-                                        // whole words because RMTMEM writes via
-                                        // write32 store the full word (see Rmt::write32).
-                                        let mut k = 0u32;
-                                        while k + 4 <= len {
-                                            let w = self.read32(buf + k);
-                                            self.write32(dst + k, w);
-                                            k += 4;
-                                        }
-                                        self.gdma.set_out_eof_des_addr(ch, desc);
-                                    } else if peri == crate::gdma::GDMA_SHA_PERIPH {
-                                        // SHA: copy the descriptor's message bytes into
-                                        // the SHA engine's message buffer (reconstructed
-                                        // LSB-first per 32-bit word, the byte order the
-                                        // SHA engine consumes). The driver passes an
-                                        // already-padded, complete 64-byte block.
-                                        let mut k = 0u32;
-                                        while k + 4 <= len {
-                                            let w = self.read32(buf + k);
-                                            self.sha.feed_byte((w & 0xFF) as u8);
-                                            self.sha.feed_byte(((w >> 8) & 0xFF) as u8);
-                                            self.sha.feed_byte(((w >> 16) & 0xFF) as u8);
-                                            self.sha.feed_byte(((w >> 24) & 0xFF) as u8);
-                                            k += 4;
-                                        }
-                                        self.gdma.set_out_eof_des_addr(ch, desc);
-                                    } else if peri == crate::gdma::GDMA_AES_PERIPH {
-                                        // AES: copy the descriptor's plaintext into the
-                                        // AES TEXT_IN buffer (LSB-first per word), then
-                                        // run the transform. In DMA mode the engine
-                                        // auto-pushes the ciphertext to the paired GDMA
-                                        // `in` channel, so walk that channel's
-                                        // descriptors and copy TEXT_OUT -> DRAM here.
-                                        let mut k = 0u32;
-                                        while k + 4 <= len {
-                                            let w = self.read32(buf + k);
-                                            self.aes.feed_text_in_byte((w & 0xFF) as u8);
-                                            self.aes.feed_text_in_byte(((w >> 8) & 0xFF) as u8);
-                                            self.aes.feed_text_in_byte(((w >> 16) & 0xFF) as u8);
-                                            self.aes.feed_text_in_byte(((w >> 24) & 0xFF) as u8);
-                                            k += 4;
-                                        }
-                                        self.aes.transform();
-                                        self.gdma.set_out_eof_des_addr(ch, desc);
-                                        // Auto-push ciphertext through the AES RX
-                                        // channel. The esp-idf AES driver allocates a
-                                        // SEPARATE GDMA channel for the ciphertext `in`
-                                        // link (crypto_shared_gdma_new_channel is called
-                                        // twice: TX then RX), so the RX channel index is
-                                        // not the same as this TX channel. Find the
-                                        // channel whose `in` block is wired to AES and
-                                        // copy TEXT_OUT -> its descriptor buffers.
-                                        for rx in 0..crate::gdma::NCH {
-                                            if self.gdma.in_peri_sel(rx)
-                                                == crate::gdma::GDMA_AES_PERIPH
-                                            {
-                                                let mut idesc = self.gdma.in_link_addr(rx);
-                                                loop {
-                                                    let dw0 = self.read32(idesc);
-                                                    let ibuf = self.read32(idesc + 4);
-                                                    let inext = self.read32(idesc + 8);
-                                                    let ilen = (dw0 >> 12) & 0xFFF;
-                                                    let ieof = (dw0 >> 30) & 1;
-                                                    let iowner = (dw0 >> 31) & 1;
-                                                    if iowner == 0 {
-                                                        break;
-                                                    }
-                                                    let mut k = 0u32;
-                                                    while k + 4 <= ilen {
-                                                        let w = self.aes.out_word_at(k);
-                                                        self.write32(ibuf + k, w);
-                                                        k += 4;
-                                                    }
-                                                    // DMA hands the descriptor back: clear owner
-                                                    // (the driver polls owner / reads length/suc_eof).
-                                                    self.write32(idesc, dw0 & !(1u32 << 31));
-                                                    if inext == 0 || ieof == 1 {
-                                                        break;
-                                                    }
-                                                    idesc = inext;
-                                                }
-                                                self.gdma.raise_in_done(rx);
-                                                break;
-                                            }
-                                        }
-                                    } else if peri == crate::gdma::GDMA_SPI2_PERIPH
-                                        || peri == crate::gdma::GDMA_SPI3_PERIPH
-                                    {
-                                        // SPI master DMA: stage the descriptor's
-                                        // bytes (address order) for one DMA-backed
-                                        // transfer, triggered after the walk (see
-                                        // below) so multi-descriptor chains send
-                                        // once. The transfer runs like a USR op
-                                        // (waveform + trans_done); start the IN
-                                        // link after trans_done latches.
-                                        let idx = if peri == crate::gdma::GDMA_SPI2_PERIPH {
-                                            0
-                                        } else {
-                                            1
-                                        };
-                                        let mut k = 0u32;
-                                        while k + 4 <= len {
-                                            let w = self.read32(buf + k);
-                                            self.spi[idx].spi_dma_feed(&w.to_le_bytes());
-                                            k += 4;
-                                        }
-                                        if k < len {
-                                            let w = self.read32(buf + k);
-                                            let tail = &w.to_le_bytes()[..(len - k) as usize];
-                                            self.spi[idx].spi_dma_feed(tail);
-                                        }
-                                        self.gdma.set_out_eof_des_addr(ch, desc);
-                                        spi_dma_pending = Some(idx);
-                                    } else if peri == crate::gdma::GDMA_LCD_PERIPH {
-                                        // LCD_CAM DMA: stream the descriptor's
-                                        // words through the TX FIFO as one
-                                        // synchronous 8080 transfer (word-aligned
-                                        // lengths; a partial tail word is dropped).
-                                        let mut words =
-                                            alloc::vec::Vec::with_capacity((len / 4) as usize);
-                                        let mut k = 0u32;
-                                        while k + 4 <= len {
-                                            words.push(self.read32(buf + k));
-                                            k += 4;
-                                        }
-                                        self.lcd_cam.dma_transfer(&words);
-                                        self.gdma.set_out_eof_des_addr(ch, desc);
-                                    }
+                                    self.gdma.raise_out_done(ch);
                                 } else {
-                                    // IN (RX) channel: copy from the peripheral's data
-                                    // registers into the descriptor's DRAM buffer.
-                                    if peri == crate::gdma::GDMA_AES_PERIPH {
-                                        // AES ciphertext out -> DRAM.
-                                        let mut k = 0u32;
-                                        while k + 4 <= len {
-                                            let w = self.aes.out_word_at(k);
-                                            self.write32(buf + k, w);
-                                            k += 4;
-                                        }
-                                        // The AES engine has already transformed the
-                                        // block (the TX `out` write fed plaintext and
-                                        // ran the cipher); raise the RX done so the
-                                        // driver's completion ISR fires regardless of
-                                        // whether the RX link was started before or
-                                        // after the TX link.
-                                        self.gdma.enable_in_int_all(ch);
-                                        self.gdma.raise_in_done(ch);
-                                    } else if peri == crate::gdma::GDMA_SPI2_PERIPH
-                                        || peri == crate::gdma::GDMA_SPI3_PERIPH
-                                    {
-                                        // SPI RX: copy the last DMA transfer's
-                                        // captured bytes into the descriptor's DRAM
-                                        // buffer (zeros beyond the capture; start
-                                        // this link after trans_done latches).
-                                        let idx = if peri == crate::gdma::GDMA_SPI2_PERIPH {
-                                            0
-                                        } else {
-                                            1
-                                        };
-                                        let mut k = 0u32;
-                                        while k + 4 <= len {
-                                            let w = self.spi[idx].dma_rx_word(k);
-                                            self.write32(buf + k, w);
-                                            k += 4;
-                                        }
-                                        self.gdma.raise_in_done(ch);
-                                    } else if peri == crate::gdma::GDMA_ADC_PERIPH {
-                                        // ADC digital DMA: drain staged conversion
-                                        // results to DRAM (zeros once the queue
-                                        // runs dry).
-                                        let mut k = 0u32;
-                                        while k + 4 <= len {
-                                            let w = self.adc.dma_pop().unwrap_or(0);
-                                            self.write32(buf + k, w);
-                                            k += 4;
-                                        }
-                                        self.gdma.raise_in_done(ch);
-                                    }
+                                    self.gdma.raise_in_done(ch);
                                 }
-                                // DMA hands the descriptor back: clear owner.
-                                self.write32(desc, dw0 & !(1u32 << 31));
-                                if next == 0 || eof == 1 {
-                                    break;
-                                }
-                                desc = next;
-                            }
-                            if let Some(idx) = spi_dma_pending {
-                                // One DMA-backed SPI transfer per OUT-link start.
-                                self.spi[idx].dma_trigger();
-                            }
-                            if is_out {
-                                self.gdma.raise_out_done(ch);
-                            } else {
-                                self.gdma.raise_in_done(ch);
-                            }
-                        } // end non-I2S synchronous walk
+                            } // end non-I2S synchronous walk
+                        } // end DMA-clock gate
                     } else if off < 5 * 0xC0 {
                         // Retroactive I2S pump arm: the esp-idf I2S driver
                         // programs the link (with START) BEFORE peri_sel, so
@@ -1870,7 +2259,15 @@ impl Soc {
             }
             TWAI_BASE => {
                 if is_write {
-                    self.twai.write32(off, value);
+                    // TWAI peripheral clock (EN0 bit 19): TR/SRR requests
+                    // don't fire gated (bits masked out, RRB and the rest
+                    // still process).
+                    let v = if !self.clk_on(false, 19) && off == 0x04 {
+                        value & !((1u32 << 0) | (1u32 << 4))
+                    } else {
+                        value
+                    };
+                    self.twai.write32(off, v);
                     0
                 } else {
                     self.twai.read32(off)
@@ -2029,6 +2426,7 @@ impl Soc {
             EFUSE_BASE => {
                 if is_write {
                     self.efuse.write32(off, value);
+                    self.refresh_flashenc_mirror();
                     0
                 } else {
                     self.efuse.read32(off)
@@ -2036,24 +2434,42 @@ impl Soc {
             }
             SHA_BASE => {
                 if is_write {
-                    self.sha.write32(off, value);
-                    0
+                    // SHA engine clock (EN1 bit 2): trigger writes start a
+                    // transform; dropped while gated (no completion event).
+                    if !self.clk_on(true, 2)
+                        && (off == 0x10 || off == 0x14 || off == 0x1C || off == 0x20)
+                    {
+                        0
+                    } else {
+                        self.sha.write32(off, value);
+                        0
+                    }
                 } else {
                     self.sha.read32(off)
                 }
             }
             crate::aes::AES_BASE => {
                 if is_write {
-                    self.aes.write32(off, value);
-                    0
+                    // AES engine clock (EN1 bit 1): TRIGGER starts a transform.
+                    if !self.clk_on(true, 1) && off == 0x48 {
+                        0
+                    } else {
+                        self.aes.write32(off, value);
+                        0
+                    }
                 } else {
                     self.aes.read32(off)
                 }
             }
             crate::rsa::RSA_BASE => {
                 if is_write {
-                    self.rsa.write32(off, value);
-                    0
+                    // RSA engine clock (EN1 bit 3): MODEXP_START runs it.
+                    if !self.clk_on(true, 3) && off == 0x80C && value & 1 != 0 {
+                        0
+                    } else {
+                        self.rsa.write32(off, value);
+                        0
+                    }
                 } else {
                     self.rsa.read32(off)
                 }
@@ -2068,81 +2484,101 @@ impl Soc {
             }
             crate::hmac::HMAC_BASE => {
                 if is_write {
-                    self.hmac.write32(off, value);
-                    // On SET_PARA_FINISH the engine latches the eFuse key for the
-                    // selected key_id into its working key.
-                    if off == (crate::hmac::SET_PARA_FINISH_OFF * 4) as u32 {
-                        self.hmac.fetch_key(&self.efuse);
+                    // HMAC engine clock (EN1 bit 5): SET_START runs it.
+                    if !self.clk_on(true, 5) && off == 0x40 {
+                        0
+                    } else {
+                        self.hmac.write32(off, value);
+                        // On SET_PARA_FINISH the engine latches the eFuse key for the
+                        // selected key_id into its working key.
+                        if off == (crate::hmac::SET_PARA_FINISH_OFF * 4) as u32 {
+                            self.hmac.fetch_key(&self.efuse);
+                        }
+                        0
                     }
-                    0
                 } else {
                     self.hmac.read32(off)
                 }
             }
             crate::ds::DS_BASE => {
                 if is_write {
-                    self.ds.write32(off, value, &self.efuse);
-                    0
+                    // DS engine clock (EN1 bit 4): SET_START (word 896,
+                    // byte 0xE00) runs the signature.
+                    if !self.clk_on(true, 4) && off == 0xE00 && value != 0 {
+                        0
+                    } else {
+                        self.ds.write32(off, value, &self.efuse);
+                        0
+                    }
                 } else {
                     self.ds.read32(off)
                 }
             }
             crate::sdmmc::SDMMC_BASE => {
                 if is_write {
-                    self.sdmmc.write32(off, value);
-                    // If a CMD started a data transfer with IDMAC enabled, walk
-                    // the descriptor ring now (needs DRAM access via the bus).
-                    if let Some(xfer) = self.sdmmc.take_idmac() {
-                        let mut transfers: Vec<(u32, usize)> = Vec::new();
-                        let mut desc = xfer.dbaddr;
-                        let mut remaining = xfer.bytcnt as usize;
-                        loop {
-                            let des0 = self.read32(desc);
-                            let des1 = self.read32(desc.wrapping_add(4));
-                            let buf = self.read32(desc.wrapping_add(8));
-                            let mut size = (des1 & 0x1FFF) as usize;
-                            if size == 0 {
-                                size = 4096;
-                            }
-                            let size = size.min(remaining);
-                            transfers.push((buf, size));
-                            // Host now owns the descriptor: clear OWN (bit 31).
-                            self.write32(desc, des0 & !(1u32 << 31));
-                            remaining = remaining.saturating_sub(size);
-                            if des0 & (1u32 << 2) != 0 {
-                                break; // LD (last descriptor)
-                            }
-                            let next = self.read32(desc.wrapping_add(12));
-                            if next == 0 {
-                                break;
-                            }
-                            desc = next;
-                        }
-                        if xfer.write {
-                            // host -> card: gather descriptor buffers from DRAM.
-                            let mut data: Vec<u8> = Vec::new();
-                            for &(buf, size) in &transfers {
-                                for i in 0..size {
-                                    data.push(self.read8(buf.wrapping_add(i as u32)) as u8);
+                    // SD/MMC host clock (EN1 bit 7): a CMD with START set
+                    // doesn't issue gated (dropped; other writes process).
+                    if !self.clk_on(true, 7) && off == 0x2C && value & (1u32 << 31) != 0 {
+                        0
+                    } else {
+                        self.sdmmc.write32(off, value);
+                        // If a CMD started a data transfer with IDMAC enabled, walk
+                        // the descriptor ring now (needs DRAM access via the bus).
+                        if let Some(xfer) = self.sdmmc.take_idmac() {
+                            let mut transfers: Vec<(u32, usize)> = Vec::new();
+                            let mut desc = xfer.dbaddr;
+                            let mut remaining = xfer.bytcnt as usize;
+                            loop {
+                                let des0 = self.read32(desc);
+                                let des1 = self.read32(desc.wrapping_add(4));
+                                let buf = self.read32(desc.wrapping_add(8));
+                                let mut size = (des1 & 0x1FFF) as usize;
+                                if size == 0 {
+                                    size = 4096;
                                 }
+                                let size = size.min(remaining);
+                                transfers.push((buf, size));
+                                // Host now owns the descriptor: clear OWN (bit 31).
+                                self.write32(desc, des0 & !(1u32 << 31));
+                                remaining = remaining.saturating_sub(size);
+                                if des0 & (1u32 << 2) != 0 {
+                                    break; // LD (last descriptor)
+                                }
+                                let next = self.read32(desc.wrapping_add(12));
+                                if next == 0 {
+                                    break;
+                                }
+                                desc = next;
                             }
-                            self.sdmmc.idmac_store(xfer.lba, &data);
-                        } else {
-                            // card -> host: scatter storage into descriptor buffers.
-                            let data = self.sdmmc.idmac_load(xfer.lba, xfer.bytcnt as usize);
-                            let mut off = 0usize;
-                            for &(buf, size) in &transfers {
-                                for i in 0..size {
-                                    if off < data.len() {
-                                        self.write8(buf.wrapping_add(i as u32), data[off] as u32);
-                                        off += 1;
+                            if xfer.write {
+                                // host -> card: gather descriptor buffers from DRAM.
+                                let mut data: Vec<u8> = Vec::new();
+                                for &(buf, size) in &transfers {
+                                    for i in 0..size {
+                                        data.push(self.read8(buf.wrapping_add(i as u32)) as u8);
+                                    }
+                                }
+                                self.sdmmc.idmac_store(xfer.lba, &data);
+                            } else {
+                                // card -> host: scatter storage into descriptor buffers.
+                                let data = self.sdmmc.idmac_load(xfer.lba, xfer.bytcnt as usize);
+                                let mut off = 0usize;
+                                for &(buf, size) in &transfers {
+                                    for i in 0..size {
+                                        if off < data.len() {
+                                            self.write8(
+                                                buf.wrapping_add(i as u32),
+                                                data[off] as u32,
+                                            );
+                                            off += 1;
+                                        }
                                     }
                                 }
                             }
+                            self.sdmmc.finish_idmac();
                         }
-                        self.sdmmc.finish_idmac();
+                        0
                     }
-                    0
                 } else {
                     self.sdmmc.read32(off)
                 }
@@ -2169,6 +2605,24 @@ impl Soc {
                         0
                     } else {
                         self.appcpu_ctrl_a
+                    }
+                } else if off == 0x018 || off == 0x01C {
+                    // Peripheral clock gates (SYSTEM_PERIP_CLK_EN0/1): stored
+                    // RMW-able words driving `clk_on` gating below. EN1
+                    // writes also shadow the USB_DEVICE clock (bit 10) into
+                    // the CDC controller for its TX hold.
+                    if is_write {
+                        if off == 0x018 {
+                            self.sys_clk_en0 = value;
+                        } else {
+                            self.sys_clk_en1 = value;
+                            self.usb.set_sys_clk(value & (1 << 10) != 0);
+                        }
+                        0
+                    } else if off == 0x018 {
+                        self.sys_clk_en0
+                    } else {
+                        self.sys_clk_en1
                     }
                 } else if off == 0x030 || off == 0x034 || off == 0x038 || off == 0x03C {
                     // Cross-core interrupt: write 1 asserts the FROM_CPU
@@ -2210,7 +2664,44 @@ impl Soc {
             0x6002_A000 => store_dispatch(is_write, off, value, &mut self.peri_backup),
             0x6004_1000 => {
                 if is_write {
-                    self.lcd_cam.write32(off, value);
+                    // LCD_CAM clock (EN1 bit 8): LCD_START / CAM_START
+                    // don't fire gated (bits masked out, config still lands).
+                    let v = if !self.clk_on(true, 8) {
+                        match off {
+                            0x14 => value & !(1u32 << 27),
+                            0x08 => value & !(1u32 << 29),
+                            _ => value,
+                        }
+                    } else {
+                        value
+                    };
+                    self.lcd_cam.write32(off, v);
+                    // Retroactive CAM DMA arm (mirrors the I2S pump arm):
+                    // firmware may start the IN link before CAM_START, so
+                    // arm here when CAM_START lands while its link already
+                    // runs (spurious re-arms are harmless: an active
+                    // cursor ignores them).
+                    if off == 0x08
+                        && v & (1u32 << 29) != 0
+                        && !self.cam_dma_in.active
+                        && self.cam_link_fresh
+                    {
+                        for ch in 0..5 {
+                            if self.gdma.in_link_started(ch)
+                                && self.gdma.in_peri_sel(ch) == crate::gdma::GDMA_LCD_PERIPH
+                            {
+                                self.cam_dma_in = CamDma {
+                                    active: true,
+                                    ch,
+                                    desc: self.gdma.in_link_addr(ch),
+                                    off: 0,
+                                };
+                                self.lcd_cam.set_dma_active(true);
+                                self.cam_link_fresh = false;
+                                break;
+                            }
+                        }
+                    }
                     0
                 } else {
                     self.lcd_cam.read32(off)
@@ -2222,7 +2713,33 @@ impl Soc {
                 // DWC core (0x60080000) + TXFIFO page (0x60081000, DFIFO0).
                 let base = if dev == USB_OTG_BASE { 0 } else { 0x1000 };
                 if is_write {
-                    self.usb_otg.write32(base + off, value);
+                    // USB-OTG controller clock (EN0 bit 23): engine actions
+                    // don't fire gated (bits masked out, config still lands)
+                    // — GRSTCTL core-soft-reset, HPRT power/reset (device
+                    // connect/port enable), and host-channel ChEna/ChDis
+                    // (transfer run/halt). DFIFO staging + plain registers
+                    // are memory-like and always land.
+                    use crate::usb_otg::{
+                        GRST_CSFTRST, GRSTCTL, HC_BASE, HC_COUNT, HC_STRIDE, HCCHAR_CHDIS,
+                        HCCHAR_CHENA, HCCHAR_OFF, HPRT, HPRT_PWR, HPRT_RST,
+                    };
+                    let v = if !self.clk_on(false, 23) && base == 0 {
+                        if off == GRSTCTL {
+                            value & !GRST_CSFTRST
+                        } else if off == HPRT {
+                            value & !(HPRT_PWR | HPRT_RST)
+                        } else if off >= HC_BASE
+                            && off < HC_BASE + HC_COUNT as u32 * HC_STRIDE
+                            && (off - HC_BASE) % HC_STRIDE == HCCHAR_OFF
+                        {
+                            value & !(HCCHAR_CHENA | HCCHAR_CHDIS)
+                        } else {
+                            value
+                        }
+                    } else {
+                        value
+                    };
+                    self.usb_otg.write32(base + off, v);
                     0
                 } else {
                     self.usb_otg.read32(base + off)
@@ -2319,6 +2836,45 @@ impl Soc {
                 ext1 = trig;
             }
         }
+        // GPIO wakeup (WAKEUP_ENA bit 2, light-sleep RTC-GPIO wakeup
+        // via esp_sleep_enable_gpio_wakeup + rtc_gpio_wakeup_enable):
+        // any RTC pin 0..21 with PINn WAKEUP_ENABLE (RTCIO PINn_REG bit
+        // 10, rtc_io_reg.h) whose INT_TYPE[9:7] matches the pad level wakes
+        // immediately. Level types are exact; edge types approximate (the
+        // fast-forward freezes inputs, so the entry level stands in for
+        // the edge: rising = high, falling = low, any = fire).
+        if ena & crate::rtc::wakeup_ena(2) != 0 {
+            for pin in 0..22 {
+                let cfg = self.rtc_io.read32(0x428 + pin * 4);
+                if cfg & (1 << 10) == 0 {
+                    continue;
+                }
+                let lv = pad_level(pin);
+                let fire = match (cfg >> 7) & 7 {
+                    1 | 5 => lv == 1, // rising edge (past) / high level
+                    2 | 4 => lv == 0, // falling edge (past) / low level
+                    3 => true,        // any edge (see above)
+                    _ => false,       // disabled
+                };
+                if fire {
+                    cause |= crate::rtc::CAUSE_GPIO;
+                    break;
+                }
+            }
+        }
+        // UART0/UART1 wakeup (WAKEUP_ENA bits 6/7): pending RX bytes at
+        // entry wake immediately (the line already signaled).
+        // Level (FIFO holds bytes) or the sticky pre-entry edge both
+        // wake; the edge is consumed whether or not it fires (entry reset
+        // semantics: a stale edge does not survive past one sleep entry).
+        let uart_edge0 = self.uarts[0].take_rx_edge();
+        let uart_edge1 = self.uarts[1].take_rx_edge();
+        if ena & crate::rtc::wakeup_ena(6) != 0 && (self.uarts[0].rx_pending() || uart_edge0) {
+            cause |= crate::rtc::CAUSE_UART0;
+        }
+        if ena & crate::rtc::wakeup_ena(7) != 0 && (self.uarts[1].rx_pending() || uart_edge1) {
+            cause |= crate::rtc::CAUSE_UART1;
+        }
         if timer_armed {
             cause |= crate::rtc::CAUSE_TIMER;
         }
@@ -2343,6 +2899,9 @@ impl Soc {
             }
             if ena & crate::rtc::wakeup_ena(11) != 0 {
                 self.sleep_ulp_watch |= crate::rtc::CAUSE_COCPU;
+            }
+            if ena & crate::rtc::wakeup_ena(13) != 0 {
+                self.sleep_ulp_watch |= crate::rtc::CAUSE_TRAP;
             }
         }
         self.sleep_cause = cause;
@@ -2386,6 +2945,72 @@ impl Soc {
     /// the TX/RX FIFOs as space/data allow, raising the per-descriptor EOF
     /// event (address + done interrupt) as their lengths fill. Called once
     /// per `tick_timers` while any I2S link is armed.
+    /// LCD_CAM GDMA-RX streaming pump: move staged capture words into
+    /// the active IN descriptor chain as they arrive, raising the
+    /// per-descriptor EOF event. A filled descriptor is handed back
+    /// (owner cleared, single-shot like the sync walk); owner=0 or a null
+    /// next parks the cursor.
+    fn poll_cam_dma(&mut self) {
+        // Capture over with nothing staged and no fresh link awaiting
+        // capture: park (firmware owns the rest; mixing DMA then CAM_DATA
+        // polling on one capture is unsupported). The freshness guard is
+        // load-bearing: a cursor armed by an IN-link start must survive
+        // until CAM_START begins streaming (parking it early routes the
+        // frame to the RX FIFO and the descriptor never fills).
+        if !self.cam_link_fresh && !self.lcd_cam.is_capturing() && self.lcd_cam.dma_pending() == 0 {
+            self.cam_dma_in.active = false;
+            self.cam_link_fresh = false;
+            self.lcd_cam.set_dma_active(false);
+            return;
+        }
+        for _ in 0..8 {
+            let (desc, off) = {
+                let c = &self.cam_dma_in;
+                (c.desc, c.off)
+            };
+            if desc == 0 {
+                self.cam_dma_in.active = false;
+                self.cam_link_fresh = false;
+                self.lcd_cam.set_dma_active(false);
+                break;
+            }
+            let dw0 = self.read32(desc);
+            let len = (dw0 >> 12) & 0xFFF;
+            let owner = (dw0 >> 31) & 1;
+            if owner == 0 {
+                self.cam_dma_in.active = false;
+                self.cam_link_fresh = false;
+                self.lcd_cam.set_dma_active(false);
+                break;
+            }
+            let buf = self.read32(desc + 4);
+            let next = self.read32(desc + 8);
+            let mut off = off;
+            while self.lcd_cam.dma_pending() > 0 && off + 4 <= len {
+                let w = self.lcd_cam.dma_pop().unwrap_or(0);
+                self.write32(buf + off, w);
+                off += 4;
+            }
+            self.cam_dma_in.off = off;
+            if off + 4 > len {
+                let ch = self.cam_dma_in.ch;
+                self.gdma.set_in_eof_des_addr(ch, desc);
+                self.gdma.raise_in_done(ch);
+                self.write32(desc, dw0 & !(1u32 << 31));
+                if next == 0 {
+                    self.cam_dma_in.active = false;
+                    self.cam_link_fresh = false;
+                    self.lcd_cam.set_dma_active(false);
+                    break;
+                }
+                self.cam_dma_in.desc = next;
+                self.cam_dma_in.off = 0;
+            } else {
+                break; // staging dry; resume next tick
+            }
+        }
+    }
+
     fn poll_i2s_dma(&mut self) {
         for port in 0..2 {
             // OUT (TX): DRAM -> TX FIFO.
@@ -2525,6 +3150,35 @@ impl Soc {
         }
     }
 
+    /// Snapshot digital-GPIO state for pad-hold retention (deep sleep):
+    /// OUT + ENABLE words, all FUNC_OUT_SEL values, and the live
+    /// DIG_PAD_HOLD mask (only masked pins 0..31 are restored).
+    pub fn snapshot_gpio_hold(&self) -> ([u32; 2], [u32; 54], u32) {
+        let (out, en, func) = self.gpio.hold_snapshot();
+        ([out, en], func, self.rtc.dig_pad_hold())
+    }
+
+    /// Restore held pads after a deep-sleep reboot (see DIG_PAD_HOLD).
+    pub fn restore_gpio_hold(&mut self, snap: ([u32; 2], [u32; 54], u32)) {
+        let ([out, en], func, mask) = snap;
+        let mut rout = 0u32;
+        let mut ren = 0u32;
+        let mut rfunc = [0x80u32; 54];
+        // Fresh-Soc defaults: OUT/ENABLE 0, FUNC_OUT_SEL 0x80.
+        for i in 0..32 {
+            if mask & (1 << i) != 0 {
+                rout |= out & (1 << i);
+                ren |= en & (1 << i);
+            }
+        }
+        for (i, f) in func.iter().enumerate() {
+            if i < 32 && mask & (1 << i) != 0 {
+                rfunc[i] = *f;
+            }
+        }
+        self.gpio.hold_restore(rout, ren, &rfunc);
+    }
+
     /// Restore RTC-retained state after a deep-sleep reboot.
     pub fn restore_rtc(&mut self, s: RtcRetain) {
         self.rtc_slow = s.slow;
@@ -2657,6 +3311,11 @@ impl Soc {
         if self.rtc.int_st() != 0 {
             src |= 1 << crate::rtc::RTC_CORE_INTR_SOURCE;
         }
+        // ADC digital done (`ETS_APB_ADC_INTR_SOURCE` = 65): the done flags
+        // live in the APB block's own INT_ST (polled drivers never enable).
+        if self.adc.int_st() != 0 {
+            src |= 1 << crate::adc::APB_ADC_INTR_SOURCE;
+        }
         // GDMA channels have per-channel sources (ETS_DMA_IN_CH0..4 =
         // 66..70, ETS_DMA_OUT_CH0..4 = 71..75) on the single shared
         // controller (all peripherals incl. AES/SHA allocate channels here).
@@ -2670,6 +3329,11 @@ impl Soc {
         }
         if self.aes.int_pending() {
             src |= 1 << 77;
+        }
+        // SHA done (`ETS_SHA_INTR_SOURCE` = 78): latched per transform,
+        // level-gated by INT_ENA (polling drivers never enable it).
+        if self.sha.int_st() != 0 {
+            src |= 1 << crate::sha::SHA_INTR_SOURCE;
         }
         if self.twai.int_pending() {
             src |= 1 << crate::twai::TWAI_INTR_SOURCE;
@@ -2700,6 +3364,10 @@ impl Soc {
         // USB-OTG DWC core (quiet without a host counterparty).
         if self.usb_otg.int_pending() {
             src |= 1 << crate::usb_otg::USB_OTG_INTR_SOURCE;
+        }
+        // UHCI0 DMA bridge event interrupts (TX/RX_START via INT_ST).
+        if self.uhci.int_st() {
+            src |= 1 << crate::uhci::UHCI0_INTR_SOURCE;
         }
         if self.ledc.int_st() != 0 {
             src |= 1 << crate::ledc::LEDC_INTR_SOURCE;

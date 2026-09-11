@@ -57,6 +57,9 @@ bool wait_rx_done() {
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C0018) |= (1u << 4);
+  *(volatile uint32_t*)(0x600C001C) |= (1u << 6);
   delay(80);
 
   REG_WRITE(GPIO_FUNC_OUT_SEL0 + 4 * SD_PIN, 25); // I2S0O_SD_OUT_IDX

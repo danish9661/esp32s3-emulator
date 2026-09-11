@@ -11,6 +11,12 @@
 // Run under run_flash only via the node harness (needs JS-side staging).
 
 #define LCD_CAM_BASE 0x60041000UL
+#define GDMA_BASE 0x6003F000UL
+// GDMA ch2 IN link (ch stride 0xC0, IN block +0x00): link @ +0x20,
+// peri_sel @ +0x48, IN start = bit 22 (see the gdma/uhci sketches).
+#define G_IN_LINK    (GDMA_BASE + 2 * 0xC0 + 0x20)
+#define G_IN_PERI    (GDMA_BASE + 2 * 0xC0 + 0x48)
+#define GDMA_CAM_PERI 5  // LCD_CAM shares peri 5 (IN = camera RX)
 #define CAM_CTRL       (LCD_CAM_BASE + 0x04)
 #define CAM_CTRL1      (LCD_CAM_BASE + 0x08)
 #define CAM_DATA       (LCD_CAM_BASE + 0x48)
@@ -69,11 +75,51 @@ static bool capture_round(uint32_t ctrl, const uint32_t *want, const char *tag) 
 
 static uint32_t swapped[8];
 
+// GDMA-RX capture leg (runs FIRST, consumes one staged frame): program a
+// ch2 IN descriptor (32 B, eof, owned) for the camera peri, then START the
+// camera — order matters, the link must arm before streaming begins — and
+// poll the descriptor owner bit for the pump's completion.
+static volatile uint32_t gdma_desc[4];
+static volatile uint32_t gdma_buf[8];
+
+static bool capture_gdma(const uint32_t *want, const char *tag) {
+  for (int i = 0; i < 8; i++) gdma_buf[i] = 0;
+  gdma_desc[0] = (1u << 31) | (1u << 30) | (32u << 12);  // owner+eof+len
+  gdma_desc[1] = (uint32_t)gdma_buf;
+  gdma_desc[2] = 0;
+  gdma_desc[3] = 0;
+  *(volatile uint32_t *)G_IN_PERI = GDMA_CAM_PERI;
+  uint32_t lsb = ((uint32_t)gdma_desc) & 0x000FFFFFu;
+  *(volatile uint32_t *)G_IN_LINK = lsb | (1u << 22);  // IN start
+  *(volatile uint32_t *)CAM_CTRL = CAM_CLK_EN | CAM_UPDATE;
+  *(volatile uint32_t *)LC_INT_CLR = 0xF;
+  *(volatile uint32_t *)CAM_CTRL1 = LINE_INT_NUM(7) | CAM_START;
+  uint32_t t0 = millis();
+  while (gdma_desc[0] & (1u << 31)) {
+    if (millis() - t0 > 2000) {
+      Serial.println("CAMCAP GDMA TIMEOUT");
+      return false;
+    }
+  }
+  bool ok = true;
+  for (int i = 0; i < 8; i++) {
+    Serial.printf("CAMCAP %s W%d=%08X\n", tag, i, gdma_buf[i]);
+    if (gdma_buf[i] != want[i]) ok = false;
+  }
+  return ok;
+}
+
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C001C) |= (1u << 8);  // LCD_CAM
+  *(volatile uint32_t*)(0x600C001C) |= (1u << 6);  // GDMA (DMA clock)
   delay(80);
   Serial.println("CAMCAP START");
   *(volatile uint32_t *)LC_INT_ENA = VSYNC_INT | HS_INT;
+
+  bool gdma = capture_gdma(FRAME, "GDMA");
+  Serial.printf("CAMCAP GDMA %s\n", gdma ? "PASS" : "MISMATCH");
 
   bool plain = capture_round(0, FRAME, "PLAIN");
   Serial.printf("CAMCAP PLAIN %s\n", plain ? "PASS" : "MISMATCH");
@@ -82,7 +128,7 @@ void setup() {
   bool swap = capture_round(CAM_BYTE_ORDER, swapped, "SWAP");
   Serial.printf("CAMCAP SWAP %s\n", swap ? "PASS" : "MISMATCH");
 
-  if (plain && swap) Serial.println("CAMCAP PASS");
+  if (gdma && plain && swap) Serial.println("CAMCAP PASS");
   Serial.println("CAMCAP DONE");
 }
 

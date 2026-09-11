@@ -51,7 +51,36 @@ fn main() {
     let flash = fs::read(&path).expect("read flash image");
 
     let mut m = Esp32S3::new();
-    m.boot_from_flash(&flash);
+    // Flash-encryption fixture: FLASHENC_KEY=<64 hex> provisions the eFuse
+    // XTS key + crypt count, then uniformly encrypts the whole image
+    // (every 16-byte block at its absolute offset, like esptool) before
+    // boot. The firmware boots and runs on decrypted plaintext.
+    let flashenc: Option<Vec<u8>> = env::var("FLASHENC_KEY").ok().map(|hex| {
+        assert_eq!(hex.len(), 64, "FLASHENC_KEY must be 64 hex chars");
+        (0..32)
+            .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).expect("hex key"))
+            .collect()
+    });
+    if let Some(key) = &flashenc {
+        let mut key32 = [0u8; 32];
+        key32.copy_from_slice(key);
+        m.soc.flashenc_provision(&key32);
+        println!("[host] flash encryption provisioned");
+    }
+    let boot_image: Vec<u8>;
+    let boot_ref: &[u8] = if flashenc.is_some() {
+        assert_eq!(flash.len() % 16, 0, "image length must be 16-byte aligned");
+        // Encrypt a copy through the backing (provisioned above), then boot
+        // the ciphertext. load+encrypt here mirrors the factory flow.
+        m.soc.load_flash_image(0, &flash);
+        m.soc.flashenc_encrypt_region(0, flash.len() as u32);
+        boot_image = m.soc.flash_image().to_vec();
+        println!("[host] flash image encrypted ({} bytes)", boot_image.len());
+        &boot_image
+    } else {
+        &flash
+    };
+    m.boot_from_flash(boot_ref);
 
     // ADC injection for sketches doing analogRead: ADC_INJECT_MV=<mv>
     // applies the voltage to ADC1 channel 3 (GPIO4).

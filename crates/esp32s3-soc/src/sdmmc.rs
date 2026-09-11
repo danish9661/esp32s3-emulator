@@ -39,6 +39,20 @@
 //! esp-idf SDMMC driver init + FATFS mount/read/write through Arduino
 //! `SD_MMC`: CMD5 RTO, CMD6 HS-switch data, ACMD13 SSR data, 4-bit bus,
 //! R1 READY/STATE status, CTRL reset self-clear, BMOD.DE-gated IDMAC).
+//!
+//! eMMC (JEDEC JESD84) is a second personality of the same simulated card:
+//! the first MMC-only CMD1 (SEND_OP_COND, which no SD flow ever sends)
+//! switches the card into MMC mode (sticky until CMD0). MMC init is
+//! CMD0 -> CMD1 (poll OCR busy) -> CMD2 (CID) -> CMD3 (host-assigned RCA)
+//! -> CMD7 (select) -> CMD9 (MMC CSD) -> CMD8 (SEND_EXT_CSD, 512 B data)
+//! -> CMD6 (SWITCH, applies index/value into the EXT_CSD shadow) ->
+//! CMD16/17/24... Block I/O, erase and IDMAC are shared with the SD path
+//! (sector addressing; EXT_CSD ERASE_GROUP_DEF=1 justifies LBA erase).
+//! Validated by unit tests + the `esp32s3_emmc` poke sketch. The Arduino
+//! `SD_MMC` stack always takes the SD path (ACMD41 succeeds), so a full
+//! IDF-driver MMC mount is unreachable — poke-level, like TWAI/HMAC/DS.
+//! Approximations: CMD6 SWITCH completes instantly (R1b-as-instant, no
+//! DAT0 busy); unknown commands return live R1 (lenient, shared).
 
 const BLOCK_LEN: usize = 512;
 const STORAGE_BLOCKS: usize = 8192; // 4 MB modeled card (FAT16 preformatted)
@@ -160,6 +174,48 @@ const SSR_RAW: [u32; 16] = [
 // READ_BL_LEN=9, C_SIZE=7 (capacity = 8*1024 = 8192 sectors = 4 MB),
 // ERASE_BLK_EN=1, SECTOR_SIZE=0x7F, R2W_FACTOR=2, WRITE_BL_LEN=9.
 const CSD_WORDS: [u32; 4] = [0x0A40_0001, 0x0007_7F80, 0x4359_0000, 0x400E_005A];
+// MMC CSD v1.2 (same RESP order; representative values, poke-asserted):
+// STRUCTURE=2 (v1.2, capacity authoritative in EXT_CSD SEC_COUNT like SDHC),
+// SPEC_VERS=4, TAAC=0x0E, TRAN_SPEED=0x32 (25 MHz legacy; HS via SWITCH),
+// CCC=0xFFF, READ_BL_LEN=9, C_SIZE=maxed, end bit set.
+const MMC_CSD_WORDS: [u32; 4] = [0x0000_0001, 0xC000_0000, 0xFFF9_0FFF, 0x840E_0032];
+// EXT_CSD (CMD8, 512 bytes) field offsets (JEDEC JESD84).
+const EXT_CSD_REV: usize = 192; // EXT_CSD revision (8 = 1.8)
+const EXT_CSD_CARD_TYPE: usize = 196; // bit0=26MHz, bit1=52MHz SDR, bit2=DDR52
+const EXT_CSD_BUS_WIDTH: usize = 183; // 0=1-bit, 1=4-bit, 2=8-bit (SWITCH)
+const EXT_CSD_HS_TIMING: usize = 185; // 0=legacy, 1=high-speed (SWITCH)
+const EXT_CSD_ERASE_GROUP_DEF: usize = 175; // 1 = sector-addressed erase
+const EXT_CSD_SEC_COUNT: usize = 212; // u32 LE sector count
+const EXT_CSD_PARTITION_CONFIG: usize = 179; // access[2:0]: 3 = RPMB
+const EXT_CSD_RPMB_SIZE_MULT: usize = 168; // 1 = 128 KB provisioned
+// RPMB frame layout (JEDEC JESD84, 512 B): stuff[0..196), MAC[196..228),
+// data[228..484), nonce[484..500), write_counter[500..504) BE,
+// address[504..506) BE, block_count[506..508) BE, result[508..510) BE,
+// type[510..512) BE. The HMAC-SHA256 covers data+nonce+counter+address+
+// count+result+type in frame order with the provisioned key.
+const RPMB_MAC: usize = 196;
+const RPMB_DATA: usize = 228;
+const RPMB_NONCE: usize = 484;
+const RPMB_COUNTER: usize = 500;
+const RPMB_ADDR: usize = 504;
+const RPMB_COUNT: usize = 506;
+const RPMB_RESULT: usize = 508;
+const RPMB_TYPE: usize = 510;
+const RPMB_FRAME: usize = 512;
+// RPMB request types; responses are request << 8.
+const RPMB_REQ_KEY: u16 = 0x0001;
+const RPMB_REQ_COUNTER: u16 = 0x0002;
+const RPMB_REQ_WRITE: u16 = 0x0003;
+const RPMB_REQ_READ: u16 = 0x0004;
+// RPMB result codes.
+const RPMB_OK: u16 = 0x0000;
+const RPMB_GENERAL_FAIL: u16 = 0x0001;
+const RPMB_AUTH_FAIL: u16 = 0x0002;
+const RPMB_COUNTER_FAIL: u16 = 0x0003;
+const RPMB_ADDR_FAIL: u16 = 0x0004;
+const RPMB_NO_KEY: u16 = 0x0007;
+// Simulated RPMB data frames (256 B each).
+const RPMB_FRAMES: usize = 32;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum CardState {
@@ -184,6 +240,12 @@ pub struct Sdmmc {
     card_state: CardState,
     app_cmd: bool,
     acmd41_count: u32,
+    /// MMC personality: set by the first CMD1 (MMC-only; no SD flow sends
+    /// it), cleared by CMD0. Selects the MMC responses for CMD3/6/8/9.
+    mmc: bool,
+    cmd1_count: u32,
+    /// EXT_CSD shadow (CMD8 data; CMD6 SWITCH writes bytes into it).
+    ext_csd: [u8; 512],
     rca: u32,
     /// Modeled card storage: STORAGE_BLOCKS x 512-byte blocks (round-trips
     /// writes), indexed by LBA. Preformatted with a FAT16 volume (MBR +
@@ -206,6 +268,19 @@ pub struct Sdmmc {
     serve_switch: bool,
     /// Set when the next data command serves ACMD13 SD Status.
     serve_ssr: bool,
+    /// Set when the next data command serves CMD8 SEND_EXT_CSD (MMC).
+    serve_extcsd: bool,
+    /// RPMB partition selected (EXT_CSD PARTITION_CONFIG access == 3).
+    rpmb_selected: bool,
+    /// Provisioned RPMB authentication key (None until a 0x0001 programs
+    /// it — trusted-environment provisioning, like manufacturing).
+    rpmb_key: Option<[u8; 32]>,
+    /// RPMB write counter (increments per authenticated write).
+    rpmb_counter: u32,
+    /// RPMB data store (frame payloads, 256 B each).
+    rpmb_data: Vec<u8>,
+    /// Staged RPMB response bytes (served to CMD18 reads, then drained).
+    rpmb_resp: VecDeque<u8>,
     /// Pending IDMAC transfer (None for PIO).
     idmac: Option<IdmacXfer>,
 }
@@ -295,11 +370,23 @@ impl Sdmmc {
     pub fn new() -> Self {
         let mut storage = vec![0u8; STORAGE_BLOCKS * BLOCK_LEN];
         format_fat16(&mut storage);
+        let mut ext_csd = [0u8; 512];
+        ext_csd[EXT_CSD_REV] = 8; // EXT_CSD rev 1.8
+        ext_csd[EXT_CSD_CARD_TYPE] = 0x07; // 26 MHz + 52 MHz SDR + DDR52
+        ext_csd[EXT_CSD_BUS_WIDTH] = 0; // 1-bit default (SWITCH-writable)
+        ext_csd[EXT_CSD_HS_TIMING] = 0; // legacy timing (SWITCH-writable)
+        ext_csd[EXT_CSD_ERASE_GROUP_DEF] = 1; // sector-addressed erase
+        let sectors = (STORAGE_BLOCKS as u32).to_le_bytes();
+        ext_csd[EXT_CSD_SEC_COUNT..EXT_CSD_SEC_COUNT + 4].copy_from_slice(&sectors);
+        ext_csd[EXT_CSD_RPMB_SIZE_MULT] = 1; // 128 KB RPMB provisioned
         Self {
             regs: [0u32; 0x400 / 4],
             card_state: CardState::Idle,
             app_cmd: false,
             acmd41_count: 0,
+            mmc: false,
+            cmd1_count: 0,
+            ext_csd,
             rca: 0x1234,
             storage,
             lba: 0,
@@ -312,6 +399,12 @@ impl Sdmmc {
             serve_scr: false,
             serve_switch: false,
             serve_ssr: false,
+            serve_extcsd: false,
+            rpmb_selected: false,
+            rpmb_key: None,
+            rpmb_counter: 0,
+            rpmb_data: vec![0u8; RPMB_FRAMES * 256],
+            rpmb_resp: VecDeque::new(),
             idmac: None,
         }
     }
@@ -376,23 +469,56 @@ impl Sdmmc {
             _ => {}
         }
         self.serve_scr = is_acmd && index == 51; // ACMD51 = SEND_SCR (data)
-        self.serve_switch = !is_acmd && index == 6 && data_exp; // CMD6 SWITCH_FUNC
+        self.serve_switch = !is_acmd && !self.mmc && index == 6 && data_exp; // CMD6 SWITCH_FUNC
         self.serve_ssr = is_acmd && index == 13 && data_exp; // ACMD13 SD_STATUS
+        self.serve_extcsd = self.mmc && index == 8 && data_exp; // CMD8 SEND_EXT_CSD
 
         let mut resp = [0u32; 4];
         match index {
             0 => {
-                // GO_IDLE_STATE: card -> idle.
+                // GO_IDLE_STATE: card -> idle (leaves MMC mode).
                 self.card_state = CardState::Idle;
+                self.mmc = false;
+                self.cmd1_count = 0;
                 resp[0] = 0;
             }
+            1 => {
+                // SEND_OP_COND (MMC-only; no SD flow sends CMD1): enter MMC
+                // mode. First poll busy, then ready + HCS (sector mode).
+                self.mmc = true;
+                self.cmd1_count += 1;
+                self.card_state = CardState::Ready;
+                if self.cmd1_count == 1 {
+                    resp[0] = arg & 0x00FF_FFFF;
+                } else {
+                    resp[0] = (1 << 31) | (1 << 30) | (arg & 0x00FF_FFFF);
+                }
+            }
             6 => {
-                // SWITCH_FUNC (R1 + 512-bit status) or ACMD6 SET_BUS_WIDTH.
+                // SD: SWITCH_FUNC (R1 + 512-bit status) or ACMD6
+                // SET_BUS_WIDTH. MMC: SWITCH (R1b, instant here) — write
+                // access (arg[31:26] == 3) stores value at index.
+                if self.mmc && !is_acmd && (arg >> 26) == 3 {
+                    let idx = ((arg >> 16) & 0xFF) as usize;
+                    let val = ((arg >> 8) & 0xFF) as u8;
+                    self.ext_csd[idx] = val;
+                    // PARTITION_CONFIG access field selects the RPMB
+                    // partition (3) for subsequent data commands; any
+                    // other value returns to the user area.
+                    if idx == EXT_CSD_PARTITION_CONFIG {
+                        self.rpmb_selected = val & 7 == 3;
+                    }
+                }
                 resp[0] = self.r1(is_acmd);
             }
             8 => {
-                // SEND_IF_COND: echo the argument (R7).
-                resp[0] = arg & 0x0000_FFFF;
+                if self.mmc {
+                    // SEND_EXT_CSD (R1 + 512-byte EXT_CSD data).
+                    resp[0] = self.r1(is_acmd);
+                } else {
+                    // SEND_IF_COND: echo the argument (R7).
+                    resp[0] = arg & 0x0000_FFFF;
+                }
             }
             41 => {
                 // SD_SEND_OP_COND (ACMD41).
@@ -416,7 +542,11 @@ impl Sdmmc {
                 self.card_state = CardState::Ident;
             }
             3 => {
-                // SEND_RCA (R6): RCA in the high half, card status below.
+                // SEND_RCA (R6): SD returns the card RCA; MMC takes the
+                // host-assigned RCA from the argument.
+                if self.mmc {
+                    self.rca = (arg >> 16) & 0xFFFF;
+                }
                 self.card_state = CardState::Stby;
                 resp[0] = (self.rca << 16) | (self.r1(false) & 0xFFFF);
             }
@@ -434,8 +564,9 @@ impl Sdmmc {
                 }
             }
             9 => {
-                // SEND_CSD (R2): CSD v2.0, 4 MB / 8192 sectors (see CSD_WORDS).
-                resp = CSD_WORDS;
+                // SEND_CSD (R2): SD CSD v2.0, MMC CSD v1.2 (capacity
+                // authoritative in EXT_CSD SEC_COUNT, like SDHC).
+                resp = if self.mmc { MMC_CSD_WORDS } else { CSD_WORDS };
             }
             10 => {
                 // SEND_CID (R2): fixed CID.
@@ -538,9 +669,29 @@ impl Sdmmc {
         }
     }
 
-    /// Source bytes for a read transfer: SWITCH_FUNC status for CMD6, SD
-    /// Status for ACMD13, SCR for ACMD51, else storage at the transfer LBA.
-    fn data_source(&self, bytcnt: usize) -> Vec<u8> {
+    /// Source bytes for a read transfer: EXT_CSD for MMC CMD8,
+    /// SWITCH_FUNC status for SD CMD6, SD Status for ACMD13, SCR for ACMD51,
+    /// else storage at the transfer LBA.
+    fn data_source(&mut self, bytcnt: usize) -> Vec<u8> {
+        // RPMB partition: serve staged response frames (drained), zeros
+        // past them — like a card whose response FIFO runs dry.
+        if self.mmc && self.rpmb_selected {
+            let mut v = Vec::new();
+            while v.len() < bytcnt {
+                if let Some(b) = self.rpmb_resp.pop_front() {
+                    v.push(b);
+                } else {
+                    break;
+                }
+            }
+            v.resize(bytcnt, 0);
+            return v;
+        }
+        if self.serve_extcsd {
+            let mut v = self.ext_csd[..bytcnt.min(512)].to_vec();
+            v.resize(bytcnt, 0);
+            return v;
+        }
         if self.serve_switch {
             return raw_words_le(&SWITCH_RAW).into_iter().take(bytcnt).collect();
         }
@@ -558,8 +709,239 @@ impl Sdmmc {
         v
     }
 
+    /// HMAC input for an RPMB frame: data + nonce + counter + address +
+    /// count + result + type in frame order (JEDEC JESD84), 284 bytes.
+    fn rpmb_mac_input(f: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(284);
+        v.extend_from_slice(&f[RPMB_DATA..RPMB_DATA + 256]);
+        v.extend_from_slice(&f[RPMB_NONCE..RPMB_NONCE + 16]);
+        v.extend_from_slice(&f[RPMB_COUNTER..RPMB_COUNTER + 4]);
+        v.extend_from_slice(&f[RPMB_ADDR..RPMB_ADDR + 2]);
+        v.extend_from_slice(&f[RPMB_COUNT..RPMB_COUNT + 2]);
+        v.extend_from_slice(&f[RPMB_RESULT..RPMB_RESULT + 2]);
+        v.extend_from_slice(&f[RPMB_TYPE..RPMB_TYPE + 2]);
+        v
+    }
+
+    fn rpmb_u16(f: &[u8], off: usize) -> u16 {
+        u16::from_be_bytes([f[off], f[off + 1]])
+    }
+
+    fn rpmb_u32(f: &[u8], off: usize) -> u32 {
+        u32::from_be_bytes([f[off], f[off + 1], f[off + 2], f[off + 3]])
+    }
+
+    /// Stage one response frame (type/result/addr/count/data/nonce/
+    /// counter + MAC under the provisioned key; zero MAC without a key).
+    fn rpmb_respond(
+        &mut self,
+        ty: u16,
+        result: u16,
+        addr: u16,
+        count: u16,
+        data: &[u8],
+        nonce: &[u8; 16],
+    ) {
+        let mut f = [0u8; RPMB_FRAME];
+        let take = data.len().min(count as usize * 256);
+        f[RPMB_DATA..RPMB_DATA + take].copy_from_slice(&data[..take]);
+        f[RPMB_NONCE..RPMB_NONCE + 16].copy_from_slice(nonce);
+        f[RPMB_COUNTER..RPMB_COUNTER + 4].copy_from_slice(&self.rpmb_counter.to_be_bytes());
+        f[RPMB_ADDR..RPMB_ADDR + 2].copy_from_slice(&addr.to_be_bytes());
+        f[RPMB_COUNT..RPMB_COUNT + 2].copy_from_slice(&count.to_be_bytes());
+        f[RPMB_RESULT..RPMB_RESULT + 2].copy_from_slice(&result.to_be_bytes());
+        f[RPMB_TYPE..RPMB_TYPE + 2].copy_from_slice(&ty.to_be_bytes());
+        if let Some(key) = &self.rpmb_key {
+            let mac = crate::hmac::hmac_sha256(key, &Self::rpmb_mac_input(&f));
+            f[RPMB_MAC..RPMB_MAC + 32].copy_from_slice(&mac);
+        }
+        self.rpmb_resp.extend(f.iter().cloned());
+    }
+
+    /// Process a multi-block authenticated-write transfer (first frame
+    /// headers + count-1 raw data chunks): same validation as a single
+    /// write, all data blocks stored, one response.
+    fn rpmb_write_multi(&mut self, bytes: &[u8], count: u16) {
+        let f = &bytes[..RPMB_FRAME];
+        let addr = Self::rpmb_u16(f, RPMB_ADDR);
+        let mut nonce = [0u8; 16];
+        nonce.copy_from_slice(&f[RPMB_NONCE..RPMB_NONCE + 16]);
+        let Some(key) = self.rpmb_key else {
+            self.rpmb_respond(
+                RPMB_REQ_WRITE.wrapping_shl(8),
+                RPMB_NO_KEY,
+                addr,
+                count,
+                &[],
+                &nonce,
+            );
+            return;
+        };
+        let mac = crate::hmac::hmac_sha256(&key, &Self::rpmb_mac_input(f));
+        if mac[..] != f[RPMB_MAC..RPMB_MAC + 32]
+            || Self::rpmb_u16(f, RPMB_RESULT) != 0
+            || Self::rpmb_u32(f, RPMB_COUNTER) != self.rpmb_counter
+            || addr as usize + count as usize > RPMB_FRAMES
+        {
+            let code =
+                if mac[..] != f[RPMB_MAC..RPMB_MAC + 32] || Self::rpmb_u16(f, RPMB_RESULT) != 0 {
+                    RPMB_AUTH_FAIL
+                } else if Self::rpmb_u32(f, RPMB_COUNTER) != self.rpmb_counter {
+                    RPMB_COUNTER_FAIL
+                } else {
+                    RPMB_ADDR_FAIL
+                };
+            self.rpmb_respond(
+                RPMB_REQ_WRITE.wrapping_shl(8),
+                code,
+                addr,
+                count,
+                &[],
+                &nonce,
+            );
+            return;
+        }
+        for i in 0..count as usize {
+            let src = RPMB_DATA + i * RPMB_FRAME;
+            let base = (addr as usize + i) * 256;
+            self.rpmb_data[base..base + 256].copy_from_slice(&bytes[src..src + 256]);
+        }
+        self.rpmb_counter = self.rpmb_counter.wrapping_add(1);
+        self.rpmb_respond(
+            RPMB_REQ_WRITE.wrapping_shl(8),
+            RPMB_OK,
+            addr,
+            count,
+            &[],
+            &nonce,
+        );
+    }
+
+    /// Process one 512-byte RPMB request frame; stage the response.
+    /// Response type = request << 8 (0x0001->0x0100 ... 0x0004->0x0400);
+    /// anything else completes with GENERAL_FAILURE.
+    fn rpmb_request(&mut self, f: &[u8]) {
+        let ty = Self::rpmb_u16(f, RPMB_TYPE);
+        let addr = Self::rpmb_u16(f, RPMB_ADDR);
+        let count = Self::rpmb_u16(f, RPMB_COUNT).max(1);
+        let mut nonce = [0u8; 16];
+        nonce.copy_from_slice(&f[RPMB_NONCE..RPMB_NONCE + 16]);
+        let resp_ty = ty.wrapping_shl(8);
+        // Key programming (trusted-environment provision): the first
+        // request stores the MAC field as the key; later ones must carry
+        // a valid MAC (key rotation) like an authenticated write.
+        if ty == RPMB_REQ_KEY {
+            if self.rpmb_key.is_none() {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&f[RPMB_MAC..RPMB_MAC + 32]);
+                self.rpmb_key = Some(key);
+                self.rpmb_counter = 0;
+                self.rpmb_respond(resp_ty, RPMB_OK, 0, 1, &[], &nonce);
+            } else {
+                let key = self.rpmb_key.unwrap_or([0u8; 32]);
+                let mac = crate::hmac::hmac_sha256(&key, &Self::rpmb_mac_input(f));
+                if mac[..] != f[RPMB_MAC..RPMB_MAC + 32] {
+                    self.rpmb_respond(resp_ty, RPMB_AUTH_FAIL, 0, 1, &[], &nonce);
+                } else {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&f[RPMB_DATA..RPMB_DATA + 32]);
+                    self.rpmb_key = Some(key);
+                    self.rpmb_counter = 0;
+                    self.rpmb_respond(resp_ty, RPMB_OK, 0, 1, &[], &nonce);
+                }
+            }
+            return;
+        }
+        // Everything else needs a provisioned key.
+        let Some(key) = self.rpmb_key else {
+            self.rpmb_respond(resp_ty, RPMB_NO_KEY, addr, count, &[], &nonce);
+            return;
+        };
+        // Authenticated requests (counter/read/write) must carry a valid
+        // MAC computed over the transmitted fields (request result = 0).
+        if matches!(ty, RPMB_REQ_COUNTER | RPMB_REQ_WRITE | RPMB_REQ_READ) {
+            let mac = crate::hmac::hmac_sha256(&key, &Self::rpmb_mac_input(f));
+            if mac[..] != f[RPMB_MAC..RPMB_MAC + 32] {
+                self.rpmb_respond(resp_ty, RPMB_AUTH_FAIL, addr, count, &[], &nonce);
+                return;
+            }
+        }
+        match ty {
+            RPMB_REQ_COUNTER => {
+                self.rpmb_respond(resp_ty, RPMB_OK, 0, 1, &[], &nonce);
+            }
+            RPMB_REQ_WRITE => {
+                if Self::rpmb_u16(f, RPMB_RESULT) != 0 {
+                    self.rpmb_respond(resp_ty, RPMB_AUTH_FAIL, addr, count, &[], &nonce);
+                } else if Self::rpmb_u32(f, RPMB_COUNTER) != self.rpmb_counter {
+                    self.rpmb_respond(resp_ty, RPMB_COUNTER_FAIL, addr, count, &[], &nonce);
+                } else if addr as usize + count as usize > RPMB_FRAMES as u16 as usize {
+                    self.rpmb_respond(resp_ty, RPMB_ADDR_FAIL, addr, count, &[], &nonce);
+                } else {
+                    // Multi-block writes pack frames back-to-back after the
+                    // first (the caller sends count frames; only the first
+                    // carries nonce/counter/address — but our PIO/IDMAC
+                    // path delivers whole transfers, so re-slice here is
+                    // limited to this frame's single data block).
+                    let base = addr as usize * 256;
+                    self.rpmb_data[base..base + 256]
+                        .copy_from_slice(&f[RPMB_DATA..RPMB_DATA + 256]);
+                    self.rpmb_counter = self.rpmb_counter.wrapping_add(1);
+                    self.rpmb_respond(resp_ty, RPMB_OK, addr, count, &[], &nonce);
+                }
+            }
+            RPMB_REQ_READ => {
+                if addr as usize + count as usize > RPMB_FRAMES as u16 as usize {
+                    self.rpmb_respond(resp_ty, RPMB_ADDR_FAIL, addr, count, &[], &nonce);
+                } else {
+                    let base = addr as usize * 256;
+                    let end = base + (count as usize) * 256;
+                    let data = self.rpmb_data[base..end].to_vec();
+                    // One response frame per data block (each with MAC).
+                    for (i, blk) in data.chunks(256).enumerate() {
+                        self.rpmb_respond(resp_ty, RPMB_OK, addr + i as u16, 1, blk, &nonce);
+                    }
+                }
+            }
+            _ => {
+                self.rpmb_respond(resp_ty, RPMB_GENERAL_FAIL, addr, count, &[], &nonce);
+            }
+        }
+    }
+
+    /// Finish a PIO write transfer: RPMB request frames go to the
+    /// authentication engine, anything else lands in storage.
+    fn rpmb_receive(&mut self, bytes: &[u8]) {
+        let mut off = 0;
+        while off + RPMB_FRAME <= bytes.len() {
+            // Multi-block authenticated write: the first frame carries
+            // headers, the following count-1 chunks are raw data blocks.
+            let ty = Self::rpmb_u16(&bytes[off..], RPMB_TYPE);
+            let count = Self::rpmb_u16(&bytes[off..], RPMB_COUNT).max(1);
+            if ty == RPMB_REQ_WRITE
+                && count > 1
+                && off + (count as usize) * RPMB_FRAME <= bytes.len()
+            {
+                let end = off + (count as usize) * RPMB_FRAME;
+                self.rpmb_write_multi(&bytes[off..end], count);
+                off = end;
+            } else {
+                self.rpmb_request(&bytes[off..off + RPMB_FRAME]);
+                off += RPMB_FRAME;
+            }
+        }
+        self.data_active = false;
+        self.data_remaining = 0;
+        self.regs[self.idx(RINTSTS)] |= INT_DATA_OVER;
+    }
+
     /// Finish a PIO write transfer: copy received bytes into storage.
     fn finish_write(&mut self) {
+        if self.mmc && self.rpmb_selected {
+            let data: Vec<u8> = core::mem::take(&mut self.data).into_iter().collect();
+            self.rpmb_receive(&data);
+            return;
+        }
         let base = (self.lba as usize) * BLOCK_LEN;
         let n = self.data.len();
         if base + n > self.storage.len() {
@@ -580,6 +962,11 @@ impl Sdmmc {
 
     /// Copy `data` (host->card) into storage at the transfer LBA.
     pub fn idmac_store(&mut self, lba: u32, data: &[u8]) {
+        if self.mmc && self.rpmb_selected {
+            self.rpmb_receive(data);
+            self.regs[self.idx(IDMAC_RINTSTS)] |= IDMAC_TI;
+            return;
+        }
         let base = (lba as usize) * BLOCK_LEN;
         let end = base + data.len();
         if end > self.storage.len() {
@@ -591,7 +978,7 @@ impl Sdmmc {
     }
 
     /// Return `len` bytes from storage at the transfer LBA (card->host).
-    pub fn idmac_load(&self, lba: u32, len: usize) -> Vec<u8> {
+    pub fn idmac_load(&mut self, lba: u32, len: usize) -> Vec<u8> {
         let _ = lba; // LBA is captured in self.lba; special sources win.
         let src = self.data_source(len);
         if src.len() >= len {
@@ -703,12 +1090,12 @@ mod tests {
     use super::*;
 
     /// Issue a command with the given index/arg and response/data flags.
-    fn issue(d: &mut Sdmmc, index: u8, arg: u32, resp: bool, data: bool, rw: bool) {
+    pub(super) fn issue(d: &mut Sdmmc, index: u8, arg: u32, resp: bool, data: bool, rw: bool) {
         issue_long(d, index, arg, resp, false, data, rw)
     }
 
     /// `issue` plus an R2 (136-bit long response) flag.
-    fn issue_long(
+    pub(super) fn issue_long(
         d: &mut Sdmmc,
         index: u8,
         arg: u32,
@@ -836,7 +1223,6 @@ mod tests {
         assert_eq!(d.read32(CTRL) & 0x7, 0);
     }
 
-    #[test]
     /// CMD12 STOP_TRANSMISSION is accepted with a live R1 (no error):
     /// the single-shot card model never opens a multi-block transfer, so
     /// there is nothing to stop, but drivers may still emit CMD12 (e.g.
@@ -955,5 +1341,264 @@ mod tests {
         let w0 = d.read32(FIFO);
         // SCR first bytes = 0x02 (SD_SPEC=2), 0x05 (bus widths 1+4 bit).
         assert_eq!(w0, 0x0000_0502);
+    }
+
+    /// Drive the card into MMC mode (shared by the MMC tests below).
+    fn mmc_init(d: &mut Sdmmc) {
+        issue(d, 0, 0, false, false, false); // GO_IDLE (clears MMC too)
+        assert!(!d.mmc);
+        issue(d, 1, 0x40FF_8000, true, false, false); // SEND_OP_COND
+        assert!(d.mmc, "first CMD1 selects MMC mode");
+        assert_eq!(d.read32(RESP0) & (1 << 31), 0); // busy
+        issue(d, 1, 0x40FF_8000, true, false, false);
+        assert_eq!(d.read32(RESP0) & (1 << 31), 1 << 31); // ready
+        assert_eq!(d.read32(RESP0) & (1 << 30), 1 << 30); // HCS/sector mode
+    }
+
+    #[test]
+    fn mmc_cmd1_busy_then_ready() {
+        let mut d = Sdmmc::new();
+        mmc_init(&mut d);
+        assert_eq!(d.card_state, CardState::Ready);
+    }
+
+    #[test]
+    fn mmc_init_assigns_host_rca_and_selects() {
+        let mut d = Sdmmc::new();
+        mmc_init(&mut d);
+        issue_long(&mut d, 2, 0, true, true, false, false); // ALL_SEND_CID
+        assert_eq!(d.card_state, CardState::Ident);
+        issue(&mut d, 3, 1 << 16, true, false, false); // SET_RELATIVE_ADDR RCA=1
+        assert_eq!(d.rca, 1, "MMC takes the host-assigned RCA");
+        assert_eq!(d.card_state, CardState::Stby);
+        issue(&mut d, 7, 1 << 16, true, false, false); // SELECT
+        assert_eq!(d.card_state, CardState::Tran);
+        assert_eq!(d.read32(RESP0), 0x900); // READY + tran
+    }
+
+    #[test]
+    fn mmc_csd_reports_structure_and_blocklen() {
+        let mut d = Sdmmc::new();
+        mmc_init(&mut d);
+        issue_long(&mut d, 9, 0, true, true, false, false); // SEND_CSD
+        assert_eq!(d.read32(RESP0), MMC_CSD_WORDS[0]);
+        assert_eq!(d.read32(RESP3), MMC_CSD_WORDS[3]);
+        // CSD_STRUCTURE (bits 127:126) = 2 (v1.2, capacity in EXT_CSD).
+        assert_eq!(d.read32(RESP3) >> 30, 2);
+        // TRAN_SPEED = 0x32, READ_BL_LEN = 9 (512 B).
+        assert_eq!(d.read32(RESP3) & 0xFF, 0x32);
+        assert_eq!((d.read32(RESP2) >> 16) & 0xF, 9);
+    }
+
+    /// Read the 512-byte EXT_CSD into bytes (LE words from the PIO FIFO).
+    fn read_ext_csd(d: &mut Sdmmc) -> [u8; 512] {
+        d.write32(BYTCNT, 512);
+        issue(d, 8, 0, true, true, false); // SEND_EXT_CSD
+        assert!(d.read32(RINTSTS) & INT_CMD_DONE != 0);
+        let mut out = [0u8; 512];
+        for (i, chunk) in out.chunks_mut(4).enumerate() {
+            let w = d.read32(FIFO);
+            chunk.copy_from_slice(&w.to_le_bytes());
+            let _ = i;
+        }
+        out
+    }
+
+    #[test]
+    fn mmc_ext_csd_reports_capacity() {
+        let mut d = Sdmmc::new();
+        mmc_init(&mut d);
+        let ext = read_ext_csd(&mut d);
+        assert_eq!(ext[EXT_CSD_REV], 8);
+        assert_eq!(ext[EXT_CSD_CARD_TYPE], 0x07);
+        assert_eq!(ext[EXT_CSD_BUS_WIDTH], 0, "default 1-bit");
+        assert_eq!(ext[EXT_CSD_HS_TIMING], 0, "default legacy timing");
+        let sec = u32::from_le_bytes([
+            ext[EXT_CSD_SEC_COUNT],
+            ext[EXT_CSD_SEC_COUNT + 1],
+            ext[EXT_CSD_SEC_COUNT + 2],
+            ext[EXT_CSD_SEC_COUNT + 3],
+        ]);
+        assert_eq!(sec, STORAGE_BLOCKS as u32);
+    }
+
+    #[test]
+    fn mmc_switch_updates_ext_csd_shadow() {
+        let mut d = Sdmmc::new();
+        mmc_init(&mut d);
+        // SWITCH write-byte: access=3, index=BUS_WIDTH(183), value=1 (4-bit).
+        let arg = (3 << 26) | ((EXT_CSD_BUS_WIDTH as u32) << 16) | (1 << 8);
+        issue(&mut d, 6, arg, true, false, false);
+        assert!(d.read32(RINTSTS) & INT_CMD_DONE != 0);
+        // SWITCH HS_TIMING(185) = 1 (high-speed).
+        let arg = (3 << 26) | ((EXT_CSD_HS_TIMING as u32) << 16) | (1 << 8);
+        issue(&mut d, 6, arg, true, false, false);
+        let ext = read_ext_csd(&mut d);
+        assert_eq!(ext[EXT_CSD_BUS_WIDTH], 1);
+        assert_eq!(ext[EXT_CSD_HS_TIMING], 1);
+    }
+
+    #[test]
+    fn mmc_block_write_read_round_trips() {
+        let mut d = Sdmmc::new();
+        mmc_init(&mut d);
+        issue(&mut d, 3, 1 << 16, true, false, false);
+        issue(&mut d, 7, 1 << 16, true, false, false);
+        assert_eq!(d.card_state, CardState::Tran);
+        d.write32(BYTCNT, 512);
+        issue(&mut d, 24, 100, true, true, true); // WRITE_BLOCK LBA 100
+        for i in 0..128u32 {
+            d.write32(FIFO, 0xDEAD_0000 | i);
+        }
+        assert!(d.read32(RINTSTS) & INT_DATA_OVER != 0);
+        d.write32(BYTCNT, 512);
+        issue(&mut d, 17, 100, true, true, false); // READ_SINGLE_BLOCK
+        for i in 0..128u32 {
+            assert_eq!(d.read32(FIFO), 0xDEAD_0000 | i);
+        }
+    }
+}
+
+#[cfg(test)]
+mod rpmb_tests {
+    use super::*;
+    use crate::hmac::hmac_sha256;
+
+    const KEY: [u8; 32] = [0x42; 32];
+
+    fn frame(
+        ty: u16,
+        addr: u16,
+        count: u16,
+        counter: u32,
+        data: &[u8],
+        key: &[u8; 32],
+    ) -> [u8; 512] {
+        let mut f = [0u8; 512];
+        let n = data.len().min(256);
+        f[228..228 + n].copy_from_slice(&data[..n]);
+        f[500..504].copy_from_slice(&counter.to_be_bytes());
+        f[504..506].copy_from_slice(&addr.to_be_bytes());
+        f[506..508].copy_from_slice(&count.to_be_bytes());
+        f[510..512].copy_from_slice(&ty.to_be_bytes());
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&f[228..484]);
+        msg.extend_from_slice(&f[484..500]);
+        msg.extend_from_slice(&f[500..504]);
+        msg.extend_from_slice(&f[504..506]);
+        msg.extend_from_slice(&f[506..508]);
+        msg.extend_from_slice(&f[508..510]);
+        msg.extend_from_slice(&f[510..512]);
+        let mac = hmac_sha256(key, &msg);
+        f[196..228].copy_from_slice(&mac);
+        f
+    }
+
+    fn result_of(f: &[u8]) -> u16 {
+        u16::from_be_bytes([f[508], f[509]])
+    }
+
+    fn type_of(f: &[u8]) -> u16 {
+        u16::from_be_bytes([f[510], f[511]])
+    }
+
+    /// Enter MMC mode and select the RPMB partition (SWITCH index 179 = 3).
+    fn rpmb_mode(d: &mut Sdmmc) {
+        super::tests::issue(d, 0, 0, false, false, false);
+        super::tests::issue(d, 1, 0x40FF_8000, true, false, false);
+        super::tests::issue(d, 1, 0x40FF_8000, true, false, false);
+        super::tests::issue(d, 6, (3 << 26) | (179 << 16) | (3 << 8), true, false, false);
+        assert!(d.rpmb_selected, "RPMB partition selected");
+    }
+
+    fn write_frames(d: &mut Sdmmc, bytes: &[u8]) {
+        d.write32(BYTCNT, bytes.len() as u32);
+        super::tests::issue(d, 25, 0, true, true, true);
+        for w in bytes.chunks(4) {
+            let mut b = [0u8; 4];
+            b[..w.len()].copy_from_slice(w);
+            d.write32(FIFO, u32::from_le_bytes(b));
+        }
+    }
+
+    fn read_frames(d: &mut Sdmmc, nbytes: usize) -> Vec<u8> {
+        d.write32(BYTCNT, nbytes as u32);
+        super::tests::issue(d, 18, 0, true, true, false);
+        let mut out = Vec::new();
+        for _ in 0..nbytes / 4 {
+            out.extend_from_slice(&d.read32(FIFO).to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn rpmb_provision_counter_write_read_round_trip() {
+        let mut d = Sdmmc::new();
+        rpmb_mode(&mut d);
+        // Provision (type 1 carries the key in the MAC field).
+        let mut prov = [0u8; 512];
+        prov[196..228].copy_from_slice(&KEY);
+        prov[510..512].copy_from_slice(&1u16.to_be_bytes());
+        write_frames(&mut d, &prov);
+        let r = read_frames(&mut d, 512);
+        assert_eq!(type_of(&r), 0x0100, "provision response type");
+        assert_eq!(result_of(&r), 0, "provision OK");
+        // Counter reads 0 with a valid MAC.
+        let q = frame(2, 0, 1, 0, &[], &KEY);
+        write_frames(&mut d, &q);
+        let r = read_frames(&mut d, 512);
+        assert_eq!(type_of(&r), 0x0200);
+        assert_eq!(result_of(&r), 0);
+        assert_eq!(&r[500..504], &[0, 0, 0, 0], "counter 0");
+        // Authenticated write of one block, then read it back.
+        let data = [0xA5u8; 256];
+        let w = frame(3, 2, 1, 0, &data, &KEY);
+        write_frames(&mut d, &w);
+        let r = read_frames(&mut d, 512);
+        assert_eq!(type_of(&r), 0x0300);
+        assert_eq!(result_of(&r), 0, "write OK");
+        let q = frame(4, 2, 1, 0, &[], &KEY);
+        write_frames(&mut d, &q);
+        let r = read_frames(&mut d, 512);
+        assert_eq!(type_of(&r), 0x0400);
+        assert_eq!(result_of(&r), 0, "read OK");
+        assert_eq!(&r[228..484], &data, "data round-trips");
+        // Counter advanced exactly once.
+        let q = frame(2, 0, 1, 0, &[], &KEY);
+        write_frames(&mut d, &q);
+        let r = read_frames(&mut d, 512);
+        assert_eq!(&r[500..504], &[0, 0, 0, 1], "counter 1");
+    }
+
+    #[test]
+    fn rpmb_rejects_bad_mac_stale_counter_and_range() {
+        let mut d = Sdmmc::new();
+        rpmb_mode(&mut d);
+        // Unprovisioned reads fail with NO_KEY.
+        let q = frame(2, 0, 1, 0, &[], &KEY);
+        write_frames(&mut d, &q);
+        let r = read_frames(&mut d, 512);
+        assert_eq!(result_of(&r), 0x0007, "NO_KEY before provision");
+        // Provision, then tamper one MAC byte on a write.
+        let mut prov = [0u8; 512];
+        prov[196..228].copy_from_slice(&KEY);
+        prov[510..512].copy_from_slice(&1u16.to_be_bytes());
+        write_frames(&mut d, &prov);
+        let _ = read_frames(&mut d, 512);
+        let mut w = frame(3, 0, 1, 0, &[0x5Au8; 256], &KEY);
+        w[200] ^= 0xFF;
+        write_frames(&mut d, &w);
+        let r = read_frames(&mut d, 512);
+        assert_eq!(result_of(&r), 0x0002, "AUTH_FAIL on tampered MAC");
+        // Stale counter rejected.
+        let w = frame(3, 0, 1, 99, &[0x5Au8; 256], &KEY);
+        write_frames(&mut d, &w);
+        let r = read_frames(&mut d, 512);
+        assert_eq!(result_of(&r), 0x0003, "COUNTER_FAIL on stale counter");
+        // Out-of-range address rejected.
+        let w = frame(4, 100, 1, 0, &[], &KEY);
+        write_frames(&mut d, &w);
+        let r = read_frames(&mut d, 512);
+        assert_eq!(result_of(&r), 0x0004, "ADDR_FAIL out of range");
     }
 }

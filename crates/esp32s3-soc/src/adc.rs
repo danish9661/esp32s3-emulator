@@ -55,6 +55,9 @@ pub const APB_INT_ENA: u32 = 0x5C;
 pub const APB_INT_RAW: u32 = 0x60;
 pub const APB_INT_ST: u32 = 0x64;
 pub const APB_INT_CLR: u32 = 0x68;
+/// APB_SARADC done-interrupt matrix source (`interrupts.h` recount: the
+/// ADC done flags live in the APB block's own INT_ST, gated by INT_ENA).
+pub const APB_ADC_INTR_SOURCE: u32 = 65;
 pub const APB_DMA_CONF: u32 = 0x6C;
 pub const APB_CLKM_CONF: u32 = 0x70;
 pub const APB_SARADC2_DATA_STATUS: u32 = 0x78;
@@ -387,6 +390,11 @@ impl Adc {
             self.oneshot_pending[unit] = ONESHOT_CYCLES;
             self.meas_busy = true;
         }
+    }
+
+    /// ADC done-interrupt status (`INT_RAW & INT_ENA`) for matrix source 65.
+    pub fn int_st(&self) -> u32 {
+        self.apb[(APB_INT_RAW / 4) as usize] & self.apb[(APB_INT_ENA / 4) as usize]
     }
 
     /// Read an APB_SARADC register (`offset` relative to APB_SARADC_BASE).

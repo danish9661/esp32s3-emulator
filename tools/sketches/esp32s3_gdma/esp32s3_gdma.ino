@@ -42,6 +42,9 @@ volatile uint32_t* const RMT = (volatile uint32_t* const)RMT_BASE;
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C001C) |= (1u << 6);
+  *(volatile uint32_t*)(0x600C0018) |= (1u << 9);
   delay(50);
 
   // Build 3 RMT items: (100t hi)(100t lo) / (200t hi)(50t lo) / (50t lo)(50t lo).

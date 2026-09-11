@@ -15,6 +15,8 @@ volatile uint32_t* const GPIO = (volatile uint32_t* const)GPIO_BASE;
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C0018) |= (1u << 10);
   delay(50);
   pinMode(4, OUTPUT);
   digitalWrite(4, LOW);

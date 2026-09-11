@@ -34,6 +34,17 @@ fn lit(stream: &mut Bytes, word: u32) {
     insn(stream, word, 4);
 }
 
+/// Enable a SYSCON peripheral clock (PERIP_CLK_EN0 @ +0x18 / EN1 @ +0x1C),
+/// required since clock gating: peripherals freeze with their bit clear
+/// (firmware normally enables these via periph_module_enable; hand-written
+/// tests must do it explicitly, like silicon requires).
+fn syscon_clk(m: &mut Esp32S3, en1: bool, bit: u32) {
+    use esp32s3_soc::memmap::SYSTEM_BASE;
+    let off = if en1 { 0x1C } else { 0x18 };
+    let cur = m.soc.read32(SYSTEM_BASE + off);
+    m.soc.write32(SYSTEM_BASE + off, cur | (1 << bit));
+}
+
 #[test]
 fn uart0_hello_world() {
     let mut m = Esp32S3::new();
@@ -252,8 +263,8 @@ fn boot_path_loads_app_from_flash() {
     // Full flash image: partition table (1 nvs entry + terminator) and the
     // app at APP_FLASH_OFFSET.
     let mut flash = std::vec![0xFFu8; 0x200_000];
-    flash[0x8000] = 0x50;
-    flash[0x8001] = 0xAA;
+    flash[0x8000] = 0xAA;
+    flash[0x8001] = 0x50;
     flash[0x8002] = 1; // type: nvs
     flash[0x8003] = 2; // subtype: no_keep
     flash[0x8004..0x8008].copy_from_slice(&0x9000u32.to_le_bytes());
@@ -348,29 +359,42 @@ fn ota_boot_selects_active_slot() {
 
     let img = esp_app_image(IRAM_BASE, APP_ENTRY, &app);
     let mut flash = std::vec![0xFFu8; 0x300_000];
-    // Partition table at 0x8000: ota_1 + otadata.
-    flash[0x8000] = 0x50;
-    flash[0x8001] = 0xAA;
-    // entry 0: ota_1 (app, subtype 0x11) @ 0x200000
+    // Partition table at 0x8000: ota_0 (count filler) + ota_1 + otadata.
+    flash[0x8000] = 0xAA;
+    flash[0x8001] = 0x50;
+    // entry 0: ota_0 (app, subtype 0x10) @ 0x100000 (never booted here)
     flash[0x8002] = 0x00;
-    flash[0x8003] = 0x11;
-    flash[0x8004..0x8008].copy_from_slice(&0x200000u32.to_le_bytes());
+    flash[0x8003] = 0x10;
+    flash[0x8004..0x8008].copy_from_slice(&0x100000u32.to_le_bytes());
     flash[0x8008..0x800C].copy_from_slice(&0x100000u32.to_le_bytes());
-    flash[0x8010..0x8020].copy_from_slice(b"ota_1\0\0\0\0\0\0\0\0\0\0\0");
-    // entry 1: otadata (data, subtype 0x39) @ 0xe000
-    flash[0x8020] = 0x50;
-    flash[0x8021] = 0xAA;
-    flash[0x8022] = 0x01;
-    flash[0x8023] = 0x39;
-    flash[0x8024..0x8028].copy_from_slice(&0xe000u32.to_le_bytes());
-    flash[0x8028..0x802C].copy_from_slice(&0x2000u32.to_le_bytes());
-    flash[0x8030..0x8040].fill(0);
-    flash[0x8030..0x8040].copy_from_slice(b"otadata\0\0\0\0\0\0\0\0\0");
-    flash[0x8040] = 0xEB;
-    flash[0x8041] = 0xEB;
-    // otadata: slot0 invalid, slot1 valid (seq 1).
-    flash[0xe000..0xe004].copy_from_slice(&0u32.to_le_bytes());
-    flash[0xe020..0xe024].copy_from_slice(&0x8000_0001u32.to_le_bytes());
+    flash[0x800C..0x801C].copy_from_slice(b"ota_0\0\0\0\0\0\0\0\0\0\0\0");
+    // entry 1: ota_1 (app, subtype 0x11) @ 0x200000
+    flash[0x8020] = 0xAA;
+    flash[0x8021] = 0x50;
+    flash[0x8022] = 0x00;
+    flash[0x8023] = 0x11;
+    flash[0x8024..0x8028].copy_from_slice(&0x200000u32.to_le_bytes());
+    flash[0x8028..0x802C].copy_from_slice(&0x100000u32.to_le_bytes());
+    flash[0x802C..0x803C].copy_from_slice(b"ota_1\0\0\0\0\0\0\0\0\0\0\0");
+    // entry 2: otadata (data, subtype 0x39) @ 0xe000
+    flash[0x8040] = 0xAA;
+    flash[0x8041] = 0x50;
+    flash[0x8042] = 0x01;
+    flash[0x8043] = 0x39;
+    flash[0x8044..0x8048].copy_from_slice(&0xe000u32.to_le_bytes());
+    flash[0x8048..0x804C].copy_from_slice(&0x2000u32.to_le_bytes());
+    flash[0x804C..0x805C].copy_from_slice(b"otadata\0\0\0\0\0\0\0\0\0");
+    flash[0x8060] = 0xEB;
+    flash[0x8061] = 0xEB;
+    // otadata (real 32-byte entries + CRC): sector 0 seq 1, sector 1 seq 2
+    // -> highest seq 2 -> slot (2-1)%2 = 1 -> ota_1 @ 0x200000.
+    {
+        use crate::partition::ota_seq_crc;
+        for (off, seq) in [(0xe000, 1u32), (0xf000, 2u32)] {
+            flash[off..off + 4].copy_from_slice(&seq.to_le_bytes());
+            flash[off + 28..off + 32].copy_from_slice(&ota_seq_crc(seq).to_le_bytes());
+        }
+    }
 
     assert_eq!(select_ota_boot_offset(&flash), Some(0x200000));
     flash[0x200000_usize..0x200000_usize + img.len()].copy_from_slice(&img);
@@ -506,13 +530,13 @@ fn ota_update_reprograms_otadata_and_reboots_into_new_slot() {
     let mut flash = std::vec![0xFFu8; 0x300_000];
     let mut entry = |idx: usize, ty: u8, sub: u8, off: u32, len: u32, label: &[u8; 16]| {
         let b = 0x8000 + idx * 0x20;
-        flash[b] = 0x50;
-        flash[b + 1] = 0xAA;
+        flash[b] = 0xAA;
+        flash[b + 1] = 0x50;
         flash[b + 2] = ty;
         flash[b + 3] = sub;
         flash[b + 4..b + 8].copy_from_slice(&off.to_le_bytes());
         flash[b + 8..b + 12].copy_from_slice(&len.to_le_bytes());
-        flash[b + 16..b + 32].copy_from_slice(label);
+        flash[b + 12..b + 28].copy_from_slice(label);
     };
     entry(
         0,
@@ -540,12 +564,13 @@ fn ota_update_reprograms_otadata_and_reboots_into_new_slot() {
     );
     flash[0x8060] = 0xEB;
     flash[0x8061] = 0xEB;
-    // otadata: slot 0 valid (seq 1), slot 1 invalid (erased flash reads
-    // 0xFF, whose bit 31 the parser treats as valid — zero it explicitly).
-    flash[OTADATA_OFF as usize..OTADATA_OFF as usize + 4]
-        .copy_from_slice(&0x8000_0001u32.to_le_bytes());
-    flash[OTADATA_OFF as usize + 0x20..OTADATA_OFF as usize + 0x24]
-        .copy_from_slice(&0u32.to_le_bytes());
+    // otadata: real 32-byte entry, seq 1 (slot (1-1)%2 = 0).
+    {
+        use crate::partition::ota_seq_crc;
+        flash[OTADATA_OFF as usize..OTADATA_OFF as usize + 4].copy_from_slice(&1u32.to_le_bytes());
+        flash[OTADATA_OFF as usize + 28..OTADATA_OFF as usize + 32]
+            .copy_from_slice(&ota_seq_crc(1).to_le_bytes());
+    }
     flash[OTA0_OFF as usize..OTA0_OFF as usize + img0.len()].copy_from_slice(&img0);
     flash[OTA1_OFF as usize..OTA1_OFF as usize + img1.len()].copy_from_slice(&img1);
     assert_eq!(select_ota_boot_offset(&flash), Some(OTA0_OFF));
@@ -562,10 +587,15 @@ fn ota_update_reprograms_otadata_and_reboots_into_new_slot() {
     assert_eq!(m.cpu[0].pc, here0, "slot-0 app reached its self-loop");
     assert_eq!(m.soc.read32(STASH), MARK0, "slot 0 executed");
 
-    // Firmware-style update: erase the otadata sector, then program both
-    // records (slot 0 invalid, slot 1 sequence 2) through MEMSPI.
-    let mut rec = [0u8; 64];
-    rec[0x20..0x24].copy_from_slice(&0x8000_0002u32.to_le_bytes());
+    // Firmware-style update: erase the otadata sector, then program a real
+    // 32-byte entry (seq 2, state NEW, correct CRC) at +32 through MEMSPI.
+    let mut rec = [0xFFu8; 64];
+    {
+        use crate::partition::ota_seq_crc;
+        rec[0x20..0x24].copy_from_slice(&2u32.to_le_bytes());
+        rec[0x20 + 24..0x20 + 28].copy_from_slice(&0u32.to_le_bytes());
+        rec[0x20 + 28..0x20 + 32].copy_from_slice(&ota_seq_crc(2).to_le_bytes());
+    }
     memspi_usr(&mut m, 0x20, OTADATA_OFF, &[], true); // SE
     memspi_usr(&mut m, 0x02, OTADATA_OFF, &rec, true); // PP
     // Read the mutated sector back through the flash window and splice it
@@ -588,8 +618,8 @@ fn ota_update_reprograms_otadata_and_reboots_into_new_slot() {
                 .try_into()
                 .unwrap()
         ),
-        0,
-        "slot-0 record cleared by the update"
+        0xFFFF_FFFF,
+        "first entry stays erased after the update"
     );
     assert_eq!(
         u32::from_le_bytes(
@@ -597,8 +627,8 @@ fn ota_update_reprograms_otadata_and_reboots_into_new_slot() {
                 .try_into()
                 .unwrap()
         ),
-        0x8000_0002,
-        "slot-1 record programmed by the update"
+        2,
+        "second entry programmed by the update"
     );
     assert_eq!(select_ota_boot_offset(&img2), Some(OTA1_OFF));
 
@@ -617,6 +647,107 @@ fn ota_update_reprograms_otadata_and_reboots_into_new_slot() {
         MARK1,
         "slot 1 executed after OTA switch"
     );
+}
+
+/// Flash-encryption pipeline: provision an eFuse XTS key, encrypt the
+/// whole image host-side (uniform encryption like esptool: every 16-byte
+/// block at its absolute offset), boot the ciphertext. The app jumps from
+/// its copied IRAM segment into an XIP-mapped `.flash.text` function, so
+/// this exercises decrypt-on-read on the stub-loader window reads, the
+/// boot-time header parse (decrypted view) AND live instruction fetch.
+#[test]
+fn flashenc_encrypted_app_boots_and_runs() {
+    use crate::asm::Asm;
+    use crate::rom_stub::APP_FLASH_OFFSET;
+    use esp32s3_soc::memmap::{FLASH_INST_BASE, IRAM_BASE};
+
+    const STASH: u32 = 0x3FC8_0400;
+    const STASH2: u32 = 0x3FC8_0404;
+    const MARK: u32 = 0xE11C_0001;
+    const BEEF: u32 = 0xE11C_BEEF;
+    // Entry (copied to IRAM by the stub loader): jump to the XIP function
+    // via a literal pool. NOTE: patch the Asm buffer BEFORE cloning it
+    // into `main` (a post-clone patch silently applies to nothing — this
+    // exact ordering bug cost an hour: the pool read 0 and execution
+    // wandered through qsort into the scratch window).
+    // NOTE 2: the pool lives at the segment base, so the entry must point
+    // PAST it (IRAM_BASE+4) — pointing at the pool executes data as code.
+    let mut a0 = Asm::new(IRAM_BASE);
+    let p_pool = a0.offset();
+    a0.lit(0); // placeholder for XIP_FN
+    let p_j = a0.l32r(2);
+    a0.jx(2);
+    let main_len = a0.bytes().len();
+    // The MMU maps whole 64 KB pages, so the XIP load address must carry
+    // the same intra-page offset as the segment's file position.
+    let xip_file_off = APP_FLASH_OFFSET as usize + 24 + 8 + main_len + 8;
+    const XIP_VPAGE: u32 = 0x1_0000;
+    let xip_fn = FLASH_INST_BASE + XIP_VPAGE + (xip_file_off & 0xFFFF) as u32;
+    a0.bytes_mut()[p_pool..p_pool + 4].copy_from_slice(&xip_fn.to_le_bytes());
+    a0.patch_l32r(p_j, IRAM_BASE + p_pool as u32);
+    let main = a0.bytes().to_vec();
+    // XIP function: stash BEEF, then MARK, then self-loop (all fetched
+    // through the decrypting instruction window; position-independent).
+    let mut x = Asm::new(xip_fn);
+    x.li(6, BEEF as i32);
+    x.li(7, STASH2 as i32);
+    x.s32i(6, 7, 0);
+    x.li(6, MARK as i32);
+    x.li(7, STASH as i32);
+    x.s32i(6, 7, 0);
+    let here = x.pc();
+    x.j(here);
+    let xip = x.bytes().to_vec();
+
+    let img = esp_app_image_multi(IRAM_BASE + 4, &[(IRAM_BASE, &main), (xip_fn, &xip)]);
+    const FLASH_LEN: usize = 0x2_0000;
+    let mut flash = std::vec![0xFFu8; FLASH_LEN];
+    flash[APP_FLASH_OFFSET as usize..APP_FLASH_OFFSET as usize + img.len()].copy_from_slice(&img);
+
+    // Provision the eFuse fixture key, encrypt the image in the backing,
+    // snapshot the ciphertext, then boot from it.
+    let key = [0x5Au8; 32];
+    let mut m = Esp32S3::new();
+    assert!(!m.soc.flash_enc_enabled(), "fresh device is plaintext");
+    m.soc.flashenc_provision(&key);
+    assert!(m.soc.flash_enc_enabled(), "provisioned device is encrypted");
+    m.soc.load_flash_image(0, &flash);
+    m.soc.flashenc_encrypt_region(0, FLASH_LEN as u32);
+    let enc = m.soc.flash_image().to_vec();
+    assert_ne!(
+        &enc[APP_FLASH_OFFSET as usize..APP_FLASH_OFFSET as usize + 16],
+        &flash[APP_FLASH_OFFSET as usize..APP_FLASH_OFFSET as usize + 16],
+        "backing holds ciphertext, not plaintext"
+    );
+    m.boot_from_flash(&enc);
+    assert_eq!(m.cpu[0].pc, 0x4000_0400, "boot leaves reset vector");
+    assert!(m.soc.rom_boot_mode(), "boot leaves rom_boot_mode set");
+    // Scratch window (loader path) must serve decrypted image bytes.
+    use crate::rom_stub::LOADER_SCRATCH;
+    for (k, &want) in img.iter().enumerate().take(32) {
+        assert_eq!(
+            m.soc.read8(LOADER_SCRATCH + k as u32),
+            want as u32,
+            "scratch byte {k} decrypts"
+        );
+    }
+    // XIP window must serve decrypted segment bytes.
+    for (k, &want) in xip.iter().enumerate() {
+        assert_eq!(
+            m.soc.read8(xip_fn + k as u32),
+            want as u32,
+            "XIP byte {k} decrypts"
+        );
+    }
+    for _ in 0..6000 {
+        if m.cpu[0].pc == here {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.cpu[0].pc, here, "XIP function reached its self-loop");
+    assert_eq!(m.soc.read32(STASH), MARK, "entry marker via XIP");
+    assert_eq!(m.soc.read32(STASH2), BEEF, "XIP function executed");
 }
 
 #[test]
@@ -851,6 +982,187 @@ fn timg1_alarm_delivers_level4_vector() {
 }
 
 #[test]
+fn sha_done_interrupt_delivers_to_vector() {
+    use crate::asm::Asm;
+    use esp32s3_soc::memmap::INT_MATRIX_BASE;
+    use esp32s3_soc::sha::SHA_BASE;
+
+    // App: literal pool (CTR/STASH/INT_MATRIX/SHA), then code. Routes
+    // source 78 (SHA done) to CPU line 15 (level 3), feeds one 64-byte
+    // direct-fill block, enables the done interrupt, then spins on CTR
+    // until the level-3 handler runs once and stashes 0xCAFE.
+    const CTR: u32 = 0x3FC8_0300;
+    const STASH: u32 = 0x3FC8_0304;
+    let mut a = Asm::new(IRAM_BASE);
+    let l_ctr = a.offset();
+    a.lit(0);
+    let l_stash = a.offset();
+    a.lit(0);
+    let l_mat = a.offset();
+    a.lit(0);
+    let l_sha = a.offset();
+    a.lit(0);
+    let code_start = a.pc();
+    let p = a.l32r(2); // INT_MATRIX_BASE
+    a.patch_l32r(p, IRAM_BASE + l_mat as u32);
+    a.movi_n(3, 15);
+    a.s32i(3, 2, 4 * 78); // matrix source 78 -> line 15
+    let p = a.l32r(2); // SHA_BASE
+    a.patch_l32r(p, IRAM_BASE + l_sha as u32);
+    a.movi_n(3, 2);
+    a.s32i(3, 2, 0x00); // MODE = SHA-256
+    a.movi_n(3, 1);
+    a.s32i(3, 2, 0x28); // INT_ENA (done interrupt)
+    a.li(4, SHA_BASE as i32 + 0x80); // TEXT fill pointer
+    a.movi_n(3, 0);
+    a.movi_n(5, 16);
+    let fill = a.pc();
+    a.s32i(3, 4, 0); // 16 words of counter pattern (one block)
+    a.addi(4, 4, 4);
+    a.addi(3, 3, 1);
+    a.bne(3, 5, fill);
+    a.movi_n(3, 1);
+    a.s32i(3, 2, 0x10); // SHA_START: transform + latch done
+    a.li(3, 0x8000); // INTENABLE bit 15
+    a.wsr(228, 3);
+    a.rsil(4, 0);
+    let loop_start = a.pc();
+    let p = a.l32r(2); // CTR
+    a.patch_l32r(p, IRAM_BASE + l_ctr as u32);
+    a.l32i(3, 2, 0);
+    a.beqz(3, loop_start); // spin while CTR == 0 (handler sets 1)
+    a.li(4, 0xCAFE);
+    let p = a.l32r(5); // STASH
+    a.patch_l32r(p, IRAM_BASE + l_stash as u32);
+    a.s32i(4, 5, 0);
+    let done = a.pc();
+    a.j(done);
+    // Patch the literal pool (values must sit at their 4-aligned slots).
+    a.bytes_mut()[l_ctr..l_ctr + 4].copy_from_slice(&CTR.to_le_bytes());
+    a.bytes_mut()[l_stash..l_stash + 4].copy_from_slice(&STASH.to_le_bytes());
+    a.bytes_mut()[l_mat..l_mat + 4].copy_from_slice(&INT_MATRIX_BASE.to_le_bytes());
+    a.bytes_mut()[l_sha..l_sha + 4].copy_from_slice(&SHA_BASE.to_le_bytes());
+
+    // Level-3 handler at VECBASE + 0x1C0 (uses only a6-a9).
+    let mut h = Asm::new(0x4000_01C0);
+    h.li(6, CTR as i32);
+    h.l32i(7, 6, 0);
+    h.addi(7, 7, 1);
+    h.s32i(7, 6, 0); // CTR += 1
+    h.li(8, SHA_BASE as i32);
+    h.movi_n(9, 1);
+    h.s32i(9, 8, 0x24); // INT_CLR (CLEAR_IRQ)
+    h.rfi(3);
+    assert!(
+        h.bytes().len() <= 0x40,
+        "handler fits the 64-byte vector slot"
+    );
+
+    let mut m = Esp32S3::new();
+    syscon_clk(&mut m, true, 2);
+    m.load_image(IRAM_BASE, a.bytes());
+    m.load_image(0x4000_01C0, h.bytes());
+    m.cpu[0].pc = code_start;
+    for _ in 0..4000 {
+        if m.cpu[0].pc == done {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.cpu[0].pc, done, "app finished its loop");
+    assert_eq!(m.soc.read32(STASH), 0xCAFE, "stash after SHA interrupt");
+    assert_eq!(m.soc.read32(CTR), 1, "handler ran once");
+    assert_eq!(m.soc.read32(INT_MATRIX_BASE + 4 * 78), 15, "matrix write");
+}
+
+#[test]
+fn adc_done_interrupt_delivers_to_vector() {
+    use crate::asm::Asm;
+    use esp32s3_soc::adc::{APB_CTRL, APB_INT_CLR, APB_INT_ENA, APB_SAR1_PATT_TAB};
+    use esp32s3_soc::memmap::{APB_SARADC_BASE, INT_MATRIX_BASE};
+
+    // App: literal pool (CTR/STASH/INT_MATRIX/ADC), then code. Routes
+    // source 65 (APB ADC done) to CPU line 15 (level 3), runs one digital
+    // single-shot conversion (pattern ch3, start pulse), enables the
+    // adc1_done interrupt, then spins on CTR until the level-3 handler
+    // runs once and stashes 0xCAFE. The conversion completes synchronously
+    // on the START write (value unimportant — delivery is what's tested).
+    const CTR: u32 = 0x3FC8_0400;
+    const STASH: u32 = 0x3FC8_0404;
+    let mut a = Asm::new(IRAM_BASE);
+    let l_ctr = a.offset();
+    a.lit(0);
+    let l_stash = a.offset();
+    a.lit(0);
+    let l_mat = a.offset();
+    a.lit(0);
+    let l_adc = a.offset();
+    a.lit(0);
+    let code_start = a.pc();
+    let p = a.l32r(2); // INT_MATRIX_BASE
+    a.patch_l32r(p, IRAM_BASE + l_mat as u32);
+    a.movi_n(3, 15);
+    a.s32i(3, 2, 4 * 65); // matrix source 65 -> line 15
+    let p = a.l32r(2); // APB_SARADC_BASE
+    a.patch_l32r(p, IRAM_BASE + l_adc as u32);
+    a.movi_n(3, 0x0C);
+    a.s32i(3, 2, APB_SAR1_PATT_TAB); // pattern: ch3 atten 0
+    a.li(3, 0x8000_0000u32 as i32);
+    a.s32i(3, 2, APB_INT_ENA); // enable adc1_done interrupt
+    a.li(3, 0x43u32 as i32); // clk_gated|single|start_force|start
+    a.s32i(3, 2, APB_CTRL); // start pulse: converts + latches done
+    a.li(3, 0x8000); // INTENABLE bit 15
+    a.wsr(228, 3);
+    a.rsil(4, 0);
+    let loop_start = a.pc();
+    let p = a.l32r(2); // CTR
+    a.patch_l32r(p, IRAM_BASE + l_ctr as u32);
+    a.l32i(3, 2, 0);
+    a.beqz(3, loop_start); // spin while CTR == 0
+    a.li(4, 0xCAFE);
+    let p = a.l32r(5); // STASH
+    a.patch_l32r(p, IRAM_BASE + l_stash as u32);
+    a.s32i(4, 5, 0);
+    let done = a.pc();
+    a.j(done);
+    // Patch the literal pool (values must sit at their 4-aligned slots).
+    a.bytes_mut()[l_ctr..l_ctr + 4].copy_from_slice(&CTR.to_le_bytes());
+    a.bytes_mut()[l_stash..l_stash + 4].copy_from_slice(&STASH.to_le_bytes());
+    a.bytes_mut()[l_mat..l_mat + 4].copy_from_slice(&INT_MATRIX_BASE.to_le_bytes());
+    a.bytes_mut()[l_adc..l_adc + 4].copy_from_slice(&APB_SARADC_BASE.to_le_bytes());
+
+    // Level-3 handler at VECBASE + 0x1C0 (uses only a6-a9).
+    let mut h = Asm::new(0x4000_01C0);
+    h.li(6, CTR as i32);
+    h.l32i(7, 6, 0);
+    h.addi(7, 7, 1);
+    h.s32i(7, 6, 0); // CTR += 1
+    h.li(8, APB_SARADC_BASE as i32);
+    h.li(9, 0x8000_0000u32 as i32);
+    h.s32i(9, 8, APB_INT_CLR); // clear adc1_done
+    h.rfi(3);
+    assert!(
+        h.bytes().len() <= 0x40,
+        "handler fits the 64-byte vector slot"
+    );
+
+    let mut m = Esp32S3::new();
+    m.load_image(IRAM_BASE, a.bytes());
+    m.load_image(0x4000_01C0, h.bytes());
+    m.cpu[0].pc = code_start;
+    for _ in 0..4000 {
+        if m.cpu[0].pc == done {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.cpu[0].pc, done, "app finished its loop");
+    assert_eq!(m.soc.read32(STASH), 0xCAFE, "stash after ADC interrupt");
+    assert_eq!(m.soc.read32(CTR), 1, "handler ran once");
+    assert_eq!(m.soc.read32(INT_MATRIX_BASE + 4 * 65), 15, "matrix write");
+}
+
+#[test]
 fn uart_rx_interrupt_echo() {
     use crate::asm::Asm;
     use esp32s3_soc::memmap::INT_MATRIX_BASE;
@@ -994,6 +1306,7 @@ fn ledc_pwm_blinks_gpio0_at_50_percent_duty() {
     a.bytes_mut()[l_stash..l_stash + 4].copy_from_slice(&STASH.to_le_bytes());
 
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, false, 11);
     m.load_image(IRAM_BASE, a.bytes());
     m.cpu[0].pc = code_start;
     let pin = |m: &Esp32S3| (m.gpio_output() & 1) != 0;
@@ -1201,6 +1514,7 @@ fn i2c0_master_write_nacks_and_stops() {
     a.bytes_mut()[l_stash..l_stash + 4].copy_from_slice(&STASH.to_le_bytes());
 
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, false, 7);
     m.load_image(IRAM_BASE, a.bytes());
     m.cpu[0].pc = code_start;
     // Sample encoding: bit0 = GPIO1 = SCL, bit1 = GPIO2 = SDA.
@@ -1769,6 +2083,7 @@ fn rmt_signal_drives_gpio_in_loopback() {
     use esp32s3_soc::rmt::{RMT_BASE, RMTMEM_BASE};
 
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, false, 9);
     // Route GPIO2 to RMT TX signal 81 (channel 0) and enable output.
     m.soc.write32(GPIO_BASE + 0x554 + 2 * 4, 81); // FUNC_OUT_SEL_CFG[2]
     m.soc.write32(GPIO_BASE + 0x20, 1 << 2); // GPIO_ENABLE_W1TS bit2
@@ -1809,6 +2124,7 @@ fn rmt_carrier_tx_demod_rx_loopback_envelope() {
     use esp32s3_soc::rmt::{RMT_BASE, RMTMEM_BASE};
 
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, false, 9);
     // Route GPIO2 to RMT TX signal 81 (channel 0) and enable output.
     m.soc.write32(GPIO_BASE + 0x554 + 2 * 4, 81); // FUNC_OUT_SEL_CFG[2]
     m.soc.write32(GPIO_BASE + 0x20, 1 << 2); // GPIO_ENABLE_W1TS bit2
@@ -2041,6 +2357,7 @@ fn twai_loopback_transmits_and_receives() {
     use esp32s3_soc::twai::TWAI_BASE;
 
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, false, 19);
     let b = TWAI_BASE;
 
     // Enter reset mode so the acceptance filter is writable.
@@ -2328,6 +2645,7 @@ fn lcd_cam_capture_delivers_injected_frame() {
     let lc_int_raw = LCD_CAM_BASE + 0x68;
 
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, true, 8);
     // CAM_V_SYNC (152) -> GPIO7 pad (input routing only; pad is sensor-driven).
     m.soc.write32(GPIO_BASE + GPIO_FUNC_IN_SEL_0 + 152 * 4, 7);
     // Stage 4 words (LE bytes) and start the capture.
@@ -2373,6 +2691,7 @@ fn lcd_cam_fifo_and_transfer_done() {
     let lc_int_clr = LCD_CAM_BASE + 0x70;
 
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, true, 8);
     // Enable + clear the TRANS_DONE interrupt, then fill the TX FIFO.
     m.soc.write32(lc_int_ena, 1 << 1);
     m.soc.write32(lc_int_clr, 0xF);
@@ -2409,6 +2728,7 @@ fn i2s_tx_drives_gpio_matrix_signals() {
     let sd_pin = 5u32; // route I2S0 SD (sig 25) here
     let bck_pin = 6u32; // route I2S0 BCK (sig 22) here
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, false, 4);
     m.soc.write32(GPIO_BASE + 0x554 + 4 * sd_pin, 25);
     m.soc.write32(GPIO_BASE + 0x554 + 4 * bck_pin, 22);
     m.soc
@@ -2443,6 +2763,7 @@ fn lcd_cam_parallel_drives_gpio_matrix_signals() {
     let data_pin = 7u32; // route LCD_DATA_OUT0 (sig 133)
     let cs_pin = 8u32; // route LCD_CS (sig 132)
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, true, 8);
     m.soc.write32(GPIO_BASE + 0x554 + 4 * data_pin, 133);
     m.soc.write32(GPIO_BASE + 0x554 + 4 * cs_pin, 132);
     m.soc
@@ -2471,6 +2792,8 @@ fn i2s_gdma_out_feeds_tx_fifo() {
     let desc = 0x3FC8_1000;
     let buf = 0x3FC8_2000;
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, true, 6);
+    syscon_clk(&mut m, false, 4);
     // Descriptor: owner=1, eof=1, length=8 bytes (2 words).
     m.soc
         .write32(desc, (1u32 << 31) | (1u32 << 30) | (8u32 << 12));
@@ -2518,6 +2841,7 @@ fn gdma_spi_out_runs_dma_transfer_and_in_returns_rx() {
     let rdesc = 0x3FC8_1100;
     let rbuf = 0x3FC8_2100;
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, true, 6);
     // TX descriptor: owner=1, eof=1, length=4 bytes.
     m.soc
         .write32(desc, (1u32 << 31) | (1u32 << 30) | (4u32 << 12));
@@ -2570,6 +2894,71 @@ fn gdma_spi_out_runs_dma_transfer_and_in_returns_rx() {
     );
 }
 
+/// UHCI UART-DMA at the SoC level: a GDMA OUT descriptor (peri_sel 2)
+/// moves bytes into UART1's TX FIFO through the framing-off pipe, and a
+/// GDMA IN descriptor drains injected UART1 RX bytes back to DRAM, with
+/// TX_START/RX_START latched in UHCI INT_ST. (Matrix source-14 delivery
+/// follows the identical pattern proven by the SHA/ADC vector tests.)
+#[test]
+fn uhci_gdma_moves_uart_bytes_both_directions() {
+    use esp32s3_soc::gdma::{GDMA_BASE, GDMA_UHCI0_PERIPH};
+    use esp32s3_soc::uhci::UHCI0_BASE;
+    let desc = 0x3FC8_1000;
+    let buf = 0x3FC8_2000;
+    let rdesc = 0x3FC8_3000;
+    let rbuf = 0x3FC8_4000;
+    let mut m = Esp32S3::new();
+    syscon_clk(&mut m, true, 6);
+    syscon_clk(&mut m, false, 8);
+    // UHCI: clock on, UART1 selected; enable both start interrupts.
+    m.soc.write32(UHCI0_BASE, (1 << 11) | (1 << 3));
+    m.soc.write32(UHCI0_BASE + 0x0C, (1 << 1) | (1 << 0));
+    // OUT: 8-byte message to UART1 TX.
+    m.soc
+        .write32(desc, (1u32 << 31) | (1u32 << 30) | (8u32 << 12));
+    m.soc.write32(desc + 4, buf);
+    m.soc.write32(desc + 8, 0);
+    m.soc.write32(buf, 0x4943_4855); // "UHCI" LE
+    m.soc.write32(buf + 4, 0x5854_2D44); // "D-TX" LE
+    m.soc.write32(GDMA_BASE + 0xA8, GDMA_UHCI0_PERIPH); // out_peri_sel[0]
+    m.soc
+        .write32(GDMA_BASE + 0x80, (desc & 0x000F_FFFF) | (1 << 21));
+    assert_eq!(
+        m.take_uart_tx(1),
+        alloc::vec![0x55, 0x48, 0x43, 0x49, 0x44, 0x2D, 0x54, 0x58],
+        "TX bytes reach UART1"
+    );
+    assert_ne!(
+        m.soc.read32(UHCI0_BASE + 0x08) & (1 << 1),
+        0,
+        "TX_START latched"
+    );
+    // IN: inject 8 RX bytes, drain to DRAM.
+    for &b in b"UHCI-RX!" {
+        m.soc.uart_inject_rx(1, b);
+    }
+    m.soc
+        .write32(rdesc, (1u32 << 31) | (1u32 << 30) | (16u32 << 12));
+    m.soc.write32(rdesc + 4, rbuf);
+    m.soc.write32(rdesc + 8, 0);
+    m.soc.write32(GDMA_BASE + 0x108, GDMA_UHCI0_PERIPH); // in_peri_sel[1]
+    m.soc
+        .write32(GDMA_BASE + 0xE0, (rdesc & 0x000F_FFFF) | (1 << 22));
+    let mut got = alloc::vec::Vec::new();
+    for i in 0..2 {
+        got.extend_from_slice(&m.soc.read32(rbuf + 4 * i).to_le_bytes());
+    }
+    assert_eq!(&got[..8], b"UHCI-RX!", "RX bytes reach DRAM");
+    assert_ne!(
+        m.soc.read32(UHCI0_BASE + 0x08) & (1 << 0),
+        0,
+        "RX_START latched"
+    );
+    // Clear both via INT_CLR.
+    m.soc.write32(UHCI0_BASE + 0x10, (1 << 1) | (1 << 0));
+    assert_eq!(m.soc.read32(UHCI0_BASE + 0x08), 0, "INT_ST clears");
+}
+
 /// MCPWM capture loopback at the SoC level: timer0 PWM drives GPIO2 via the
 /// output matrix, GPIO2 feeds CAP0 via input selection, and two rising
 /// edges latch timer values ~10000 ticks apart with the CAP0 interrupt.
@@ -2579,6 +2968,7 @@ fn mcpwm_capture_measures_pwm_period_via_loopback() {
     use esp32s3_soc::memmap::GPIO_BASE;
     let mcpwm = 0x6001_E000;
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, false, 17);
     // GPIO2 <- PWM0_OUT0A (160), output driver on.
     m.soc.write32(GPIO_BASE + 0x554 + 2 * 4, 160);
     m.soc.write32(GPIO_BASE + GPIO_ENABLE_W1TS, 1 << 2);
@@ -2612,6 +3002,7 @@ fn mcpwm_carrier_chops_output_on_gpio() {
     use esp32s3_soc::memmap::GPIO_BASE;
     let mcpwm = 0x6001_E000;
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, false, 17);
     // GPIO2 <- PWM0_OUT0A (160), output driver on.
     m.soc.write32(GPIO_BASE + 0x554 + 2 * 4, 160);
     m.soc.write32(GPIO_BASE + GPIO_ENABLE_W1TS, 1 << 2);
@@ -2621,7 +3012,7 @@ fn mcpwm_carrier_chops_output_on_gpio() {
     m.soc.write32(mcpwm + 0x40, 50);
     m.soc.write32(mcpwm + 0x50, (2 << 4) | 1);
     // Carrier: en + prescale 0 (period 8 steps) + duty 4/8.
-    m.soc.write32(mcpwm + 0x64, 1 | (0 << 1) | (4 << 5));
+    m.soc.write32(mcpwm + 0x64, 1 | (4 << 5));
     for _ in 0..200 {
         m.step();
     }
@@ -2694,6 +3085,7 @@ fn spi_slave_dma_routes_through_gdma_links() {
 fn gdma_m2m_copies_memory_to_memory() {
     use esp32s3_soc::gdma::GDMA_BASE;
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, true, 6);
     // DRAM scratch: source pattern, source/dest descriptors (8 bytes).
     let src = 0x3FC8_2000u32;
     let dst = 0x3FC8_2100u32;
@@ -3058,6 +3450,7 @@ fn cross_core_interrupt_yields_to_other_core() {
 #[test]
 fn sdmmc_idmac_walks_descriptors() {
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, true, 7);
     let sd = SDMMC_BASE;
 
     // Descriptor ring + data buffers in DRAM.
@@ -3130,6 +3523,7 @@ fn sdmmc_idmac_reads_fat_boot_sectors() {
     };
 
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, true, 7);
     let sd = SDMMC_BASE;
     let desc = 0x3FCE_4000;
     let buf = 0x3FCE_5000;
@@ -3331,6 +3725,7 @@ fn gpio_rmt_edge_fires_gpio_isr() {
     );
 
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, false, 9);
     m.load_image(IRAM_BASE, a.bytes());
     m.load_image(0x4000_01C0, h.bytes());
     m.cpu[0].pc = code_start;
@@ -3358,6 +3753,7 @@ fn rmt_tx_loopback_into_rx_channel() {
     use esp32s3_soc::rmt::{RMT_BASE, RMTMEM_BASE};
 
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, false, 9);
     // GPIO2 <- RMT TX ch0 (signal 81), output enabled.
     m.soc.write32(GPIO_BASE + 0x554 + 2 * 4, 81);
     m.soc.write32(GPIO_BASE + 0x20, 1 << 2);
@@ -3649,6 +4045,8 @@ fn i2s_in_pump_advances_desc_chain() {
     use esp32s3_soc::gdma::{GDMA_BASE, GDMA_I2S0_PERIPH};
     use esp32s3_soc::memmap::I2S0_BASE;
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, true, 6);
+    syscon_clk(&mut m, false, 4);
     // Two IN descs: 8 bytes then 8 bytes (4 words total), eof on second.
     let d0 = 0x3FC8_3000u32;
     let d1 = 0x3FC8_3100u32;
@@ -3691,6 +4089,8 @@ fn i2s_out_pump_large_chain() {
     use esp32s3_soc::gdma::{GDMA_BASE, GDMA_I2S0_PERIPH};
     use esp32s3_soc::memmap::I2S0_BASE;
     let mut m = Esp32S3::new();
+    syscon_clk(&mut m, true, 6);
+    syscon_clk(&mut m, false, 4);
     // OUT chain across uneven descriptors: 960 + 8 bytes, eof on second.
     // EOF raises the per-descriptor event but does not stop the walk.
     let d0 = 0x3FC8_5000u32;
@@ -3733,4 +4133,505 @@ fn touch_status_reports_injected_counter() {
     m.soc.touch_inject(3, 1877);
     assert_eq!(m.soc.read32(SENS + 0xAC), 1877);
     assert_eq!(m.soc.read32(SENS + TOUCH_CHN_ST_OFF) & (1 << 31), 1 << 31);
+}
+
+#[test]
+fn uart_flow_control_crosstalk_via_gpio_matrix() {
+    // UART1 TX flow control driven by GPIO2 (U1CTS_IN = 16), RTS observed
+    // on GPIO3 (U1RTS_OUT = 16). Hand-assembled firmware would work, but
+    // MMIO pokes exercise the identical bus path with less encoding risk.
+    use esp32s3_soc::memmap::{GPIO_BASE, UART1_BASE};
+    let mut m = Esp32S3::new();
+    syscon_clk(&mut m, false, 5); // UART1
+    // GPIO2 output high (CTS stop); GPIO3 output-enabled for RTS readback
+    // (peripheral-driven pins read back the driven signal via GPIO_IN).
+    m.soc.write32(GPIO_BASE + 0x24, 1 << 2); // ENABLE_W1TS pin 2
+    m.soc.write32(GPIO_BASE + 0x08, 1 << 2); // OUT_W1TS pin 2 -> high
+    m.soc.write32(GPIO_BASE + 0x24, 1 << 3); // ENABLE_W1TS pin 3
+    m.soc.write32(GPIO_BASE + 0x554 + 3 * 4, 16); // FUNC_OUT_SEL[3] = U1RTS
+    m.soc.write32(GPIO_BASE + 0x154 + 16 * 4, 2); // FUNC_IN_SEL[16] = GPIO2
+    // TX flow on: FIFO byte held (CTS high), console sees nothing.
+    m.soc.write32(UART1_BASE + 0x20, 1 << 15); // CONF0 TX_FLOW_EN
+    m.soc.write32(UART1_BASE, 0x41); // FIFO 'A'
+    for _ in 0..10 {
+        m.step();
+    }
+    assert!(m.soc.take_uart_tx(1).is_empty(), "held while CTS high");
+    // Drop CTS (GPIO2 low): flush on the next steps.
+    m.soc.write32(GPIO_BASE + 0x0C, 1 << 2); // OUT_W1TC pin 2
+    for _ in 0..10 {
+        m.step();
+    }
+    assert_eq!(
+        m.soc.take_uart_tx(1),
+        alloc::vec![0x41],
+        "flushed on CTS go"
+    );
+    // RX flow on with threshold 1: RTS (GPIO3) ready-low while RX empty.
+    m.soc.write32(UART1_BASE + 0x20, (1 << 15) | (1 << 22)); // TX+RX flow
+    m.soc.write32(0x6001_0000 + 0x60, 1 << 7); // MEM_CONF RX_FLOW_THRHD=1
+    for _ in 0..10 {
+        m.step();
+    }
+    assert_eq!(m.soc.gpio_output() & (1 << 3), 0, "RTS ready while empty");
+    // Fill RX to threshold: RTS stops (high).
+    m.soc.uart_inject_rx(1, 0x5A);
+    for _ in 0..10 {
+        m.step();
+    }
+    assert_ne!(m.soc.gpio_output() & (1 << 3), 0, "RTS stop at threshold");
+}
+
+/// Inject a peer CAN frame into TWAI in normal (non-loopback) mode: the
+/// virtual-second-node path fills the RX buffer subject to the acceptance
+/// filter, and RRB releases it — exactly like a bus reception.
+#[test]
+fn twai_inject_rx_delivers_peer_frame_in_normal_mode() {
+    use esp32s3_soc::twai::{FRAME_LEN, TWAI_BASE};
+
+    let mut m = Esp32S3::new();
+    syscon_clk(&mut m, false, 19);
+    let b = TWAI_BASE;
+
+    // Reset mode for the filter, accept-all, then normal mode (stm = 0).
+    m.soc.write32(b, 1);
+    for off in [0x40u32, 0x44, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C] {
+        m.soc
+            .write32(b + off, if off < 0x50 { 0 } else { 0xFFFF_FFFF });
+    }
+    m.soc.write32(b, 0);
+
+    let mut frame = [0u8; FRAME_LEN];
+    frame[0] = 0x08;
+    frame[1] = 0x24;
+    frame[2] = 0x60;
+    for (i, v) in (0x13u8..0x13 + 10).enumerate() {
+        frame[3 + i] = v;
+    }
+    m.soc.twai_inject_rx(frame);
+    assert_eq!(m.soc.read32(b + 0x08) & 1, 1, "rbs set by injected frame");
+    for (i, &v) in frame.iter().enumerate() {
+        assert_eq!(
+            m.soc.read32(b + 0x40 + (i as u32) * 4),
+            v as u32,
+            "RX byte {i} differs"
+        );
+    }
+    m.soc.write32(b + 0x04, 1 << 2); // RRB
+    assert_eq!(m.soc.read32(b + 0x08) & 1, 0, "RRB did not clear rbs");
+}
+
+/// Deep-sleep digital-pad hold (RTC_CNTL_DIG_PAD_HOLD @ +0xDC): a held pad
+/// keeps driving across the wake reboot; an unheld pad resets with the
+/// digital core.
+#[test]
+fn deep_sleep_gpio_hold_preserves_driven_pins() {
+    use esp32s3_soc::memmap::GPIO_BASE;
+    use esp32s3_soc::rtc::{
+        RTC_CNTL_BASE, SLEEP_EN_BIT, SLP_TIMER0_OFF, SLP_TIMER1_OFF, SLP_WAKEUP_CAUSE_OFF,
+        STATE0_OFF,
+    };
+    const SLP_TIMER0: u32 = RTC_CNTL_BASE + SLP_TIMER0_OFF;
+    const SLP_TIMER1: u32 = RTC_CNTL_BASE + SLP_TIMER1_OFF;
+    const STATE0: u32 = RTC_CNTL_BASE + STATE0_OFF;
+    const WAKEUP_CAUSE: u32 = RTC_CNTL_BASE + SLP_WAKEUP_CAUSE_OFF;
+    const PAD_HOLD: u32 = RTC_CNTL_BASE + 0xDC;
+
+    for held in [true, false] {
+        let mut m = Esp32S3::new();
+        // GPIO2 output high.
+        m.soc.write32(GPIO_BASE + 0x24, 1 << 2);
+        m.soc.write32(GPIO_BASE + 0x08, 1 << 2);
+        // Deep sleep with a short timer.
+        m.soc.write32(SLP_TIMER0, 0x100);
+        m.soc.write32(SLP_TIMER1, 0);
+        m.soc.write32(RTC_CNTL_BASE + 0x90, 1 << 31); // DIG_PWC deep
+        if held {
+            m.soc.write32(PAD_HOLD, 1 << 2);
+        }
+        let prev = m.soc.read32(STATE0);
+        m.soc.write32(STATE0, prev | SLEEP_EN_BIT);
+        let mut woke = false;
+        for _ in 0..200_000 {
+            m.step();
+            if m.soc.read32(WAKEUP_CAUSE) & (1 << 3) != 0 {
+                woke = true;
+                break;
+            }
+        }
+        assert!(woke, "held={held}: machine did not wake");
+        assert_eq!(
+            m.soc.gpio_output() & (1 << 2),
+            if held { 1 << 2 } else { 0 },
+            "held={held}: GPIO2 after wake"
+        );
+    }
+}
+
+/// USB-Serial-JTAG TX hold while the USB_DEVICE clock (EN1 bit 10) is off:
+/// EP1 bytes stage invisibly and flush to the console on clock return.
+#[test]
+fn usb_serial_tx_holds_while_clock_gated() {
+    const USB: u32 = 0x6003_8000;
+    const EN1: u32 = 0x600C_001C;
+    let mut m = Esp32S3::new();
+    // Gate the USB clock off (RMW keeps the other default enables).
+    let en1 = m.soc.read32(EN1);
+    m.soc.write32(EN1, en1 & !(1 << 10));
+    m.soc.write32(USB, 0x48); // EP1 'H'
+    m.soc.write32(USB, 0x69); // EP1 'i'
+    for _ in 0..10 {
+        m.step();
+    }
+    assert!(m.soc.take_usb_serial_tx().is_empty(), "held while gated");
+    // Clock back on: the tick flushes the endpoint FIFO to the console.
+    m.soc.write32(EN1, en1 | (1 << 10));
+    for _ in 0..10 {
+        m.step();
+    }
+    assert_eq!(m.soc.take_usb_serial_tx(), alloc::vec![0x48, 0x69]);
+}
+
+/// Secure-boot fail-closed gate: with eFuse SECURE_BOOT_EN burned (BLK0
+/// word 5 = REPEAT_DATA4 bit 20), `boot_from_flash` refuses the boot and
+/// parks both CPUs instead of insecurely booting an unverified image.
+/// Default eFuse boots normally.
+#[test]
+fn secure_boot_enabled_denies_boot_and_parks_cpus() {
+    const EFUSE_BASE: u32 = 0x6000_7000;
+    let mut m = Esp32S3::new();
+    // Burn SECURE_BOOT_EN through the real PGM path (staged words +
+    // PGM_CMD BLK_NUM 0).
+    for (i, w) in [0u32, 0, 0, 0, 0, 1 << 20, 0, 0].iter().enumerate() {
+        m.soc.write32(EFUSE_BASE + (i as u32) * 4, *w);
+    }
+    m.soc.write32(EFUSE_BASE + 0x1D4, 0x2); // PGM bit, BLK_NUM 0
+    assert!(m.soc.secure_boot_enabled(), "SECURE_BOOT_EN burned");
+    m.boot_from_flash(&[0xFF; 0x1000]);
+    assert!(m.secure_boot_rejected(), "boot refused");
+    let pc0 = m.cpu[0].pc;
+    for _ in 0..100 {
+        m.step();
+    }
+    assert_eq!(m.cpu[0].pc, pc0, "CPUs parked");
+    assert!(m.soc.take_uart_tx(0).is_empty(), "no output when denied");
+}
+
+/// Light-sleep GPIO wakeup (RTCIO PINn WAKEUP_ENABLE + level): a held-high
+/// RTC pin with a high-level wakeup armed resumes immediately with the
+/// GPIO cause bit.
+#[test]
+fn light_sleep_gpio_wakeup_resumes_with_gpio_cause() {
+    use esp32s3_soc::memmap::GPIO_BASE;
+    use esp32s3_soc::rtc::{RTC_CNTL_BASE, SLEEP_EN_BIT, STATE0_OFF};
+    let mut m = Esp32S3::new();
+    // GPIO4 output high.
+    m.soc.write32(GPIO_BASE + 0x24, 1 << 4);
+    m.soc.write32(GPIO_BASE + 0x08, 1 << 4);
+    // RTCIO PIN4_REG (page offset 0x438): WAKEUP_ENABLE + high level.
+    m.soc.write32(0x6000_8438, (1 << 10) | (5 << 7));
+    // WAKEUP_STATE ENA bit 2 (GPIO_TRIG).
+    let ws = m.soc.read32(RTC_CNTL_BASE + 0x3C);
+    m.soc.write32(RTC_CNTL_BASE + 0x3C, ws | (1 << 17));
+    // Light sleep (DIG_PWC default = light).
+    let prev = m.soc.read32(RTC_CNTL_BASE + STATE0_OFF);
+    m.soc
+        .write32(RTC_CNTL_BASE + STATE0_OFF, prev | SLEEP_EN_BIT);
+    for _ in 0..1000 {
+        m.step();
+        if !m.is_asleep() {
+            break;
+        }
+    }
+    assert!(!m.is_asleep(), "GPIO wakeup did not resume");
+    assert_eq!(
+        m.soc.read32(RTC_CNTL_BASE + 0x130) & (1 << 2),
+        1 << 2,
+        "GPIO cause bit"
+    );
+}
+
+/// Light-sleep UART0 wakeup: pending RX bytes at entry resume immediately
+/// with the UART0 cause bit.
+#[test]
+fn light_sleep_uart_wakeup_resumes_with_uart_cause() {
+    use esp32s3_soc::rtc::{RTC_CNTL_BASE, SLEEP_EN_BIT, STATE0_OFF};
+    let mut m = Esp32S3::new();
+    m.soc.uart_inject_rx(0, 0x5A);
+    // WAKEUP_STATE ENA bit 6 (UART0_TRIG).
+    let ws = m.soc.read32(RTC_CNTL_BASE + 0x3C);
+    m.soc.write32(RTC_CNTL_BASE + 0x3C, ws | (1 << 21));
+    // Light sleep (DIG_PWC default = light).
+    let prev = m.soc.read32(RTC_CNTL_BASE + STATE0_OFF);
+    m.soc
+        .write32(RTC_CNTL_BASE + STATE0_OFF, prev | SLEEP_EN_BIT);
+    for _ in 0..1000 {
+        m.step();
+        if !m.is_asleep() {
+            break;
+        }
+    }
+    assert!(!m.is_asleep(), "UART wakeup did not resume");
+    assert_eq!(
+        m.soc.read32(RTC_CNTL_BASE + 0x130) & (1 << 6),
+        1 << 6,
+        "UART0 cause bit"
+    );
+}
+
+/// MCPWM timer-event interrupt delivery: TIMER0 TEZ (INT bit 3) routes
+/// source 31 to line 15 (level 3); the handler clears INT_CLR and counts.
+#[test]
+fn mcpwm_tez_interrupt_delivers_to_vector() {
+    use crate::asm::Asm;
+    use esp32s3_soc::mcpwm::{MCPWM_BASE, MCPWM_INTR_SOURCE};
+    use esp32s3_soc::memmap::INT_MATRIX_BASE;
+
+    const CTR: u32 = 0x3FC8_0500;
+    const STASH: u32 = 0x3FC8_0504;
+    let mut a = Asm::new(IRAM_BASE);
+    let l_ctr = a.offset();
+    a.lit(0);
+    let l_stash = a.offset();
+    a.lit(0);
+    let l_mat = a.offset();
+    a.lit(0);
+    let l_mcpwm = a.offset();
+    a.lit(0);
+    let code_start = a.pc();
+    let p = a.l32r(2); // INT_MATRIX_BASE
+    a.patch_l32r(p, IRAM_BASE + l_mat as u32);
+    a.movi_n(3, 15);
+    a.s32i(3, 2, 4 * MCPWM_INTR_SOURCE); // matrix source 31 -> line 15
+    let p = a.l32r(2); // MCPWM_BASE
+    a.patch_l32r(p, IRAM_BASE + l_mcpwm as u32);
+    // TIMER0 up, period 500, run (slow enough that the handler
+    // exits and the app observes CTR between TEZ refires).
+    a.li(3, 500 << 8);
+    a.s32i(3, 2, 0x04);
+    a.li(3, (1 << 3) | 2);
+    a.s32i(3, 2, 0x08);
+    a.li(3, 1 << 3);
+    a.s32i(3, 2, 0x110); // INT_ENA TIMER0_TEZ
+    a.li(3, 0x8000); // INTENABLE bit 15
+    a.wsr(228, 3);
+    a.rsil(4, 0);
+    let loop_start = a.pc();
+    let p = a.l32r(2); // CTR
+    a.patch_l32r(p, IRAM_BASE + l_ctr as u32);
+    a.l32i(3, 2, 0);
+    a.beqz(3, loop_start); // spin while CTR == 0
+    a.li(4, 0xCAFE);
+    let p = a.l32r(5); // STASH
+    a.patch_l32r(p, IRAM_BASE + l_stash as u32);
+    a.s32i(4, 5, 0);
+    let done = a.pc();
+    a.j(done);
+    a.bytes_mut()[l_ctr..l_ctr + 4].copy_from_slice(&CTR.to_le_bytes());
+    a.bytes_mut()[l_stash..l_stash + 4].copy_from_slice(&STASH.to_le_bytes());
+    a.bytes_mut()[l_mat..l_mat + 4].copy_from_slice(&INT_MATRIX_BASE.to_le_bytes());
+    a.bytes_mut()[l_mcpwm..l_mcpwm + 4].copy_from_slice(&MCPWM_BASE.to_le_bytes());
+
+    // Level-3 handler: CTR += 1, clear TIMER0_TEZ, rfi 3.
+    let mut h = Asm::new(0x4000_01C0);
+    h.li(6, CTR as i32);
+    h.l32i(7, 6, 0);
+    h.addi(7, 7, 1);
+    h.s32i(7, 6, 0);
+    h.li(8, MCPWM_BASE as i32);
+    h.li(9, 1 << 3);
+    h.s32i(9, 8, 0x11C); // INT_CLR TIMER0_TEZ
+    h.rfi(3);
+    assert!(h.bytes().len() <= 0x40, "handler fits the slot");
+
+    let mut m = Esp32S3::new();
+    syscon_clk(&mut m, false, 17); // MCPWM0
+    m.load_image(IRAM_BASE, a.bytes());
+    m.load_image(0x4000_01C0, h.bytes());
+    m.cpu[0].pc = code_start;
+    for _ in 0..20000 {
+        if m.cpu[0].pc == done {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.cpu[0].pc, done, "app finished its loop");
+    assert_eq!(m.soc.read32(STASH), 0xCAFE, "stash after MCPWM interrupt");
+    assert_eq!(m.soc.read32(CTR), 1, "handler ran once");
+}
+
+/// USB-OTG string descriptors + SOF advance + disconnect: the simulated
+/// device reports string indexes, answers GET_DESCRIPTOR STRING, the
+/// frame counter advances while clocked, and a disconnect drops ConnSts.
+#[test]
+fn usb_otg_strings_sof_and_disconnect() {
+    const USB: u32 = 0x6008_0000;
+    let mut m = Esp32S3::new();
+    syscon_clk(&mut m, false, 23); // USB controller clock
+    // Power the port (device connects, like the usb_host sketch).
+    m.soc.write32(USB + 0x440, 1 << 12); // HPRT_PWR
+    assert_ne!(m.soc.read32(USB + 0x440) & 1, 0, "connected");
+    // Force host mode (GUSBCFG bit 29) so DFIFO stages SETUP payloads.
+    m.soc.write32(USB + 0x00C, 1 << 29);
+    // GET_DESCRIPTOR STRING1 via the control path: stage the 8 SETUP
+    // bytes (rt=0x80 req=6 val=0x0301 len=20) into DFIFO0, then run the
+    // channel like the usb_host sketch does.
+    m.soc.write32(USB + 0x1000, 0x03010680);
+    m.soc.write32(USB + 0x1000, 0x00140000);
+    // HCTSIZ0: xfer 20, pid SETUP(3).
+    m.soc.write32(USB + 0x510, 20 | (3 << 19) | (3 << 29));
+    // HCCHAR0: MPS 64, EP0, addr 0, ChEna.
+    m.soc.write32(USB + 0x500, 64 | (1 << 31));
+    // IN data stage (pid 2, dir bit 15): moves the staged string into RXFIFO.
+    m.soc.write32(USB + 0x510, 20 | (1 << 19) | (2 << 29));
+    m.soc.write32(USB + 0x500, 64 | (1 << 15) | (1 << 31));
+    // Transfer ran synchronously: RXFIFO holds the string descriptor.
+    let hcint = m.soc.read32(USB + 0x508);
+    let w0 = m.soc.read32(USB + 0x1000);
+    assert_eq!(hcint & 0x9, 0x1, "XFERCOMPL, no STALL");
+    assert_eq!(w0 & 0xFFFF, 0x0314, "STR1 header (len 20, type 3)");
+    assert_eq!((w0 >> 16) & 0xFFFF, 0x0045, "STR1 'E'");
+    // SOF advances while clocked.
+    let f0 = m.soc.read32(USB + 0x408);
+    for _ in 0..10 {
+        m.step();
+    }
+    assert!(m.soc.read32(USB + 0x408) != f0, "HFNUM advances");
+    // Disconnect drops ConnSts + ENA and latches enable-change.
+    m.soc.usb_otg_disconnect();
+    let hprt = m.soc.read32(USB + 0x440);
+    assert_eq!(hprt & 1, 0, "ConnSts dropped");
+    assert_eq!(hprt & (1 << 2), 0, "port disabled");
+    assert_ne!(hprt & (1 << 3), 0, "enable-change latched");
+}
+
+/// UHCI SLIP framing through GDMA: with SEPER_EN set, OUT bytes frame
+/// (separators + escapes) onto the UART line, and IN bytes deframe back
+/// into DRAM (split pairs reassembled).
+#[test]
+fn uhci_slip_frames_out_and_deframes_in() {
+    use esp32s3_soc::gdma::{GDMA_BASE, GDMA_UHCI0_PERIPH};
+    use esp32s3_soc::uhci::UHCI0_BASE;
+    let desc = 0x3FC8_1000;
+    let buf = 0x3FC8_2000;
+    let rdesc = 0x3FC8_3000;
+    let rbuf = 0x3FC8_4000;
+    let mut m = Esp32S3::new();
+    syscon_clk(&mut m, true, 6);
+    syscon_clk(&mut m, false, 8);
+    // UHCI: clock on, UART1 selected, SEPER_EN framing on.
+    m.soc.write32(UHCI0_BASE, (1 << 11) | (1 << 3) | (1 << 5));
+    // OUT: 4 bytes incl. escapables -> framed on the UART line.
+    m.soc
+        .write32(desc, (1u32 << 31) | (1u32 << 30) | (4u32 << 12));
+    m.soc.write32(desc + 4, buf);
+    m.soc.write32(desc + 8, 0);
+    m.soc.write32(buf, 0x42DB_C041); // 41 C0 DB 42 LE
+    m.soc.write32(GDMA_BASE + 0xA8, GDMA_UHCI0_PERIPH);
+    m.soc
+        .write32(GDMA_BASE + 0x80, (desc & 0x000F_FFFF) | (1 << 21));
+    assert_eq!(
+        m.take_uart_tx(1),
+        alloc::vec![0xC0, 0x41, 0xDB, 0xDC, 0xDB, 0xDD, 0x42, 0xC0],
+        "SLIP-framed bytes reach UART1"
+    );
+    // IN: framed bytes in UART RX deframe into DRAM.
+    for b in [0xC0u8, 0x41, 0xDB, 0xDC, 0xC0] {
+        m.soc.uart_inject_rx(1, b);
+    }
+    m.soc
+        .write32(rdesc, (1u32 << 31) | (1u32 << 30) | (16u32 << 12));
+    m.soc.write32(rdesc + 4, rbuf);
+    m.soc.write32(rdesc + 8, 0);
+    m.soc.write32(GDMA_BASE + 0x108, GDMA_UHCI0_PERIPH);
+    m.soc
+        .write32(GDMA_BASE + 0xE0, (rdesc & 0x000F_FFFF) | (1 << 22));
+    let w = m.soc.read32(rbuf);
+    assert_eq!(w & 0xFFFF, 0xC041, "deframed bytes reach DRAM, got {w:#x}");
+}
+
+/// LCD_CAM GDMA-RX end to end at the SoC level: an IN descriptor chain
+/// for the camera peri plus CAM_START streams a staged frame through the
+/// DMA pump into DRAM (mirrors the `esp32s3_camcap` GDMA leg).
+#[test]
+fn cam_gdma_rx_streams_frame_to_descriptors() {
+    const CAM: u32 = 0x6004_1000;
+    const GDMA: u32 = 0x6003_F000;
+    let desc = 0x3FC8_1000u32;
+    let buf = 0x3FC8_2000u32;
+    let mut m = Esp32S3::new();
+    syscon_clk(&mut m, true, 6);
+    syscon_clk(&mut m, true, 8);
+    m.soc
+        .cam_inject_frame(&[0x04, 0x03, 0x02, 0x01, 0x44, 0x33, 0x22, 0x11]);
+    // IN desc ch2, peri 5, len 8, eof, owned.
+    m.soc
+        .write32(desc, (1u32 << 31) | (1u32 << 30) | (8u32 << 12));
+    m.soc.write32(desc + 4, buf);
+    m.soc.write32(desc + 8, 0);
+    m.soc.write32(GDMA + 0x1C8, 5);
+    m.soc
+        .write32(GDMA + 0x1A0, (desc & 0x000F_FFFF) | (1 << 22));
+    // CAM_CTRL + START (with LINE_INT_NUM(7) + INT_ENA like the sketch).
+    m.soc.write32(CAM + 0x04, (1 << 31) | (1 << 4));
+    m.soc.write32(CAM + 0x64, (1 << 2) | (1 << 3));
+    m.soc.write32(CAM + 0x08, (7 << 16) | (1 << 29));
+    for i in 0..200 {
+        m.step();
+        if m.soc.read32(desc) & (1 << 31) == 0 {
+            break;
+        }
+        if i == 199 {
+            panic!("owner stuck");
+        }
+    }
+    assert_eq!(m.soc.read32(buf), 0x01020304);
+    assert_eq!(m.soc.read32(buf + 4), 0x11223344);
+}
+
+/// Deep-sleep ULP-trap wakeup (WAKEUP_STATE TRIG bit 13, RISCV_TRAP_TRIG):
+/// a running ULP that halts mid-sleep wakes the chip with the trap cause.
+#[test]
+fn deep_sleep_ulp_trap_wakes_with_trap_cause() {
+    use esp32s3_soc::memmap::RTC_SLOW_BASE;
+    use esp32s3_soc::rtc::{
+        RTC_CNTL_BASE, SLEEP_EN_BIT, SLP_TIMER0_OFF, SLP_TIMER1_OFF, SLP_WAKEUP_CAUSE_OFF,
+        STATE0_OFF,
+    };
+    use esp32s3_soc::ulp::ULP_BASE;
+    const WAKEUP_CAUSE: u32 = RTC_CNTL_BASE + SLP_WAKEUP_CAUSE_OFF;
+    let mut m = Esp32S3::new();
+    // Hand-assembled rv32im program: store to ULP reg slot 0 then ebreak
+    // (halts after a few steps — mid-sleep, like a trap).
+    let prog: [u32; 6] = [
+        0x6000_80B7,
+        0x10C0_8093,
+        0x1234_5137,
+        0x6781_0113,
+        0x0020_A023,
+        0x0010_0073,
+    ];
+    for (i, w) in prog.iter().enumerate() {
+        m.soc.write32(RTC_SLOW_BASE + (i as u32) * 4, *w);
+    }
+    // Release the ULP, arm the trap trigger, enter deep sleep — all via
+    // MMIO with no steps between, so the ULP is still running at entry.
+    m.soc.write32(ULP_BASE, 1);
+    let ws = m.soc.read32(RTC_CNTL_BASE + 0x3C);
+    m.soc.write32(RTC_CNTL_BASE + 0x3C, ws | (1 << (15 + 13)));
+    m.soc.write32(RTC_CNTL_BASE + SLP_TIMER0_OFF, 0x100);
+    m.soc.write32(RTC_CNTL_BASE + SLP_TIMER1_OFF, 0);
+    m.soc.write32(RTC_CNTL_BASE + 0x90, 1 << 31); // DIG_PWC deep
+    let prev = m.soc.read32(RTC_CNTL_BASE + STATE0_OFF);
+    m.soc
+        .write32(RTC_CNTL_BASE + STATE0_OFF, prev | SLEEP_EN_BIT);
+    let mut woke = false;
+    for _ in 0..200_000 {
+        m.step();
+        if m.soc.read32(WAKEUP_CAUSE) & (1 << 13) != 0 {
+            woke = true;
+            break;
+        }
+    }
+    assert!(woke, "ULP trap did not wake deep sleep");
 }

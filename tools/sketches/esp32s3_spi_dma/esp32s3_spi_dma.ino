@@ -51,6 +51,9 @@ static int wait_level(int pin, int level, uint32_t budget) {
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C001C) |= (1u << 6);
+  *(volatile uint32_t*)(0x600C0018) |= (1u << 6); // SPI2
   delay(50);
 
   // Route SPI2 CLK/MOSI/CS0 to GPIO pins (peripheral output driver).

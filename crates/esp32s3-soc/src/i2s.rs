@@ -36,6 +36,12 @@
 //!   4-channel).
 //! - **PDM**: `tx_pdm_en` (`TX_CONF` bit 20) re-encodes each transmitted word
 //!   as a first-order sigma-delta PDM bitstream on the SD line.
+//! - **PDM RX** (`RX_PDM2PCM_EN`, `RX_CONF` bit 21): host-injected PDM bits
+//!   (`inject_pdm`, MSB-first words) decimate through a SINC^1 moving
+//!   average (OSR 64) into signed 16-bit PCM words that enter the normal
+//!   injected-RX path (shift + FIFO + `rx_done`). Higher-order SINC stages
+//!   are not modeled; without a PDM microphone the bit source is the host
+//!   (unit-tested — no firmware-reachable producer exists, so no sketch).
 //!
 //! KNOWN LIMITATIONS: `tx_clkm_conf.clk_en` (bit 29) gating is not modeled
 //! (the clock always runs once TX is started); slave mode requires an external
@@ -85,6 +91,14 @@ const TX_SLAVE_MOD: u32 = 1 << 3;
 const RX_SLAVE_MOD: u32 = 1 << 3;
 const TX_TDM_EN: u32 = 1 << 19;
 const TX_PDM_EN: u32 = 1 << 20;
+// Kept for the register map (RX_CONF bit 21 selects the PDM front-end
+// into the RX path): it has no behavioral hook because both front-ends
+// (PDM pins, I2S pins) are host-driven in the model — decimation runs in
+// inject_pdm unconditionally (hmac.rs precedent for map-only consts).
+#[allow(dead_code)]
+const RX_PDM2PCM_EN: u32 = 1 << 21;
+// PDM-RX decimation: SINC^1 moving average over 64 bits into i16 PCM.
+const PDM_OSR: u32 = 64;
 const SIG_LOOPBACK: u32 = 1 << 27;
 
 const RX_DONE: u32 = 1 << 0;
@@ -125,6 +139,9 @@ pub struct I2s {
     tx_bck_div: u32,
     // TX PDM sigma-delta accumulator (first-order).
     tx_pdm_acc: i32,
+    // PDM-RX decimator window (ones count + bits seen in the open window).
+    pdm_win_ones: u32,
+    pdm_win_n: u32,
     // RX serial-shift state.
     rx_busy: bool,
     rx_shift: u32,
@@ -167,6 +184,8 @@ impl I2s {
             tx_sd: 0,
             tx_bck_div: 1,
             tx_pdm_acc: 0,
+            pdm_win_ones: 0,
+            pdm_win_n: 0,
             rx_busy: false,
             rx_shift: 0,
             rx_recv: 0,
@@ -295,6 +314,27 @@ impl I2s {
         b as u32
     }
 
+    /// Feed one word (MSB-first) of PDM bits into the RX decimator.
+    /// With PDM2PCM_EN set, every 64 bits complete a SINC^1 average that
+    /// lands in the injected-RX FIFO as a signed 16-bit PCM word
+    /// (density 0.5 = silence 0; full-scale +/-32767). Without it the
+    /// word passes through as raw bits (PDM front-end without conversion
+    /// is not a driver configuration). Trailing bits under 64 wait for
+    /// more (RX reset clears them with the rest of the engine state).
+    pub fn inject_pdm(&mut self, word: u32) {
+        for i in (0..32).rev() {
+            self.pdm_win_ones += (word >> i) & 1;
+            self.pdm_win_n += 1;
+            if self.pdm_win_n >= PDM_OSR {
+                let pcm = (self.pdm_win_ones * 0xFFFF + PDM_OSR / 2) / PDM_OSR;
+                let signed = pcm as i32 - 0x8000;
+                self.inject_rx(signed as u16 as u32);
+                self.pdm_win_ones = 0;
+                self.pdm_win_n = 0;
+            }
+        }
+    }
+
     /// Push a word into the injected-RX source FIFO (used as the RX data
     /// source when there is no external codec, e.g. in tests).
     pub fn inject_rx(&mut self, word: u32) {
@@ -354,6 +394,8 @@ impl I2s {
                     self.rx_count = 0;
                     self.rx_in_count = 0;
                     self.rx_bit = 0;
+                    self.pdm_win_ones = 0;
+                    self.pdm_win_n = 0;
                     value &= !0x3;
                 }
                 self.regs[Self::idx_of(o)] = value;
@@ -784,5 +826,58 @@ mod tests {
         assert_eq!(d.read32(TX_TDM_CTRL), 0xDEAD_BEEF);
         d.write32(0x40, 0x1357_9246); // TX_PCM2PDM_CONF
         assert_eq!(d.read32(0x40), 0x1357_9246);
+    }
+}
+
+#[cfg(test)]
+mod pdm_rx_tests {
+    use super::*;
+
+    fn pdm_dev() -> I2s {
+        // NOTE: inject PDM bits BEFORE writing RX_START (like inject_rx):
+        // START latches rx_in[0] into the shifter, or a zero word when
+        // empty — mirroring the existing injected-RX test's ordering.
+        let mut d = I2s::new(0);
+        d.write32(RX_CLKM_CONF, 1);
+        d.write32(INT_ENA, RX_DONE);
+        d
+    }
+
+    fn pdm_start(d: &mut I2s) {
+        d.write32(RX_CONF, RX_START_BIT | RX_PDM2PCM_EN);
+    }
+
+    #[test]
+    fn pdm_extremes_decimate_to_full_scale() {
+        let mut d = pdm_dev();
+        d.inject_pdm(0xFFFF_FFFF);
+        d.inject_pdm(0xFFFF_FFFF); // 64 ones
+        d.inject_pdm(0x0000_0000);
+        d.inject_pdm(0x0000_0000); // 64 zeros
+        pdm_start(&mut d);
+        for _ in 0..256 {
+            d.tick();
+        }
+        assert_eq!(d.read32(FIFO), 32767, "full density -> +32767");
+        // -32768 = 0x8000 (16-bit passthrough, like inject_rx words).
+        assert_eq!(d.read32(FIFO), 0x8000, "empty density -> -32768");
+        assert_ne!(d.int_raw & RX_DONE, 0, "rx_done after drain");
+    }
+
+    #[test]
+    fn pdm_half_density_decimates_to_silence() {
+        let mut d = pdm_dev();
+        d.inject_pdm(0xAAAA_AAAA);
+        d.inject_pdm(0xAAAA_AAAA); // 32/64 ones
+        pdm_start(&mut d);
+        for _ in 0..256 {
+            d.tick();
+        }
+        let v = d.read32(FIFO);
+        // (32*65535+32)/64 - 32768 = -1 (integer rounding).
+        assert!(
+            v == 0xFFFF_FFFF || v == 0,
+            "half density ~= silence, got {v:#x}"
+        );
     }
 }

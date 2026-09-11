@@ -25,6 +25,8 @@ static volatile gdma_desc_t g_rxdesc;
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C001C) |= (1u << 6);
   delay(50);
 
   // Pattern table 0: channel 3, 11 dB atten (byte = atten | ch<<2).

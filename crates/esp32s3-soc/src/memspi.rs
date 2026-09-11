@@ -173,6 +173,15 @@ struct Chip {
     /// as BYTES, but the driver programs dummy CYCLES — e.g. 5 for 0xEB —
     /// so any hardcoded count desyncs the stream and reads return zeros).
     collect_total: u8,
+    /// Flash-encryption XTS key (None = plaintext). Mirrored from the Soc
+    /// (which owns the eFuse) whenever eFuse state changes; the model never
+    /// reads eFuse itself.
+    enc: Option<[u8; 32]>,
+    /// Last decrypted 16-byte flash block (decrypt-on-read cache: XTS works
+    /// on 16-byte units, so sequential bulk reads decrypt each block once).
+    dec_base: u32,
+    dec_blk: [u8; 16],
+    dec_ok: bool,
     write_enable: bool,
     /// Status register 1 (SRWD/BP bits; RDSR reports bit 1 = WEL live).
     status: u8,
@@ -216,19 +225,73 @@ impl Chip {
                 r
             }
             ChipState::Read => {
-                let r = flash[self.addr as usize];
+                let r = if let Some(key) = self.enc {
+                    self.dec_read(flash, self.addr, &key)
+                } else {
+                    flash[self.addr as usize]
+                };
                 self.addr = (self.addr + 1) & mask;
                 r
             }
             ChipState::Program => {
                 // NOR program clears bits only (m25p80 flash_write8 ANDs).
                 if self.write_enable {
-                    flash[self.addr as usize] &= tx;
+                    if let Some(key) = self.enc {
+                        self.enc_program(flash, self.addr, tx, &key);
+                    } else {
+                        flash[self.addr as usize] &= tx;
+                    }
                 }
                 self.addr = (self.addr + 1) & mask;
                 0
             }
         }
+    }
+
+    /// Plaintext byte at `addr` through the decrypt-on-read cache (XTS
+    /// works on 16-byte units, so sequential bulk reads decrypt each
+    /// block once; the erased-bypass keeps empty checks reading 0xFF).
+    fn dec_read(&mut self, flash: &[u8], addr: u32, key: &[u8; 32]) -> u8 {
+        let base = addr & !15;
+        if !self.dec_ok || self.dec_base != base {
+            let mut blk = [0xFFu8; 16];
+            for (i, slot) in blk.iter_mut().enumerate() {
+                if let Some(v) = flash.get(base as usize + i) {
+                    *slot = *v;
+                }
+            }
+            self.dec_blk = crate::aes::flash_xts_decrypt(key, base, &blk);
+            self.dec_base = base;
+            self.dec_ok = true;
+        }
+        self.dec_blk[(addr & 15) as usize]
+    }
+
+    /// Encrypted program: read-modify-write the 16-byte block (decrypt,
+    /// AND the byte like NOR, re-encrypt, store) and refresh the cache.
+    fn enc_program(&mut self, flash: &mut [u8], addr: u32, tx: u8, key: &[u8; 32]) {
+        let base = addr & !15;
+        let mut plain = if self.dec_ok && self.dec_base == base {
+            self.dec_blk
+        } else {
+            let mut blk = [0xFFu8; 16];
+            for (i, slot) in blk.iter_mut().enumerate() {
+                if let Some(v) = flash.get(base as usize + i) {
+                    *slot = *v;
+                }
+            }
+            crate::aes::flash_xts_decrypt(key, base, &blk)
+        };
+        plain[(addr & 15) as usize] &= tx;
+        let enc = crate::aes::flash_xts_encrypt(key, base, &plain);
+        for (i, &e) in enc.iter().enumerate() {
+            if let Some(slot) = flash.get_mut(base as usize + i) {
+                *slot = e;
+            }
+        }
+        self.dec_blk = plain;
+        self.dec_base = base;
+        self.dec_ok = true;
     }
 
     /// Command decode (m25p80 decode_new_cmd subset).
@@ -284,6 +347,7 @@ impl Chip {
                 if self.write_enable {
                     flash.fill(0xFF);
                 }
+                self.dec_ok = false;
             }
             // Unknown commands (DP, RES-as-0xAB, HPM, ...): m25p80 replies
             // with repeated 0x00 bytes.
@@ -316,6 +380,7 @@ impl Chip {
                     let end = (a + 0x1000).min(flash.len());
                     flash[a..end].fill(0xFF);
                 }
+                self.dec_ok = false;
                 self.state = ChipState::Idle;
             }
             CMD_BE => {
@@ -324,6 +389,7 @@ impl Chip {
                     let end = (a + 0x1_0000).min(flash.len());
                     flash[a..end].fill(0xFF);
                 }
+                self.dec_ok = false;
                 self.state = ChipState::Idle;
             }
             _ => self.state = ChipState::Idle,
@@ -407,6 +473,13 @@ pub struct Memspi {
 }
 
 impl Memspi {
+    /// Mirror the flash-encryption XTS key from the Soc (None = plaintext
+    /// flash). Invalidates the decrypt cache.
+    pub(crate) fn set_flashenc(&mut self, key: Option<[u8; 32]>) {
+        self.chip.enc = key;
+        self.chip.dec_ok = false;
+    }
+
     pub fn new() -> Self {
         let mut regs = [0u32; REG_COUNT];
         // QEMU esp32s3_spi_reset_hold defaults.
@@ -1044,7 +1117,7 @@ mod tests {
             REG_USER,
             USER_USR_COMMAND | USER_USR_ADDR | USER_USR_MISO,
         );
-        m.write32(&mut f, REG_USER2, 0x0000 | (15 << 28)); // 16-bit OPI read
+        m.write32(&mut f, REG_USER2, 15 << 28); // 16-bit OPI read
         m.write32(&mut f, REG_MISO_DLEN, 31);
         m.write32(&mut f, REG_CMD, CMD_USR);
         assert_eq!(m.read32(REG_W0), 0xA5FF005A);
@@ -1122,7 +1195,7 @@ mod tests {
             REG_USER,
             USER_USR_COMMAND | USER_USR_ADDR | USER_USR_MISO,
         );
-        m.write32(&mut f, REG_USER2, 0x0000 | (15 << 28));
+        m.write32(&mut f, REG_USER2, 15 << 28);
         m.write32(&mut f, REG_MISO_DLEN, 31);
         m.write32(&mut f, REG_CMD, CMD_USR);
         assert_eq!(m.read32(REG_W0), 0);

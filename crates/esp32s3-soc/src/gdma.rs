@@ -70,6 +70,12 @@ pub const GDMA_RMT_PERIPH: u32 = 9;
 pub const GDMA_SPI2_PERIPH: u32 = 0;
 pub const GDMA_SPI3_PERIPH: u32 = 1;
 
+/// UHCI0 peripheral id for `peri_sel` (`soc/gdma_channel.h`
+/// `SOC_GDMA_TRIG_PERIPH_UHCI0` = 2). The GDMA `out` channel moves
+/// descriptor bytes into the UHCI-selected UART's TX FIFO; the `in`
+/// channel drains its RX FIFO to DRAM (framing-off passthrough).
+pub const GDMA_UHCI0_PERIPH: u32 = 2;
+
 /// LCD_CAM peripheral id for `peri_sel` (`soc/gdma_channel.h`
 /// `SOC_GDMA_TRIG_PERIPH_LCD0` = 5, shared with CAM0). The GDMA `out`
 /// channel streams descriptor words through the LCD TX FIFO as one

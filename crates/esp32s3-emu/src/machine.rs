@@ -29,6 +29,13 @@ pub struct Esp32S3 {
     /// True while the machine is fast-forwarding a deep-sleep period (CPU
     /// halted, no instructions executed).
     asleep: bool,
+    /// Secure-boot rejection latch (fail-closed): set by `boot_from_flash`
+    /// when eFuse SECURE_BOOT_EN is set. The ROM stub performs no signature
+    /// verification, so the boot is refused and both CPUs park (no ticks,
+    /// no output) instead of insecurely booting. Cleared on the next
+    /// allowed boot. Signed-image boot needs the espsecure signing
+    /// pipeline (out of scope: no offline flow produces signed images).
+    boot_denied: bool,
     /// Remaining steps to fast-forward while `asleep`.
     sleep_remaining: u64,
     /// Light (resume, clocks gated) vs deep (reboot) sleep for the current
@@ -53,6 +60,7 @@ impl Esp32S3 {
             soc: Soc::new(),
             flash: Vec::new(),
             asleep: false,
+            boot_denied: false,
             sleep_remaining: 0,
             sleep_light: false,
             last_console_byte: None,
@@ -68,6 +76,9 @@ impl Esp32S3 {
     /// ticks and per-core instruction counts identical to the single-core
     /// behavior the machine tests were written against.
     pub fn step(&mut self) -> StepResult {
+        if self.boot_denied {
+            return StepResult::Ok;
+        }
         self.soc.tick_timers(1);
         // A device (e.g. a WDT stage with a reset action) may have requested a
         // hard reset while the timers advanced; reboot before executing more.
@@ -129,6 +140,9 @@ impl Esp32S3 {
     /// granularity, ≤16 instructions late). `step` is untouched and remains
     /// the precise single-step path the machine tests use.
     pub fn step_fast(&mut self) -> (StepResult, StepResult, u32) {
+        if self.boot_denied {
+            return (StepResult::Ok, StepResult::Ok, 0);
+        }
         let llen = self.soc.fast_len_for(0, self.cpu[0].pc);
         let flen = self.soc.fast_len_for(1, self.cpu[1].pc);
         let (Some(llen), Some(flen)) = (llen, flen) else {
@@ -250,8 +264,19 @@ impl Esp32S3 {
     /// peripheral (WDT) triggers a system reset.
     pub fn reset(&mut self) {
         self.cpu = [Cpu::new(0), Cpu::new(1)];
+        // Silicon flash is non-volatile: preserve MEMSPI program/erase
+        // writes (OTA updates, NVS) across the reboot by snapshotting the
+        // live backing store (same length as the original image) instead of
+        // rebooting from the pristine image, which would lose them.
+        let n = self.flash.len();
+        self.flash = self.soc.flash_image()[..n].to_vec();
+        // eFuse is OTP (never wiped by reset): preserve it so encrypted
+        // devices keep their key across reboots.
+        let efuse = self.soc.efuse_snapshot();
         self.soc = Soc::new();
+        self.soc.restore_efuse(efuse);
         self.asleep = false;
+        self.boot_denied = false;
         self.sleep_remaining = 0;
         self.sleep_light = false;
         self.last_console_byte = None;
@@ -263,6 +288,12 @@ impl Esp32S3 {
     /// True while the machine is fast-forwarding a deep-sleep period.
     pub fn is_asleep(&self) -> bool {
         self.asleep
+    }
+
+    /// True when the last `boot_from_flash` was refused for secure boot
+    /// (eFuse SECURE_BOOT_EN set): both CPUs are parked with no output.
+    pub fn secure_boot_rejected(&self) -> bool {
+        self.boot_denied
     }
 
     /// Remaining steps to fast-forward while in deep-sleep.
@@ -346,10 +377,14 @@ impl Esp32S3 {
             return;
         }
         let retain = self.soc.snapshot_rtc();
+        let gpio_hold = self.soc.snapshot_gpio_hold();
         self.reset();
         self.soc.set_sleep_wakeup_cause(cause);
         self.soc.set_ext1_status(ext1);
         self.soc.restore_rtc(retain);
+        // Digital-pad hold (DIG_PAD_HOLD): held pads keep driving across
+        // the reboot like silicon; unheld pads reset with the digital core.
+        self.soc.restore_gpio_hold(gpio_hold);
         // Deep-sleep reset reason: `esp_sleep_get_wakeup_cause` only reads
         // the wakeup-cause register when the PRO reason is DEEPSLEEP (5).
         self.soc.set_reset_cause(
@@ -384,24 +419,59 @@ impl Esp32S3 {
     /// to the ROM reset vector. The ROM stub (rom_stub.rs) loads the app
     /// image from flash offset `APP_FLASH_OFFSET` and jumps to its entry.
     pub fn boot_from_flash(&mut self, flash: &[u8]) {
+        // Secure-boot fail-closed gate: with SECURE_BOOT_EN burned, the
+        // mask-ROM would verify the bootloader signature before loading
+        // anything. The stub performs no verification, so refuse the boot
+        // (parked CPUs, no output) instead of insecurely booting an
+        // unverified image. Default eFuse (all zero) boots normally.
+        if self.soc.secure_boot_enabled() {
+            self.boot_denied = true;
+            return;
+        }
+        self.boot_denied = false;
         self.flash = flash.to_vec();
         self.soc.load_flash_image(0, flash);
+        // Encrypted devices: parse/map from a decrypted view (the ROM
+        // bootloader reads through decrypting HW; the stub loader + XIP do
+        // the same at runtime via flash_byte/MEMSPI). The raw backing stays
+        // ciphertext (persisted across resets like silicon).
+        let decrypted;
+        let view: &[u8] = if self.soc.flash_enc_enabled() {
+            decrypted = self.soc.flash_image_decrypted();
+            &decrypted
+        } else {
+            flash
+        };
         // Pick the app slot: OTA images select ota_0/ota_1 via the otadata
         // partition; non-OTA images fall back to the factory slot at
         // APP_FLASH_OFFSET (0x10000).
         let app_off =
-            crate::partition::select_ota_boot_offset(flash).unwrap_or(rom_stub::APP_FLASH_OFFSET);
+            crate::partition::select_ota_boot_offset(view).unwrap_or(rom_stub::APP_FLASH_OFFSET);
         // Pre-map the app's flash-mapped segments (.flash.text/.flash.rodata)
         // in the cache MMU — the real 2nd-stage bootloader maps them instead
         // of copying (the ROM stub's copy loop cannot write the read-only
         // windows).
-        self.soc.map_app_flash_segments(app_off);
+        self.soc.map_app_flash_segments(view, app_off);
         // The stub's own flash reads must NOT go through that MMU (it reads
         // the image the way the real ROM reads flash — via SPI, MMU-free).
         self.soc.set_rom_boot_mode(true);
         let rom = rom_stub::rom_image();
         self.load_image(rom_stub::ROM_BASE, &rom);
         self.load_rom_data();
+        // ROM 1st-stage flash detection: on silicon the mask-ROM boot runs
+        // detect_spi_flash_chip (RDID) before the bootloader and stores the
+        // physical size in the legacy chip struct's chip_size field
+        // (0x3FCEF6A8, read as a5+4 by esp_flash_init_default_chip, which
+        // then stores it unconditionally into default_chip->size at
+        // 0x420069af).  Our stub loader skips the ROM 1st stage, so the
+        // field keeps the snapshot blob's baked-in 0x200000 (2 MB) while the
+        // emulated chip is the full image (esptool merge_bin pads to the
+        // physical size, and the bootloader header byte 3 agrees).  The
+        // stale 2 MB makes esp_ota_begin fail with 0x102
+        // (ESP_ERR_INVALID_ARG): esp_partition_erase_range rejects ota_1
+        // (0x150000+0x140000) as out of bounds.  Patch the field with the
+        // image size, i.e. the state the real ROM boot leaves behind.
+        self.soc.write32(0x3FCE_F6A8, flash.len() as u32); // legacy chip_size = physical flash size
         // ROM data: the ROM layout struct + its pointer in RTC fast memory
         // (esp32s3.rom.ld maps ets_rom_layout_p = 0x3FF1FFFC); the app's
         // heap init reads layout->dram0_rtos_reserved_start via it.  The
@@ -489,14 +559,22 @@ impl Esp32S3 {
             // Dedup the ROM doubling bug: the ROM's putc (0x40043CE8) writes
             // each char to BOTH UART0 and USB.  When merging, the UART copy is
             // a duplicate of the previous USB byte.  Drop it.
+            //
+            // Scoped to ROM boot mode ONLY (the stub clears it once core 0
+            // jumps into the app): the cross-call arm drops ANY UART byte
+            // equal to the trailing USB byte, which corrupted app-stage
+            // output — a sketch marker ("UART-SLEEP-ARMED") lost its first
+            // byte to a coincidental boot-log collision, defeating marker
+            // injection and hanging the sleep harness with zero output.
+            // App firmware prints single-console; nothing to dedup there.
             let mut filtered_usb = Vec::new();
             let mut filtered_uart = Vec::new();
             // First handle same-call dedup: if both FIFOs have identical content,
             // the UART copy is a duplicate — keep USB only.
-            if !usb.is_empty() && out == usb {
+            if self.soc.rom_boot_mode() && !usb.is_empty() && out == usb {
                 filtered_uart.clear();
                 filtered_usb = usb;
-            } else {
+            } else if self.soc.rom_boot_mode() {
                 // Cross-call dedup: check each uart byte against last emitted
                 for &b in &out {
                     if self.last_console_was_usb && self.last_console_byte == Some(b) {
@@ -509,6 +587,9 @@ impl Esp32S3 {
                     // USB bytes are never deduped (they are the primary)
                     filtered_usb.push(b);
                 }
+            } else {
+                filtered_uart = out;
+                filtered_usb = usb;
             }
             out = filtered_uart;
             // Update dedup state from what we actually emit

@@ -29,7 +29,8 @@ pub const TWAI_BASE: u32 = 0x6002_B000;
 pub const TWAI_INTR_SOURCE: u32 = 37;
 
 /// Number of bytes in the shared TX/RX frame buffer.
-const FRAME_LEN: usize = 13;
+/// CAN frame image length (13 payload bytes through the shared buffer).
+pub const FRAME_LEN: usize = 13;
 
 #[derive(Default)]
 pub struct Twai {
@@ -110,18 +111,38 @@ impl Twai {
         self.status |= (1 << 2) | (1 << 3);
         self.status &= !(1 << 5); // ts = 0 (not transmitting)
         self.ir |= 1 << 1; // ti (transmit interrupt)
-        if self_rx && self.accepts(&frame) {
-            if self.rx_full {
-                // New frame with the RX buffer still occupied -> data overrun.
-                self.status |= 1 << 1; // dos
-                self.ir |= 1 << 3; // doi
-            }
-            self.buf = frame;
-            self.rx_full = true;
-            self.status |= 1 << 0; // rbs
-            self.status &= !(1 << 4); // rs = 0
-            self.ir |= 1 << 0; // ri (receive interrupt)
+        if self_rx {
+            self.receive(frame);
         }
+    }
+
+    /// Deliver one bus frame into the RX buffer (acceptance-filtered): the
+    /// virtual-second-node path — a host-driven peer transmission, exactly
+    /// what the controller would sample off the bus in normal (non-loopback)
+    /// mode. Filter rejects, overrun latches, and RRB release behave like
+    /// the self-reception path below.
+    pub fn inject_rx(&mut self, frame: [u8; FRAME_LEN]) {
+        if self.in_reset() {
+            return;
+        }
+        self.receive(frame);
+    }
+
+    /// Acceptance-filtered RX fill shared by self-reception and injection.
+    fn receive(&mut self, frame: [u8; FRAME_LEN]) {
+        if !self.accepts(&frame) {
+            return;
+        }
+        if self.rx_full {
+            // New frame with the RX buffer still occupied -> data overrun.
+            self.status |= 1 << 1; // dos
+            self.ir |= 1 << 3; // doi
+        }
+        self.buf = frame;
+        self.rx_full = true;
+        self.status |= 1 << 0; // rbs
+        self.status &= !(1 << 4); // rs = 0
+        self.ir |= 1 << 0; // ri (receive interrupt)
     }
 
     pub fn write32(&mut self, off: u32, value: u32) {

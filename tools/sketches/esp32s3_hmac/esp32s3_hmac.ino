@@ -78,6 +78,8 @@ const uint8_t EXP2[32] = {0xfb,0x01,0x1e,0x61,0x54,0xa1,0x9b,0x9a,0x4c,0x76,0x73
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C001C) |= (1u << 5);
   delay(200);
   Serial.println("HMAC VALIDATION START");
   hmac_run(MSG1, sizeof(MSG1) - 1, EXP1);

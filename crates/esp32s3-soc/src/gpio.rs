@@ -273,6 +273,35 @@ impl Gpio {
         Some((pin, inv))
     }
 
+    /// Snapshot the pad-hold state (deep-sleep DIG_PAD_HOLD): OUT + ENABLE
+    /// words plus all 54 FUNC_OUT_SEL_CFG values.
+    pub fn hold_snapshot(&self) -> (u32, u32, [u32; 54]) {
+        let mut func = [0u32; 54];
+        for (i, f) in func.iter_mut().enumerate() {
+            *f = self.regs[(GPIO_FUNC_OUT_SEL_0 / 4) as usize + i];
+        }
+        (
+            self.regs[(GPIO_OUT / 4) as usize],
+            self.regs[(GPIO_ENABLE / 4) as usize],
+            func,
+        )
+    }
+
+    /// Restore held pads after a deep-sleep reboot (fresh Soc resets them).
+    pub fn hold_restore(&mut self, out: u32, en: u32, func: &[u32; 54]) {
+        self.regs[(GPIO_OUT / 4) as usize] = out;
+        self.regs[(GPIO_ENABLE / 4) as usize] = en;
+        for (i, f) in func.iter().enumerate() {
+            self.regs[(GPIO_FUNC_OUT_SEL_0 / 4) as usize + i] = *f;
+        }
+        // Reseed edge baselines like the input synchronizer (retention
+        // itself raises no edges); PIN interrupt config reset to disabled
+        // with the reboot, so nothing is armed unless firmware re-arms.
+        for i in 0..PIN_COUNT {
+            self.refresh_armed(i);
+        }
+    }
+
     /// Current logical level (0/1) of GPIO `pin`: the driven output if the pin
     /// is output-enabled, else its input/strap state (GPIO_IN loopback).
     pub fn pin_level(&self, pin: u32) -> u32 {

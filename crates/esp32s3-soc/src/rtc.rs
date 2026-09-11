@@ -44,6 +44,13 @@ pub const SLP_TIMER0_OFF: u32 = 0x04;
 pub const SLP_TIMER1_OFF: u32 = 0x08;
 pub const STATE0_OFF: u32 = 0x18;
 pub const SLEEP_EN_BIT: u32 = 1 << 31;
+// RTC_CNTL_OPTIONS0_REG @ +0x0 (rtc_cntl_reg.h): SW_PROCPU_RST is bit 5,
+// SW_APPCPU_RST bit 4, SW_SYS_RST bit 31 (all WO). Ground truth is the
+// real ROM body (esp32s3_rom.bin @ 0x44684, reached via the 0x6E4 slot):
+// cpu 0 sets BIT5, cpu 1 sets BIT4, then returns.
+pub const OPTIONS0_OFF: u32 = 0x0;
+pub const SW_PROCPU_RST_BIT: u32 = 1 << 5;
+pub const SW_SYS_RST_BIT: u32 = 1 << 31;
 pub const SLP_WAKEUP_CAUSE_OFF: u32 = 0x130;
 // RTC_CNTL interrupt block (rtc_cntl_reg.h): ENA @ +0x40, RAW @ +0x44,
 // ST @ +0x48, CLR @ +0x4C. Touch DONE = bit 6, SCAN_DONE = bit 4
@@ -66,9 +73,15 @@ const BOD_RST_WAIT_SHIFT: u32 = 16;
 const BOD_RST_ENA: u32 = 1 << 26;
 const BOD_CNT_CLR: u32 = 1 << 29;
 const BOD_ENA: u32 = 1 << 30;
-// Sleep-event interrupt bits (rtc_cntl_reg.h INT_RAW): SLP_REJECT = bit 0,
-// SLP_WAKEUP = bit 1 (`rtc_sleep_start` spins on bits [1:0]).
-const SLP_WAKEUP_BIT: u32 = 1 << 1;
+// Sleep-event interrupt bits (rtc_cntl_reg.h INT_RAW): SLP_WAKEUP = bit 0,
+// SLP_REJECT = bit 1 (`rtc_sleep_start` spins on bits [1:0], then returns
+// bit 1 as its status — so WAKEUP must latch at bit 0; latching it at bit 1
+// makes the resume path normalize the status to ESP_ERR_INVALID_STATE and
+// drop the wakeup cause).
+const SLP_WAKEUP_BIT: u32 = 1 << 0;
+/// SLP_REJECT = bit 1 (never raised: no rejected-sleep flow is modeled).
+#[allow(dead_code)]
+const SLP_REJECT_BIT: u32 = 1 << 1;
 // Touch FSM trigger registers (rtc_cntl_reg.h): CTRL2 @ +0x10C
 // (touch_start_force / timer_force_done), SCAN_CTRL @ +0x110 (pad map).
 const TOUCH_CTRL2_OFF: u32 = 0x10C;
@@ -105,7 +118,15 @@ pub const fn wakeup_ena(n: u32) -> u32 {
 // bit 11 (COCPU/RISCV ULP) both return ULP).
 pub const CAUSE_EXT0: u32 = 1 << 0;
 pub const CAUSE_EXT1: u32 = 1 << 1;
+// GPIO / UART0 / UART1 light-sleep wakeups (esp_rom rtc.h WAKEUP_REASON:
+// GPIO_TRIG = BIT2, UART0_TRIG = BIT6, UART1_TRIG = BIT7).
+pub const CAUSE_GPIO: u32 = 1 << 2;
+pub const CAUSE_UART0: u32 = 1 << 6;
+pub const CAUSE_UART1: u32 = 1 << 7;
 pub const CAUSE_TIMER: u32 = 1 << 3;
+// ULP-RISC-V trap wakeup (RISCV_TRAP_TRIG = BIT13): like the COCPU/FSM
+// triggers, it fires when the running ULP halts mid-sleep.
+pub const CAUSE_TRAP: u32 = 1 << 13;
 // Touch-pad wakeup (`TOUCH_TRIG_EN = BIT8`, esp_rom rtc.h): the touch
 // controller runs during sleep and wakes on a threshold crossing.
 pub const CAUSE_TOUCH: u32 = 1 << 8;
@@ -153,7 +174,7 @@ pub struct Rtc {
     /// scan via TOUCH_CTRL2/SCAN_CTRL (the event the driver's oneshot wait
     /// blocks on), cleared by INT_CLR. Other INT_RAW bits live in `regs`.
     touch_raw: u32,
-    /// Latched sleep-event bits (SLP_REJECT bit 0 / SLP_WAKEUP bit 1,
+    /// Latched sleep-event bits (SLP_WAKEUP bit 0 / SLP_REJECT bit 1,
     /// rtc_cntl_reg.h INT_RAW): `rtc_sleep_start` spins on bits [1:0]
     /// after triggering sleep, so a light-sleep wake latches SLP_WAKEUP
     /// (cleared by INT_CLR like the touch latch). SLP_REJECT is never
@@ -222,6 +243,12 @@ impl Default for Rtc {
 }
 
 impl Rtc {
+    /// Digital-GPIO hold mask (RTC_CNTL_DIG_PAD_HOLD_REG @ +0xDC, TRM
+    /// memory map): held pads keep OUT/ENABLE/FUNC across deep sleep.
+    pub fn dig_pad_hold(&self) -> u32 {
+        self.regs[0xDC / 4]
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -290,11 +317,10 @@ impl Rtc {
             (cfg0 >> 19) & 7,
         ];
         let mut cum: u64 = 0;
-        for i in 0..4 {
+        for (i, &a) in stg.iter().enumerate() {
             cum += self.regs[(0x9C + 4 * i as u32) as usize / 4] as u64;
             if !self.wdt_fired[i] && self.wdt_count >= cum {
                 self.wdt_fired[i] = true;
-                let a = stg[i];
                 if a == 2 || a == 3 {
                     self.wdt_reset = true;
                 }
@@ -405,6 +431,21 @@ impl Rtc {
 
     pub fn write32(&mut self, offset: u32, value: u32) {
         match offset {
+            OPTIONS0_OFF => {
+                // SW_PROCPU_RST (the bit esp_rom_software_reset_cpu(0)
+                // sets): resetting the PRO CPU reboots the chip, so latch
+                // it into the shared reset flag the machine consumes (like
+                // a WDT stage). SW_SYS_RST is latched the same way. Both
+                // are WO (read back 0). SW_APPCPU_RST (bit 4) is NOT
+                // latched: the only real flow setting it (esp_restart_noos)
+                // sets PROCPU_RST in the same call stack, so the chip
+                // reboots microseconds later either way.
+                if value & (SW_PROCPU_RST_BIT | SW_SYS_RST_BIT) != 0 {
+                    self.wdt_reset = true;
+                }
+                self.regs[OPTIONS0_OFF as usize / 4] =
+                    value & !(SW_PROCPU_RST_BIT | SW_SYS_RST_BIT);
+            }
             TIME_UPDATE_OFF if value & TIME_UPDATE_BIT != 0 => {
                 self.latched = self.count;
             }

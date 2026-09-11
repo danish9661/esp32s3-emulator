@@ -12,13 +12,11 @@
 //!
 //! Flash encryption: the eFuse flash-crypt config reads correct-by-default
 //! (RD_REPEAT fields reset 0: SPI_BOOT_CRYPT_CNT = 0, key purposes = 0,
-//! so every boot takes the encryption-OFF plaintext path, which is what
-//! all validatable firmware uses). The XTS crypto primitive itself is
-//! proven (`esp_aes_crypt_xts` over HW ECB passes in battery). What is NOT
-//! modeled is an encrypted-image pipeline (eFuse-burned XTS keys + esptool-
-//! encrypted flash + XTS decryption on instruction/data fetch): arduino-cli
-//! cannot produce encrypted images and there is no host key, so nothing
-//! could validate it — out of scope (same class as eMMC).
+//! so every boot takes the encryption-OFF plaintext path). The encrypted-
+//! image pipeline is modeled too: host-provisioned XTS key in BLOCK_KEY0
+//! plus SPI_BOOT_CRYPT_CNT, uniform XTS over flash, decrypt on fetch.
+//! Validated by the `flashenc` battery entry, which boots real hello
+//! firmware from an encrypted image.
 
 use crate::memmap::EFUSE_BASE;
 
@@ -53,7 +51,23 @@ const EFUSE_KEY_COUNT: usize = 6;
 // 0x00006655.
 const MAC_LO: u32 = 0x4433_2211;
 const MAC_HI: u32 = 0x0000_6655;
+// eFuse block RD-mirror bases (efuse_reg.h, all 8-word contiguous windows):
+// BLK0 (WR_DIS + REPEAT_DATA0..4 + MAC_SPI_SYS_0/1) @ 0x2C, BLK3 USR_DATA
+// @ 0x7C, BLK4..9 KEYn @ 0x9C + n*0x20, BLK10 SYS_DATA_PART2 @ 0x15C.
+// BLK1/BLK2 mirrors (MAC/SYS_PART1) are non-contiguous partial windows
+// with factory content and no driver burn flow — PGM to them is ignored.
+// RD_REPEAT_DATA0[6:0] = RD_DIS (efuse_reg.h): bit i masks reads of
+// BLK(4+i) (KEY0..5, then BLK10 SYS_DATA_PART2); BLK0..3 stay readable.
+const BLK0_MIRROR_OFF: usize = 0x2C / 4;
+const BLK10_MIRROR_OFF: usize = 0x15C / 4;
+const BLOCK_WORDS: usize = 8;
+const REPEAT_DATA0_OFF: usize = 0x30 / 4;
+const RD_DIS_MASK: u32 = 0x7F;
+// RD_REPEAT_DATA4 (0x40) SECURE_BOOT_EN bit (efuse_reg.h bit 20).
+const REPEAT_DATA4_OFF: usize = 0x40 / 4;
+const SECURE_BOOT_EN_BIT: u32 = 1 << 20;
 
+#[derive(Clone)]
 pub struct Efuse {
     regs: [u32; REG_COUNT],
     /// Staged PGM_DATA0..7 burn words (written before PGM_CMD).
@@ -93,9 +107,43 @@ impl Efuse {
             // EFUSE_STATUS_REG state field reads idle (0) — the driver's
             // read-done poll exits immediately on our materialized array.
             EFUSE_STATUS_OFF => 0,
-            _ if w < REG_COUNT => self.regs[w],
+            _ if w < REG_COUNT => {
+                // Read-disabled blocks (RD_DIS) read zero like blown fuses.
+                if let Some(bit) = Self::rd_dis_for(w)
+                    && self.regs[REPEAT_DATA0_OFF] & (1 << bit) & RD_DIS_MASK != 0
+                {
+                    return 0;
+                }
+                self.regs[w]
+            }
             _ => 0,
         }
+    }
+
+    /// SPI_BOOT_CRYPT_CNT field (RD_REPEAT_DATA1 @ 0x34, bits [20:18]):
+    /// odd parity enables flash encryption (`efuse_hal_flash_encryption_
+    /// enabled` reads exactly this). Resets 0 (disabled).
+    pub fn crypt_cnt(&self) -> u32 {
+        (self.regs[0x34 / 4] >> 18) & 7
+    }
+
+    /// Read-disable bit covering mirror word `w`, if any (RD_DIS[6:0] ->
+    /// BLK4..10: KEY0..5 mirrors, then BLK10 SYS_DATA_PART2).
+    fn rd_dis_for(w: usize) -> Option<u32> {
+        if (EFUSE_KEY_BASE_OFF..EFUSE_KEY_BASE_OFF + EFUSE_KEY_COUNT * EFUSE_KEY_STRIDE_OFF)
+            .contains(&w)
+        {
+            Some(((w - EFUSE_KEY_BASE_OFF) / EFUSE_KEY_STRIDE_OFF) as u32)
+        } else if (BLK10_MIRROR_OFF..BLK10_MIRROR_OFF + BLOCK_WORDS).contains(&w) {
+            Some(6)
+        } else {
+            None
+        }
+    }
+
+    /// Secure-boot enable (RD_REPEAT_DATA4 SECURE_BOOT_EN, efuse_reg.h).
+    pub fn secure_boot_enabled(&self) -> bool {
+        self.regs[REPEAT_DATA4_OFF] & SECURE_BOOT_EN_BIT != 0
     }
 
     /// Read the 32-byte HMAC/DS key from eFuse key block `id` (0..5), as a
@@ -103,6 +151,10 @@ impl Efuse {
     pub fn hmac_key(&self, id: usize) -> [u8; 32] {
         let mut key = [0u8; 32];
         if id >= EFUSE_KEY_COUNT {
+            return key;
+        }
+        // A read-disabled key block reads all zeros (same as the RD mirror).
+        if self.regs[REPEAT_DATA0_OFF] & (1 << id) & RD_DIS_MASK != 0 {
             return key;
         }
         let base = EFUSE_KEY_BASE_OFF + id * EFUSE_KEY_STRIDE_OFF;
@@ -125,6 +177,12 @@ impl Efuse {
             return;
         }
         match w {
+            // RD_REPEAT_DATA1 (@ 0x34): read-only on silicon, but the host
+            // fixture provisions SPI_BOOT_CRYPT_CNT (bits [20:18]) here to
+            // model a factory-encrypted device. One-way (OR) like a burn.
+            _ if w == 0x34 / 4 => {
+                self.regs[w] |= value & (7 << 18);
+            }
             // read_cmd (bit 0): on real silicon this copies the eFuse array into
             // the RD_* registers. Our array is already materialized, so this is a
             // no-op (the STATUS poll sees idle immediately).
@@ -134,9 +192,37 @@ impl Efuse {
             // ignored (documented). Verified: the driver prints
             // "BURN BLOCK3" for ESP_EFUSE_USER_DATA.
             EFUSE_CMD_OFF => {
-                if value & 0x2 != 0 && (value >> 2) & 0xF == 3 {
-                    for i in 0..8 {
-                        self.regs[0x7C / 4 + i] |= self.pgm_stage[i];
+                if value & 0x2 != 0 {
+                    let blk = (value >> 2) & 0xF;
+                    // WR_DIS (BLOCK0 word 0) blocks direct PGM burns to the
+                    // named block (bitN -> BLKN approximation; the driver's
+                    // own refusal reads the stored WR_DIS value directly, so
+                    // driver flows are exact regardless of this mapping).
+                    let wr_dis = self.regs[BLK0_MIRROR_OFF];
+                    // (base mirror word, word count): BLK0 is 6 words
+                    // (WR_DIS + REPEAT_DATA0..4 @ 0x2C..0x40 — the
+                    // MAC_SPI_SYS mirrors past it belong to BLK1, and
+                    // burning staged zeros over the seeded MAC trips the
+                    // driver's read-back verify); the rest are full 8-word
+                    // blocks. BLK1/BLK2 (MAC/SYS_PART1 partial mirrors) and
+                    // 11..15 have no driver burn flow and are ignored.
+                    let mirror = match blk {
+                        0 => Some((BLK0_MIRROR_OFF, 6)),
+                        3 => Some((0x7C / 4, BLOCK_WORDS)),
+                        4..=9 => Some((
+                            EFUSE_KEY_BASE_OFF + (blk - 4) as usize * EFUSE_KEY_STRIDE_OFF,
+                            BLOCK_WORDS,
+                        )),
+                        10 => Some((BLK10_MIRROR_OFF, BLOCK_WORDS)),
+                        _ => None,
+                    };
+                    // (`1 << blk` fits u32 for every burnable block.)
+                    if let Some((base, n)) = mirror
+                        && wr_dis & (1 << blk) == 0
+                    {
+                        for i in 0..n {
+                            self.regs[base + i] |= self.pgm_stage[i];
+                        }
                     }
                 }
                 let _ = value & 1;

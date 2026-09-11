@@ -249,6 +249,7 @@ let vdevSensor = null;
 let vdevAdc = null;
 let vdevCam = null;
 let flashBytes = null;
+let flashKeyHex = null;
 let timer = null;
 let totalSteps = 0;
 
@@ -278,10 +279,22 @@ function stopLoop() {
   }
 }
 
-async function loadFlash(bytes) {
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.substr(2 * i, 2), 16);
+  }
+  return out;
+}
+
+async function loadFlash(bytes, keyHex) {
   stopLoop();
   emu = new Emulator();
-  emu.load_flash(bytes);
+  if (keyHex) {
+    emu.load_flash_encrypted(bytes, hexToBytes(keyHex));
+  } else {
+    emu.load_flash(bytes);
+  }
 
   if (typeof PeripheralBridge !== 'undefined') {
     bridge = new PeripheralBridge(emu);
@@ -303,6 +316,7 @@ async function loadFlash(bytes) {
   }
 
   flashBytes = bytes;
+  flashKeyHex = keyHex || null;
   totalSteps = 0;
   consoleText = '';
   consoleLines = [];
@@ -323,11 +337,11 @@ els.firmware.addEventListener('change', async (e) => {
   loadFlash(new Uint8Array(buf));
 });
 
-async function loadFromUrl(url) {
+async function loadFromUrl(url, keyHex) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`fetch ${url} -> ${res.status}`);
   const buf = await res.arrayBuffer();
-  loadFlash(new Uint8Array(buf));
+  loadFlash(new Uint8Array(buf), keyHex);
 }
 
 // ── Gallery ──
@@ -338,6 +352,7 @@ try {
     for (const item of list) {
       const opt = document.createElement('option');
       opt.value = `./firmware/${item.file}`;
+      opt.dataset.key = item.key || '';
       opt.textContent = item.name;
       els.gallery.appendChild(opt);
     }
@@ -345,11 +360,12 @@ try {
 } catch (_) { /* no manifest */ }
 
 els.gallery.addEventListener('change', async (e) => {
+  const sel = e.target.selectedOptions[0];
   const url = e.target.value;
   if (!url) return;
   try {
     setStatus(`loading ${url}…`);
-    await loadFromUrl(url);
+    await loadFromUrl(url, sel.dataset.key || null);
   } catch (err) {
     setStatus(`failed: ${err.message}`);
   }
@@ -371,7 +387,7 @@ els.stop.addEventListener('click', () => {
 
 els.reset.addEventListener('click', () => {
   if (!flashBytes) return;
-  loadFlash(flashBytes);
+  loadFlash(flashBytes, flashKeyHex);
 });
 
 els.steps.addEventListener('input', () => {

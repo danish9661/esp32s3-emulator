@@ -21,6 +21,8 @@ static int poll_clear(uint32_t off, uint32_t bit) {
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: OTG engine frozen otherwise).
+  *(volatile uint32_t*)(0x600C0018) |= (1u << 23); // USB-OTG
 
   *O(0x010) = 1u;  // GRSTCTL.CSFTRST
   bool rst_ok = poll_clear(0x010, 1u) && (*O(0x010) & (1u << 31)) != 0;

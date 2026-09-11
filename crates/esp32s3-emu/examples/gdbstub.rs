@@ -247,7 +247,7 @@ fn main() {
                             if let (Some(&c), true) = (it.next(), !data.is_empty()) {
                                 let n = c.wrapping_sub(29).wrapping_add(1) as usize;
                                 let last = *data.last().unwrap();
-                                data.extend(std::iter::repeat(last).take(n.min(4096)));
+                                data.extend(std::iter::repeat_n(last, n.min(4096)));
                             }
                         } else {
                             let hi = hexval(b);
@@ -265,12 +265,11 @@ fn main() {
                 }
             }
             b'c' => {
-                if pkt.len() > 1 {
-                    if let Ok(a) =
+                if pkt.len() > 1
+                    && let Ok(a) =
                         u32::from_str_radix(std::str::from_utf8(&pkt[1..]).unwrap_or(""), 16)
-                    {
-                        m.cpu[0].pc = a;
-                    }
+                {
+                    m.cpu[0].pc = a;
                 }
                 let mut left = CONT_BUDGET;
                 let stop = loop {
@@ -304,12 +303,11 @@ fn main() {
                 send_str(&mut s, &mut pending, stop);
             }
             b's' => {
-                if pkt.len() > 1 {
-                    if let Ok(a) =
+                if pkt.len() > 1
+                    && let Ok(a) =
                         u32::from_str_radix(std::str::from_utf8(&pkt[1..]).unwrap_or(""), 16)
-                    {
-                        m.cpu[0].pc = a;
-                    }
+                {
+                    m.cpu[0].pc = a;
                 }
                 m.step();
                 for b in m.take_uart_tx(0).into_iter().chain(m.take_uart_tx(1)) {

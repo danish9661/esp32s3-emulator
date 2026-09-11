@@ -2657,6 +2657,8 @@ void write_bytes(uint32_t base, const uint8_t* data, int len) {
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C001C) |= (1u << 4);
   delay(200);
   Serial.println("DS VALIDATION START");
   // C is contiguous: C_Y(0x000) || C_M(0x200) || C_RB(0x400) || C_BOX(0x600).

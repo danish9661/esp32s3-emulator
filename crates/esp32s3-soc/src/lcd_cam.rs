@@ -28,8 +28,11 @@
 //! resumes it. `CAM_CTRL` bit 5 (`CAM_BYTE_ORDER`) byte-swaps each word.
 //! `CAM_RESET` (CTRL1.30) / `CAM_AFIFO_RESET` (CTRL1.31) clear RX state.
 //!
-//! NOT modeled: GDMA-RX transport (CPU `CAM_DATA` polling only — no
-//! validatable driver exists offline), `CAM_STOP_EN`, clock-divider timing
+//! GDMA-RX transport streams captured words into IN descriptors (peri 5)
+//! via a cursor pump (see `Soc::poll_cam_dma`); `CAM_STOP_EN` (CAM_CTRL
+//! bit 0: stop when the GDMA staging FIFO is full) is honored. Use one
+//! path per capture (polling fills RX FIFO, DMA fills descriptors).
+//! NOT modeled: clock-divider timing
 //! (one word per tick), 2BYTE packing (injected words already are units).
 //!
 //! The presented signals are observable on GPIO pins whose `FUNC_OUT_SEL` is
@@ -73,6 +76,9 @@ const CAM_RESET_BIT: u32 = 1 << 30; // CAM_CTRL1: camera module reset
 const CAM_AFIFO_RESET_BIT: u32 = 1 << 31; // CAM_CTRL1: async RX FIFO reset
 const CAM_CTRL: u32 = 0x04;
 const CAM_BYTE_ORDER_BIT: u32 = 1 << 5; // CAM_CTRL: swap bytes per word
+// CAM_CTRL bit 0: stop capture when the GDMA staging FIFO is full
+// (lcd_cam_reg.h CAM_STOP_EN); without it overruns drop words.
+const CAM_STOP_EN_BIT: u32 = 1 << 0;
 
 const LCD_TRANS_DONE: u32 = 1 << 1;
 const CAM_VSYNC_INT: u32 = 1 << 2;
@@ -88,6 +94,11 @@ pub struct LcdCam {
     tx_count: usize,
     rx_fifo: [u32; FIFO_DEPTH],
     rx_count: usize,
+    /// GDMA-RX staging FIFO (capture words bound for IN descriptors).
+    dma_fifo: alloc::collections::VecDeque<u32>,
+    /// GDMA-RX path armed (IN cursor active): tick_cam streams here
+    /// instead of `rx_fifo`.
+    dma_active: bool,
     int_raw: u32,
     int_ena: u32,
     // Parallel-transfer output state.
@@ -118,6 +129,8 @@ impl LcdCam {
             tx_count: 0,
             rx_fifo: [0; FIFO_DEPTH],
             rx_count: 0,
+            dma_fifo: alloc::collections::VecDeque::new(),
+            dma_active: false,
             int_raw: 0,
             int_ena: 0,
             busy: false,
@@ -266,6 +279,30 @@ impl LcdCam {
         self.regs[Self::idx(CAM_CTRL)] & CAM_BYTE_ORDER_BIT != 0
     }
 
+    /// Arm/disarm the GDMA-RX path (IN cursor active): captured words
+    /// stream into the staging FIFO instead of `rx_fifo`.
+    pub fn set_dma_active(&mut self, on: bool) {
+        self.dma_active = on;
+        if !on {
+            self.dma_fifo.clear();
+        }
+    }
+
+    /// Pop a staged GDMA word for the descriptor pump (None when dry).
+    pub fn dma_pop(&mut self) -> Option<u32> {
+        self.dma_fifo.pop_front()
+    }
+
+    /// Staged GDMA words available.
+    pub fn dma_pending(&self) -> usize {
+        self.dma_fifo.len()
+    }
+
+    /// Capture running (set by CAM_START, cleared at end-of-frame).
+    pub fn is_capturing(&self) -> bool {
+        self.capturing
+    }
+
     pub fn tick(&mut self) {
         if self.busy {
             self.pclk ^= 1;
@@ -308,8 +345,16 @@ impl LcdCam {
             }
         }
         self.cam_pclk ^= 1;
-        if self.rx_count >= FIFO_DEPTH {
+        if !self.dma_active && self.rx_count >= FIFO_DEPTH {
             return; // backpressure: firmware must drain CAM_DATA first
+        }
+        if self.dma_active && self.dma_fifo.len() >= FIFO_DEPTH {
+            // GDMA staging full: end the capture with STOP_EN, else stall
+            // (retry next tick — no loss) until the pump drains.
+            if self.regs[Self::idx(CAM_CTRL)] & CAM_STOP_EN_BIT != 0 {
+                self.end_capture();
+            }
+            return;
         }
         let limit = self.rec_bytelen();
         if limit != 0 && self.byte_count > limit {
@@ -326,8 +371,12 @@ impl LcdCam {
         }
         self.cur_pos += 1;
         self.byte_count += 4;
-        self.rx_fifo[self.rx_count] = w;
-        self.rx_count += 1;
+        if self.dma_active {
+            self.dma_fifo.push_back(w);
+        } else {
+            self.rx_fifo[self.rx_count] = w;
+            self.rx_count += 1;
+        }
         self.cam_word = w;
         self.line_pos += 1;
         if self.line_pos > self.line_int_num() {
@@ -604,5 +653,72 @@ mod tests {
         assert_eq!(d.cam_input_level(SIG_V_SYNC), 1, "VSYNC mid-frame");
         assert_eq!(d.cam_input_level(SIG_DATA0 + 4), 1, "data bit 4");
         assert_eq!(d.cam_input_level(SIG_DATA0), 0, "data bit 0");
+    }
+}
+
+#[cfg(test)]
+mod dma_tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    fn dma_dev() -> LcdCam {
+        let mut d = LcdCam::new();
+        d.cam_inject_frame(&[0x1111_1111, 0x2222_2222]);
+        d.set_dma_active(true);
+        d.write32(CAM_CTRL1, CAM_START_BIT);
+        d
+    }
+
+    #[test]
+    fn dma_path_streams_into_staging_not_rx_fifo() {
+        let mut d = dma_dev();
+        for _ in 0..16 {
+            d.tick();
+        }
+        assert_eq!(d.dma_pending(), 2, "both words staged for GDMA");
+        assert_eq!(d.read32(CAM_FIFO_STATUS) & 0x7FF, 0, "RX FIFO untouched");
+        assert_eq!(d.dma_pop(), Some(0x1111_1111));
+        assert_eq!(d.dma_pop(), Some(0x2222_2222));
+        assert_eq!(d.dma_pop(), None, "staging drained");
+    }
+
+    #[test]
+    fn stop_en_ends_capture_on_full_staging() {
+        let mut d = LcdCam::new();
+        // 20-word frame (over the 16-word staging cap), STOP_EN set, no
+        // pump drain: staging fills, then the capture self-clears START.
+        let frame: Vec<u32> = (0..20).collect();
+        d.cam_inject_frame(&frame);
+        d.set_dma_active(true);
+        d.write32(CAM_CTRL, CAM_STOP_EN_BIT);
+        d.write32(CAM_CTRL1, CAM_START_BIT);
+        for _ in 0..64 {
+            d.tick();
+        }
+        assert_eq!(d.dma_pending(), 16, "staging capped");
+        assert_eq!(
+            d.read32(CAM_CTRL1) & CAM_START_BIT,
+            0,
+            "START self-cleared on full staging with STOP_EN"
+        );
+        assert!(!d.is_capturing(), "capture ended");
+    }
+
+    #[test]
+    fn overrun_without_stop_en_keeps_capturing() {
+        let mut d = LcdCam::new();
+        let frame: Vec<u32> = (0..20).collect();
+        d.cam_inject_frame(&frame);
+        d.set_dma_active(true);
+        d.write32(CAM_CTRL1, CAM_START_BIT); // STOP_EN clear
+        for _ in 0..64 {
+            d.tick();
+        }
+        assert_eq!(d.dma_pending(), 16, "staging capped");
+        assert_ne!(
+            d.read32(CAM_CTRL1) & CAM_START_BIT,
+            0,
+            "START held without STOP_EN"
+        );
     }
 }

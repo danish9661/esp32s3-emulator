@@ -1000,6 +1000,30 @@ mod cpu_tests {
     }
 
     #[test]
+    fn wsr_mmid_does_not_clobber_lbeg() {
+        // WSR_MMID has no RSR/XSR twin and no storage on the MMU-less S3;
+        // it must be a no-op, not an sr_of catch-all write to SR 0 (LBEG).
+        // movi a4,0x34 = 0x0034A042; wsr.lbeg a4 = 0x00130040;
+        // movi a2,0x56 = 0x0056A022; wsr.mmid a2 = 0x00135920
+        // (wsr = (1<<20)|(3<<16)|(sr<<8)|(t<<4), MMID SR = 89);
+        // rsr.lbeg a3 = 0x00030030.
+        let mut prog = Vec::new();
+        let mut a = 0x4000_1000u32;
+        put(&mut prog, &mut a, 0x0034_A042); // movi a4, 0x34
+        put(&mut prog, &mut a, 0x0013_0040); // wsr.lbeg a4
+        put(&mut prog, &mut a, 0x0056_A022); // movi a2, 0x56
+        put(&mut prog, &mut a, 0x0013_5920); // wsr.mmid a2
+        put(&mut prog, &mut a, 0x0003_0030); // rsr a3, lbeg
+        let end = a;
+
+        let mut bus = RamBus::load(&prog);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_1000;
+        run(&mut cpu, &mut bus, end);
+        assert_eq!(cpu.reg(3), 0x34, "LBEG must survive WSR_MMID");
+    }
+
+    #[test]
     fn rsr_windowbase_windowstart_roundtrip() {
         // `sr_of` needs explicit WINDOWBASE/WINDOWSTART arms: without them
         // both RSRs fall through to `_ => 0` and read LBEG (SR 0), which
@@ -1394,10 +1418,10 @@ mod cpu_tests {
     fn ee_dsp_instruction_is_unimplemented() {
         // An unimplemented TIE/DSP (`ee.*`) instruction must halt the core with
         // StepResult::Unimplemented rather than mis-executing or raising a
-        // spurious illegal-instruction exception.
-        // ee.srs.accx a1, a2, 0 = 24 11 7e: decodes but has no executor
-        // (its shift-AR operand is not encoded), so it still traps loud.
-        let prog = [(0x4000_1000u32, 0x007E_1124u32)];
+        // spurious illegal-instruction exception. 0xEF00000E is a 4-byte word
+        // matching no decoder rule, so it decodes to OPCODE_EE_UNIMPLEMENTED
+        // and still traps loud.
+        let prog = [(0x4000_1000u32, 0xEF00_000Eu32)];
         let mut bus = RamBus::load(&prog);
         let mut cpu = Cpu::new(0);
         cpu.pc = 0x4000_1000;
@@ -2282,7 +2306,6 @@ mod cpu_tests {
     }
 
     #[test]
-    #[test]
     fn ee_cmul_fused_ld_pair_then_load() {
         // ee.cmul.s16.ld.incp q0, a2, q1, q2, q3, 0 = e0 81 9c 2e
         // (GAS-captured): sel0 pair0 (3+4i)(1+0i)>>1 = (1,2) into q1[0,1],
@@ -2330,7 +2353,7 @@ mod cpu_tests {
     fn ee_cmul_fused_st_pair_then_store() {
         // ee.cmul.s16.st.incp q0, a2, q1, q2, q3, 0 = e4 81 90 2e: sel0
         // pair0 into q1[0,1], qu=q0 stored, AR += 16.
-        let (cpu, mut bus) = ee_run_mem(0xE481_902E, 4, |c, b| {
+        let (cpu, mut bus) = ee_run_mem(0xE481_902E, 4, |c, _b| {
             c.set_reg(2, 0x4000_2000);
             c.set_sreg(crate::cpu::SR_SAR, 1);
             c.qregs[0] = [
@@ -2484,6 +2507,123 @@ mod cpu_tests {
         run(&mut cpu, &mut bus, 0x4000_1009);
         assert_eq!(cpu.accx, 1496);
         assert_eq!(cpu.reg(2), 0x4000_2020);
+    }
+
+    /// Word builder for `ee.srs.accx rd, rs, sel` (GAS-probed layout:
+    /// rd = bits [11:8], rs = bits [7:4], sel = bit 14; spot-checked
+    /// against assembler output: a1,a2,0 = 0x7E1124, a6,a9,0 = 0x7E1694,
+    /// a1,a2,1 = 0x7E5124).
+    fn ee_srs_word(rd: u32, rs: u32, sel: u32) -> u32 {
+        0x007E_1004 | (rd << 8) | (rs << 4) | (sel << 14)
+    }
+
+    #[test]
+    fn ee_srs_accx_word_matches_gas() {
+        assert_eq!(ee_srs_word(1, 2, 0), 0x007E_1124);
+        assert_eq!(ee_srs_word(6, 9, 0), 0x007E_1694);
+        assert_eq!(ee_srs_word(1, 2, 1), 0x007E_5124);
+    }
+
+    #[test]
+    fn ee_srs_accx_signed_shift_and_saturate() {
+        // sel=0: arithmetic shift ACCX by rs[5:0], write back, rd = sat32.
+        // Shift 0 passes through (the esp-nn epilogue shape).
+        let cpu = ee_run1(ee_srs_word(6, 9, 0), |c| {
+            c.accx = 1496;
+            c.set_reg(9, 0);
+        });
+        assert_eq!(cpu.reg(6), 1496);
+        assert_eq!(cpu.accx, 1496);
+        // Plain shift right.
+        let cpu = ee_run1(ee_srs_word(6, 9, 0), |c| {
+            c.accx = 0x1234_5678;
+            c.set_reg(9, 4);
+        });
+        assert_eq!(cpu.reg(6), 0x0123_4567);
+        assert_eq!(cpu.accx, 0x0123_4567);
+        // Negative value shifts arithmetically.
+        let cpu = ee_run1(ee_srs_word(6, 9, 0), |c| {
+            c.accx = -8;
+            c.set_reg(9, 2);
+        });
+        assert_eq!(cpu.reg(6), 0xFFFF_FFFE);
+        assert_eq!(cpu.accx, -2);
+        // Positive saturation at 2^31-1 (ACCX keeps the full value).
+        let cpu = ee_run1(ee_srs_word(6, 9, 0), |c| {
+            c.accx = 0x20_0000_0000;
+            c.set_reg(9, 0);
+        });
+        assert_eq!(cpu.reg(6), 0x7FFF_FFFF);
+        assert_eq!(cpu.accx, 0x20_0000_0000);
+        // Negative saturation at -2^31.
+        let cpu = ee_run1(ee_srs_word(6, 9, 0), |c| {
+            c.accx = -0x20_0000_0000;
+            c.set_reg(9, 0);
+        });
+        assert_eq!(cpu.reg(6), 0x8000_0000);
+        // Shift amount uses only rs[5:0]: 64 behaves as 0.
+        let cpu = ee_run1(ee_srs_word(6, 9, 0), |c| {
+            c.accx = 1496;
+            c.set_reg(9, 64);
+        });
+        assert_eq!(cpu.reg(6), 1496);
+        // Large shifts converge to the sign (write-back included).
+        let cpu = ee_run1(ee_srs_word(6, 9, 0), |c| {
+            c.accx = -8;
+            c.set_reg(9, 63);
+        });
+        assert_eq!(cpu.reg(6), 0xFFFF_FFFF);
+        assert_eq!(cpu.accx, -1);
+    }
+
+    #[test]
+    fn ee_srs_accx_unsigned_shift_and_saturate() {
+        // sel=1: logical shift of the zero-extended 40-bit pattern.
+        let cpu = ee_run1(ee_srs_word(6, 9, 1), |c| {
+            c.accx = 0xFF_0000_0000;
+            c.set_reg(9, 8);
+        });
+        assert_eq!(cpu.reg(6), 0xFF00_0000);
+        assert_eq!(cpu.accx, 0xFF00_0000);
+        // Unsigned saturation at 2^32-1 (40-bit value above u32 range).
+        let cpu = ee_run1(ee_srs_word(6, 9, 1), |c| {
+            c.accx = 0x1_FFFF_FFFF;
+            c.set_reg(9, 0);
+        });
+        assert_eq!(cpu.reg(6), 0xFFFF_FFFF);
+        assert_eq!(cpu.accx, 0x1_FFFF_FFFF);
+        // Shift out everything.
+        let cpu = ee_run1(ee_srs_word(6, 9, 1), |c| {
+            c.accx = 0xFF_FFFF_FFFF;
+            c.set_reg(9, 63);
+        });
+        assert_eq!(cpu.reg(6), 0);
+        assert_eq!(cpu.accx, 0);
+    }
+
+    #[test]
+    fn ee_srs_accx_dot_product_epilogue() {
+        // The esp-nn quantized-dot-product tail: zero.accx, two loads,
+        // vmulas.s8.accx, then `movi a9, 0; ee.srs.accx a6, a9, 0`.
+        // A = B = [1..16], dot = 1496, shift 0 -> rd = 1496.
+        let prog = [
+            (0x4000_1000u32, 0x0083_0124u32), // vld.128.ip q0, a2, 16
+            (0x4000_1003u32, 0x0083_8124u32), // vld.128.ip q1, a2, 16
+            (0x4000_1006u32, 0x001A_08C4u32), // vmulas.s8.accx q0, q1
+            (0x4000_1009u32, 0x007E_1694u32), // ee.srs.accx a6, a9, 0
+        ];
+        let mut bus = RamBus::load(&prog);
+        let mut cpu = Cpu::new(0);
+        cpu.pc = 0x4000_1000;
+        cpu.set_reg(2, 0x4000_2000);
+        cpu.set_reg(9, 0);
+        for i in 0..16 {
+            bus.write8(0x4000_2000 + i as u32, i as u32 + 1);
+            bus.write8(0x4000_2010 + i as u32, i as u32 + 1);
+        }
+        run(&mut cpu, &mut bus, 0x4000_100C);
+        assert_eq!(cpu.reg(6), 1496);
+        assert_eq!(cpu.accx, 1496);
     }
 
     #[test]

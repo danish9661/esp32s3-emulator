@@ -14,6 +14,8 @@ static volatile uint32_t* R(uint32_t off) {
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C0018) |= (1u << 19);
   // Frame info: DLC=8, standard (11-bit) data frame -> byte0 = 0x08.
   uint8_t tx[13];
   tx[0] = 0x08;

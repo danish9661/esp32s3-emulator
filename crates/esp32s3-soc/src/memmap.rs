@@ -139,6 +139,9 @@ pub const UART0_BASE: u32 = 0x6000_0000;
 pub const UART1_BASE: u32 = 0x6001_0000;
 pub const UART2_BASE: u32 = 0x6002_E000;
 
+/// UHCI0 DMA bridge base (`DR_REG_UHCI0_BASE`, soc/reg_base.h).
+pub const UHCI0_BASE: u32 = 0x6001_4000;
+
 pub const GPIO_BASE: u32 = 0x6000_4000;
 
 pub const TIMG0_BASE: u32 = 0x6001_F000;
@@ -173,7 +176,7 @@ pub const SYSTEM_BASE: u32 = 0x600C_0000;
 /// touching them during boot/init never panics.
 pub const I2S0_BASE: u32 = 0x6000_F000;
 pub const I2S1_BASE: u32 = 0x6002_D000;
-pub const SYSCON_BASE: u32 = 0x6002_6000;
+pub const SYSCON_BASE: u32 = 0x6002_6000; // sysclk/tick/out config (NOT peripheral clocks: those are SYSTEM_PERIP_CLK_EN0/1)
 pub const PERI_BACKUP_BASE: u32 = 0x6002_A000;
 pub const LCD_CAM_BASE: u32 = 0x6004_1000;
 pub const SENSITIVE_BASE: u32 = 0x600C_1000;

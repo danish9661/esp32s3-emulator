@@ -20,6 +20,8 @@ static volatile uint32_t* G(uint32_t off) {
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C0018) |= (1u << 17);
   const int OUT = 2;
   const int FAULTPIN = 4;
 

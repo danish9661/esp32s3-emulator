@@ -16,6 +16,8 @@ static volatile uint32_t* G(uint32_t off) {
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C0018) |= (1u << 17);
   delay(200);
   *G(0x554 + PINA * 4) = 160;  // PWM0_OUT0A -> GPIO2
   *G(0x554 + PINB * 4) = 161;  // PWM0_OUT0B -> GPIO5

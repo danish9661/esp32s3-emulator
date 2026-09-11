@@ -60,6 +60,14 @@ pub struct UsbSerialJtag {
     /// the device via IN tokens, and the interrupt stays asserted as
     /// long as the TX FIFO has space).
     need_reassert: bool,
+    /// TX bytes staged while the USB_DEVICE clock (EN1 bit 10) is off
+    /// (silicon holds them in the endpoint FIFO instead of shifting);
+    /// flushed on the next tick once the clock returns. UART holds in its
+    /// TXFIFO the same way (see uart.rs flow control); the console drain
+    /// (`take_tx`) only ever sees shifted bytes.
+    hold: VecDeque<u8>,
+    /// SYSTEM USB_DEVICE clock shadow (set by the SoC on EN1 writes).
+    sys_clk: bool,
     /// Countdown (in tick() calls) until the next re-assertion.
     /// Models the USB host polling interval (~1 ms ≈ 1000 APB cycles).
     /// This prevents the ISR from firing every step, which would kill
@@ -73,9 +81,16 @@ impl UsbSerialJtag {
             regs: [0u32; REG_COUNT],
             tx_out: Vec::new(),
             rx: VecDeque::new(),
+            hold: VecDeque::new(),
+            sys_clk: true,
             need_reassert: false,
             reassert_countdown: 0,
         }
+    }
+
+    /// SYSTEM USB_DEVICE clock (EN1 bit 10) shadow for the TX hold.
+    pub fn set_sys_clk(&mut self, on: bool) {
+        self.sys_clk = on;
     }
 
     /// Drain the bytes this device emitted (host console output).
@@ -94,6 +109,11 @@ impl UsbSerialJtag {
     /// the TX task cycling so it can drain subsequent `Serial.write()`
     /// batches.
     pub fn tick(&mut self) {
+        // The SoC only ticks while the USB clock is on, so a non-empty
+        // hold flushes exactly on clock return.
+        if !self.hold.is_empty() {
+            self.tx_out.extend(self.hold.drain(..));
+        }
         if self.need_reassert {
             if self.reassert_countdown > 0 {
                 self.reassert_countdown -= 1;
@@ -166,8 +186,14 @@ impl UsbSerialJtag {
     pub fn write32(&mut self, offset: u32, value: u32) {
         match offset {
             EP1 => {
-                // TX byte -> host console (captured immediately).
-                self.tx_out.push((value & 0xFF) as u8);
+                // TX byte -> host console (captured immediately when the
+                // controller clock runs; held in the endpoint FIFO while
+                // gated, capped like the 128B UART FIFO for safety).
+                if self.sys_clk {
+                    self.tx_out.push((value & 0xFF) as u8);
+                } else if self.hold.len() < 1024 {
+                    self.hold.push_back((value & 0xFF) as u8);
+                }
             }
             EP1_CONF => {
                 // wr_done: latch serial_in_empty_int so the driver's TX-done

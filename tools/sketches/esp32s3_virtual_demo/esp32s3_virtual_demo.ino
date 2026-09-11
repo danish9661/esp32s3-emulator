@@ -78,6 +78,8 @@ uint8_t spi_xfer(uint8_t tx) {
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C0018) |= (1u << 7) | (1u << 6); // I2C0 + SPI2
   Serial.println("VIRTUAL DEMO START");
 
   // ---- I2C: firmware -> JS (send a command the browser displays) ----

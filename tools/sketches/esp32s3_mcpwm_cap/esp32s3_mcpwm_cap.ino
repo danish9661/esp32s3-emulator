@@ -27,6 +27,8 @@ static uint32_t wait_cap() {
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C0018) |= (1u << 17);
   delay(50);
 
   // Route OUT0A -> GPIO2 (output driver on, like the mcpwm sketch).

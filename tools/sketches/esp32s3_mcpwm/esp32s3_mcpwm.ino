@@ -33,6 +33,9 @@ static int measure_duty(int pin, uint32_t samples) {
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C0018) |= (1u << 17);
+  *(volatile uint32_t*)(0x600C0018) |= (1u << 20);
   const int PIN = 2;
 
   // Route PWM0_OUT0A (signal 160) to GPIO2 and enable the output driver.
@@ -72,8 +75,25 @@ void setup() {
   int duty3 = measure_duty(PIN1, 4000);
   Serial.printf("MCPWM1 duty3=%d%%\n", duty3);
 
+  // Pass 4: external timer sync. GPIO4 drives SYNC0_IN (signal 160);
+  // a rising edge with SYNCI_EN reloads timer0 with PHASE.
+  const int SYNC_PIN = 4;
+  pinMode(SYNC_PIN, OUTPUT);
+  digitalWrite(SYNC_PIN, LOW);
+  *G(0x154 + 160 * 4) = SYNC_PIN;  // FUNC_IN_SEL[160] = GPIO4
+  *M(0x0C) = (1u << 0) | (20u << 4);  // SYNCI_EN + PHASE=20
+  // Wait until the free-running counter passes 50, then pulse SYNC.
+  uint32_t t0 = millis();
+  while ((*M(0x10) & 0xFFFFu) <= 50u) {
+    if (millis() - t0 > 1000) break;
+  }
+  digitalWrite(SYNC_PIN, HIGH);
+  uint32_t synced = *M(0x10) & 0xFFFFu;
+  Serial.printf("MCPWM sync cnt=%lu\n", (unsigned long)synced);
+  bool sync_ok = synced >= 15 && synced <= 45;
+
   if (duty1 >= 40 && duty1 <= 60 && duty2 >= 15 && duty2 <= 35
-      && duty3 >= 40 && duty3 <= 60) {
+      && duty3 >= 40 && duty3 <= 60 && sync_ok) {
     Serial.println("MCPWM PASS");
   } else {
     Serial.println("MCPWM FAIL");

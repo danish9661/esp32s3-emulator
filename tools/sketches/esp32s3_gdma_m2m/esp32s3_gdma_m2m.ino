@@ -27,6 +27,8 @@ static int poll(uint32_t off, uint32_t bit) {
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C001C) |= (1u << 6);
   for (int i = 0; i < 8; i++) g_dst[i] = 0;
 
   g_odesc.dw0 = (8) | (8 << 12) | (1u << 30) | (1u << 31);

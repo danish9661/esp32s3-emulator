@@ -1,6 +1,6 @@
 // Headless validation for the LCD_CAM camera capture (battery-runnable).
 //
-// Stages two identical 8-word frames (the `esp32s3_camcap` sketch captures
+// Stages three identical 8-word frames (the `esp32s3_camcap` sketch captures
 // twice: plain, then byte-swapped) into the emulator before stepping, then
 // runs to `CAMCAP DONE` and asserts every printed word plus `CAMCAP PASS`.
 // Mirrors tools/virtual_demo_harness.mjs (nodejs wasm build, rebuilt when
@@ -54,6 +54,7 @@ emu.load_flash(flash);
 const cam = new VirtualCamera(FRAME);
 emu.cam_inject_frame(cam.takeFrame());
 emu.cam_inject_frame(cam.takeFrame());
+emu.cam_inject_frame(cam.takeFrame());
 
 let uart = '';
 const FRAMES = 600;
@@ -71,13 +72,15 @@ for (let f = 0; f < FRAMES && !done; f++) {
 const fails = [];
 const has = (s) => uart.includes(s);
 for (let i = 0; i < 8; i++) {
+  if (!has(`CAMCAP GDMA W${i}=${hex8(FRAME[i])}`)) fails.push(`missing GDMA W${i}`);
   if (!has(`CAMCAP PLAIN W${i}=${hex8(FRAME[i])}`)) fails.push(`missing PLAIN W${i}`);
   if (!has(`CAMCAP SWAP W${i}=${hex8(swap32(FRAME[i]))}`)) fails.push(`missing SWAP W${i}`);
 }
+if (!has('CAMCAP GDMA PASS')) fails.push('missing GDMA PASS');
 if (!has('CAMCAP PLAIN PASS')) fails.push('missing PLAIN PASS');
 if (!has('CAMCAP SWAP PASS')) fails.push('missing SWAP PASS');
 if (!has('CAMCAP PASS')) fails.push('missing CAMCAP PASS');
-if (cam.framesProvided !== 2) fails.push(`framesProvided=${cam.framesProvided} want 2`);
+if (cam.framesProvided !== 3) fails.push(`framesProvided=${cam.framesProvided} want 3`);
 
 if (fails.length) {
   console.error('CAMCAP HARNESS FAIL: ' + fails.join('; '));

@@ -125,6 +125,10 @@ void setup() {
     }
   }
   if (ok) Serial.println("FLASHREAD HIGH RW OK");
+  // Odd-address write needs its own erase: NOR program can only clear bits,
+  // so writing over the even pattern above without erasing reads back the
+  // AND of both patterns (silicon-identical behavior, not a model gap).
+  ESP.flashEraseSector(0x200000 / 4096);
   for (int i = 0; i < 64; i++) s_buf[i] = (uint8_t)(0x50 + i);
   ESP.flashWrite(0x200001, s_words, 64);
   ESP.flashRead(0x200001, s_words, 64);

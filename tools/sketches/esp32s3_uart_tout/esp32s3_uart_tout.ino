@@ -16,6 +16,8 @@
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C0018) |= (1u << 5);
   // Full threshold 120 (a 1-byte burst never reaches it), timeout enable.
   U1_CONF1 = (U1_CONF1 & ~0x3FFu) | 120u | (1u << 23);
   // Timeout = 10 bit-times (explicit; also the reset default).

@@ -88,7 +88,48 @@
     "file": "esp32s3_camcap.merged.bin"
   },
   {
-    "name": "i2s_driver \u2014 I2S duplex loopback (driver)",
+    "name": "i2s_driver — I2S duplex loopback (driver)",
     "file": "esp32s3_i2s_driver.merged.bin"
+  },
+  {
+    "name": "ota_update — OTA update, reboot into slot 1",
+    "file": "esp32s3_ota_update.merged.bin"
+  },
+  {
+    "name": "emmc — eMMC init + block R/W",
+    "file": "esp32s3_emmc.merged.bin"
+  },
+  {
+    "name": "usb_host — USB-OTG host enumeration",
+    "file": "esp32s3_usb_host.merged.bin"
+  },
+  {
+    "name": "flashenc — hello world, encrypted flash (XTS)",
+    "file": "esp32s3_hello.merged.bin",
+    "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+  },
+  {
+    "name": "ee_dsp — TIE vector DSP + SRS epilogue",
+    "file": "esp32s3_ee_dsp.merged.bin"
+  },
+  {
+    "name": "temp — temperature sensor readout",
+    "file": "esp32s3_temp.merged.bin"
+  },
+  {
+    "name": "psram_opi — octal PSRAM malloc/RW",
+    "file": "esp32s3_psram_opi.merged.bin"
+  },
+  {
+    "name": "mcpwm_fault — PWM fault trip/release",
+    "file": "esp32s3_mcpwm_fault.merged.bin"
+  },
+  {
+    "name": "dedic_gpio — dedicated GPIO bundle",
+    "file": "esp32s3_dedic_gpio.merged.bin"
+  },
+  {
+    "name": "lightsleep — light sleep resume",
+    "file": "esp32s3_lightsleep.merged.bin"
   }
 ]

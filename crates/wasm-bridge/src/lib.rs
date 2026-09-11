@@ -51,6 +51,25 @@ impl Emulator {
         self.inner.boot_from_flash(flash);
     }
 
+    /// Install a plaintext image as a factory-encrypted device: provision
+    /// the eFuse XTS key, uniformly encrypt the image (every 16-byte block
+    /// at its absolute offset, like esptool), then boot the ciphertext.
+    /// `key` must hold exactly 32 bytes. Used by the gallery's
+    /// flash-encryption demo (mirrors `run_flash`'s FLASHENC_KEY flow).
+    pub fn load_flash_encrypted(&mut self, flash: &[u8], key: &[u8]) {
+        assert_eq!(key.len(), 32, "flash-encryption key must be 32 bytes");
+        assert_eq!(flash.len() % 16, 0, "image must be 16-byte aligned");
+        let mut k = [0u8; 32];
+        k.copy_from_slice(key);
+        self.inner.soc.flashenc_provision(&k);
+        self.inner.soc.load_flash_image(0, flash);
+        self.inner
+            .soc
+            .flashenc_encrypt_region(0, flash.len() as u32);
+        let enc = self.inner.soc.flash_image().to_vec();
+        self.inner.boot_from_flash(&enc);
+    }
+
     /// Advance the machine by `n` instruction-steps (both cores + timers).
     pub fn step(&mut self, n: u32) {
         for _ in 0..n {

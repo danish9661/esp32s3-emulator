@@ -27,6 +27,8 @@ static inline void issue(uint8_t idx, uint32_t arg, uint32_t flags) {
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C001C) |= (1u << 7);
   delay(200);
 
   // GO_IDLE_STATE

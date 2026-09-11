@@ -65,6 +65,8 @@ bool run_read(uint8_t addr, uint32_t* out_raw, uint32_t* out_sr) {
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C0018) |= (1u << 7);
   delay(50);
   I2C[0x04 / 4] = (1u << 4);   // CTR: master mode (no trans_start yet)
 

@@ -13,8 +13,11 @@
 // Test 4 (ldf128 round trip): S = [1.0f, 2.0f, 3.0f, 4.0f] words,
 //   ldf.128.ip f4-f7 <- S (raw word, a2 = S), stf.128.ip f4-f7 -> D
 //   (raw word), D must equal S word-for-word (pairwise-swap round trip).
+// Test 5 (srs): dot = 1496 again, srs shift 2 -> 374 (ACCX becomes 374),
+//   then srs shift 0 -> 374 again (proves the ACCX write-back: the second
+//   srs sees 374, not the original 1496).
 // Markers: "EE DSP DOT OK", "EE DSP VADDS OK", "EE DSP CMUL OK",
-// "EE DSP LDF128 OK", "EE DSP DONE"
+// "EE DSP LDF128 OK", "EE DSP SRS OK", "EE DSP DONE"
 // (any mismatch prints "EE DSP FAIL", which the battery treats as failure).
 
 static int8_t dsp_a[16] __attribute__((aligned(16)));
@@ -143,6 +146,31 @@ void setup() {
   Serial.println(dsp_t[0], HEX);
   if (ok128) {
     Serial.println("EE DSP LDF128 OK");
+  } else {
+    Serial.println("EE DSP FAIL");
+  }
+
+  // --- Test 5: SRS shift+saturate with ACCX write-back.
+  uint8_t *pa5 = (uint8_t *)dsp_a;
+  uint8_t *pb5 = (uint8_t *)dsp_b;
+  uint32_t srs_a = 0, srs_b = 0;
+  int sh2 = 2, sh0 = 0;
+  __asm__ volatile(
+      "ee.zero.accx\n"
+      "ee.vld.128.ip q0, %0, 16\n"
+      "ee.vld.128.ip q1, %1, 16\n"
+      "ee.vmulas.s8.accx q0, q1\n"
+      "ee.srs.accx %2, %4, 0\n"
+      "ee.srs.accx %3, %5, 0\n"
+      : "+a"(pa5), "+a"(pb5), "=a"(srs_a), "=a"(srs_b)
+      : "a"(sh2), "a"(sh0)
+      : "memory");
+  Serial.print("EE DSP SRS a=");
+  Serial.print(srs_a);
+  Serial.print(" b=");
+  Serial.println(srs_b);
+  if (srs_a == 374 && srs_b == 374) {
+    Serial.println("EE DSP SRS OK");
   } else {
     Serial.println("EE DSP FAIL");
   }

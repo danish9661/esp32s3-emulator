@@ -21,6 +21,8 @@ volatile uint32_t* const GPIO = (volatile uint32_t* const)GPIO_BASE;
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C0018) |= (1u << 9);
   delay(50);
 
   // Snapshot pre-existing RMT state (Arduino core / bootloader baggage?).

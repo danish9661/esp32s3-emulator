@@ -253,7 +253,8 @@ pub fn decode_ee(insn: u32) -> Opcode {
             _ => Opcode::OPCODE_EE_VMULAS_U16_QACC_LDBC_INCP,
         };
     }
-    // TODO(ee): remaining format_32 families (fft.*, fused .ld/.st forms).
+    // All format_32 families execute (218/218 opcodes, incl. srs.accx);
+    // unrecognized patterns fall through to OPCODE_EE_UNIMPLEMENTED.
     Opcode::OPCODE_EE_UNIMPLEMENTED
 }
 
@@ -1166,6 +1167,40 @@ fn ee_vmulas_qacc(cpu: &mut Cpu, name: &str, raw: u32) {
     }
 }
 
+/// Shift-right-saturate ACCX (QEMU `srs_accx_s3`; the ESP32-P4 PIE twin
+/// documents it as `ESP.SRS.S/U.XACC`): `ee.srs.accx rd, rs, sel`
+/// shifts the 40-bit ACCX right by rs[5:0], writes the 40-bit result back,
+/// and writes rd the saturated 32-bit result — signed (sel=0:
+/// min(max(v, -2^31), 2^31-1)) or unsigned (sel=1: min(v, 2^32-1)).
+///
+/// GAS-probed operand layout (all 15 ARs x sel 0/1 encode distinctly, so
+/// the old "shift-AR unencodable" note was simply wrong — nothing is
+/// masked): rd = bits [11:8], rs = bits [7:4], sel = bit 14, i.e. word =
+/// 0x7E1004 | rd<<8 | rs<<4 | sel<<14 (verified: a1,a2,0 = 0x7E1124,
+/// a6,a9,0 = 0x7E1694, a1,a2,1 = 0x7E5124). Real-firmware usage: the
+/// esp-nn/esp-dl quantized dot-product epilogue
+/// (`movi a9, 0; ee.srs.accx a6, a9, 0` after `ee.vmulas.*.accx`).
+fn ee_srs_accx(cpu: &mut Cpu, raw: u32) {
+    let rd = (raw >> 8) & 0xF;
+    let rs = (raw >> 4) & 0xF;
+    let sel = (raw >> 14) & 1;
+    let s = cpu.reg(rs) & 63;
+    if sel == 0 {
+        // Signed: sign-extend the 40-bit pattern, shift, keep signed (the
+        // vmulas convention, so later accumulates stay sane).
+        let v = (cpu.accx << 24) >> 24;
+        let shifted = v >> s;
+        cpu.accx = shifted;
+        cpu.set_reg(rd, shifted.clamp(-0x8000_0000, 0x7FFF_FFFF) as u32);
+    } else {
+        // Unsigned: zero-extend the 40-bit pattern, shift, keep unsigned.
+        let v = (cpu.accx as u64) & 0x00FF_FFFF_FFFF;
+        let shifted = v >> s;
+        cpu.accx = shifted as i64;
+        cpu.set_reg(rd, shifted.min(0xFFFF_FFFF) as u32);
+    }
+}
+
 /// GPIO output latch ops (QEMU `wr_mask_gpio_out_s3`); `ee.get_gpio_in`
 /// reads the SoC-resolved dedicated-input channels (GPIO-matrix
 /// CORE1_GPIO_IN0..7) via the bus, NOT the output latch.
@@ -1343,6 +1378,8 @@ pub fn exec_ee<B: Bus>(cpu: &mut Cpu, bus: &mut B, opc: Opcode, raw: u32) -> boo
         ee_zero(cpu, raw, 1);
     } else if name == "ee_zero_accx" {
         ee_zero(cpu, raw, 2);
+    } else if name == "ee_srs_accx" {
+        ee_srs_accx(cpu, raw);
     } else if name == "ee_movi_32_q" {
         ee_movi(cpu, raw, ((raw >> 10) & 3) as usize, true);
     } else if name == "ee_movi_32_a" {

@@ -17,6 +17,8 @@ volatile uint32_t* const RMTMEM = (volatile uint32_t* const)RMTMEM_BASE;
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C0018) |= (1u << 9);
   delay(50);
 
   // Channel 0 config: div_cnt=2, idle_out_en, idle_out_lv=1 (idle high).

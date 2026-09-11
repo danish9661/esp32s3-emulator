@@ -20,6 +20,10 @@ void setup() {
   uint32_t sdio_conf = *(volatile uint32_t *)0x6000807C;
   uint32_t dig_pwc = *(volatile uint32_t *)0x60008090;
   Serial.printf("LIGHTSLEEP dbg sdio_conf=%x dig_pwc=%x\n", sdio_conf, dig_pwc);
+  // Let the console TX drain fully before sleeping (suspend records
+  // UARTs with TX in flight; a draining console looks "active").
+  Serial.flush();
+  delay(100);
   esp_sleep_enable_timer_wakeup(1000000);
   esp_light_sleep_start();
   // Resume lands here (no reboot on real silicon).

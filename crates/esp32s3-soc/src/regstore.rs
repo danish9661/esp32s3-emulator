@@ -27,7 +27,7 @@ impl RegStore {
 
     /// Read the 32-bit register at `offset` (offset is the low 12 bits of the
     /// address within the peripheral's 4 KB page). Out-of-range offsets read 0.
-    pub fn read32(&mut self, offset: u32) -> u32 {
+    pub fn read32(&self, offset: u32) -> u32 {
         let i = ((offset & 0xFFF) / 4) as usize;
         *self.regs.get(i).unwrap_or(&0)
     }

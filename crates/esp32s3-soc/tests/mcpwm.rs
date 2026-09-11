@@ -217,7 +217,7 @@ fn sync_sw_reloads_timer_with_phase() {
     m.write32(0x0C, (500 << 4) | (1 << 1));
     assert_eq!(m.read32(0x10), 500, "timer0 reloaded with phase");
     // A write without SYNC_SW leaves the counter alone.
-    m.write32(0x0C, (700 << 4));
+    m.write32(0x0C, 700 << 4);
     assert_eq!(m.read32(0x10), 500, "no reload without SYNC_SW");
 }
 
@@ -357,7 +357,7 @@ fn pwm50() -> Mcpwm {
 fn carrier_chops_generator_at_programmed_duty() {
     let mut m = pwm50();
     // Carrier: en + prescale 0 (period 8 steps) + duty 4/8 (50%).
-    m.write32(OPER0_CARRIER, 1 | (0 << 1) | (4 << 5));
+    m.write32(OPER0_CARRIER, 1 | (4 << 5));
     let mut high = 0u32;
     let mut edges = 0u32;
     let mut prev = m.signal_level(160);
@@ -381,14 +381,14 @@ fn carrier_chops_generator_at_programmed_duty() {
 fn carrier_out_invert_flips_wave() {
     let mut m = pwm50();
     // duty 2/8 (25%): normal ~25%, out-inverted ~75% over 800 ticks.
-    m.write32(OPER0_CARRIER, 1 | (0 << 1) | (2 << 5));
+    m.write32(OPER0_CARRIER, 1 | (2 << 5));
     let mut high = 0u32;
     for _ in 0..800 {
         m.tick();
         high += m.signal_level(160);
     }
     assert!((80..=120).contains(&high), "duty 2/8 wrong: {high}/800");
-    m.write32(OPER0_CARRIER, 1 | (0 << 1) | (2 << 5) | (1 << 12));
+    m.write32(OPER0_CARRIER, 1 | (2 << 5) | (1 << 12));
     let mut high_i = 0u32;
     for _ in 0..800 {
         m.tick();
@@ -408,7 +408,7 @@ fn carrier_in_invert_modulates_low_input() {
     for _ in 0..4 {
         m.tick();
     }
-    m.write32(OPER0_CARRIER, 1 | (0 << 1) | (4 << 5));
+    m.write32(OPER0_CARRIER, 1 | (4 << 5));
     let mut high = 0u32;
     for _ in 0..200 {
         m.tick();
@@ -416,7 +416,7 @@ fn carrier_in_invert_modulates_low_input() {
     }
     assert_eq!(high, 0, "LOW input must gate the carrier off");
     // In-invert: the LOW input now reads HIGH and chops at 50%.
-    m.write32(OPER0_CARRIER, 1 | (0 << 1) | (4 << 5) | (1 << 13));
+    m.write32(OPER0_CARRIER, 1 | (4 << 5) | (1 << 13));
     let mut high_i = 0u32;
     for _ in 0..200 {
         m.tick();
@@ -433,7 +433,7 @@ fn carrier_oshtwth_widens_first_pulse() {
     let mut m = Mcpwm::new();
     // duty 0/8 (wave always LOW) + oshtwth 2: the first pulse after the
     // rising edge is forced HIGH for 2 carrier periods (16 steps).
-    m.write32(OPER0_CARRIER, 1 | (0 << 1) | (0 << 5) | (2 << 8));
+    m.write32(OPER0_CARRIER, 1 | (2 << 8));
     m.write32(OPER0_FORCE, 2);
     for _ in 0..10 {
         m.tick();
@@ -448,4 +448,93 @@ fn carrier_oshtwth_widens_first_pulse() {
         m.tick();
     }
     assert_eq!(m.signal_level(160), 0, "wave must be LOW after one-shot");
+}
+
+// Timer/operator event interrupts (mcpwm_reg.h INT bits: TIMER0_TEZ=3,
+// TIMER0_TEP=6, OP0_TEA=15, OP0_TEB=18).
+
+#[test]
+fn timer_tez_and_tep_latch_on_up_wrap() {
+    let mut m = Mcpwm::new();
+    m.write32(TIMER0_CFG0, 100 << 8);
+    m.write32(TIMER0_CFG1, (1 << 3) | 2);
+    for _ in 0..100 {
+        m.tick();
+    }
+    let raw = m.read32(INT_RAW);
+    assert_ne!(raw & (1 << 3), 0, "TIMER0_TEZ latched, raw={raw:#x}");
+    assert_ne!(raw & (1 << 6), 0, "TIMER0_TEP latched, raw={raw:#x}");
+}
+
+#[test]
+fn timer_tep_latches_at_updown_peak_without_tez() {
+    let mut m = Mcpwm::new();
+    // Up-down mode (mode=3): bit pattern per TIMER0_CFG1 test above.
+    m.write32(TIMER0_CFG0, 100 << 8);
+    m.write32(TIMER0_CFG1, (3 << 3) | 2);
+    // Peak hits after 100 prescale-1 steps (counter 0 -> 99).
+    for _ in 0..100 {
+        m.tick();
+    }
+    let raw = m.read32(INT_RAW);
+    assert_ne!(
+        raw & (1 << 6),
+        0,
+        "TIMER0_TEP latched at peak, raw={raw:#x}"
+    );
+    assert_eq!(raw & (1 << 3), 0, "no TEZ at peak, raw={raw:#x}");
+}
+
+#[test]
+fn operator_tea_teb_latch_on_compare_match() {
+    let mut m = pwm50();
+    // Comparator B = 75 (OPER0_TSTMP_B @ 0x44; default 0 would hide
+    // behind the TEZ branch like real silicon's zero match).
+    m.write32(0x44, 75);
+    // One more period crosses both comparator matches.
+    for _ in 0..100 {
+        m.tick();
+    }
+    let raw = m.read32(INT_RAW);
+    assert_ne!(raw & (1 << 15), 0, "OP0_TEA latched, raw={raw:#x}");
+    assert_ne!(raw & (1 << 18), 0, "OP0_TEB latched, raw={raw:#x}");
+}
+
+#[test]
+fn external_sync_reloads_timer_on_rising_edge() {
+    use std::cell::Cell;
+    let mut m = Mcpwm::new();
+    // Timer0 SYNC @ 0x0C: SYNCI_EN (bit 0) + PHASE=500 in [19:4].
+    m.write32(0x0C, (500 << 4) | 1);
+    let lvl = Cell::new(0u32);
+    let input = |_sig: u32| lvl.get();
+    // Low level: no reload (counter advances from 0).
+    m.tick_sync(160, &input);
+    // Rising edge: reload with PHASE.
+    lvl.set(1);
+    m.tick_sync(160, &input);
+    assert_eq!(m.read32(TIMER0_STATUS), 500, "sync reload with phase");
+    // Held high: no second reload (edge-triggered).
+    m.tick_sync(160, &input);
+    assert_eq!(m.read32(TIMER0_STATUS), 500, "no reload while held");
+}
+
+#[test]
+fn dead_time_outswap_exchanges_ab_outputs() {
+    let mut m = pwm50();
+    // DT0_CFG @ 0x58: A_OUTSWAP (bit 9) + B_OUTSWAP (bit 10) —
+    // full A/B exchange (a lone A_OUTSWAP leaves B on B).
+    m.write32(0x58, (1 << 9) | (1 << 10));
+    let mut a_high = 0u32;
+    let mut b_high = 0u32;
+    for _ in 0..200 {
+        m.tick();
+        a_high += m.signal_level(160);
+        b_high += m.signal_level(161);
+    }
+    assert_eq!(a_high, 0, "swapped A reads B (low), got {a_high}");
+    assert!(
+        (95..=105).contains(&b_high),
+        "swapped B reads A (~50%), got {b_high}/200"
+    );
 }

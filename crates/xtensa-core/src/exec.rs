@@ -752,8 +752,8 @@ pub(crate) fn execute<B: Bus>(
             Outcome::Seq
         }
         Opcode::OPCODE_WAITI => {
-            // waiti level: no interrupt controller in P1; no-op (TODO:
-            // yield once interrupts exist).
+            // waiti level: architectural power-down hint; modeled as no-op
+            // (interrupts still preempt normally on the next step).
             Outcome::Seq
         }
         Opcode::OPCODE_EXCW => {
@@ -851,6 +851,13 @@ pub(crate) fn execute<B: Bus>(
             cpu.set_reg(o[0].value, cpu.sreg(sr_of(opc)));
             Outcome::Seq
         }
+        Opcode::OPCODE_WSR_MMID => {
+            // MMID (memory-management ID) has no storage on the MMU-less
+            // S3: the write is dropped instead of aliasing SR 0 (LBEG)
+            // through sr_of's catch-all (same bug class as the old PRID /
+            // WINDOWBASE gaps). Unobservable: no RSR_MMID decodes.
+            Outcome::Seq
+        }
         Opcode::OPCODE_WSR_LBEG
         | Opcode::OPCODE_WSR_LEND
         | Opcode::OPCODE_WSR_LCOUNT
@@ -868,7 +875,6 @@ pub(crate) fn execute<B: Bus>(
         | Opcode::OPCODE_WSR_MISC1
         | Opcode::OPCODE_WSR_MISC2
         | Opcode::OPCODE_WSR_MISC3
-        | Opcode::OPCODE_WSR_MMID
         | Opcode::OPCODE_WSR_ERACCESS
         | Opcode::OPCODE_WSR_IBREAKENABLE
         | Opcode::OPCODE_WSR_MEMCTL
@@ -1180,14 +1186,14 @@ pub(crate) fn execute<B: Bus>(
         Opcode::OPCODE_RUR_UA_STATE_0 => {
             cpu.set_reg(
                 o[0].value,
-                u32::from_le_bytes(cpu.ua_state[4 * 0..4 * 0 + 4].try_into().unwrap()),
+                u32::from_le_bytes(cpu.ua_state[0..4].try_into().unwrap()),
             );
             Outcome::Seq
         }
         Opcode::OPCODE_RUR_UA_STATE_1 => {
             cpu.set_reg(
                 o[0].value,
-                u32::from_le_bytes(cpu.ua_state[4 * 1..4 * 1 + 4].try_into().unwrap()),
+                u32::from_le_bytes(cpu.ua_state[4..8].try_into().unwrap()),
             );
             Outcome::Seq
         }
@@ -1207,12 +1213,12 @@ pub(crate) fn execute<B: Bus>(
         }
         Opcode::OPCODE_WUR_UA_STATE_0 => {
             let v = cpu.reg(o[0].value);
-            cpu.ua_state[4 * 0..4 * 0 + 4].copy_from_slice(&v.to_le_bytes());
+            cpu.ua_state[0..4].copy_from_slice(&v.to_le_bytes());
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_UA_STATE_1 => {
             let v = cpu.reg(o[0].value);
-            cpu.ua_state[4 * 1..4 * 1 + 4].copy_from_slice(&v.to_le_bytes());
+            cpu.ua_state[4..8].copy_from_slice(&v.to_le_bytes());
             Outcome::Seq
         }
         Opcode::OPCODE_WUR_UA_STATE_2 => {

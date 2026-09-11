@@ -131,3 +131,65 @@ fn rs485_echo_needs_en_and_tx_rx_en() {
     assert_eq!(u.read32(UART_FIFO), 0x5A, "echo byte");
     assert_eq!(u.read32(UART_FIFO), 0, "FIFO drained");
 }
+
+/// Hardware flow control (CONF0 TX_FLOW_EN[15] / RX_FLOW_EN[22],
+/// uart_reg.h): with TX flow on and CTS high the transmitter holds bytes
+/// (EMPTY/DONE low, TXFIFO_CNT live); a CTS drop flushes them. CTS_CHG
+/// latches on every CTS edge.
+#[test]
+fn tx_flow_control_holds_and_flushes_on_cts() {
+    let mut u = Uart::new();
+    // TX_FLOW_EN + empty threshold 1 (EMPTY reads low once a byte is
+    // held); clear the reset EMPTY/DONE latches first.
+    u.write32(UART_CONF0, 1 << 15);
+    u.write32(UART_CONF1, 96 | (1 << 10));
+    u.write32(UART_INT_CLR, 0xFFFF);
+    // Default CTS = pull-high (stop).
+    u.write32(UART_FIFO, 0x41);
+    u.write32(UART_FIFO, 0x42);
+    assert!(u.take_tx().is_empty(), "held while CTS high");
+    let st = u.read32(UART_STATUS);
+    assert_eq!((st >> 16) & 0x3FF, 2, "TXFIFO_CNT live, st={st:#x}");
+    assert_eq!(st & (1 << 14), 1 << 14, "CTSn high, st={st:#x}");
+    assert_eq!(u.read32(UART_INT_RAW) & INT_TXFIFO_EMPTY, 0, "EMPTY low");
+    assert_eq!(u.read32(UART_INT_RAW) & INT_TX_DONE, 0, "DONE low");
+    // CTS drop (go): flush + DONE latch + CTS_CHG edge.
+    u.set_cts(0);
+    assert_eq!(u.take_tx(), vec![0x41, 0x42], "flushed on CTS go");
+    assert_eq!(u.read32(UART_STATUS) & (1 << 14), 0, "CTSn low");
+    assert_ne!(u.read32(UART_INT_RAW) & INT_CTS_CHG, 0, "CTS_CHG latched");
+    assert_ne!(u.read32(UART_INT_RAW) & INT_TX_DONE, 0, "DONE on flush");
+}
+
+/// RX flow control drives RTSn (STATUS[30], U_RTSn signal) from the RX
+/// level against MEM_CONF RX_FLOW_THRHD[16:7]: ready (0) below, stop (1)
+/// at/above. Disabled flow idles RTSn high.
+#[test]
+fn rx_flow_control_drives_rtsn_from_level() {
+    let mut u = Uart::new();
+    assert_eq!(u.rts_level(), 1, "RTSn idle high without flow");
+    u.write32(UART_CONF0, 1 << 22);
+    u.write32(UART_MEM_CONF, 4 << 7); // threshold 4
+    assert_eq!(u.rts_level(), 0, "RTSn ready while empty");
+    u.inject_rx(b'A');
+    u.inject_rx(b'B');
+    u.inject_rx(b'C');
+    assert_eq!(u.rts_level(), 0, "ready below threshold");
+    u.inject_rx(b'D');
+    assert_eq!(u.rts_level(), 1, "stop at threshold");
+    assert_eq!(u.read32(UART_STATUS) & (1 << 30), 1 << 30, "RTSn in STATUS");
+}
+
+/// The sticky RX edge survives a FIFO drain (sleep-entry FIFO reset): an
+/// injected-then-read byte still reports its edge exactly once.
+#[test]
+fn rx_edge_sticky_until_taken() {
+    let mut u = Uart::new();
+    assert!(!u.take_rx_edge(), "no edge at reset");
+    u.inject_rx(b'Z');
+    assert!(u.rx_pending());
+    assert_eq!(u.read32(UART_FIFO), u32::from(b'Z'));
+    assert!(!u.rx_pending(), "FIFO drained");
+    assert!(u.take_rx_edge(), "edge survives the drain");
+    assert!(!u.take_rx_edge(), "edge consumed once");
+}

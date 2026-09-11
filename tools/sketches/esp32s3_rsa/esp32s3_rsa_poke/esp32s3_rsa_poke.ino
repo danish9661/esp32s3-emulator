@@ -28,6 +28,8 @@ void setup() __attribute__((optimize("O0")));
 void setup() {
   MARKERv4 = 0x1234;
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C001C) |= (1u << 3);
   Serial.println("S0");
   // Force the RSA registers to be touched directly, inlined in setup.
   for (volatile int i = 0; i < 32; i++) poke32(RSA_M + i*4, N_le[i]);

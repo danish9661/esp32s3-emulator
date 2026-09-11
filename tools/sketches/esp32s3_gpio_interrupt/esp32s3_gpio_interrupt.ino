@@ -24,6 +24,8 @@ void IRAM_ATTR gpio_isr_handler() {
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C0018) |= (1u << 9);
   delay(50);
 
   pinMode(2, OUTPUT);

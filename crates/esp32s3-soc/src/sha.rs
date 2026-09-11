@@ -24,6 +24,8 @@ pub const SHA_BASE: u32 = 0x6003_B000;
 
 /// GDMA peripheral id for the SHA engine (`SOC_GDMA_TRIG_PERIPH_SHA0`).
 pub const GDMA_SHA_PERIPH: u32 = 7;
+/// SHA done-interrupt matrix source (`interrupts.h` recount: AES=77 → SHA=78).
+pub const SHA_INTR_SOURCE: u32 = 78;
 
 const SHA256_K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -286,6 +288,9 @@ pub struct Sha {
     mode: u32,
     block_num: u32,
     int_ena: u32,
+    /// Done-interrupt raw flag (latched when a transform completes, cleared
+    /// by CLEAR_IRQ @ 0x24; `INT_ST = RAW & ENA` drives source 78).
+    int_raw: u32,
     /// Accumulated message bytes for the current DMA/direct operation.
     msg: Vec<u8>,
     /// Running hash state (h0..hN), big-endian words.
@@ -416,6 +421,13 @@ impl Sha {
                 self.digest[i] = self.h[i].swap_bytes();
             }
         }
+        // Latch the done-interrupt raw flag (a transform completed).
+        self.int_raw = 1;
+    }
+
+    /// Done-interrupt status (`RAW & ENA`) for matrix source 78.
+    pub fn int_st(&self) -> u32 {
+        self.int_raw & self.int_ena
     }
 
     pub fn read32(&self, off: u32) -> u32 {
@@ -458,6 +470,8 @@ impl Sha {
                 // SHA_DMA_CONTINUE: continue running hash.
                 self.process();
             }
+            // SHA_CLEAR_IRQ (WO): any write clears the done-interrupt latch.
+            0x24 => self.int_raw = 0,
             0x28 => self.int_ena = value,
             0x80..=0xFC => {
                 // TEXT (message) direct-fill: append the 4 bytes LSB-first,

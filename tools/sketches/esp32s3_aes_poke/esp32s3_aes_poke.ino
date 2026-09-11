@@ -20,6 +20,8 @@ static void wr(uint32_t off, uint32_t v) { REG(off) = v; }
 
 void setup() {
   Serial.begin(115200);
+  // Enable peripheral clocks (SYSCON gating: frozen otherwise).
+  *(volatile uint32_t*)(0x600C001C) |= (1u << 1);
   delay(50);
 
   // Key bytes 00..0f stored little-endian as 32-bit words.

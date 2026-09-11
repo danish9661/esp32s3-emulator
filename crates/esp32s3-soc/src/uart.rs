@@ -67,8 +67,27 @@ pub const INT_TX_DONE: u32 = 1 << 14;
 // these low bits must carry the count — a ST_UTX_OUT-style constant here
 // (as on classic ESP32) poisons every length computation with 0x300.
 const STATUS_RXFIFO_CNT_MASK: u32 = 0x3FF;
-// Modem-line idle levels (TRM defaults): ctsn/rxd/dtrn high, dsrn low.
-const STATUS_MODEM_IDLE: u32 = (1 << 14) | (1 << 15) | (1 << 29);
+// Modem-line idle levels (TRM defaults): ctsn/rxd/dtrn/rtsn/txd high,
+// dsrn low.
+const STATUS_MODEM_IDLE: u32 = (1 << 14) | (1 << 15) | (1 << 29) | (1 << 30) | (1 << 31);
+const STATUS_CTSN: u32 = 1 << 14;
+const STATUS_RTSN: u32 = 1 << 30;
+const STATUS_TXFIFO_CNT_SHIFT: u32 = 16;
+const STATUS_TXFIFO_CNT_MASK: u32 = 0x3FF;
+// UART_CONF0 flow-control bits (uart_reg.h): TX_FLOW_EN[15] gates the
+// transmitter on CTSn; RX_FLOW_EN[22] drives RTSn from the RX level.
+const CONF0_TX_FLOW_EN: u32 = 1 << 15;
+const CONF0_RX_FLOW_EN: u32 = 1 << 22;
+// UART_MEM_CONF RX_FLOW_THRHD[16:7]: RX level asserting RTSn (stop).
+const MEM_CONF_RX_FLOW_THRHD_SHIFT: u32 = 7;
+const MEM_CONF_RX_FLOW_THRHD_MASK: u32 = 0x3FF;
+// CTS-edge interrupt (uart_reg.h CTS_CHG_INT_RAW bit 6).
+pub const INT_CTS_CHG: u32 = 1 << 6;
+// GPIO-matrix modem signals (gpio_sig_map.h): UnCTS_IN/RTS_OUT, n = 0..2.
+pub const UART_CTS_SIG: [u32; 3] = [13, 16, 19];
+pub const UART_RTS_SIG: [u32; 3] = [13, 16, 19];
+// Hardware FIFO depth (uart_struct.h TX/RX size): held TX bytes cap here.
+const FIFO_DEPTH: usize = 128;
 
 // UART_CONF1 fields (TRM UART_CONF1_REG @ 0x24).
 const CONF1_RX_TOUT_EN: u32 = 1 << 23;
@@ -92,6 +111,17 @@ pub struct Uart {
     tx_out: Vec<u8>,
     /// Received-but-unread bytes (the RX FIFO).
     rx: VecDeque<u8>,
+    /// Sticky RX-edge flag for light-sleep UART wakeup: silicon wakes on
+    /// the RX start-bit edge, not the FIFO level, and the sleep-entry path
+    /// resets the FIFO — so a byte injected before entry must still wake
+    /// after the reset drains it. Set on every injected byte, consumed
+    /// (taken) by the sleep evaluation.
+    rx_edge: bool,
+    /// TX bytes held by hardware flow control (CTSn high with TX_FLOW_EN);
+    /// flushed to `tx_out` when CTS drops. Empty unless flow-controlled.
+    tx_hold: VecDeque<u8>,
+    /// CTSn input level (1 = stop TX when TX_FLOW_EN; reset pull-high).
+    cts: u32,
     /// RX-idle ticks since the last received byte (RXFIFO_TOUT counter).
     tout_idle: u64,
 }
@@ -116,8 +146,79 @@ impl Uart {
             regs,
             tx_out: Vec::new(),
             rx: VecDeque::new(),
+            rx_edge: false,
+            tx_hold: VecDeque::new(),
+            cts: 1,
             tout_idle: 0,
         }
+    }
+
+    /// Transmitter may shift: flow control off, or CTSn low (go).
+    fn can_tx(&self) -> bool {
+        self.regs[(UART_CONF0 / 4) as usize] & CONF0_TX_FLOW_EN == 0 || self.cts == 0
+    }
+
+    /// Drive the CTSn input level (matrix U_CTSn, unrouted = pull-high).
+    /// A change latches CTS_CHG; a drop to go flushes held TX bytes.
+    pub fn set_cts(&mut self, level: u32) {
+        let level = level & 1;
+        if level != self.cts {
+            self.cts = level;
+            self.regs[(UART_INT_RAW / 4) as usize] |= INT_CTS_CHG;
+            if level == 0 {
+                self.flush_hold();
+            }
+        }
+    }
+
+    /// Move held TX bytes to the line (transmitter runs).
+    fn flush_hold(&mut self) {
+        if self.tx_hold.is_empty() {
+            return;
+        }
+        // RS485 echo applies to flushed bytes exactly like direct writes.
+        let rs485 = self.regs[(UART_RS485_CONF / 4) as usize];
+        let echo = rs485 & (RS485_EN | RS485_TX_RX_EN) == (RS485_EN | RS485_TX_RX_EN)
+            && self.regs[(UART_CONF0 / 4) as usize] & (1 << 8) == 0;
+        while let Some(b) = self.tx_hold.pop_front() {
+            self.tx_out.push(b);
+            if echo {
+                self.inject_rx(b);
+            }
+        }
+        self.regs[(UART_INT_RAW / 4) as usize] |= INT_TXFIFO_EMPTY | INT_TX_DONE;
+    }
+
+    /// RTSn output level (0 = ready): asserted while RX sits below the
+    /// MEM_CONF flow threshold when RX_FLOW_EN is set; idle high otherwise.
+    /// Routed to the U_RTSn matrix signal by the SoC.
+    pub fn rts_level(&self) -> u32 {
+        if self.regs[(UART_CONF0 / 4) as usize] & CONF0_RX_FLOW_EN == 0 {
+            return 1;
+        }
+        let thrhd = ((self.regs[(UART_MEM_CONF / 4) as usize] >> MEM_CONF_RX_FLOW_THRHD_SHIFT)
+            & MEM_CONF_RX_FLOW_THRHD_MASK)
+            .max(1);
+        u32::from(self.rx.len() as u32 >= thrhd)
+    }
+
+    /// Live STATUS: stored register with the TX count, CTSn, RTSn, TXD
+    /// overlaid (RX count is maintained in the stored word on inject/pop).
+    fn status_live(&self) -> u32 {
+        let mut v = self.regs[(UART_STATUS / 4) as usize];
+        v = (v & !(STATUS_TXFIFO_CNT_MASK << STATUS_TXFIFO_CNT_SHIFT))
+            | ((self.tx_hold.len() as u32).min(STATUS_TXFIFO_CNT_MASK) << STATUS_TXFIFO_CNT_SHIFT);
+        if self.cts == 0 {
+            v &= !STATUS_CTSN;
+        } else {
+            v |= STATUS_CTSN;
+        }
+        if self.rts_level() == 0 {
+            v &= !STATUS_RTSN;
+        } else {
+            v |= STATUS_RTSN;
+        }
+        v | (1 << 31) // TXD idle high (instant shift, never mid-bit)
     }
 
     /// Drain the bytes this UART emitted (host console output).
@@ -136,13 +237,14 @@ impl Uart {
         self.tx_out.extend_from_slice(bytes);
     }
 
-    /// Push one received byte into the RX FIFO (host console input).
-    /// Caps at the 128-byte hardware depth (`SOC_UART_FIFO_LEN`): the REPL
+    /// Push one received byte into the RX FIFO (host console input).    /// Caps at the 128-byte hardware depth (`SOC_UART_FIFO_LEN`): the REPL
     /// ISR reads `rxfifo_cnt` bytes into a fixed 128B stack buffer, so the
     /// count must never exceed depth — a 150B burst smashed the ISR stack
     /// (input text landed in a length field -> runaway copy -> Guru).
     /// Real silicon drops overrun bytes the same way.
     pub fn inject_rx(&mut self, byte: u8) {
+        // Any arrival is an RX edge (the only wire activity in the model).
+        self.rx_edge = true;
         if self.rx.len() >= 128 {
             return;
         }
@@ -162,6 +264,36 @@ impl Uart {
         }
     }
 
+    /// True while unread RX bytes sit in the FIFO (UART light-sleep
+    /// wakeup samples this at sleep entry).
+    pub fn rx_pending(&self) -> bool {
+        !self.rx.is_empty()
+    }
+
+    /// Take the sticky RX-edge flag (light-sleep UART wakeup consumes the
+    /// edge that arrived before the entry FIFO reset).
+    pub fn take_rx_edge(&mut self) -> bool {
+        core::mem::take(&mut self.rx_edge)
+    }
+
+    /// Pop up to `n` bytes from the RX FIFO (GDMA/UHCI IN path), keeping
+    /// the STATUS count in sync like register-FIFO reads do.
+    pub(crate) fn take_rx(&mut self, n: usize) -> Vec<u8> {
+        let mut v = Vec::new();
+        while v.len() < n {
+            if let Some(b) = self.rx.pop_front() {
+                v.push(b);
+            } else {
+                break;
+            }
+        }
+        let regs = &mut self.regs;
+        regs[(UART_STATUS / 4) as usize] = (regs[(UART_STATUS / 4) as usize]
+            & !STATUS_RXFIFO_CNT_MASK)
+            | ((self.rx.len() as u32) & STATUS_RXFIFO_CNT_MASK);
+        v
+    }
+
     /// APB bit time in model ticks from CLKDIV (≈ clkdiv at 80 MHz APB;
     /// falls back to the 115200-baud divisor when unprogrammed).
     fn bit_ticks(&self) -> u64 {
@@ -176,6 +308,9 @@ impl Uart {
     /// rx_tout_en set (TRM UART RXFIFO_TOUT). Fast path: nothing pending or
     /// the timeout disabled.
     pub fn tick(&mut self, cycles: u64) {
+        if !self.tx_hold.is_empty() && self.can_tx() {
+            self.flush_hold();
+        }
         if self.rx.is_empty() {
             return;
         }
@@ -205,7 +340,7 @@ impl Uart {
     pub fn int_raw_live(&self) -> u32 {
         let mut v = self.regs[(UART_INT_RAW / 4) as usize];
         let thrhd = (self.regs[(UART_CONF1 / 4) as usize] >> 10) & 0x3FF;
-        if thrhd != 0 {
+        if thrhd != 0 && self.tx_hold.is_empty() {
             v |= INT_TXFIFO_EMPTY;
         }
         v
@@ -230,6 +365,8 @@ impl Uart {
                 }
                 b as u32
             }
+            // Live STATUS (TX count, CTSn, RTSn, TXD overlaid).
+            UART_STATUS => self.status_live(),
             // Interrupt status = RAW & ENA (TRM UART_INT_ST).
             UART_INT_ST => self.int_st(),
             // RAW shows the live level for TXFIFO_EMPTY (see int_raw_live).
@@ -243,23 +380,33 @@ impl Uart {
             UART_FIFO => {
                 // TXD_BRK (CONF0 bit 8) sends a break — ignore for now.
                 if self.regs[(UART_CONF0 / 4) as usize] & (1 << 8) == 0 {
-                    self.tx_out.push(value as u8);
-                    // RS485 echo (TRM RS485_CONF rs485tx_rx_en, bit 3): in
-                    // RS485 mode with the echo bit set the receiver hears
-                    // the transmitter (half-duplex loopback). Without the
-                    // bit the receiver is muted during TX — which the model
-                    // already satisfies (TX never echoes by default). Stop-
-                    // bit delays (dl0/dl1) and signal delays (rx/tx_dly_num)
-                    // are timing-only at instant-drain granularity (no-op);
-                    // clash/parity/frm error interrupts need a real bus.
-                    let rs485 = self.regs[(UART_RS485_CONF / 4) as usize];
-                    if rs485 & (RS485_EN | RS485_TX_RX_EN) == (RS485_EN | RS485_TX_RX_EN) {
-                        self.inject_rx(value as u8);
+                    if !self.can_tx() {
+                        // Flow-controlled stop: hold in the TX FIFO (capped
+                        // at hardware depth; silicon overrun drops the same
+                        // way). EMPTY/DONE stay low until the flush.
+                        if self.tx_hold.len() < FIFO_DEPTH {
+                            self.tx_hold.push_back(value as u8);
+                        }
+                    } else {
+                        self.tx_out.push(value as u8);
+                        // RS485 echo (TRM RS485_CONF rs485tx_rx_en, bit 3): in
+                        // RS485 mode with the echo bit set the receiver hears
+                        // the transmitter (half-duplex loopback). Without the
+                        // bit the receiver is muted during TX — which the model
+                        // already satisfies (TX never echoes by default). Stop-
+                        // bit delays (dl0/dl1) and signal delays (rx/tx_dly_num)
+                        // are timing-only at instant-drain granularity (no-op);
+                        // clash/parity/frm error interrupts need a real bus.
+                        let rs485 = self.regs[(UART_RS485_CONF / 4) as usize];
+                        if rs485 & (RS485_EN | RS485_TX_RX_EN) == (RS485_EN | RS485_TX_RX_EN) {
+                            self.inject_rx(value as u8);
+                        }
+                        // Emitted bytes drain instantly: EMPTY + DONE latch.
+                        // Held bytes leave both low until the CTS flush.
+                        let raw = &mut self.regs[(UART_INT_RAW / 4) as usize];
+                        *raw |= INT_TXFIFO_EMPTY | INT_TX_DONE;
                     }
                 }
-                // FIFO drains instantly: TXFIFO_EMPTY + TX_DONE latch high.
-                let raw = &mut self.regs[(UART_INT_RAW / 4) as usize];
-                *raw |= INT_TXFIFO_EMPTY | INT_TX_DONE;
             }
             UART_INT_CLR => {
                 // Writing 1 clears the corresponding RAW bit (TRM UART_INT_CLR).
