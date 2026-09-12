@@ -51,6 +51,7 @@ cargo build --release -p esp32s3-emu --example run_flash 2>&1 | grep -E "^error"
 #   need JS-side devices); the sketch .merged.bin is passed as argv[1].
 CASES=(
 "hello||Hello from ESP32-S3!;boot OK|"
+"hello_opi||Hello from ESP32-S3!;boot OK|150000000"
 "flashenc|FLASHENC_KEY=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f|Hello from ESP32-S3!;boot OK|"
 "periph|ADC_INJECT_MV=825|boot OK|"
 "uart_echo|UART_INJECT=hello|[uart1] rx 'h'|"
@@ -89,6 +90,7 @@ CASES=(
 "twai||TWAI LOOPBACK PASS|"
 "twai_driver||TWAI DRIVER LOOPBACK PASS|"
 "mcpwm||MCPWM PASS|"
+"mcpwm_dt_driver||MCPWM DT DRIVER PASS|300000000"
 "mcpwm_sync||MCPWM SYNC PASS|"
 "mcpwm_dt||MCPWM DT PASS|"
 "mcpwm_cap||MCPWM CAP PASS|"
@@ -98,6 +100,7 @@ CASES=(
 "sigmadelta||SIGMADELTA PASS|"
 "efuse||EFUSE DONE|"
 "efuse_burn||EFUSE BURN PASS;EFUSE WRDIS PASS;EFUSE BURN DONE|"
+"efuse_custom||EFUSE CUSTOM PASS;EFUSE CUSTOM DONE|"
 "rng||RNG PASS|"
 "rtcio||RTCIO PASS|"
 "lpi2c||LP I2C POKE PASS|"
@@ -209,6 +212,7 @@ for c in "${CASES[@]}"; do
     psram_qspi) srcdir="$SK/esp32s3_psram"; fqbn="$fqbn:PSRAM=enabled"; bin="$srcdir/esp32s3_psram_qspi.merged.bin"; inobin="esp32s3_psram.ino.merged.bin";;
     psram_opi) srcdir="$SK/esp32s3_psram"; fqbn="$fqbn:PSRAM=opi"; bin="$srcdir/esp32s3_psram_opi.merged.bin"; inobin="esp32s3_psram.ino.merged.bin";;
     psram_16m) srcdir="$SK/esp32s3_psram"; fqbn="$fqbn:PSRAM=opi"; bin="$srcdir/esp32s3_psram_16m.merged.bin"; inobin="esp32s3_psram.ino.merged.bin";;
+    hello_opi) srcdir="$SK/esp32s3_hello"; fqbn="$fqbn:FlashMode=opi,PSRAM=opi"; bin="$srcdir/esp32s3_hello_opi.merged.bin"; inobin="esp32s3_hello.ino.merged.bin";;
     touch_denoise) srcdir="$SK/esp32s3_touch"; bin="$srcdir/esp32s3_touch.merged.bin"; inobin="esp32s3_touch.ino.merged.bin";;
     flashenc) srcdir="$SK/esp32s3_hello"; bin="$srcdir/esp32s3_hello.merged.bin"; inobin="esp32s3_hello.ino.merged.bin";;
   esac

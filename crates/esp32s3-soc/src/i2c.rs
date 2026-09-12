@@ -63,6 +63,24 @@ pub const I2C_INT_RAW: u32 = 0x20;
 pub const I2C_INT_CLR: u32 = 0x24;
 pub const I2C_INT_ENA: u32 = 0x28;
 pub const I2C_INT_ST: u32 = 0x2C;
+pub const I2C_SCL_STRETCH_CONF: u32 = 0x84;
+// SCL_STRETCH_CONF bits (i2c_struct.h scl_stretch_conf): protect period
+// [9:0], slave_scl_stretch_en[10], slave_scl_stretch_clr[11, WT].
+// Kept for the register map (protect period [9:0]): it has no time base
+// in instant host-driven exchanges (the event latches immediately), so it
+// is stored-and-read-back but never consumed.
+#[allow(dead_code)]
+const STRETCH_PROTECT_MASK: u32 = 0x3FF;
+const STRETCH_EN: u32 = 1 << 10;
+const STRETCH_CLR: u32 = 1 << 11;
+// Slave stretch causes (i2c_reg.h STRETCH_CAUSE in SR[15:14]): 0 = read
+// start, 1 = TX FIFO empty on slave read, 2 = RX FIFO full on slave
+// write, 3 = none (reset default).
+const SR_STRETCH_CAUSE_SHIFT: u32 = 14;
+const STRETCH_CAUSE_READ_START: u32 = 0;
+const STRETCH_CAUSE_TX_EMPTY: u32 = 1;
+const STRETCH_CAUSE_RX_FULL: u32 = 2;
+const STRETCH_CAUSE_NONE: u32 = 3;
 pub const I2C_SDA_HOLD: u32 = 0x30;
 pub const I2C_SDA_SAMPLE: u32 = 0x34;
 pub const I2C_SCL_HIGH_PERIOD: u32 = 0x38;
@@ -109,6 +127,7 @@ const INT_TRANS_COMPLETE: u32 = 1 << 7;
 const INT_TRANS_START: u32 = 1 << 9;
 const INT_NACK: u32 = 1 << 10;
 const INT_TXFIFO_UDF: u32 = 1 << 12;
+const INT_SLAVE_STRETCH: u32 = 1 << 16;
 const INT_DET_START: u32 = 1 << 15;
 
 // Master op codes (IDF i2c_ll.h I2C_LL_CMD_*).
@@ -174,6 +193,8 @@ pub struct I2c {
     events: Vec<EmuEvent>,
     /// Injected RX bytes for the next master-read (host virtual device supply).
     pending_rx: VecDeque<u8>,
+    /// Latched stretch cause (SR STRETCH_CAUSE[15:14]); reset = none (3).
+    stretch_cause: u32,
     /// Latched slave status bits (SR.slave_rw + slave_addressed) from the
     /// last host-driven slave exchange; cleared by FIFO reset / SLAVE_ADDR
     /// rewrite.
@@ -200,6 +221,7 @@ impl I2c {
             events: Vec::new(),
             pending_rx: VecDeque::new(),
             slave_sr: 0,
+            stretch_cause: STRETCH_CAUSE_NONE,
         }
     }
 
@@ -251,11 +273,28 @@ impl I2c {
     /// SR.slave_addressed + slave_rw=0, and raise TRANS_START + RXFIFO_WM +
     /// TRANS_COMPLETE + END_DETECT. A mismatched address is ignored (the
     /// slave NACKs it on real HW). Only acts in slave mode.
+    /// Latch a slave stretch event (cause + SLAVE_STRETCH interrupt).
+    /// Gated on slave_scl_stretch_en; the protect period has no time base
+    /// in instant host-driven exchanges (documented): the event latches
+    /// and firmware releases it via stretch_clr after servicing the FIFO.
+    fn stretch_event(&mut self, cause: u32) {
+        if self.regs[(I2C_SCL_STRETCH_CONF / 4) as usize] & STRETCH_EN == 0 {
+            return;
+        }
+        self.stretch_cause = cause;
+        self.regs[(I2C_INT_RAW / 4) as usize] |= INT_SLAVE_STRETCH;
+    }
+
     pub fn slave_inject_write(&mut self, addr7: u32, bytes: &[u8]) {
         if !self.is_slave() || !self.slave_addr_match(addr7) {
             return;
         }
         for &b in bytes {
+            // A full RX FIFO with stretch enabled holds SCL (cause 2);
+            // the byte still drops (overrun), like the unstretched path.
+            if (self.rx_cnt as usize) >= FIFO_DEPTH {
+                self.stretch_event(STRETCH_CAUSE_RX_FULL);
+            }
             self.rx_push(b);
             self.events.push(EmuEvent {
                 kind: EVT_I2C_WRITE,
@@ -276,10 +315,16 @@ impl I2c {
         if !self.is_slave() || !self.slave_addr_match(addr7) {
             return Vec::new();
         }
+        // Read-data start stretches with the function enabled (cause 0).
+        self.stretch_event(STRETCH_CAUSE_READ_START);
         let mut out = Vec::new();
         for _ in 0..n {
             if self.tx_cnt == 0 {
                 self.regs[(I2C_INT_RAW / 4) as usize] |= INT_TXFIFO_UDF;
+                // Dry TX FIFO mid-read stretches (cause 1); the available
+                // prefix still completes (instant exchange: firmware fills
+                // the FIFO and the master retries, clearing via CLR).
+                self.stretch_event(STRETCH_CAUSE_TX_EMPTY);
                 break;
             }
             let b = self.txfifo[(self.tx_head % FIFO_DEPTH as u32) as usize];
@@ -754,6 +799,8 @@ impl I2c {
                 sr &= !((FIFO_DEPTH as u32 - 1) << SR_TXFIFO_CNT_SHIFT);
                 sr |= self.tx_cnt.min(FIFO_DEPTH as u32 - 1) << SR_TXFIFO_CNT_SHIFT;
                 sr |= self.slave_sr;
+                sr &= !(0x3 << SR_STRETCH_CAUSE_SHIFT);
+                sr |= self.stretch_cause << SR_STRETCH_CAUSE_SHIFT;
                 if self.op.is_some() {
                     sr |= SR_BUS_BUSY;
                 } else {
@@ -814,6 +861,16 @@ impl I2c {
                 // Re-addressing drops the latched slave status.
                 self.regs[(I2C_SLAVE_ADDR / 4) as usize] = value;
                 self.slave_sr = 0;
+            }
+            I2C_SCL_STRETCH_CONF => {
+                // Stretch config store; the WT clear bit releases a held
+                // stretch (cause back to none + RAW bit cleared) without
+                // disabling the function. The CLR bit itself reads 0.
+                if value & STRETCH_CLR != 0 {
+                    self.stretch_cause = STRETCH_CAUSE_NONE;
+                    self.regs[(I2C_INT_RAW / 4) as usize] &= !INT_SLAVE_STRETCH;
+                }
+                self.regs[(I2C_SCL_STRETCH_CONF / 4) as usize] = value & !STRETCH_CLR;
             }
             _ if (I2C_COMD..I2C_COMD + 8 * 4).contains(&offset) => {
                 let slot = ((offset - I2C_COMD) / 4) as usize;

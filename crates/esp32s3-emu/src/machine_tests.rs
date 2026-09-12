@@ -4635,3 +4635,271 @@ fn deep_sleep_ulp_trap_wakes_with_trap_cause() {
     }
     assert!(woke, "ULP trap did not wake deep sleep");
 }
+
+/// MWDT0 fires with the SHARED watchdog clock (EN0 bit 3) CLEAR: only the
+/// TIMG0 module clock (bit 13) gates the watchdog tick. Ground truth is
+/// driver-behavioral — IDF's own Task-WDT runs MWDT0 while startup leaves
+/// EN0 = 0x7100E007 (bit 3 clear), so silicon MWDT demonstrably runs
+/// without it. Same 'R'-per-boot counting as `wdt_reset_reboots_machine`,
+/// plus an EN0.3-clear prelude.
+#[test]
+fn wdt_fires_with_shared_watchdog_clock_off() {
+    use crate::asm::Asm;
+    use crate::rom_stub::APP_FLASH_OFFSET;
+
+    const APP_ENTRY: u32 = IRAM_BASE;
+    let mut a = Asm::new(IRAM_BASE);
+    // Clear SYSTEM EN0 bit 3 (WDG_CLK) first: everything below runs gated.
+    a.li(2, 0x600C_0018u32 as i32); // SYSTEM_PERIP_CLK_EN0
+    a.l32i(3, 2, 0);
+    a.movi(4, -9); // ~8: keep every enable except WDG
+    a.and(3, 3, 4);
+    a.s32i(3, 2, 0);
+    // Print 'R' (UART0 FIFO), arm MWDT0 stage 0 = reset, loop forever.
+    a.li(2, 0x6000_0000);
+    a.movi_n(3, 0x52); // 'R'
+    a.s32i(3, 2, 0);
+    a.li(2, TIMG0_BASE as i32);
+    a.movi_n(3, 4);
+    a.s32i(3, 2, 0x50); // WDT_CONFIG2 (hold0) = 4
+    a.li(3, 0xC000_0000u32 as i32); // WDT_CONFIG0: EN | stg0=reset(2<<29)
+    a.s32i(3, 2, 0x48);
+    let here = a.pc();
+    a.j(here);
+    let app = a.bytes().to_vec();
+
+    let img = esp_app_image(IRAM_BASE, APP_ENTRY, &app);
+    let mut flash = std::vec![0xFFu8; 0x200_000];
+    flash[APP_FLASH_OFFSET as usize..APP_FLASH_OFFSET as usize + img.len()].copy_from_slice(&img);
+
+    let mut m = Esp32S3::new();
+    m.boot_from_flash(&flash);
+    let mut out = std::vec::Vec::new();
+    for _ in 0..5000 {
+        m.step();
+        out.extend(m.take_uart_tx(0));
+    }
+    let r_count = out.iter().filter(|&&b| b == b'R').count();
+    assert!(
+        r_count >= 2,
+        "MWDT must fire with EN0.3 clear (>=2 'R's), got {r_count}"
+    );
+}
+
+/// Model-clock coherence invariant (documents the 1:1 clock-tree
+/// approximation): one global tick per step advances TIMG0 (divider 0),
+/// SYSTIMER unit0, and the RTC slow clock in a FIXED ratio — TIMG and
+/// SYSTIMER 1:1, RTC at exactly 1/SLOW_CLK_DIV (240M/32.5k = 7384).
+/// Firmware observes only self-consistent time (no wall clock exists),
+/// so this ratio — not silicon's ~16:1 SYSTIMER:APB — is the contract;
+/// remodeling it would only slow boots for zero observable gain.
+#[test]
+fn model_clock_runs_all_domains_in_lockstep() {
+    use esp32s3_soc::memmap::SYSTIMER_BASE;
+    use esp32s3_soc::rtc::RTC_CNTL_BASE;
+    // TIMG0 up, divider 0 (every tick), from 0.
+    let mut m = Esp32S3::new();
+    syscon_clk(&mut m, false, 13); // TIMG0
+    m.soc.write32(TIMG0_BASE, 0xC000_0000); // EN | INCREASE
+    m.soc.write32(TIMG0_BASE + 0x18, 0); // T0LOADLO
+    m.soc.write32(TIMG0_BASE + 0x20, 0); // T0LOAD
+    // SYSTIMER unit0 runs from reset (WORK_EN preset); RTC slow clock too.
+    m.soc.tick_timers(73840);
+    assert_eq!(
+        m.soc.read32(TIMG0_BASE + 0x04),
+        73840,
+        "TIMG0 advanced 1/step"
+    );
+    m.soc.write32(SYSTIMER_BASE + 0x004, 1 << 30); // UNIT0_OP update snapshot
+    assert_eq!(
+        m.soc.read32(SYSTIMER_BASE + 0x044),
+        73840,
+        "SYSTIMER advanced 1/step"
+    );
+    m.soc.write32(RTC_CNTL_BASE + 0x0C, 1 << 31); // TIME_UPDATE latch
+    assert_eq!(
+        m.soc.read32(RTC_CNTL_BASE + 0x10),
+        10,
+        "RTC slow clock advanced 73840/7384"
+    );
+}
+
+/// UHCI HEAD capture: with HEAD_EN + SAVE_HEAD, an IN transfer's first 2
+/// payload bytes land in RX_HEAD (@0x30) instead of DRAM.
+#[test]
+fn uhci_head_capture_diverts_first_two_bytes() {
+    use esp32s3_soc::gdma::{GDMA_BASE, GDMA_UHCI0_PERIPH};
+    use esp32s3_soc::uhci::UHCI0_BASE;
+    let rdesc = 0x3FC8_3000;
+    let rbuf = 0x3FC8_4000;
+    let mut m = Esp32S3::new();
+    syscon_clk(&mut m, true, 6);
+    syscon_clk(&mut m, false, 8);
+    // UHCI: clock on, UART1 selected, HEAD_EN; SAVE_HEAD in CONF1.
+    m.soc.write32(UHCI0_BASE, (1 << 11) | (1 << 3) | (1 << 6));
+    m.soc.write32(UHCI0_BASE + 0x18, 1 << 3);
+    for b in [0xAAu8, 0xBB, 0xCC, 0xDD] {
+        m.soc.uart_inject_rx(1, b);
+    }
+    m.soc
+        .write32(rdesc, (1u32 << 31) | (1u32 << 30) | (16u32 << 12));
+    m.soc.write32(rdesc + 4, rbuf);
+    m.soc.write32(rdesc + 8, 0);
+    m.soc.write32(GDMA_BASE + 0x108, GDMA_UHCI0_PERIPH);
+    m.soc
+        .write32(GDMA_BASE + 0xE0, (rdesc & 0x000F_FFFF) | (1 << 22));
+    assert_eq!(m.soc.read32(UHCI0_BASE + 0x30), 0xBBAA, "RX_HEAD");
+    assert_eq!(m.soc.read32(rbuf), 0x0000_DDCC, "DRAM past the head");
+}
+
+/// CAM DMA-then-poll mixing on one capture: after the GDMA descriptor
+/// fills and parks, later-streamed words fall back to the RX FIFO
+/// (CAM_DATA polling) instead of vanishing.
+#[test]
+fn cam_dma_then_poll_mixing_falls_back_to_fifo() {
+    const CAM: u32 = 0x6004_1000;
+    const GDMA: u32 = 0x6003_F000;
+    let desc = 0x3FC8_1000u32;
+    let buf = 0x3FC8_2000u32;
+    let mut m = Esp32S3::new();
+    syscon_clk(&mut m, true, 6);
+    syscon_clk(&mut m, true, 8);
+    // 4-word frame, 1-word descriptor: DMA takes word 0, the rest must
+    // land in the RX FIFO for polling.
+    m.soc
+        .cam_inject_frame(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+    m.soc
+        .write32(desc, (1u32 << 31) | (1u32 << 30) | (4u32 << 12));
+    m.soc.write32(desc + 4, buf);
+    m.soc.write32(desc + 8, 0);
+    m.soc.write32(GDMA + 0x1C8, 5);
+    m.soc
+        .write32(GDMA + 0x1A0, (desc & 0x000F_FFFF) | (1 << 22));
+    m.soc.write32(CAM + 0x04, (1 << 31) | (1 << 4));
+    m.soc.write32(CAM + 0x08, 1 << 29); // CAM_START, no byte limit
+    for _ in 0..300 {
+        m.step();
+        if m.soc.read32(desc) & (1 << 31) == 0 {
+            break;
+        }
+    }
+    assert_eq!(m.soc.read32(desc) & (1 << 31), 0, "descriptor filled");
+    assert_eq!(m.soc.read32(buf), 0x0403_0201, "first word via DMA");
+    // Remainder arrived in the RX FIFO: poll two words.
+    let mut got_empty = true;
+    for _ in 0..300 {
+        m.step();
+        if m.soc.read32(CAM + 0x4C) & 0x7FF != 0 {
+            got_empty = false;
+            break;
+        }
+    }
+    assert!(!got_empty, "RX FIFO received post-DMA words");
+    assert_eq!(
+        m.soc.read32(CAM + 0x48),
+        0x0807_0605,
+        "second word via polling"
+    );
+}
+
+/// Short-frame GDMA tail: a capture shorter than the descriptor ends the
+/// transfer with a partial fill (owner cleared, IN done raised) instead of
+/// hanging the descriptor forever.
+#[test]
+fn cam_short_frame_completes_partial_descriptor() {
+    const CAM: u32 = 0x6004_1000;
+    const GDMA: u32 = 0x6003_F000;
+    let desc = 0x3FC8_1000u32;
+    let buf = 0x3FC8_2000u32;
+    let mut m = Esp32S3::new();
+    syscon_clk(&mut m, true, 6);
+    syscon_clk(&mut m, true, 8);
+    // 2-word frame against an 8-word descriptor.
+    m.soc
+        .cam_inject_frame(&[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE]);
+    m.soc
+        .write32(desc, (1u32 << 31) | (1u32 << 30) | (32u32 << 12));
+    m.soc.write32(desc + 4, buf);
+    m.soc.write32(desc + 8, 0);
+    m.soc.write32(GDMA + 0x1C8, 5);
+    m.soc
+        .write32(GDMA + 0x1A0, (desc & 0x000F_FFFF) | (1 << 22));
+    m.soc.write32(CAM + 0x04, (1 << 31) | (1 << 4));
+    m.soc.write32(CAM + 0x08, 1 << 29);
+    for _ in 0..500 {
+        m.step();
+        if m.soc.read32(desc) & (1 << 31) == 0 {
+            break;
+        }
+    }
+    assert_eq!(m.soc.read32(desc) & (1 << 31), 0, "partial tail completed");
+    assert_eq!(m.soc.read32(buf), 0xEFBEADDE, "first two words landed");
+}
+
+/// I2C slave stretch end to end through the bus: enable the stretch
+/// function, run a dry master-read (cause 1 + SLAVE_STRETCH), clear it,
+/// fill the TX FIFO, and complete the exchange.
+#[test]
+fn i2c_slave_stretch_holds_and_releases_exchange() {
+    use esp32s3_soc::i2c::{I2C_CTR, I2C_SLAVE_ADDR, I2C_SR};
+    const I2C0: u32 = 0x6001_3000;
+    let mut m = Esp32S3::new();
+    syscon_clk(&mut m, false, 7); // I2C0
+    m.soc.write32(I2C0 + I2C_CTR, 0); // slave mode
+    m.soc.write32(I2C0 + I2C_SLAVE_ADDR, 0x42);
+    m.soc.write32(I2C0 + 0x84, 1 << 10); // slave_scl_stretch_en
+    assert!(m.soc.i2c_slave_take_read(0, 0x42, 2).is_empty());
+    assert_eq!(m.soc.read32(I2C0 + I2C_SR) >> 14 & 3, 1, "stretch cause");
+    // Firmware fills the FIFO and releases the stretch.
+    m.soc.write32(I2C0 + 0x1C, 0x5A); // DATA port push
+    m.soc.write32(I2C0 + 0x84, (1 << 10) | (1 << 11)); // en + clr
+    assert_eq!(m.soc.read32(I2C0 + I2C_SR) >> 14 & 3, 3, "released");
+    assert_eq!(m.soc.i2c_slave_take_read(0, 0x42, 1), alloc::vec![0x5A]);
+}
+
+/// PSRAM mixed-size differential vs a host mirror (byte/halfword/word
+/// traffic through the cache MMU window, verified periodically).
+#[test]
+fn psram_mixed_size_differential() {
+    // Map PSRAM page 0 at vpage 0 via MMU, then hammer mixed sizes.
+    let mut m = Esp32S3::new();
+    // MMU table @ 0x600C5000: mmu[0] = PSRAM page 0 (0x8000+type bit).
+    m.soc.write32(0x600C_5000, 0x8000);
+    let base = 0x3C00_0000u32;
+    let mut mirror = alloc::vec![0u8; 256];
+    let mut seed = 0x12345678u32;
+    let mut next = || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        seed
+    };
+    for i in 0..2000 {
+        let r = next();
+        let off = r % 250;
+        let size = 1 << (next() % 3); // 1, 2, 4
+        let v = next();
+        match size {
+            1 => {
+                m.soc.write8(base + off, v);
+                mirror[off as usize] = v as u8;
+            }
+            2 => {
+                m.soc.write16(base + off, v);
+                mirror[off as usize] = v as u8;
+                mirror[off as usize + 1] = (v >> 8) as u8;
+            }
+            _ => {
+                m.soc.write32(base + off, v);
+                let b = v.to_le_bytes();
+                mirror[off as usize..off as usize + 4].copy_from_slice(&b);
+            }
+        }
+        // Verify full mirror every 200 ops.
+        if i % 200 == 199 {
+            for (j, &b) in mirror.iter().enumerate() {
+                let got = m.soc.read8(base + j as u32);
+                assert_eq!(got, b as u32, "mismatch at +{j:#x} after {i} ops");
+            }
+        }
+        let _ = r;
+    }
+}

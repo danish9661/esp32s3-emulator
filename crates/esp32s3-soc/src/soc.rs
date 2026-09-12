@@ -898,6 +898,11 @@ impl Soc {
         self.adc.inject_voltage(unit, channel, milli_volts);
     }
 
+    /// Reseed the hardware-RNG LCG (host frontend).
+    pub fn rng_reseed(&mut self, seed: u32) {
+        self.rng.reseed(seed);
+    }
+
     /// Inject the TSENS DAC code (host frontend for temperatureRead).
     pub fn tsens_inject(&mut self, raw: u8) {
         self.adc.tsens_inject(raw);
@@ -1432,6 +1437,15 @@ impl Soc {
             // EN0): free-running while clocked (see HFNUM).
             if self.clk_on(false, 23) {
                 self.usb_otg.tick();
+            }
+            // UHCI receive-hung watchdog (CONF CLK_EN + SYSTEM EN0.8):
+            // counts ticks with RX_START latched and a dry UART RX.
+            if self.uhci.clk_on() && self.clk_on(false, 8) {
+                let empty = match self.uhci.uart_sel() {
+                    Some(n) => !self.uarts[n].rx_pending(),
+                    None => true,
+                };
+                self.uhci.tick_rx_idle(empty);
             }
         }
         self.rtc.tick(cycles);
@@ -2166,6 +2180,12 @@ impl Soc {
                                             // UHCI RX: drain the selected UART's RX
                                             // FIFO to DRAM (zeros once it runs dry;
                                             // empty when the UHCI clock is off).
+                                            // HEAD capture (HEAD_EN + SAVE_HEAD): the
+                                            // transfer's first 2 payload bytes land
+                                            // in RX_HEAD instead of DRAM.
+                                            let capture = self.uhci.head_capture();
+                                            let mut head = [0u8; 2];
+                                            let mut head_n = 0usize;
                                             let mut k = 0u32;
                                             while k + 4 <= len {
                                                 let mut w = [0u8; 4];
@@ -2184,10 +2204,21 @@ impl Soc {
                                                         data.extend(self.uhci.slip_decode(&raw));
                                                     }
                                                     data.truncate(4);
-                                                    w[..data.len()].copy_from_slice(&data);
+                                                    let mut di = 0;
+                                                    while capture && head_n < 2 && di < data.len() {
+                                                        head[head_n] = data[di];
+                                                        head_n += 1;
+                                                        di += 1;
+                                                    }
+                                                    let rest = &data[di..];
+                                                    w[..rest.len()].copy_from_slice(rest);
                                                 }
                                                 self.write32(buf + k, u32::from_le_bytes(w));
                                                 k += 4;
+                                            }
+                                            if capture && head_n > 0 {
+                                                let hi = if head_n > 1 { head[1] } else { 0 };
+                                                self.uhci.set_rx_head(head[0], hi);
                                             }
                                             self.uhci.latch_rx_start();
                                             self.gdma.raise_in_done(ch);
@@ -2952,11 +2983,30 @@ impl Soc {
     /// next parks the cursor.
     fn poll_cam_dma(&mut self) {
         // Capture over with nothing staged and no fresh link awaiting
-        // capture: park (firmware owns the rest; mixing DMA then CAM_DATA
-        // polling on one capture is unsupported). The freshness guard is
+        // capture: park (later-streamed words fall back to the RX FIFO,
+        // so DMA-then-poll mixing on one capture works). The freshness guard is
         // load-bearing: a cursor armed by an IN-link start must survive
         // until CAM_START begins streaming (parking it early routes the
         // frame to the RX FIFO and the descriptor never fills).
+        // Short-frame tail: the capture ended with a partial fill
+        // outstanding — complete it with the actual length (owner
+        // cleared, done raised) instead of hanging the descriptor.
+        if self.lcd_cam.take_dma_eof() && self.cam_dma_in.active {
+            let desc = self.cam_dma_in.desc;
+            if desc != 0 {
+                let dw0 = self.read32(desc);
+                if dw0 & (1u32 << 31) != 0 {
+                    let ch = self.cam_dma_in.ch;
+                    self.gdma.set_in_eof_des_addr(ch, desc);
+                    self.gdma.raise_in_done(ch);
+                    self.write32(desc, dw0 & !(1u32 << 31));
+                }
+            }
+            self.cam_dma_in.active = false;
+            self.cam_link_fresh = false;
+            self.lcd_cam.set_dma_active(false);
+            return;
+        }
         if !self.cam_link_fresh && !self.lcd_cam.is_capturing() && self.lcd_cam.dma_pending() == 0 {
             self.cam_dma_in.active = false;
             self.cam_link_fresh = false;

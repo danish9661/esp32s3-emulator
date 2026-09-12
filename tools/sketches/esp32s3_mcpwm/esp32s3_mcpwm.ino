@@ -92,8 +92,22 @@ void setup() {
   Serial.printf("MCPWM sync cnt=%lu\n", (unsigned long)synced);
   bool sync_ok = synced >= 15 && synced <= 45;
 
+  // Pass 5: shadow staging (UPMETHOD). Stop the timer, switch TSTMP_A
+  // to TEZ update, stage 75%: SHDW_FULL must latch while the duty stays
+  // frozen; restart commits on the next wrap (FULL clears, duty -> 75%).
+  *M(0x08) = (1u << 3);          // stop (start < 2)
+  *M(0x3C) = 1;                  // A_UPMETHOD = TEZ
+  *M(0x40) = 75;                 // staged (active stays 25)
+  bool full = (*M(0x3C) & (1u << 8)) != 0;
+  *M(0x08) = (1u << 3) | 2;      // run
+  int duty4 = measure_duty(PIN, 4000);
+  bool full_clear = (*M(0x3C) & (1u << 8)) == 0;
+  Serial.printf("MCPWM shadow full=%d duty4=%d%% clear=%d\n",
+      (int)full, duty4, (int)full_clear);
+  bool shadow_ok = full && full_clear && duty4 >= 65 && duty4 <= 85;
+
   if (duty1 >= 40 && duty1 <= 60 && duty2 >= 15 && duty2 <= 35
-      && duty3 >= 40 && duty3 <= 60 && sync_ok) {
+      && duty3 >= 40 && duty3 <= 60 && sync_ok && shadow_ok) {
     Serial.println("MCPWM PASS");
   } else {
     Serial.println("MCPWM FAIL");

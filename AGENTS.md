@@ -3549,3 +3549,76 @@ IDF-driver MMC mount, `ee.*` unmapped patterns (loud trap, correct).
       USB classes (no host), CAM+POLL mixing per capture, short-frame GDMA
       tails (no eof without full length).
     Workspace + wasm32 green, clippy `-D warnings` clean (0), fmt clean.
+  - 2026-09-12: **Second residual sweep: "implement it properly" (all but
+    WiFi/BLE)**. Re-audited every deferred item against headers/binaries;
+    implemented what is real, proved the rest unimplementable-or-vacuous.
+    Battery 96/0/0 (+efuse_custom).
+    - **Clock tree**: kept 1:1, pinned by `model_clock_runs_all_domains_in_
+      lockstep` (TIMG+systimer +1/step, RTC +1/7384 over 73840 ticks) — the
+      ratio is the contract; silicon ratios are wall-clock-invisible.
+    - **WDG bit3**: proven unneeded by driver behavior (IDF Task-WDT runs
+      MWDT0 with EN0=0x7100E007, bit3 clear) + `wdt_fires_with_shared_
+      watchdog_clock_off` machine test (EN0.3 cleared, still reboots).
+    - **RNG**: `RNG_SEED=<u32>` env varies streams across runs (default
+      fixed for reproducibility) via `rng_reseed`.
+    - **eFuse BLK1**: empirically resolved — ESP_EFUSE_CUSTOM_MAC is 6 bytes
+      at USR_DATA offset 24 through the existing BLK3 path (rc=0, exact
+      readback, mirror bytes verified); no BLK1 code needed. Promoted the
+      probe to `esp32s3_efuse_custom` (`EFUSE CUSTOM PASS`, battery entry).
+    - **MCPWM shadow**: full UPMETHOD staging (period/TSTMP/GEN/DT + SHDW_
+      FULL lifecycle, TEZ/TEP/SW+external-SYNC commit, disable-drop) with
+      active/shadow split (reads show staged, tick uses active). 3 unit
+      tests + sketch leg (`shadow full=1 duty4=77% clear=1`). INSEL/DEB
+      stay out (S-table figure absent from headers). Cautionary tale:
+      phase-blind windows again (49/50 high right after wrap is correct —
+      use full-period windows).
+    - **UHCI RX_HUNG** (documented 1024-tick constant) + **HEAD capture**
+      (RX_HEAD @0x30, SAVE_HEAD in CONF1; TX heads are driver-prepended):
+      unit test + GDMA machine test. Sketch raw leg already clears framing.
+    - **CAM mixing + short tails**: DMA-then-poll falls back to RX FIFO
+      (machine test), short frames complete partial descs via dma_eof
+      (machine test). Freshness-guard lesson stands.
+    - **I2S PDM RX**: SINC^1 OSR-64 (`inject_pdm` → tick → FIFO → rx_done;
+      full-scale/half-density KATs); RX_PDM2PCM_EN map-only with reason.
+    - **eMMC RPMB**: full engine + `esp32s3_emmc` leg (`EMMC RPMB PASS`,
+      counter 0→1, in-sketch mbedTLS HMAC).
+    - **Evaluated, unchanged with reason**: GPIO hold 32+ (no HOLD1 reg —
+      silicon limit), PMS/WCL (needs region map + WCL world + fault cause;
+      stores round-trip), SHA-512_t (no headers on disk, no driver),
+      I2C stretch (no slow slave), OPI flash (no producer), LP FSMs (no
+      counterparty), WDG-gate shape (proven), RNG default (feature).
+    Workspace + wasm32 green, clippy `-D warnings` clean (0), fmt clean.
+  - 2026-09-12: **Third sweep: "find a way" (all but WiFi/BLE)**. Attacked
+    every remaining deferred item with fresh ground-truth hunts; implemented
+    what proved real, closed the rest with evidence. Battery 98/0/0
+    (+hello_opi, +mcpwm_dt_driver).
+    - **OPI flash: validated, no model change.** `FlashMode=opi,PSRAM=opi`
+      builds (PSRAM=opi is required for a valid sdkconfig); the image boots
+      to `Hello`/`boot OK` (`hello_opi` battery entry). Full-trace proof:
+      every flash-CS transaction decodes as plain SPI (0x03/0x05/0x9F) —
+      the FQBN "opi" only octalizes PSRAM, flash stays SPI. The `esp_core_
+      dump_flash ... (22588)` line on PSRAM builds is a benign empty-
+      partition message (boot otherwise identical); isolated to PSRAM-heap
+      builds via DIO+QSPI cross-build, XIP reads verified zero, PSRAM
+      mixed-size differential added as regression cover.
+    - **UART LOOPBACK** (CONF0.14): TX feeds RX unconditionally (+ flush
+      path), unit test + `uart_flow` leg (`loopback=3c`).
+    - **I2C slave stretch**: SCL_STRETCH_CONF @0x84 (en/clr), STRETCH_CAUSE
+      in SR[15:14] (0 read-start / 1 dry-TX / 2 full-RX), SLAVE_STRETCH INT
+      bit 16; instant exchanges latch but still complete (protect period
+      has no time base — documented). 3 unit tests + machine test.
+    - **MCPWM DEB/OUTINVERT via IDF driver tracing**: the real
+      `mcpwm_generator_set_dead_time` programs CFG=0x20100 (DEB+CLK_SEL),
+      FED=199/RED=99 — DEB_MODE puts both delays on the B path with A
+      bypassed (old symmetric model read 34% overlap). Implemented DEB +
+      RED/FED_OUTINVERT (13/14) + `mcpwm_dt_driver` sketch (`dutyA=48%
+      dutyB=49% overlap=30` aliasing, `DT DRIVER PASS`, battery entry).
+      INSEL probed both ways (dual + same-generator → OUTSWAP bit 9, never
+      INSEL): no driver flow sets it — stays documented.
+    - **Evaluated, closed with evidence**: GPIO hold 32+ (zero "hold" hits
+      in gpio/rtc_io headers — silicon limit), PMS/WCL (no region-address
+      registers in sensitive_struct.h, no WCL headers on disk), SHA-512_t
+      (mbedTLS exposes only is384 — no API can request it), OPI flash (see
+      above), LP FSMs (no matrix signals, no LP headers — no validatable
+      path), I2C stretch done above, WDG shape proven, RNG default kept.
+    Workspace + wasm32 green, clippy `-D warnings` clean (0), fmt clean.

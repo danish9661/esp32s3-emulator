@@ -108,6 +108,16 @@ const SYNCI_EN: u32 = 1 << 0;
 const DT_CFG: u32 = 0x00;
 const DT_A_OUTSWAP: u32 = 1 << 9;
 const DT_B_OUTSWAP: u32 = 1 << 10;
+// Dead-time path control (mcpwm_dt_cfg_reg_t @ DT_BASE0 + op*0x38):
+// DEB_MODE[8] (dual-edge B: both delays shape the B path, A bypasses),
+// RED_OUTINVERT[13] / FED_OUTINVERT[14] (path output polarity, applied
+// post-dead-time pre-carrier like OUTSWAP), CLK_SEL[17] (clock source,
+// tick units — no effect). A/B_OUTBYPASS[15:16] reset to bypass yet the
+// IDF dead-time driver leaves them set while delays take effect, so they
+// do not gate the delay paths (documented reading of driver behavior).
+const DT_DEB_MODE: u32 = 1 << 8;
+const DT_RED_OUTINVERT: u32 = 1 << 13;
+const DT_FED_OUTINVERT: u32 = 1 << 14;
 
 // Fault submodule (mcpwm_fault_detect_reg_t @0xE4 + per-operator FH regs):
 // FAULT_DETECT: F0/1/2_EN[2:0], F0/1/2_POLE[5:3] (1 = high-active),
@@ -182,6 +192,22 @@ pub struct Mcpwm {
     timer_count: [u32; NTIMER],
     /// Previous SYNC0..2 input levels (rising-edge reload).
     prev_sync: [u32; 3],
+    /// Shadow staging (UPMETHOD, mcpwm_reg.h): with non-immediate update
+    /// methods, CFG0 period / TSTMP_A/B / GENERATOR0/1 / DT FED/RED writes
+    /// stage here and commit to the active copies on TEZ/TEP/sync.
+    /// Immediate (reset default) writes through with no staging.
+    period_active: [u32; NTIMER],
+    period_shadow: [u32; NTIMER],
+    period_pending: [bool; NTIMER],
+    tstmp_active: [[u32; 2]; NOPER],
+    tstmp_shadow: [[u32; 2]; NOPER],
+    tstmp_pending: [[bool; 2]; NOPER],
+    gen_active: [[u32; 2]; NOPER],
+    gen_shadow: [[u32; 2]; NOPER],
+    gen_pending: [[bool; 2]; NOPER],
+    dt_active: [[u32; 2]; NOPER],
+    dt_shadow: [[u32; 2]; NOPER],
+    dt_pending: [[bool; 2]; NOPER],
     /// Per-timer prescale accumulator (advance the counter every prescale+1 ticks).
     timer_prescale_cnt: [u32; NTIMER],
     /// Up-down direction: 0 = counting up, 1 = counting down.
@@ -238,6 +264,18 @@ impl Mcpwm {
             regs: [0; REG_WORDS],
             timer_count: [0; NTIMER],
             prev_sync: [0; 3],
+            period_active: [0; NTIMER],
+            period_shadow: [0; NTIMER],
+            period_pending: [false; NTIMER],
+            tstmp_active: [[0; 2]; NOPER],
+            tstmp_shadow: [[0; 2]; NOPER],
+            tstmp_pending: [[false; 2]; NOPER],
+            gen_active: [[0; 2]; NOPER],
+            gen_shadow: [[0; 2]; NOPER],
+            gen_pending: [[false; 2]; NOPER],
+            dt_active: [[0; 2]; NOPER],
+            dt_shadow: [[0; 2]; NOPER],
+            dt_pending: [[false; 2]; NOPER],
             timer_prescale_cnt: [0; NTIMER],
             timer_dir: [0; NTIMER],
             gen_level: [[0; 2]; NOPER],
@@ -281,8 +319,8 @@ impl Mcpwm {
 
     /// Apply a generator action to both A/B outputs of an operator.
     fn apply_action(&mut self, op: usize, shift: u32) {
-        let g0 = self.gen_reg(op, GENERATOR0);
-        let g1 = self.gen_reg(op, GENERATOR1);
+        let g0 = self.gen_active[op][0];
+        let g1 = self.gen_active[op][1];
         let a = (g0 >> shift) & 3;
         let b = (g1 >> shift) & 3;
         self.gen_level[op][0] = Self::do_action(self.gen_level[op][0], a);
@@ -295,6 +333,64 @@ impl Mcpwm {
             ACT_LOW => 0,
             ACT_TOGGLE => cur ^ 1,
             _ => cur,
+        }
+    }
+
+    /// Shadow-commit event codes (mask bits shared with the GEN/DT
+    /// 4-bit UPMETHOD fields: TEZ = 1, TEP = 2, SYNC = 4).
+    const EV_TEZ: u32 = 1;
+    const EV_TEP: u32 = 2;
+    const EV_SYNC: u32 = 4;
+    /// UPMETHOD disable bit (writes stage but never commit).
+    const EV_DISABLE: u32 = 8;
+
+    /// Commit staged shadow registers for timer `t` on event `ev`
+    /// (TEZ/TEP/sync): the timer period plus every operator bound to it.
+    /// Timer event interrupts latch at the same sites in `tick`.
+    fn commit(&mut self, t: usize, ev: u32) {
+        // Timer period (CFG1 PERIOD_UPMETHOD[25:24]: 0 imm, 1 TEZ, 2 sync,
+        // 3 TEZ-or-sync).
+        let pm = (self.timer_cfg1(t) >> 24) & 3;
+        let fire = pm == 0
+            || (pm == 1 && ev == Self::EV_TEZ)
+            || (pm == 2 && ev == Self::EV_SYNC)
+            || (pm == 3 && ev != Self::EV_TEP);
+        if fire && self.period_pending[t] {
+            self.period_active[t] = self.period_shadow[t];
+            self.period_pending[t] = false;
+        }
+        for op in 0..NOPER {
+            if self.op_timer_sel(op) != t {
+                continue;
+            }
+            let stmp = self.regs[(OPER_BASE0 as usize + op * OPER_STRIDE) / 4];
+            for ab in 0..2 {
+                let m = (stmp >> (ab * 4)) & 0xF;
+                if m != 0 && m & Self::EV_DISABLE == 0 && m & ev != 0 && self.tstmp_pending[op][ab]
+                {
+                    self.tstmp_active[op][ab] = self.tstmp_shadow[op][ab];
+                    self.tstmp_pending[op][ab] = false;
+                }
+            }
+            let gm =
+                self.regs[(OPER_BASE0 as usize + op * OPER_STRIDE + GEN_CFG0 as usize) / 4] & 0xF;
+            if gm != 0 && gm & Self::EV_DISABLE == 0 && gm & ev != 0 {
+                for g in 0..2 {
+                    if self.gen_pending[op][g] {
+                        self.gen_active[op][g] = self.gen_shadow[op][g];
+                        self.gen_pending[op][g] = false;
+                    }
+                }
+            }
+            let dtc = self.regs[(DT_BASE0 as usize + op * DT_STRIDE as usize) / 4];
+            for ab in 0..2 {
+                // FED method [3:0], RED method [7:4] of DT0_CFG.
+                let m = (dtc >> (ab * 4)) & 0xF;
+                if m != 0 && m & Self::EV_DISABLE == 0 && m & ev != 0 && self.dt_pending[op][ab] {
+                    self.dt_active[op][ab] = self.dt_shadow[op][ab];
+                    self.dt_pending[op][ab] = false;
+                }
+            }
         }
     }
 
@@ -323,10 +419,11 @@ impl Mcpwm {
             }
             let cfg0 = self.timer_cfg0(t);
             let prescale = (cfg0 >> TIMER_PRESCALE_SHIFT) & 0xFF;
-            let mut period = (cfg0 >> TIMER_PERIOD_SHIFT) & 0xFFFF;
+            let mut period = self.period_active[t] & 0xFFFF;
             if period == 0 {
                 period = 1;
             }
+
             self.timer_prescale_cnt[t] += 1;
             if self.timer_prescale_cnt[t] < prescale + 1 {
                 continue;
@@ -341,6 +438,7 @@ impl Mcpwm {
                     let n = old + 1;
                     if n >= period {
                         self.int_raw |= 1 << (TEP_INT_BASE + t as u32);
+                        self.commit(t, Self::EV_TEP);
                         (0, true)
                     } else {
                         (n, false)
@@ -361,6 +459,7 @@ impl Mcpwm {
                             self.timer_dir[t] = 1;
                             // Peak (count == period): TEP, not TEZ.
                             self.int_raw |= 1 << (TEP_INT_BASE + t as u32);
+                            self.commit(t, Self::EV_TEP);
                             (period - 1, false)
                         } else {
                             (old + 1, false)
@@ -376,9 +475,10 @@ impl Mcpwm {
             };
             self.timer_count[t] = new;
             if tez {
-                // TEZ (count == 0): latch TIMERt_TEZ, apply the zero-event
-                // action selectors.
+                // TEZ (count == 0): latch TIMERt_TEZ, commit shadowed
+                // registers bound to TEZ, apply the zero-event actions.
                 self.int_raw |= 1 << (TEZ_INT_BASE + t as u32);
+                self.commit(t, Self::EV_TEZ);
                 for op in 0..NOPER {
                     if self.op_timer_sel(op) == t {
                         self.apply_action(op, GEN_UTEZ);
@@ -391,8 +491,8 @@ impl Mcpwm {
                     if self.op_timer_sel(op) != t {
                         continue;
                     }
-                    let cmpa = self.gen_reg(op, GEN_TSTMP_A) & 0xFFFF;
-                    let cmpb = self.gen_reg(op, GEN_TSTMP_B) & 0xFFFF;
+                    let cmpa = self.tstmp_active[op][0] & 0xFFFF;
+                    let cmpb = self.tstmp_active[op][1] & 0xFFFF;
                     if new == cmpa {
                         self.int_raw |= 1 << (OP_TEA_INT_BASE + op as u32);
                         self.apply_action(op, GEN_UTEA);
@@ -468,8 +568,8 @@ impl Mcpwm {
     /// PWM behavior is bit-identical when DT is unprogrammed.
     fn tick_dead_time(&mut self) {
         for op in 0..NOPER {
-            let fed = self.regs[(DT_BASE0 + op as u32 * DT_STRIDE + DT_FED) as usize / 4] & 0xFFFF;
-            let red = self.regs[(DT_BASE0 + op as u32 * DT_STRIDE + DT_RED) as usize / 4] & 0xFFFF;
+            let fed = self.dt_active[op][0] & 0xFFFF;
+            let red = self.dt_active[op][1] & 0xFFFF;
             for g in 0..2 {
                 let raw = self.gen_level[op][g];
                 if fed == 0 && red == 0 {
@@ -624,6 +724,7 @@ impl Mcpwm {
             if rising && self.regs[(t * TIMER_STRIDE) + TIMER_SYNC as usize / 4] & SYNCI_EN != 0 {
                 let sync = self.regs[(t * TIMER_STRIDE) + TIMER_SYNC as usize / 4];
                 self.timer_count[t] = (sync >> PHASE_SHIFT) & 0xFFFF;
+                self.commit(t, Self::EV_SYNC);
             }
         }
     }
@@ -698,15 +799,29 @@ impl Mcpwm {
             // Unprogrammed dead-time (FED=RED=0) reads the generator level
             // directly (combinatorial passthrough, exactly the old path);
             // programmed delays come from the ticked inertial state.
-            let fed = self.regs[(DT_BASE0 + op as u32 * DT_STRIDE + DT_FED) as usize / 4] & 0xFFFF;
-            let red = self.regs[(DT_BASE0 + op as u32 * DT_STRIDE + DT_RED) as usize / 4] & 0xFFFF;
+            let fed = self.dt_active[op][0] & 0xFFFF;
+            let red = self.dt_active[op][1] & 0xFFFF;
+            let cfg = self.regs[(DT_BASE0 + op as u32 * DT_STRIDE + DT_CFG) as usize / 4];
             let base = if fed == 0 && red == 0 {
                 self.gen_level[op][g]
             } else {
                 self.dt_out[op][g]
             };
+            // DEB_MODE: A bypasses the dead-time chain (raw generator
+            // level); both delays shape B (the IDF complementary mode).
+            let mut base = if cfg & DT_DEB_MODE != 0 && g == 0 {
+                self.gen_level[op][0]
+            } else {
+                base
+            };
+            // Path output polarity (FED->A, RED->B), post-dead-time.
+            if g == 0 && cfg & DT_FED_OUTINVERT != 0 {
+                base ^= 1;
+            }
+            if g == 1 && cfg & DT_RED_OUTINVERT != 0 {
+                base ^= 1;
+            }
             // S6/S7 output swap (post-dead-time, pre-carrier ordering).
-            let cfg = self.regs[(DT_BASE0 + op as u32 * DT_STRIDE + DT_CFG) as usize / 4];
             let swapped = if cfg & DT_A_OUTSWAP != 0 && cfg & DT_B_OUTSWAP != 0 {
                 1 - g
             } else if cfg & DT_A_OUTSWAP != 0 && g == 0 {
@@ -757,9 +872,113 @@ impl Mcpwm {
                             | ((self.fault_ost_on[op] as u32) << 1);
                     }
                 }
+                // STMP_CFG: overlay the live SHDW_FULL bits (A[8]/B[9]
+                // set while a staged value awaits transfer).
+                for op in 0..NOPER {
+                    if offset == OPER_BASE0 + op as u32 * OPER_STRIDE as u32 {
+                        let mut v = self.regs[idx] & !(0x100 | 0x200);
+                        if self.tstmp_pending[op][0] {
+                            v |= 0x100;
+                        }
+                        if self.tstmp_pending[op][1] {
+                            v |= 0x200;
+                        }
+                        return v;
+                    }
+                }
                 if idx < REG_WORDS { self.regs[idx] } else { 0 }
             }
         }
+    }
+
+    /// Store-or-stage a shadowed register write (UPMETHOD, mcpwm_reg.h):
+    /// with an immediate method the active copy updates at once (yesterday's
+    /// behavior); with an event method the value stages (visible on read,
+    /// SHDW_FULL-style pending) until `commit`; with disable it stages but
+    /// never commits. Covers CFG0 period, TSTMP_A/B, GENERATOR0/1, DT
+    /// FED/RED; everything else (prescale, methods, INSEL/OUTSWAP, FORCE)
+    /// stores immediately. STMP_CFG SHDW_FULL bits (8, 9) are HW-owned and
+    /// masked out of writes (read overlays the live pending state).
+    fn shadow_store(&mut self, offset: u32, value: u32) {
+        let idx = (offset / 4) as usize;
+        // Timer CFG0 (per-timer base t*0x10 + 0x04): prescale always live,
+        // period staged unless the CFG1 PERIOD_UPMETHOD is immediate.
+        if offset >= TIMER_CFG0
+            && offset < TIMER_CFG0 + NTIMER as u32 * TIMER_STRIDE as u32
+            && (offset - TIMER_CFG0).is_multiple_of(TIMER_STRIDE as u32)
+        {
+            let t = ((offset - TIMER_CFG0) / TIMER_STRIDE as u32) as usize;
+            let cur = self.regs[idx];
+            let period = (value >> TIMER_PERIOD_SHIFT) & 0xFFFF;
+            self.regs[idx] = (cur & 0xFF) | (value & 0xFF) | (period << TIMER_PERIOD_SHIFT);
+            if (self.timer_cfg1(t) >> 24) & 3 == 0 {
+                self.period_active[t] = period;
+                self.period_pending[t] = false;
+            } else {
+                self.period_shadow[t] = period;
+                self.period_pending[t] = true;
+            }
+            return;
+        }
+        // Operator + dead-time shadowed words.
+        if offset >= OPER_BASE0 && offset < OPER_BASE0 + NOPER as u32 * OPER_STRIDE as u32 {
+            let op = ((offset - OPER_BASE0) / OPER_STRIDE as u32) as usize;
+            let local = (offset - OPER_BASE0) % OPER_STRIDE as u32;
+            // TSTMP_A/B (0x04/0x08), methods in STMP_CFG (+0x00).
+            if local == GEN_TSTMP_A || local == GEN_TSTMP_B {
+                let ab = if local == GEN_TSTMP_A { 0 } else { 1 };
+                let m = (self.regs[(OPER_BASE0 as usize + op * OPER_STRIDE) / 4] >> (ab * 4)) & 0xF;
+                self.regs[idx] = value;
+                if m == 0 {
+                    self.tstmp_active[op][ab] = value & 0xFFFF;
+                    self.tstmp_pending[op][ab] = false;
+                } else if m & Self::EV_DISABLE == 0 {
+                    self.tstmp_shadow[op][ab] = value & 0xFFFF;
+                    self.tstmp_pending[op][ab] = true;
+                }
+                return;
+            }
+            // GENERATOR0/1 (0x14/0x18), method GEN_CFG0 (+0x0C) [3:0].
+            if local == GENERATOR0 || local == GENERATOR1 {
+                let g = if local == GENERATOR0 { 0 } else { 1 };
+                let m = self.regs[(OPER_BASE0 as usize + op * OPER_STRIDE + GEN_CFG0 as usize) / 4]
+                    & 0xF;
+                self.regs[idx] = value;
+                if m == 0 {
+                    self.gen_active[op][g] = value;
+                    self.gen_pending[op][g] = false;
+                } else if m & Self::EV_DISABLE == 0 {
+                    self.gen_shadow[op][g] = value;
+                    self.gen_pending[op][g] = true;
+                }
+                return;
+            }
+            // STMP_CFG (+0x00): SHDW_FULL bits are HW-owned, mask them out.
+            if local == 0x00 {
+                self.regs[idx] = value & !(0x100 | 0x200);
+                return;
+            }
+        }
+        // Dead-time FED/RED values (+0x04/+0x08 of DT0_CFG block).
+        if offset >= DT_BASE0 && offset < DT_BASE0 + NOPER as u32 * DT_STRIDE {
+            let op = ((offset - DT_BASE0) / DT_STRIDE) as usize;
+            let local = (offset - DT_BASE0) % DT_STRIDE;
+            if local == DT_FED || local == DT_RED {
+                let ab = if local == DT_FED { 0 } else { 1 };
+                let m = (self.regs[(DT_BASE0 as usize + op * DT_STRIDE as usize) / 4] >> (ab * 4))
+                    & 0xF;
+                self.regs[idx] = value;
+                if m == 0 {
+                    self.dt_active[op][ab] = value & 0xFFFF;
+                    self.dt_pending[op][ab] = false;
+                } else if m & Self::EV_DISABLE == 0 {
+                    self.dt_shadow[op][ab] = value & 0xFFFF;
+                    self.dt_pending[op][ab] = true;
+                }
+                return;
+            }
+        }
+        self.regs[idx] = value;
     }
 
     pub fn write32(&mut self, offset: u32, value: u32) {
@@ -810,7 +1029,7 @@ impl Mcpwm {
                     }
                 }
                 if idx < REG_WORDS {
-                    self.regs[idx] = value;
+                    self.shadow_store(offset, value);
                     // Timer sync: a SYNC_SW write reloads the counter with
                     // PHASE (external SYNCI_EN reloads via tick_sync; the
                     // level-triggered write matches what the driver emits).
@@ -821,6 +1040,7 @@ impl Mcpwm {
                     {
                         let t = ((offset - TIMER_SYNC) / TIMER_STRIDE as u32) as usize;
                         self.timer_count[t] = (value >> PHASE_SHIFT) & 0xFFFF;
+                        self.commit(t, Self::EV_SYNC);
                     }
                     // gen_force: direct force of generator A/B output level.
                     if offset >= OPER_BASE0

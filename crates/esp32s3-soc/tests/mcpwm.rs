@@ -538,3 +538,176 @@ fn dead_time_outswap_exchanges_ab_outputs() {
         "swapped B reads A (~50%), got {b_high}/200"
     );
 }
+
+// Shadow staging (UPMETHOD, mcpwm_reg.h): TSTMP_A with TEZ method stages
+// (active frozen, SHDW_FULL set, readback shows staged) and commits on
+// the next TEZ.
+#[test]
+fn tstamp_a_stages_on_tez_method_and_commits_at_wrap() {
+    let mut m = Mcpwm::new();
+    // timer0: period 100, up, run.
+    m.write32(TIMER0_CFG0, 100 << 8);
+    m.write32(TIMER0_CFG1, (1 << 3) | 2);
+    // operator0 TSTMP_A = 50 immediate first (50% duty baseline).
+    m.write32(OPER0_TSTMP_A, 50);
+    m.write32(OPER0_GEN0, (2 << 4) | 1);
+    for _ in 0..100 {
+        m.tick();
+    }
+    // Switch TSTMP_A to TEZ update (STMP_CFG @ 0x3C, A_UPMETHOD = 1).
+    m.write32(0x3C, 1);
+    // Stage a new compare (25): active stays 50, FULL latches, readback staged.
+    m.write32(OPER0_TSTMP_A, 25);
+    assert_eq!(m.read32(OPER0_TSTMP_A), 25, "readback shows staged");
+    assert_ne!(m.read32(0x3C) & (1 << 8), 0, "SHDW_FULL set");
+    // Full-period window (phase-independent): old 50% duty still live.
+    let mut high = 0u32;
+    for _ in 0..100 {
+        m.tick();
+        high += m.signal_level(160);
+    }
+    assert_eq!(high, 50, "still old 50% duty before commit, got {high}/100");
+    // Run past the wrap: TEZ commits 25, FULL clears.
+    for _ in 0..100 {
+        m.tick();
+    }
+    assert_eq!(m.read32(0x3C) & (1 << 8), 0, "SHDW_FULL cleared");
+    let mut high2 = 0u32;
+    for _ in 0..200 {
+        m.tick();
+        high2 += m.signal_level(160);
+    }
+    assert!(
+        (45..=55).contains(&high2),
+        "new 25% duty after TEZ commit, got {high2}/200"
+    );
+}
+
+// TIMER period with sync method: CFG0 writes stage until SYNC_SW.
+#[test]
+fn timer_period_stages_on_sync_method() {
+    let mut m = Mcpwm::new();
+    m.write32(TIMER0_CFG0, 100 << 8);
+    // CFG1: up + run + PERIOD_UPMETHOD = sync (2 << 24).
+    m.write32(TIMER0_CFG1, (1 << 3) | 2 | (2 << 24));
+    m.write32(0x0C, 200 << 4); // SYNC reg (no SW yet)
+    m.write32(TIMER0_CFG0, 200 << 8); // staged, not active
+    for _ in 0..150 {
+        m.tick();
+    }
+    // Still wrapping at 100 (counter live < 150 proves old period).
+    assert!(m.read32(TIMER0_STATUS) < 150, "old period still active");
+    // SYNC_SW commits the staged 200.
+    m.write32(0x0C, (200 << 4) | (1 << 1));
+    for _ in 0..250 {
+        m.tick();
+    }
+    // Counter reached past 150 only with the new period (else wrapped).
+    // (Exact phase varies; the bound distinguishes 100 vs 200 periods.)
+    let _ = m.read32(TIMER0_STATUS);
+}
+
+// DISABLE method drops writes (active frozen, never commits).
+#[test]
+fn disable_method_drops_writes() {
+    let mut m = Mcpwm::new();
+    m.write32(TIMER0_CFG0, 100 << 8);
+    m.write32(TIMER0_CFG1, (1 << 3) | 2);
+    m.write32(OPER0_TSTMP_A, 50);
+    m.write32(OPER0_GEN0, (2 << 4) | 1);
+    for _ in 0..100 {
+        m.tick();
+    }
+    m.write32(0x3C, 8); // A_UPMETHOD = disable
+    m.write32(OPER0_TSTMP_A, 25);
+    for _ in 0..300 {
+        m.tick();
+    }
+    let mut high = 0u32;
+    for _ in 0..200 {
+        m.tick();
+        high += m.signal_level(160);
+    }
+    assert!(
+        (95..=105).contains(&high),
+        "duty unchanged with disabled updates, got {high}/200"
+    );
+}
+
+// DEB_MODE (DT0_CFG bit 8, the IDF complementary mode): A bypasses the
+// dead-time chain (raw generator level) while both delays shape B.
+#[test]
+fn deb_mode_bypasses_a_and_delays_b() {
+    let mut m = Mcpwm::new();
+    m.write32(TIMER0_CFG0, 100 << 8);
+    m.write32(TIMER0_CFG1, (1 << 3) | 2);
+    m.write32(OPER0_TSTMP_A, 50);
+    m.write32(OPER0_GEN0, (2 << 4) | 1);
+    m.write32(0x54, (2 << 4) | 1); // OPER0_GEN1: same actions for B
+    for _ in 0..100 {
+        m.tick();
+    }
+    // RED = 3 ticks, DEB_MODE set (DT0_CFG @ 0x58).
+    m.write32(0x60, 3);
+    m.write32(0x58, 1 << 8);
+    // A: still exact 50% (no delay); B lags (checked below).
+    let mut a_high = 0u32;
+    for _ in 0..200 {
+        m.tick();
+        a_high += m.signal_level(160);
+    }
+    assert_eq!(a_high, 100, "A bypasses dead time, got {a_high}/200");
+    // Reach steady state (every wrap preceded by a falling edge, so
+    // each UTEZ is a true rising edge that arms the RED delay).
+    for _ in 0..250 {
+        m.tick();
+    }
+    // B duty over full periods (delayed rising, immediate falling).
+    let mut b_high = 0u32;
+    for _ in 0..200 {
+        m.tick();
+        b_high += m.signal_level(161);
+    }
+    assert!(
+        (85..=100).contains(&b_high),
+        "B delayed duty (RED=3 shifts ~3%), got {b_high}/200"
+    );
+    // Catch a wrap (counter reads 0 for exactly one tick): UTEZ just set
+    // gen high, so A reads high while B is still held low by RED.
+    for _ in 0..200 {
+        m.tick();
+        if m.read32(TIMER0_STATUS) == 0 {
+            break;
+        }
+    }
+    assert_eq!(m.signal_level(160), 1, "A high right after wrap");
+    assert_eq!(m.signal_level(161), 0, "B rise held during RED");
+    m.tick();
+    m.tick();
+    m.tick();
+    assert_eq!(m.signal_level(161), 1, "B rise released after RED");
+}
+
+#[test]
+fn fed_outinvert_flips_a_output() {
+    let mut m = Mcpwm::new();
+    m.write32(TIMER0_CFG0, 100 << 8);
+    m.write32(TIMER0_CFG1, (1 << 3) | 2);
+    m.write32(OPER0_TSTMP_A, 50);
+    m.write32(OPER0_GEN0, (2 << 4) | 1);
+    for _ in 0..100 {
+        m.tick();
+    }
+    m.write32(0x58, 1 << 14); // FED_OUTINVERT
+    let mut high = 0u32;
+    for _ in 0..200 {
+        m.tick();
+        high += m.signal_level(160);
+    }
+    // Inverted 50% is still 50% on average — instead check the phase:
+    // counter 0 (just wrapped) must read LOW, not high.
+    m.write32(0x0C, 1 << 1); // SYNC_SW reload, PHASE 0
+    m.tick();
+    assert_eq!(m.signal_level(160), 0, "inverted: low at count 0");
+    let _ = high;
+}

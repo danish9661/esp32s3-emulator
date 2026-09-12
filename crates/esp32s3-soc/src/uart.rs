@@ -76,8 +76,11 @@ const STATUS_TXFIFO_CNT_SHIFT: u32 = 16;
 const STATUS_TXFIFO_CNT_MASK: u32 = 0x3FF;
 // UART_CONF0 flow-control bits (uart_reg.h): TX_FLOW_EN[15] gates the
 // transmitter on CTSn; RX_FLOW_EN[22] drives RTSn from the RX level.
+// LOOPBACK[14] (uart_reg.h loopback test mode) feeds every transmitted
+// byte back into the receiver, like the RS485 echo but unconditional.
 const CONF0_TX_FLOW_EN: u32 = 1 << 15;
 const CONF0_RX_FLOW_EN: u32 = 1 << 22;
+const CONF0_LOOPBACK: u32 = 1 << 14;
 // UART_MEM_CONF RX_FLOW_THRHD[16:7]: RX level asserting RTSn (stop).
 const MEM_CONF_RX_FLOW_THRHD_SHIFT: u32 = 7;
 const MEM_CONF_RX_FLOW_THRHD_MASK: u32 = 0x3FF;
@@ -180,9 +183,13 @@ impl Uart {
         let rs485 = self.regs[(UART_RS485_CONF / 4) as usize];
         let echo = rs485 & (RS485_EN | RS485_TX_RX_EN) == (RS485_EN | RS485_TX_RX_EN)
             && self.regs[(UART_CONF0 / 4) as usize] & (1 << 8) == 0;
+        let loopback = self.regs[(UART_CONF0 / 4) as usize] & CONF0_LOOPBACK != 0;
         while let Some(b) = self.tx_hold.pop_front() {
             self.tx_out.push(b);
             if echo {
+                self.inject_rx(b);
+            }
+            if loopback {
                 self.inject_rx(b);
             }
         }
@@ -399,6 +406,9 @@ impl Uart {
                         // clash/parity/frm error interrupts need a real bus.
                         let rs485 = self.regs[(UART_RS485_CONF / 4) as usize];
                         if rs485 & (RS485_EN | RS485_TX_RX_EN) == (RS485_EN | RS485_TX_RX_EN) {
+                            self.inject_rx(value as u8);
+                        }
+                        if self.regs[(UART_CONF0 / 4) as usize] & CONF0_LOOPBACK != 0 {
                             self.inject_rx(value as u8);
                         }
                         // Emitted bytes drain instantly: EMPTY + DONE latch.

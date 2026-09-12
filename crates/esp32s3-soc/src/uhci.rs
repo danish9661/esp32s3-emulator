@@ -38,6 +38,12 @@ const CONF_UART0_CE: u32 = 1 << 2;
 const CONF_UART1_CE: u32 = 1 << 3;
 const CONF_UART2_CE: u32 = 1 << 4;
 const CONF_CLK_EN: u32 = 1 << 11;
+const CONF_HEAD_EN: u32 = 1 << 6;
+// CONF1 @ 0x18 SAVE_HEAD bit (uhci_reg.h): capture the head bytes.
+const CONF1_SAVE_HEAD: u32 = 1 << 3;
+// Received-packet head register (uhci_reg.h RX_HEAD_REG @ 0x30).
+const RX_HEAD_OFF: u32 = 0x30;
+const CONF1_OFF: u32 = 0x18;
 const CONF_SEPER_EN: u32 = 1 << 5;
 // NOTE: no CONF_HEAD_EN const (bit 6): HEAD framing is accepted but has no
 // effect (its 2-byte head content is unverifiable offline), so the bit is
@@ -53,6 +59,11 @@ const ESC_SELF_SECOND: u8 = 0xDD;
 // INT bits.
 const INT_RX_START: u32 = 1 << 0;
 const INT_TX_START: u32 = 1 << 1;
+const INT_RX_HUNG: u32 = 1 << 2;
+// RX_HUNG idle threshold (ticks with RX_START latched and no RX data).
+// Chosen constant (no TRM figure, no driver flow consumes it): the bit
+// exists so firmware polling it observes documented behavior.
+const RX_HUNG_TICKS: u32 = 1024;
 
 const INT_RAW_OFF: u32 = 0x04;
 const INT_ST_OFF: u32 = 0x08;
@@ -64,6 +75,12 @@ pub struct Uhci {
     int_raw: u32,
     int_ena: u32,
     esc_conf: u32,
+    conf1: u32,
+    /// Received-packet head bytes (first 2 payload bytes when HEAD_EN +
+    /// SAVE_HEAD capture them instead of DRAM).
+    rx_head: u32,
+    /// RX_HUNG idle counter (ticks with RX_START latched and dry RX).
+    hung_count: u32,
     /// Split escape pair carry (IN deframer saw a trailing ESC0).
     dec_pend: bool,
 }
@@ -75,6 +92,9 @@ impl Uhci {
             int_raw: 0,
             int_ena: 0,
             esc_conf: (0xDC << 16) | (0xDB << 8) | 0xC0,
+            conf1: 0,
+            rx_head: 0,
+            hung_count: 0,
             dec_pend: false,
         }
     }
@@ -181,12 +201,43 @@ impl Uhci {
     /// Latch RX_START (GDMA-IN link ran through UHCI).
     pub fn latch_rx_start(&mut self) {
         self.int_raw |= INT_RX_START;
+        self.hung_count = 0;
+    }
+
+    /// Receive watchdog tick: with RX_START latched and a dry receiver,
+    /// count idle ticks and raise RX_HUNG at the threshold; any data (or
+    /// no latched start) resets the count. Called per step while clocked
+    /// (see the SoC tick wiring).
+    pub fn tick_rx_idle(&mut self, rx_empty: bool) {
+        if self.int_raw & INT_RX_START == 0 || !rx_empty {
+            self.hung_count = 0;
+            return;
+        }
+        self.hung_count += 1;
+        if self.hung_count >= RX_HUNG_TICKS {
+            self.int_raw |= INT_RX_HUNG;
+        }
+    }
+
+    /// Head capture armed (HEAD_EN + SAVE_HEAD): the transfer's first 2
+    /// payload bytes land in RX_HEAD instead of DRAM (uhci_reg.h
+    /// RX_HEAD_REG; TX heads are driver-prepended data, already handled
+    /// by the passthrough).
+    pub fn head_capture(&self) -> bool {
+        self.conf0 & CONF_HEAD_EN != 0 && self.conf1 & CONF1_SAVE_HEAD != 0
+    }
+
+    /// Store the captured head (first payload byte in [7:0], LE-consistent).
+    pub fn set_rx_head(&mut self, lo: u8, hi: u8) {
+        self.rx_head = (hi as u32) << 8 | lo as u32;
     }
 
     pub fn read32(&self, off: u32) -> u32 {
         match off {
             0x00 => self.conf0,
+            CONF1_OFF => self.conf1,
             ESCAPE_CONF_OFF => self.esc_conf,
+            RX_HEAD_OFF => self.rx_head,
             INT_RAW_OFF => self.int_raw,
             INT_ST_OFF => self.int_raw & self.int_ena,
             INT_ENA_OFF => self.int_ena,
@@ -203,6 +254,7 @@ impl Uhci {
                     self.dec_pend = false;
                 }
             }
+            CONF1_OFF => self.conf1 = value,
             ESCAPE_CONF_OFF => self.esc_conf = value,
             INT_ENA_OFF => self.int_ena = value,
             INT_CLR_OFF => self.int_raw &= !value,
@@ -297,5 +349,45 @@ mod slip_tests {
             u.slip_encode(&[0x7E, 0x41]),
             Vec::from([0x7E, 0x7D, 0x5D, 0x41, 0x7E])
         );
+    }
+}
+
+#[cfg(test)]
+mod hung_tests {
+    use super::*;
+
+    #[test]
+    fn rx_hung_raises_after_idle_threshold_with_start_latched() {
+        let mut u = Uhci::new();
+        u.write32(0x00, CONF_CLK_EN | CONF_UART1_CE);
+        // No START latched: idle ticks never raise.
+        for _ in 0..2048 {
+            u.tick_rx_idle(true);
+        }
+        assert_eq!(u.read32(INT_RAW_OFF) & INT_RX_HUNG, 0);
+        // Latch RX_START with a dry receiver: raises at 1024 idle ticks.
+        u.latch_rx_start();
+        for _ in 0..1023 {
+            u.tick_rx_idle(true);
+        }
+        assert_eq!(u.read32(INT_RAW_OFF) & INT_RX_HUNG, 0, "not yet");
+        u.tick_rx_idle(true);
+        assert_ne!(u.read32(INT_RAW_OFF) & INT_RX_HUNG, 0, "hung raised");
+        assert_eq!(
+            u.read32(INT_ST_OFF) & INT_RX_HUNG,
+            0,
+            "masked until enabled"
+        );
+        u.write32(INT_ENA_OFF, INT_RX_HUNG);
+        assert_ne!(u.read32(INT_ST_OFF) & INT_RX_HUNG, 0, "ST asserts");
+        // Data arrival resets the watchdog.
+        u.write32(INT_CLR_OFF, INT_RX_HUNG);
+        u.tick_rx_idle(false);
+        for _ in 0..2048 {
+            u.tick_rx_idle(true);
+        }
+        // START still latched from before, so it raises again (documented:
+        // the count resets but the latch persists until CLR).
+        assert_ne!(u.read32(INT_RAW_OFF) & INT_RX_HUNG, 0);
     }
 }

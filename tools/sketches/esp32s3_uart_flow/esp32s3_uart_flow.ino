@@ -59,7 +59,17 @@ void setup() {
   Serial.printf("UART FLOW rts_stop=%d\n", (int)rts_stop);
   bool rts_ok = rts_ready == 0 && rts_stop == 1;
 
-  Serial.println(hold_ok && flush_ok && rts_ok ? "UART FLOW PASS" : "UART FLOW FAIL");
+  // Loopback leg (CONF0 bit 14): TX feeds RX unconditionally. Clear the
+  // flow bits first so CTS/RTS state cannot interfere, drain leftovers.
+  *U1(0x20) = (1u << 14);
+  *U1(0x4C) = 0;  // RS485 off (else the byte echoes twice)
+  while ((*U1(0x1C) & 0x3FFu) != 0) { (void)*U1(0x00); }
+  *U1(0x00) = 0x3C;
+  uint32_t lb = *U1(0x00);
+  Serial.printf("UART FLOW loopback=%02lx\n", (unsigned long)lb);
+  bool lb_ok = lb == 0x3C;
+
+  Serial.println(hold_ok && flush_ok && rts_ok && lb_ok ? "UART FLOW PASS" : "UART FLOW FAIL");
 }
 
 void loop() {}

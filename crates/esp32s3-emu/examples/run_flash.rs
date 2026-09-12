@@ -82,6 +82,15 @@ fn main() {
     };
     m.boot_from_flash(boot_ref);
 
+    // RNG reseed: RNG_SEED=<u32> varies the esp_random() stream across
+    // runs (deterministic within a run; default seed keeps tests stable).
+    if let Ok(seed) = env::var("RNG_SEED")
+        && let Ok(seed) = seed.parse::<u32>()
+    {
+        m.soc.rng_reseed(seed);
+        println!("[host] reseeded RNG ({seed:#x})");
+    }
+
     // ADC injection for sketches doing analogRead: ADC_INJECT_MV=<mv>
     // applies the voltage to ADC1 channel 3 (GPIO4).
     if let Ok(mv) = env::var("ADC_INJECT_MV")

@@ -30,8 +30,10 @@
 //!
 //! GDMA-RX transport streams captured words into IN descriptors (peri 5)
 //! via a cursor pump (see `Soc::poll_cam_dma`); `CAM_STOP_EN` (CAM_CTRL
-//! bit 0: stop when the GDMA staging FIFO is full) is honored. Use one
-//! path per capture (polling fills RX FIFO, DMA fills descriptors).
+//! bit 0: stop when the GDMA staging FIFO is full) is honored. DMA and
+//! polling mix freely: words stream to descriptors while an IN cursor is
+//! parked on them, then fall back to the RX FIFO; a short final frame
+//! completes its partial descriptor instead of hanging it.
 //! NOT modeled: clock-divider timing
 //! (one word per tick), 2BYTE packing (injected words already are units).
 //!
@@ -96,6 +98,9 @@ pub struct LcdCam {
     rx_count: usize,
     /// GDMA-RX staging FIFO (capture words bound for IN descriptors).
     dma_fifo: alloc::collections::VecDeque<u32>,
+    /// Capture ended with a partial descriptor outstanding (short frame):
+    /// the pump completes it with the actual length instead of hanging.
+    dma_eof: bool,
     /// GDMA-RX path armed (IN cursor active): tick_cam streams here
     /// instead of `rx_fifo`.
     dma_active: bool,
@@ -131,6 +136,7 @@ impl LcdCam {
             rx_count: 0,
             dma_fifo: alloc::collections::VecDeque::new(),
             dma_active: false,
+            dma_eof: false,
             int_raw: 0,
             int_ena: 0,
             busy: false,
@@ -257,6 +263,11 @@ impl LcdCam {
         self.busy || self.capturing
     }
 
+    /// Short-frame tail outstanding for the pump (see `dma_eof`).
+    pub fn take_dma_eof(&mut self) -> bool {
+        core::mem::take(&mut self.dma_eof)
+    }
+
     /// Latch a capture shut: VSYNC off, START self-cleared (lets firmware
     /// poll START as a busy flag, like SPI's self-clearing usr bit).
     fn end_capture(&mut self) {
@@ -265,6 +276,12 @@ impl LcdCam {
         self.cam_vsync = 0;
         self.cam_hsync = 0;
         self.regs[Self::idx(CAM_CTRL1)] &= !CAM_START_BIT;
+        // A DMA-bound capture with an outstanding partial descriptor ends
+        // it with the actual length (the pump completes it; see
+        // `take_dma_eof`). Polling captures ignore the flag.
+        if self.dma_active {
+            self.dma_eof = true;
+        }
     }
 
     fn line_int_num(&self) -> usize {

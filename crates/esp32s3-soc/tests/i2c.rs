@@ -374,3 +374,57 @@ fn master_10bit_address_as_two_write_bytes() {
     assert_eq!(i.int_raw() & (1 << 10), 1 << 10, "NACKs with no device");
     assert_eq!(i.int_raw() & (1 << 7), 1 << 7, "completes");
 }
+
+/// Slave SCL stretch (scl_stretch_conf @ 0x84, i2c_struct.h): with
+/// slave_scl_stretch_en set, a master-read start latches cause 0 +
+/// SLAVE_STRETCH (INT bit 16); running dry mid-read latches cause 1;
+/// stretch_clr releases (cause back to none 3, RAW bit cleared).
+#[test]
+fn slave_stretch_latches_cause_and_int_on_dry_read() {
+    let mut i = I2c::new(0);
+    i.write32(I2C_CTR, 0); // slave mode
+    i.write32(I2C_SLAVE_ADDR, 0x42);
+    i.write32(I2C_SCL_STRETCH_CONF, 1 << 10); // stretch_en
+    // Dry read: start stretches (cause 0), then underruns (cause 1).
+    let got = i.slave_take_read(0x42, 2);
+    assert!(got.is_empty(), "nothing to send");
+    assert_eq!(i.read32(I2C_SR) >> 14 & 3, 1, "TX-empty cause");
+    assert_ne!(i.int_raw() & (1 << 16), 0, "SLAVE_STRETCH latched");
+    // Fill the FIFO and clear: next read completes with cause re-latched
+    // at start (0), then data flows.
+    i.write32(I2C_DATA, 0xAB);
+    i.write32(I2C_SCL_STRETCH_CONF, (1 << 10) | (1 << 11)); // en + clr
+    assert_eq!(i.read32(I2C_SR) >> 14 & 3, 3, "CLR releases to none");
+    let got = i.slave_take_read(0x42, 1);
+    assert_eq!(got, vec![0xAB], "byte delivered after fill");
+    assert_eq!(i.read32(I2C_SR) >> 14 & 3, 0, "read-start cause");
+}
+
+/// Slave write into a full RX FIFO latches cause 2 with stretch enabled.
+#[test]
+fn slave_stretch_latches_on_full_rx_fifo() {
+    let mut i = I2c::new(0);
+    i.write32(I2C_CTR, 0);
+    i.write32(I2C_SLAVE_ADDR, 0x42);
+    i.write32(I2C_SCL_STRETCH_CONF, 1 << 10);
+    // Fill the 32-byte RX FIFO, then overflow by one.
+    i.slave_inject_write(0x42, &[0x55; 32]);
+    assert_eq!(i.read32(I2C_SR) >> 14 & 3, 3, "no stretch while space");
+    i.slave_inject_write(0x42, &[0x66]);
+    assert_eq!(i.read32(I2C_SR) >> 14 & 3, 2, "RX-full cause");
+    assert_ne!(i.int_raw() & (1 << 16), 0, "SLAVE_STRETCH latched");
+}
+
+/// Without stretch_en, dry reads behave exactly as before (UDF, no
+/// stretch cause or interrupt).
+#[test]
+fn dry_read_without_stretch_en_is_unchanged() {
+    let mut i = I2c::new(0);
+    i.write32(I2C_CTR, 0);
+    i.write32(I2C_SLAVE_ADDR, 0x42);
+    let got = i.slave_take_read(0x42, 1);
+    assert!(got.is_empty());
+    assert_ne!(i.int_raw() & (1 << 12), 0, "UDF still fires");
+    assert_eq!(i.int_raw() & (1 << 16), 0, "no stretch int");
+    assert_eq!(i.read32(I2C_SR) >> 14 & 3, 3, "cause stays none");
+}

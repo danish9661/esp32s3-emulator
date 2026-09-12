@@ -39,6 +39,14 @@ impl Rng {
         Self::default()
     }
 
+    /// Reseed the LCG (host frontend: `RNG_SEED=<u32>` varies the stream
+    /// across runs while staying deterministic within a run — firmware
+    /// RNG consumers get different streams on demand; the default seed
+    /// keeps unit tests reproducible).
+    pub fn reseed(&mut self, seed: u32) {
+        self.state = seed;
+    }
+
     fn idx(&self, offset: u32) -> usize {
         ((offset & 0x3FF) / 4) as usize
     }

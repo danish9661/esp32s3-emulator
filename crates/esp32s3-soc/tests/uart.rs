@@ -193,3 +193,15 @@ fn rx_edge_sticky_until_taken() {
     assert!(u.take_rx_edge(), "edge survives the drain");
     assert!(!u.take_rx_edge(), "edge consumed once");
 }
+
+/// LOOPBACK (CONF0 bit 14, uart_reg.h loopback test mode): transmitted
+/// bytes re-enter the receiver unconditionally (unlike the RS485 echo,
+/// no mode bit needed).
+#[test]
+fn loopback_feeds_tx_into_rx() {
+    let mut u = Uart::new();
+    u.write32(UART_CONF0, 1 << 14);
+    u.write32(UART_FIFO, 0xA5);
+    assert_eq!(u.read32(UART_FIFO), 0xA5, "looped back");
+    assert_eq!(u.read32(UART_FIFO), 0, "FIFO drained");
+}
