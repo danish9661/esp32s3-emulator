@@ -66,6 +66,12 @@ const TOUCH_SCAN_DONE_BIT: u32 = 1 << 4;
 // voltage condition holds, rst_wait[25:16] more ticks to a chip reset
 // when rst_ena[26] is set; cnt_clr[29] clears the counter, ena[30]
 // enables the detector.
+// Super WDT (rtc_cntl_reg.h SWD_CONF @ +0xB4, WPROTECT @ +0xB8 key
+// 0x8F1D312A): store round-trips via the generic regs backing, but the
+// timeout feed is deliberately unmodeled — silicon enables it by default
+// with SIGNAL_WIDTH 300 (~9 ms), so a live timeout would reset mid-boot
+// without the ROM/IDF early feeds/disables; modeling it would break every
+// boot to validate nothing (no sketch drives SWD).
 const BROWN_OUT_OFF: u32 = 0xE8;
 const BOD_INT_BIT: u32 = 1 << 9;
 const BOD_INT_WAIT_SHIFT: u32 = 4;

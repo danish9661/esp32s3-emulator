@@ -243,6 +243,12 @@ fn main() {
             }
             if cause == 0 {
                 // Illegal instruction — likely the ESP-IDF panic `ill`.
+                // PANIC_CONTINUE lets the firmware's own handler run it
+                // (panic_abort ends in a deliberate `ill`; the coredump
+                // sketch needs the reboot it triggers).
+                if env::var("PANIC_CONTINUE").is_ok() {
+                    continue;
+                }
                 let epc = m.cpu[0].sreg(SR_EPC1);
                 println!(
                     "\n>> ILLEGAL at step {i}, pc {:#010x}, EPC1 {:#010x}, wb {}, b0={:#04x}",
@@ -273,6 +279,9 @@ fn main() {
             }
             if cause == 1 && env::var("SYSCALL_CONTINUE").is_ok() {
                 continue; // Same as above (core1 syscalls).
+            }
+            if cause == 0 && env::var("PANIC_CONTINUE").is_ok() {
+                continue; // Deliberate panic `ill` (see core0 arm).
             }
             println!(
                 "\n== step {i}: core1 exception(cause={cause}) at pc {:#010x}; EPC1 {:#010x}",

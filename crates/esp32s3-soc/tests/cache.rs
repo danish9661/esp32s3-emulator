@@ -226,3 +226,15 @@ fn cache_ctrl_enable_readback() {
     soc.write32(EXTMEM_BASE + 0x060, 0x1); // ICACHE_CTRL.ENABLE
     assert_eq!(soc.read32(EXTMEM_BASE + 0x060), 0x1);
 }
+
+#[test]
+fn maintenance_regs_round_trip() {
+    let mut soc = Soc::new();
+    // Lock/prelock/occupy/sync-addr windows (extmem_reg.h) are R/W stores.
+    soc.write32(EXTMEM_BASE + 0x01C, 0x12345678);
+    assert_eq!(soc.read32(EXTMEM_BASE + 0x01C), 0x12345678);
+    soc.write32(EXTMEM_BASE + 0x02C, 0x00ABCDEF);
+    assert_eq!(soc.read32(EXTMEM_BASE + 0x02C), 0x00ABCDEF);
+    soc.write32(EXTMEM_BASE + 0x044, 0xDEADBEEF);
+    assert_eq!(soc.read32(EXTMEM_BASE + 0x044), 0xDEADBEEF);
+}

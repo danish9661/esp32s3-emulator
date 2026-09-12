@@ -121,6 +121,7 @@ fn prescale_slows_the_counter() {
 
 // Capture register offsets (mcpwm_cap_*_reg_t).
 const CAP_TIMER_CFG: u32 = 0xE8;
+const CAP_TIMER_PHASE: u32 = 0xEC;
 const CAP_CHN_CFG0: u32 = 0xF0;
 const CAP_CHN0: u32 = 0xFC;
 const CAP_STATUS: u32 = 0x108;
@@ -155,10 +156,10 @@ fn capture_posedge_latches_timer_and_raises_int() {
         pos: Cell::new(0),
     };
     for _ in 0..4 {
-        m.tick_capture(166, &|sig| s.input(sig));
+        m.tick_capture(166, 160, &|sig| s.input(sig));
     }
     assert_eq!(m.read32(CAP_INT_RAW) & (1 << 27), 0, "no int yet");
-    m.tick_capture(166, &|sig| s.input(sig));
+    m.tick_capture(166, 160, &|sig| s.input(sig));
     assert_eq!(m.read32(CAP_CHN0), 5, "timer latched (5 ticks)");
     assert_eq!(m.read32(CAP_STATUS) & 1, 0, "posedge status");
     assert_eq!(m.read32(CAP_INT_RAW) & (1 << 27), 1 << 27, "CAP0 int");
@@ -178,14 +179,14 @@ fn capture_prescale_divides_edges() {
         pos: Cell::new(0),
     };
     for _ in 0..3 {
-        m.tick_capture(166, &|sig| s.input(sig));
+        m.tick_capture(166, 160, &|sig| s.input(sig));
     }
     assert_eq!(
         m.read32(CAP_INT_RAW) & (1 << 27),
         0,
         "first edge divided out"
     );
-    m.tick_capture(166, &|sig| s.input(sig));
+    m.tick_capture(166, 160, &|sig| s.input(sig));
     assert_eq!(m.read32(CAP_CHN0), 4, "second edge latched");
 }
 
@@ -199,10 +200,10 @@ fn capture_negedge_and_disabled_channel() {
         levels: vec![true, true, false, false],
         pos: Cell::new(0),
     };
-    m.tick_capture(166, &|sig| s.input(sig));
-    m.tick_capture(166, &|sig| s.input(sig));
+    m.tick_capture(166, 160, &|sig| s.input(sig));
+    m.tick_capture(166, 160, &|sig| s.input(sig));
     assert_eq!(m.read32(CAP_INT_RAW) & (1 << 27), 0, "no edge yet");
-    m.tick_capture(166, &|sig| s.input(sig));
+    m.tick_capture(166, 160, &|sig| s.input(sig));
     assert_eq!(m.read32(CAP_CHN0), 3, "timer latched");
     assert_eq!(m.read32(CAP_STATUS) & 1, 1, "negedge status");
     // Channel 1 (never enabled) stays quiet.
@@ -506,6 +507,8 @@ fn external_sync_reloads_timer_on_rising_edge() {
     let mut m = Mcpwm::new();
     // Timer0 SYNC @ 0x0C: SYNCI_EN (bit 0) + PHASE=500 in [19:4].
     m.write32(0x0C, (500 << 4) | 1);
+    // SYNCISEL @ 0x34: timer0 selects SYNC0 (4) per mcpwm_reg.h.
+    m.write32(0x34, 4);
     let lvl = Cell::new(0u32);
     let input = |_sig: u32| lvl.get();
     // Low level: no reload (counter advances from 0).
@@ -710,4 +713,92 @@ fn fed_outinvert_flips_a_output() {
     m.tick();
     assert_eq!(m.signal_level(160), 0, "inverted: low at count 0");
     let _ = high;
+}
+
+// Timer-to-timer sync chain (mcpwm_reg.h SYNCO_SEL + SYNCISEL): timer0
+// TEZ sync_out reloads timer1 when timer1 selects timer0 and both arm.
+#[test]
+fn synco_tez_chains_timer0_into_timer1() {
+    let mut m = Mcpwm::new();
+    // timer0: period 10, up, run, SYNCO_SEL=TEZ (1 << 2).
+    m.write32(0x04, 10 << 8);
+    m.write32(0x08, (1 << 3) | 2);
+    m.write32(0x0C, (1 << 2) | 1);
+    // timer1: stopped, SYNCI_EN, PHASE=7, selects timer0 sync_out (1).
+    m.write32(0x1C, (7 << 4) | 1);
+    m.write32(0x34, 1 << 3);
+    for _ in 0..10 {
+        m.tick();
+    }
+    assert_eq!(m.read32(0x20), 7, "timer1 reloaded from timer0 TEZ");
+}
+
+// SW toggle always generates sync_out regardless of SYNCO_SEL.
+#[test]
+fn sync_sw_propagates_to_selecting_timer() {
+    let mut m = Mcpwm::new();
+    // timer1 listens to timer0 sync_out, armed, PHASE=9.
+    m.write32(0x1C, (9 << 4) | 1);
+    m.write32(0x34, 1 << 3);
+    // SW sync on timer0 (SYNCO_SEL=0 default, but SW always emits).
+    m.write32(0x0C, 1 << 1);
+    assert_eq!(m.read32(0x20), 9, "SW sync_out chained");
+}
+
+// External SYNC selection: timer0 listens to SYNC1 (5), so SYNC0 edges
+// are ignored and SYNC1 rising reloads.
+#[test]
+fn external_sync_respects_syncisel_selection() {
+    let mut m = Mcpwm::new();
+    m.write32(0x0C, (500 << 4) | 1);
+    m.write32(0x34, 5);
+    let seq = core::cell::Cell::new((0u32, 0u32));
+    let input = |sig: u32| {
+        let (s0, s1) = seq.get();
+        if sig == 160 { s0 } else { s1 }
+    };
+    seq.set((1, 0));
+    m.tick_sync(160, &input);
+    assert_eq!(m.read32(TIMER0_STATUS), 0, "SYNC0 ignored when SEL=SYNC1");
+    seq.set((1, 1));
+    m.tick_sync(160, &input);
+    assert_eq!(m.read32(TIMER0_STATUS), 500, "SYNC1 reloads");
+}
+
+// Capture-timer sync: SW sync_out on timer0 reloads the capture timer via
+// CAP_SYNCI_SEL, and a CAP_SYNC_SW write with SEL 0 does the same.
+#[test]
+fn capture_sync_from_timer_and_sw_reload_phase() {
+    let mut m = Mcpwm::new();
+    m.write32(CAP_TIMER_CFG, 1); // capture timer enable
+    m.write32(CAP_TIMER_PHASE, 1000);
+    // Arm on timer0 sync_out (SEL 1).
+    m.write32(CAP_TIMER_CFG, 1 | (1 << 1) | (1 << 2));
+    // SW sync on timer0 emits sync_out regardless of SYNCO_SEL.
+    m.write32(0x0C, 1 << 1);
+    assert_eq!(m.cap_timer(), 1000, "timer sync_out reloaded capture");
+    // One tick advances past the reload.
+    m.tick_capture(166, 160, &|_| 0);
+    assert_eq!(m.cap_timer(), 1001);
+    // SW-triggered capture sync with SEL 0 reloads on the next tick.
+    m.write32(CAP_TIMER_CFG, 1 | (1 << 1) | (1 << 5));
+    m.tick_capture(166, 160, &|_| 0);
+    assert_eq!(m.cap_timer(), 1001, "CAP_SYNC_SW reloaded capture");
+}
+
+// Capture-timer sync ignores timer sync_out when armed on an external
+// SYNC instead (SEL 4 = SYNC0): only the matrix edge reloads.
+#[test]
+fn capture_sync_external_selection_ignores_timer() {
+    let mut m = Mcpwm::new();
+    m.write32(CAP_TIMER_CFG, 1);
+    m.write32(CAP_TIMER_PHASE, 500);
+    // SEL 4 = SYNC0, armed.
+    m.write32(CAP_TIMER_CFG, 1 | (1 << 1) | (4 << 2));
+    m.write32(0x0C, 1 << 1); // timer0 SW sync_out must not reload
+    assert_eq!(m.cap_timer(), 0, "timer pulse ignored when SEL=SYNC0");
+    // Rising SYNC0 edge reloads with PHASE.
+    m.tick_capture(166, 160, &|_| 0);
+    m.tick_capture(166, 160, &|_| 1);
+    assert_eq!(m.cap_timer(), 501, "SYNC0 edge reloaded (500+1 tick)");
 }

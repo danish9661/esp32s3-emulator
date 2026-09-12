@@ -3622,3 +3622,151 @@ IDF-driver MMC mount, `ee.*` unmapped patterns (loud trap, correct).
       above), LP FSMs (no matrix signals, no LP headers — no validatable
       path), I2C stretch done above, WDG shape proven, RNG default kept.
     Workspace + wasm32 green, clippy `-D warnings` clean (0), fmt clean.
+  - 2026-09-12: **Core-dump write path validated (was blocked on a harness
+    asymmetry, not a model gap)**. `esp32s3_coredump` sketch (boot0: `get
+    rc=260` → `abort()` → backtrace + `ELF SHA256` + `Rebooting...`; boot1:
+    `get rc=0 size=10820` → `COREDUMP PASS`) now a battery entry
+    (`coredump|PANIC_CONTINUE=1`, default STEPS). Three stacked fixes:
+    (1) GPIO/UART wakeup gated light-only (`!deep` — deep keeps the
+    legacy timer-only wake); (2) PSRAM persists across `reset()` via
+    `psram_snapshot/restore` + `psram_wipe()` on deep `wake()` +
+    `psram_persists_across_reset_but_not_deep_sleep` test; (3) RTC slow
+    memory retained across `reset()` via `snapshot/restore_rtc` +
+    `rtc_slow_memory_survives_reset` test (proves the sketch's boot
+    counter). The reported "core1 exception cause=0 at panic_abort's
+    `ill`" was EXPECTED firmware behavior: APP-core `abort()` ends in a
+    deliberate `ill`, and run_flash's core1 arm broke where core0 already
+    had a cause==0 report. New `PANIC_CONTINUE=1` (SYSCALL_CONTINUE
+    precedent) lets the firmware's own handler run it, both arms.
+    Cautionary tales: (a) my probe misread VECBASE (SR 231) as EPC1
+    (SR 177) — verify SR numbers before theorizing; (b) the kvec entry
+    with EXCCAUSE=4 + tick-ISR window rotations (11↔13↔15) were all
+    healthy FreeRTOS behavior, proven by full-state single-step rings —
+    the fault was harness policy, found only after ruling out the model;
+    (c) abort-path UART shows the known dual-console doubling
+    ("aabboorrtt", same class as the 2026-08-20 note) — cosmetic.
+    Battery 99/0/0 (+coredump).
+  - 2026-09-13: **C-batch: MCPWM SYNCO chain + cache maintenance round-trip;
+    remaining items evaluated with header evidence (all but WiFi/BLE)**.
+    - **MCPWM SYNCO chain implemented** (`mcpwm.rs`, verified vs
+      `mcpwm_reg.h` SYNCO_SEL + SYNCISEL + invert): TIMER_SYNC [3:2]
+      selects sync_out (0 sync_in forward, 1 TEZ, 2 TEP; SW always
+      generates), TIMER_SYNCI_CFG @0x34 routes (1 timer0, 2 timer1,
+      3 timer2, 4 SYNC0, 5 SYNC1, 6 SYNC2, else none) with
+      EXTERNAL_SYNCI invert [9]/[10]/[11]. `tick()` emits on TEZ/TEP per
+      SEL, SW writes always emit, `tick_sync` samples the selected
+      external only, `do_sync`/`propagate_sync_out` forward with a
+      visited guard against timer loops. 3 unit tests (TEZ chain,
+      SW emit, SEL filtering) + `esp32s3_mcpwm_sync` SYNCO leg
+      (`t1=7 PASS`, battery marker extended to `SYNC PASS;SYNCO PASS`).
+    - **Real bugs found en route**: (1) timer-index math
+      `(t*STRIDE)+SYNC/4` mis-indexes timers 1/2 (C precedence `/`
+      before `+`: t=1 gives 19 not 7) — latent since only timer0 was
+      ever tested; fixed to `(t*STRIDE+SYNC)/4` in all 5 sites.
+      (2) Harness: SYNCO leg failed `t1=0` on missing MCPWM clock
+      enable (SYSCON EN0.17) — SW reloads are register writes (no
+      clock needed) so the old sketch passed vacuously; added the
+      `periph_module_enable`-equivalent RMW like `esp32s3_mcpwm`.
+      (3) `esp32s3_mcpwm` pass 4 programmed SYNCI_EN without SYNCISEL
+      (default 0 = none per header) — worked only under the old
+      t-indexed model; now sets `0x34=4` (SYNC0).
+    - **Cache maintenance round-trip** (`cache.rs`): EXT_MEM lock/
+      prelock/occupy/sync-addr/size regs (extmem_reg.h R/W) now read
+      back stored values instead of 0, with an OOB guard on write;
+      new `maintenance_regs_round_trip` test. Boot-neutral (IDF init
+      sequences that verify programming now observe it).
+    - **Evaluated, deliberately unchanged**: MCPWM pattern-detect
+      (zero hits in mcpwm_reg.h — no S3 HW), SPI QIO/DIO
+      (FREAD_QUAD/DUAL/OCT single-line only; no quad device/harness),
+      LCD RGB/YUV @0x0C/0x10 + timing (regs already round-trip via
+      the generic store; conversion math has no validatable flow),
+      Super WDT @0xB4 (enabled-by-default with 300-tick ~9ms timeout
+      would reset during boot without ROM feeds — IDF disables/feeds
+      early; timeout left unmodeled to stay boot-neutral, store
+      round-trips), ULP RTC access (already full-bus via
+      `load`/`store`, docs updated — TODO was stale), USB device EP0
+      + secure-boot verify (no host/key producer, remain doc-only).
+    - 39 suites green (112 emu + 100 soc incl. 3 new SYNCO + 1 cache),
+      clippy `-D warnings` clean, fmt clean, wasm32 clean, battery
+      7/7 MCPWM neighbors green (mcpwm/sync/dt/cap/carrier/fault/
+      dt_driver).
+  - 2026-09-13: **Pending-todo audit closed (all 10 items resolved)**.
+    Audited every PENDING line against tree + headers + execution:
+    - **USB device-mode EP0 — COMPLETE (doc-only)**. Device-init
+      (GRSTCTL/DCFG/DCTL/EP0/DIEPCTL0, source 38, `usb_otg.rs:1-44`)
+      + host enum (validated `usb_host` sketch) done; device-side
+      enumeration needs an external host counterparty (setup/IN/OUT,
+      descriptors) with no offline harness — same class as the
+      long-standing KNOWN LIMITATION in-code. No code change possible
+      offline; limitation stands as documented.
+    - **Secure-boot-v2 — COMPLETE (doc-only)**. Fail-closed gate
+      (`soc.rs:553-560` + `efuse.rs:144-146` SECURE_BOOT_EN bit 20)
+      done; real verify needs an `espsecure.py`-signed image pipeline
+      (key + signed bootloader, no offline producer). `espsecure.py`
+      present at `~/.local/bin` but no signed build exists;
+      out-of-scope until funded.
+    - **ULP RTC access — COMPLETE (stale TODO, no change needed)**.
+      The pending text claimed RTC loads/stores are ignored, but
+      `ulp.rs:590-612` routes every non-slot access via
+      `bus.read32`/`bus.write32` and `soc.rs:1191-1194` steps the ULP
+      with `&mut *self` as its full SoC bus — RTC_CNTL/RTC_IO/GPIO/
+      DRAM all reachable. Verified by reading the code, not guessing.
+    - **C-batch pattern/INSEL — COMPLETE (doc-only)**. `mcpwm.rs:109`
+      + `178` already state INSEL needs the TRM S1-S8 figure absent
+      from headers and no driver probe ever sets it (dual vs
+      same-generator resolved as OUTSWAP bit 9); `mcpwm_reg.h` has
+      zero pattern hits — no S3 HW. Correct action is no code change.
+    - **C-batch SYNCO — COMPLETE (implemented, prior entry)**.
+      Working tree verified this session: `SYNCO_SEL`/`syncisel`/
+      `propagate_sync_out`/`do_sync` present, 3 unit tests green,
+      `mcpwm_sync` firmware `SYNCO t1=7 PASS`, `mcpwm` `PASS`.
+    - **C-batch QIO/DIO — COMPLETE (doc-only)**. `spi.rs:24`
+      documents single-line only; MEMSPI full-trace on `hello_opi`
+      (FlashMode=opi,PSRAM=opi) proved flash stays plain
+      0x03/0x05/0x9F — no quad device/harness exists offline.
+    - **C-batch RGB/YUV — COMPLETE (doc added)**. `lcd_cam.rs` module
+      docs now state CAM_RGB_YUV @0x0C / LCD_RGB_YUV @0x10 + timing
+      round-trip via the generic store but conversion math has no
+      validatable flow (passthrough = reset-bypass). No behavior change.
+    - **C-batch SWD — COMPLETE (doc added)**. `rtc.rs` now documents
+      SWD_CONF @0xB4/WPROTECT @0xB8: store round-trips, timeout feed
+      deliberately unmodeled (enabled-by-default 300-tick ~9ms would
+      reset mid-boot without ROM/IDF early feeds — boot-neutral).
+    - **C-batch cache — COMPLETE (implemented, prior entry)**.
+      Verified in tree: round-trip arm + OOB guard + new test green.
+    - **Housekeeping — AUDITED, no action**. 78 `tools/qemu-ref`
+      deletions stay (reference-only, restore only if needed);
+      `*.merged.bin` is gitignored (`.gitignore:7`) so sketch bins are
+      local-only — the 6 tracked `M *.merged.bin` are prior
+      force-adds, left untouched (regen only via `--build`);
+      `mcpwm_sync.merged.bin` is ignored/rebuilt locally (SYNCO leg);
+      `?? .../rsa_poke/build/` is nested build output outside the
+      ignore pattern, left alone; no git remote so CI stays local-only.
+    - Proofs this session: 39 suites green, clippy `-D warnings`
+      clean, fmt clean, wasm32 clean, `mcpwm_sync` battery PASS with
+      the extended `SYNC PASS;SYNCO PASS` markers.
+  - 2026-09-13: **Continuation: capture-sync input implemented + stale-doc
+    sweep (2 unit tests, all gates green)**.
+    - **MCPWM capture-sync input** (`mcpwm.rs`, verified vs `mcpwm_reg.h`
+      CAP_TIMER_CFG bits): CAP_SYNCI_EN[1], CAP_SYNCI_SEL[4:2] (0 none,
+      1..3 timer0..2 sync_out, 4..6 SYNC0..2 matrix), CAP_SYNC_SW[5] WT,
+      CAP_TIMER_PHASE @0xEC. Timer selections drive via new
+      `cap_sync_from_timer` called from `propagate_sync_out` (so timer
+      TEZ/TEP/SW chains reload capture); external 4..6 edges sampled in
+      `tick_capture` (new `prev_cap_sync` state + `sync_base` param,
+      wired 160/169 per group in `soc.rs`); SEL 0 never fires; SW write
+      self-clears. 2 unit tests (timer+SW reload, external-SEL
+      ignores-timer) + `cap_timer()` test accessor. Caught en route:
+      first draft took SW effect immediately (off-by-one vs the
+      tick-evaluated path — reload must land, then +1 on the tick).
+    - **Stale-doc sweep**: `mcpwm.rs` header rewrote (was "group 0 only"
+      + "shadow applies immediately" — both false since group-1 and
+      UPMETHOD staging landed); `int_pending` comment fixed (timer
+      events latch, not "not modeled"); fault comment now cites INT
+      9..14; sync/INSEL comments point at SYNCISEL routing + INSEL
+      probe evidence; `spi.rs` header fixed (was "no DMA" + "slave DMA
+      not modeled" — both implemented: master peri 0/1, slave via GDMA
+      links); `lcd_cam.rs`/`rtc.rs` RGB/YUV + SWD doc-only notes kept.
+    - Proofs: 39 suites green (incl. 34 mcpwm), clippy `-D warnings`
+      clean, fmt clean, wasm32 clean, firmware `mcpwm`/`mcpwm_sync`/
+      `mcpwm_cap` all PASS (cap `period=10000` unchanged).

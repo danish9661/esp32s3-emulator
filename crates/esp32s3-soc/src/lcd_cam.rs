@@ -35,7 +35,12 @@
 //! parked on them, then fall back to the RX FIFO; a short final frame
 //! completes its partial descriptor instead of hanging it.
 //! NOT modeled: clock-divider timing
-//! (one word per tick), 2BYTE packing (injected words already are units).
+//! (one word per tick), 2BYTE packing (injected words already are units),
+//! RGB/YUV conversion (CAM_RGB_YUV @ 0x0C / LCD_RGB_YUV @ 0x10) and LCD
+//! timing (CTRL/CTRL1/CTRL2 VSYNC_WIDTH/VB_FRONT: lcd_cam_reg.h) — regs
+//! round-trip via the generic store but pixel-format math and panel timing
+//! have no validatable firmware flow offline, so data passes through
+//! unconverted like the reset-bypass path.
 //!
 //! The presented signals are observable on GPIO pins whose `FUNC_OUT_SEL` is
 //! routed to the corresponding LCD_CAM signal index (see `signal_level`);

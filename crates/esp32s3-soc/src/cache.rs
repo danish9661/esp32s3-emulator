@@ -137,6 +137,11 @@ impl Cache {
             0x130 => (1 << 0) | (1 << 12),
             // FREEZE (DCACHE 0x150 / ICACHE 0x154): stored done bit.
             0x150 | 0x154 => self.regs[idx],
+            // Maintenance / address-window registers (TAG_POWER, PRELOCK,
+            // LOCK, SYNC_ADDR/SIZE, OCCUPY, PRELOAD_ADDR/SIZE, AUTOLOAD_SCT,
+            // extmem_reg.h) are R/W stores: round-trip what firmware wrote
+            // so init sequences that verify their programming observe it.
+            _ if idx < 256 => self.regs[idx],
             _ => 0,
         }
     }
@@ -162,6 +167,9 @@ impl Cache {
     /// Cache control register write.
     pub fn write32(&mut self, off: u32, val: u32) {
         let idx = (off >> 2) as usize;
+        if idx >= 256 {
+            return;
+        }
         match off {
             0x000 | 0x004 => self.dcache_enable = val & 1,
             0x060 | 0x064 => self.icache_enable = val & 1,

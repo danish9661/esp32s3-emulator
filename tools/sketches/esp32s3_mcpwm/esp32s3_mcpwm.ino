@@ -82,6 +82,7 @@ void setup() {
   digitalWrite(SYNC_PIN, LOW);
   *G(0x154 + 160 * 4) = SYNC_PIN;  // FUNC_IN_SEL[160] = GPIO4
   *M(0x0C) = (1u << 0) | (20u << 4);  // SYNCI_EN + PHASE=20
+  *M(0x34) = 4;  // timer0 SYNCISEL = SYNC0 (mcpwm_reg.h)
   // Wait until the free-running counter passes 50, then pulse SYNC.
   uint32_t t0 = millis();
   while ((*M(0x10) & 0xFFFFu) <= 50u) {

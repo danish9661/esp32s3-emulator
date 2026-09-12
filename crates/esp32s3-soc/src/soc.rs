@@ -903,6 +903,23 @@ impl Soc {
         self.rng.reseed(seed);
     }
 
+    /// Snapshot the PSRAM backing (CPU/system resets retain it).
+    pub fn psram_snapshot(&self) -> alloc::boxed::Box<[u8]> {
+        self.psram.clone()
+    }
+
+    /// Restore PSRAM across a non-deep reset (see `psram_wipe`).
+    pub fn restore_psram(&mut self, snap: alloc::boxed::Box<[u8]>) {
+        if snap.len() == self.psram.len() {
+            self.psram.copy_from_slice(&snap);
+        }
+    }
+
+    /// Wipe PSRAM to erased zeros (deep-sleep power-down loss).
+    pub fn psram_wipe(&mut self) {
+        self.psram.fill(0);
+    }
+
     /// Inject the TSENS DAC code (host frontend for temperatureRead).
     pub fn tsens_inject(&mut self, raw: u8) {
         self.adc.tsens_inject(raw);
@@ -1299,7 +1316,8 @@ impl Soc {
             }
             // MCPWM capture samples its channel inputs via the GPIO-matrix
             // input routing (PCNT-style); group 0 listens on 166..168,
-            // group 1 on 175..177 (gpio_sig_map.h PWMx_CAPn_IN_IDX). Levels
+            // group 1 on 175..177 (gpio_sig_map.h PWMx_CAPn_IN_IDX), sync on
+            // 160..162 / 169..171 (the same SYNC0..2 as the timers). Levels
             // come from the pad readback (not pin_level: an output-enabled
             // peripheral-driven pin reads GPIO_OUT there, not the driven
             // signal).
@@ -1312,7 +1330,7 @@ impl Soc {
                         None => 0,
                     }
                 };
-                self.mcpwm.tick_capture(166, &cap_in);
+                self.mcpwm.tick_capture(166, 160, &cap_in);
             }
             if self.mcpwm1.cap_timer_enabled() && self.clk_on(false, 20) {
                 let rb = self.gpio_in_readback();
@@ -1323,7 +1341,7 @@ impl Soc {
                         None => 0,
                     }
                 };
-                self.mcpwm1.tick_capture(175, &cap_in);
+                self.mcpwm1.tick_capture(175, 169, &cap_in);
             }
             // MCPWM fault/trip: level-driven FAULT0..2 inputs (group 0 =
             // 163..165, group 1 = 172..174, gpio_sig_map.h PWMx_Fn_IN_IDX),
@@ -2874,7 +2892,10 @@ impl Soc {
         // immediately. Level types are exact; edge types approximate (the
         // fast-forward freezes inputs, so the entry level stands in for
         // the edge: rising = high, falling = low, any = fire).
-        if ena & crate::rtc::wakeup_ena(2) != 0 {
+        // GPIO/UART wakeups are light-sleep-only (esp_sleep_enable_gpio/
+        // uart_wakeup have no effect in deep sleep — the digital core that
+        // would sense them is powered down).
+        if !deep && ena & crate::rtc::wakeup_ena(2) != 0 {
             for pin in 0..22 {
                 let cfg = self.rtc_io.read32(0x428 + pin * 4);
                 if cfg & (1 << 10) == 0 {

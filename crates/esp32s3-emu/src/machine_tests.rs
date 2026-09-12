@@ -4903,3 +4903,66 @@ fn psram_mixed_size_differential() {
         let _ = r;
     }
 }
+
+/// PSRAM retains across CPU/system resets but is wiped by deep sleep
+/// (the octal-RAM array powers down; silicon does not retain it).
+#[test]
+fn psram_persists_across_reset_but_not_deep_sleep() {
+    use esp32s3_soc::rtc::{
+        RTC_CNTL_BASE, SLEEP_EN_BIT, SLP_TIMER0_OFF, SLP_TIMER1_OFF, SLP_WAKEUP_CAUSE_OFF,
+        STATE0_OFF,
+    };
+    let mut m = Esp32S3::new();
+    m.boot_from_flash(&[0xFF; 0x1000]);
+    // Map PSRAM page 0 at data vpage 0, write a pattern through the window.
+    // (No steps run here, so clear the ROM-boot MMU bypass explicitly —
+    // it clears on its own once a booted core leaves the ROM.)
+    m.soc.set_rom_boot_mode(false);
+    m.soc.write32(0x600C_5000, 0x8000);
+    m.soc.write32(0x3C00_0000, 0xDEAD_BEEF);
+    assert_eq!(m.soc.read32(0x3C00_0000), 0xDEAD_BEEF, "pre-reset write");
+    // Plain reset (WDT path) preserves PSRAM.
+    m.reset();
+    m.soc.set_rom_boot_mode(false);
+    m.soc.write32(0x600C_5000, 0x8000);
+    assert_eq!(
+        m.soc.read32(0x3C00_0000),
+        0xDEAD_BEEF,
+        "PSRAM survives CPU reset"
+    );
+    // Deep sleep loses it.
+    m.soc.write32(RTC_CNTL_BASE + SLP_TIMER0_OFF, 0x100);
+    m.soc.write32(RTC_CNTL_BASE + SLP_TIMER1_OFF, 0);
+    m.soc.write32(RTC_CNTL_BASE + 0x90, 1 << 31); // DIG_PWC deep
+    let prev = m.soc.read32(RTC_CNTL_BASE + STATE0_OFF);
+    m.soc
+        .write32(RTC_CNTL_BASE + STATE0_OFF, prev | SLEEP_EN_BIT);
+    let mut woke = false;
+    for _ in 0..200_000 {
+        m.step();
+        if m.soc.read32(RTC_CNTL_BASE + SLP_WAKEUP_CAUSE_OFF) & (1 << 3) != 0 {
+            woke = true;
+            break;
+        }
+    }
+    assert!(woke, "machine did not wake");
+    m.soc.set_rom_boot_mode(false);
+    m.soc.write32(0x600C_5000, 0x8000);
+    assert_eq!(m.soc.read32(0x3C00_0000), 0, "deep sleep wipes PSRAM");
+}
+
+/// RTC slow memory (and the RTC domain generally) survives CPU/system
+/// resets — only power-down loses it. A plain reset must preserve it.
+#[test]
+fn rtc_slow_memory_survives_reset() {
+    use esp32s3_soc::memmap::RTC_SLOW_BASE;
+    let mut m = Esp32S3::new();
+    m.boot_from_flash(&[0xFF; 0x1000]);
+    m.soc.write32(RTC_SLOW_BASE, 0x1234_5678);
+    m.reset();
+    assert_eq!(
+        m.soc.read32(RTC_SLOW_BASE),
+        0x1234_5678,
+        "RTC slow mem retained across reset"
+    );
+}

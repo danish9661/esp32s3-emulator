@@ -5,8 +5,8 @@
 //! 0x6002_4000, GPSPI3 at 0x6002_5000; 0x6002_8000 is the SD/MMC host, a
 //! separate peripheral — see sdmmc.rs).
 //!
-//! Modeled: CPU-controlled master USR transactions (no DMA).  Writing
-//! CMD.usr (bit 24) starts a transfer whose phases are enabled by USER:
+//! Modeled: CPU-controlled master USR transactions plus GDMA-backed master
+//! DMA (peri_sel 0/1). Writing CMD.usr (bit 24) starts a transfer whose phases are enabled by USER:
 //! command (USER2.usr_command_value/bitlen), address (ADDR +
 //! USER1.usr_addr_bitlen), dummy (USER1.usr_dummy_cyclelen) and data
 //! (MS_DLEN.ms_data_bitlen bits, half-duplex MOSI or MISO, or both with
@@ -20,10 +20,13 @@
 //!
 //! Interrupts: transaction completion latches INT_RAW.trans_done (bit 12,
 //! TRM SPI_DMA_INT_RAW; the classic-ESP32 bit-0 layout does NOT apply);
-//! delivery is wired in soc.rs int_pending.  Not modeled: DMA slave mode,
-//! quad/octal, segments, the CMD.update latch (values are used as written
-//! — functionally equivalent once firmware follows the IDF update sequence).
-//! MISO input has no device attached, so RX phases read back zeros.
+//! delivery is wired in soc.rs int_pending. Master DMA (GDMA peri_sel 0/1,
+//! validated by the spi_dma sketch) and slave DMA (host-driven exchanges
+//! through the GDMA IN/OUT links, validated by the spi_slave_dma sketch)
+//! are modeled. Not modeled: quad/octal, segments, the CMD.update latch
+//! (values are used as written — functionally equivalent once firmware
+//! follows the IDF update sequence). MISO input has no device attached, so
+//! RX phases read back zeros.
 //!
 //! Slave mode: when SPI_SLAVE.slave_mode (bit 26) is set, CMD.usr no longer
 //! starts a master transaction. The external master does not exist in the
@@ -33,8 +36,9 @@
 //! into data_buf, records SLAVE1.data_bitlen, raises trans_done),
 //! `slave_take_read` emulates a master-read-from-slave (returns the
 //! firmware-preloaded data_buf bytes, records the bitlen, raises
-//! trans_done). CPU-controlled (Rd_BUF/Wr_BUF) semantics; slave DMA and the
-//! live slave waveform on Q are not modeled.
+//! trans_done). DMA variants of the same exchanges move the bytes through
+//! the GDMA IN/OUT links instead. The live slave waveform on Q is not
+//! modeled.
 
 // Register offsets (TRM GPSPI chapter).
 use alloc::vec;

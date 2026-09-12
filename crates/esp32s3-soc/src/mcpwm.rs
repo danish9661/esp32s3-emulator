@@ -1,4 +1,4 @@
-//! ESP32-S3 MCPWM (motor-control PWM) model — group 0 only.
+//! ESP32-S3 MCPWM (motor-control PWM) model — groups 0 and 1.
 //!
 //! Register block base `0x6001E000` (`DR_REG_PWM0_BASE`, esp-idf
 //! `reg_base.h`; `0x6000B000` is HINF, NOT MCPWM — see the note in
@@ -17,13 +17,15 @@
 //!
 //! This models the core PWM path (up / down / up-down counting + action-based
 //! generators) enough for a real firmware to produce a correct duty cycle on a
-//! GPIO, plus capture, software-sync reload, dead-time and the fault/trip
+//! GPIO, plus timer-to-timer/external sync (SYNCO_SEL + SYNCISEL + PHASE
+//! reload, mcpwm_reg.h), capture (incl. its sync input), software-sync reload,
+//! dead-time (incl. DEB dual-edge-B and RED/FED output invert), the fault/trip
 //! submodule (FAULT0..2 inputs force generator outputs via CBC/one-shot
-//! actions with enter/exit interrupts). The carrier submodule is simulated
-//! (8-slice wave chopping the generator output post-dead-time, with
-//! first-pulse one-shot + in/out invert); the update-shadow machinery is
-//! latched but applies immediately (matching the reset all-immediate
-//! update methods).
+//! actions with enter/exit interrupts), and TEZ/TEP/TEA/TEB event interrupts.
+//! The carrier submodule is simulated (8-slice wave chopping the generator
+//! output post-dead-time, with first-pulse one-shot + in/out invert). TSTMP/
+//! GEN/DT staged values commit per their UPMETHOD (TEZ/TEP/sync); the timer
+//! STOP event latches its interrupt but performs no other stop action.
 
 /// MCPWM group-0 register block base (esp-idf `DR_REG_PWM0_BASE`).
 pub const MCPWM_BASE: u32 = 0x6001_E000;
@@ -46,11 +48,19 @@ const OPER_STRIDE: usize = 0x38;
 const TIMER_CFG0: u32 = 0x04;
 const TIMER_CFG1: u32 = 0x08;
 const TIMER_STATUS: u32 = 0x10;
-// Timer sync (mcpwm_timer_sync_reg_t): SYNCI_EN[0], SYNC_SW[1] (toggle to
-// trigger), PHASE[19:4] reload value, at timer stride + 0x0C.
+// Timer sync (mcpwm_timer_sync_reg_t, TRM + mcpwm_reg.h): SYNCI_EN[0],
+// SYNC_SW[1] (toggle to trigger), SYNCO_SEL[3:2] (0 sync_in forward,
+// 1 TEZ, 2 TEP; SW toggle always generates sync_out), PHASE[19:4]
+// reload value, at timer stride + 0x0C.
 const TIMER_SYNC: u32 = 0x0C;
 const SYNC_SW: u32 = 1 << 1;
+const SYNCO_SEL_SHIFT: u32 = 2;
 const PHASE_SHIFT: u32 = 4;
+// Timer sync-input selection (mcpwm_timer_synci_cfg_reg_t @ 0x34,
+// mcpwm_reg.h): TIMERn_SYNCISEL 1 timer0 sync_out, 2 timer1 sync_out,
+// 3 timer2 sync_out, 4 SYNC0, 5 SYNC1, 6 SYNC2, else none. External
+// invert bits EXTERNAL_SYNCI0/1/2_INVERT at [9]/[10]/[11].
+const TIMER_SYNCI_CFG: u32 = 0x34;
 // Operator block base (operator[k] at OPER_BASE0 + k*0x38) and the
 // per-operator field offsets LOCAL to that block (mcpwm_operator_reg_t).
 const OPER_BASE0: u32 = 0x3C;
@@ -73,7 +83,15 @@ const INT_CLR: u32 = 0x11C;
 
 // Capture submodule (mcpwm_cap_*_reg_t): timer cfg @0xE8, phase @0xEC,
 // channel cfg @0xF0+4n, channel value @0xFC+4n, edge status @0x108.
+// CAP_TIMER_CFG bits (mcpwm_reg.h): CAP_TIMER_EN[0], CAP_SYNCI_EN[1],
+// CAP_SYNCI_SEL[4:2] (0 none, 1 timer0 sync_out, 2 timer1, 3 timer2,
+// 4 SYNC0, 5 SYNC1, 6 SYNC2), CAP_SYNC_SW[5] (WT: reload cap timer with
+// CAP_TIMER_PHASE when SYNCI_EN set).
 const CAP_TIMER_CFG: u32 = 0xE8;
+const CAP_TIMER_PHASE: u32 = 0xEC;
+const CAP_SYNCI_EN: u32 = 1 << 1;
+const CAP_SYNCI_SEL_SHIFT: u32 = 2;
+const CAP_SYNC_SW: u32 = 1 << 5;
 const CAP_CHN_CFG_BASE: u32 = 0xF0;
 const CAP_CHN_BASE: u32 = 0xFC;
 const CAP_STATUS: u32 = 0x108;
@@ -91,19 +109,21 @@ const TEZ_INT_BASE: u32 = 3;
 const TEP_INT_BASE: u32 = 6;
 const OP_TEA_INT_BASE: u32 = 15;
 const OP_TEB_INT_BASE: u32 = 18;
-// Timer sync input (mcpwm_timer_sync_reg_t @ timer stride + 0x0C):
-// SYNCI_EN[0] arms the external SYNCt_IN reload (timer t listens to
-// SYNCt, group 0 = 160..162, group 1 = 169..171, gpio_sig_map.h
-// PWMx_SYNCn_IN_IDX). SYNC_SW[1]/PHASE[19:4] already modeled.
+// Timer sync input (SYNCI_EN[0] arm + SYNCISEL routing @ 0x34, verified
+// vs mcpwm_reg.h this session: values 1/2/3 select a timer sync_out,
+// 4/5/6 select SYNC0/1/2): see TIMER_SYNCI_CFG below; SYNC_SW[1]/
+// PHASE[19:4] already modeled.
 // Dead-time output swap (mcpwm_dt_cfg_reg_t @ DT_BASE0 + op*0x38):
 // A_OUTSWAP[9] / B_OUTSWAP[10] (S6/S7) swap the generator outputs
 // post-dead-time (applied pre-carrier, same documented ordering class
-// as the fault force). INSEL/DEB_MODE need the TRM S1-S8 switch table
-// figure and stay unmodeled (reset = symmetric bypass, as modeled).
+// as the fault force). INSEL stays latched-bypass: no IDF driver flow
+// sets DT_RED_INSEL[11]/DT_FED_INSEL[12] (probed both dead-time driver
+// modes — dual and same-generator resolve as OUTSWAP bit 9), and the
+// S1-S8 switch figure is absent from the headers, so the symmetric
+// bypass (as modeled) is the only validatable behavior.
 // Timer sync input arm (mcpwm_timer_sync_reg_t @ timer stride + 0x0C):
-// SYNCI_EN[0] arms the external SYNCt_IN reload (timer t listens to
-// SYNCt, group 0 = 160..162, group 1 = 169..171, gpio_sig_map.h
-// PWMx_SYNCn_IN_IDX). SYNC_SW[1]/PHASE[19:4] already modeled.
+// SYNCI_EN[0] arms the selected input (see TIMER_SYNCI_CFG); SYNC_SW[1]/
+// PHASE[19:4] plus SYNCO_SEL[3:2] already modeled.
 const SYNCI_EN: u32 = 1 << 0;
 const DT_CFG: u32 = 0x00;
 const DT_A_OUTSWAP: u32 = 1 << 9;
@@ -167,8 +187,9 @@ const PWM0_OUT0A_IDX: u32 = 160;
 const PWM0_OUT2B_IDX: u32 = 165;
 // Dead-time submodule (mcpwm_dt_reg_t): DT[k] base stride 0x38 with FED
 // (falling-edge delay) @ +0x04 and RED (rising-edge delay) @ +0x08,
-// both [15:0] in (emulator) tick units. INSEL routing is not modeled;
-// delays apply to both generator outputs symmetrically.
+// both [15:0] in (emulator) tick units. INSEL routing stays latched-
+// bypass (see the note above); DEB dual-edge-B plus RED/FED output
+// invert are modeled and driver-validated (mcpwm_dt_driver sketch).
 const DT_BASE0: u32 = 0x58;
 const DT_STRIDE: u32 = 0x38;
 const DT_FED: u32 = 0x04;
@@ -233,6 +254,8 @@ pub struct Mcpwm {
     /// Per-channel first-sample seeding (a channel latches no edge on the
     /// tick its sampling starts, like the PCNT first-sample gate).
     cap_init: [bool; 3],
+    /// Previous capture-sync input level (edge-detected SYNC reload).
+    prev_cap_sync: u32,
     /// Live fault-event bitmap (EVENT_F0..2, recomputed every fault tick).
     fault_events: u32,
     /// Per-operator CBC (cycle-by-cycle) action ongoing.
@@ -289,6 +312,7 @@ impl Mcpwm {
             cap_edge_cnt: [0; 3],
             prev_cap: [0; 3],
             cap_init: [false; 3],
+            prev_cap_sync: 0,
             fault_events: 0,
             fault_cbc_on: [false; NOPER],
             fault_ost_on: [false; NOPER],
@@ -431,7 +455,7 @@ impl Mcpwm {
             self.timer_prescale_cnt[t] = 0;
 
             let old = self.timer_count[t];
-            let (new, tez) = match mode {
+            let (new, tez, _tep) = match mode {
                 1 => {
                     // Up / increment: wrap period-1 -> 0. The period
                     // boundary is both TEP (count == period) and TEZ.
@@ -439,17 +463,20 @@ impl Mcpwm {
                     if n >= period {
                         self.int_raw |= 1 << (TEP_INT_BASE + t as u32);
                         self.commit(t, Self::EV_TEP);
-                        (0, true)
+                        if self.synco_sel(t) == 2 {
+                            self.propagate_sync_out(t, &mut [false; 3]);
+                        }
+                        (0, true, true)
                     } else {
-                        (n, false)
+                        (n, false, false)
                     }
                 }
                 2 => {
                     // Down / decrement.
                     if old == 0 {
-                        (period - 1, false)
+                        (period - 1, false, false)
                     } else {
-                        (old - 1, false)
+                        (old - 1, false, false)
                     }
                 }
                 3 => {
@@ -460,18 +487,21 @@ impl Mcpwm {
                             // Peak (count == period): TEP, not TEZ.
                             self.int_raw |= 1 << (TEP_INT_BASE + t as u32);
                             self.commit(t, Self::EV_TEP);
-                            (period - 1, false)
+                            if self.synco_sel(t) == 2 {
+                                self.propagate_sync_out(t, &mut [false; 3]);
+                            }
+                            (period - 1, false, true)
                         } else {
-                            (old + 1, false)
+                            (old + 1, false, false)
                         }
                     } else if old == 0 {
                         self.timer_dir[t] = 0;
-                        (1, false)
+                        (1, false, false)
                     } else {
-                        (old - 1, false)
+                        (old - 1, false, false)
                     }
                 }
-                _ => (old, false),
+                _ => (old, false, false),
             };
             self.timer_count[t] = new;
             if tez {
@@ -479,6 +509,9 @@ impl Mcpwm {
                 // registers bound to TEZ, apply the zero-event actions.
                 self.int_raw |= 1 << (TEZ_INT_BASE + t as u32);
                 self.commit(t, Self::EV_TEZ);
+                if self.synco_sel(t) == 1 {
+                    self.propagate_sync_out(t, &mut [false; 3]);
+                }
                 for op in 0..NOPER {
                     if self.op_timer_sel(op) == t {
                         self.apply_action(op, GEN_UTEZ);
@@ -602,6 +635,12 @@ impl Mcpwm {
         self.regs[CAP_TIMER_CFG as usize / 4] & CAP_TIMER_EN != 0
     }
 
+    /// Live capture-timer counter (test accessor; firmware reads edges via
+    /// CAP_CHN latches, not this counter directly).
+    pub fn cap_timer(&self) -> u32 {
+        self.cap_timer
+    }
+
     /// Sampled input level of capture channel `n` (post-invert).
     fn cap_level<F: Fn(u32) -> u32>(&self, cap_base: u32, input: &F, n: usize) -> u32 {
         let cfg = self.regs[(CAP_CHN_CFG_BASE as usize + 4 * n) / 4];
@@ -614,9 +653,32 @@ impl Mcpwm {
     /// On a configured edge (divided by prescale+1) the timer latches into
     /// CAP_CHN, the edge records in CAP_STATUS, and the CAPn interrupt
     /// latches. Called regardless of the PWM timers (capture is independent).
-    pub fn tick_capture<F: Fn(u32) -> u32>(&mut self, cap_base: u32, input: &F) {
+    /// A capture-timer sync reloads the timer with CAP_TIMER_PHASE: either a
+    /// CAP_SYNC_SW write (with CAP_SYNCI_EN set and SEL 0) or a rising edge
+    /// on the selected external input (SEL 4..6 SYNC0..2 from the matrix at
+    /// `sync_base`+0/1/2). Timer sync_out selections (1..3) are driven from
+    /// tick()/SW writes via `cap_sync_from_timer`, not sampled here.
+    pub fn tick_capture<F: Fn(u32) -> u32>(&mut self, cap_base: u32, sync_base: u32, input: &F) {
         if !self.cap_timer_enabled() {
             return;
+        }
+        let cfg = self.regs[CAP_TIMER_CFG as usize / 4];
+        if cfg & CAP_SYNC_SW != 0 {
+            self.regs[CAP_TIMER_CFG as usize / 4] = cfg & !CAP_SYNC_SW;
+            if cfg & CAP_SYNCI_EN != 0 && (cfg >> CAP_SYNCI_SEL_SHIFT) & 7 == 0 {
+                self.cap_timer = self.regs[CAP_TIMER_PHASE as usize / 4];
+            }
+        }
+        if cfg & CAP_SYNCI_EN != 0 {
+            let sel = (cfg >> CAP_SYNCI_SEL_SHIFT) & 7;
+            if (4..=6).contains(&sel) {
+                let lvl = input(sync_base + (sel - 4)) & 1;
+                let rising = lvl == 1 && self.prev_cap_sync == 0;
+                self.prev_cap_sync = lvl;
+                if rising {
+                    self.cap_timer = self.regs[CAP_TIMER_PHASE as usize / 4];
+                }
+            }
         }
         self.cap_timer = self.cap_timer.wrapping_add(1);
         for n in 0..3 {
@@ -706,36 +768,105 @@ impl Mcpwm {
         }
     }
 
-    /// True when any timer arms the external sync input (tick gate).
-    pub fn sync_armed(&self) -> bool {
-        (0..NTIMER).any(|t| self.regs[(t * TIMER_STRIDE) + TIMER_SYNC as usize / 4] & SYNCI_EN != 0)
+    /// Sync-input selection for timer `t` (TIMER_SYNCI_CFG @ 0x34).
+    fn syncisel(&self, t: usize) -> u32 {
+        (self.regs[TIMER_SYNCI_CFG as usize / 4] >> (t * 3)) & 7
     }
 
-    /// Advance the timer-sync submodule by one SoC step: sample the SYNC0..2
-    /// matrix inputs (`sync_base` + t, group 0 = 160, group 1 = 169,
-    /// gpio_sig_map.h PWMx_SYNCn_IN_IDX); a rising edge with SYNCI_EN
-    /// reloads timer t with PHASE (same load as SYNC_SW). Sampled even with
-    /// the timers stopped, like the fault inputs.
+    /// Sync-output selection for timer `t` (TIMER_SYNC [3:2]).
+    fn synco_sel(&self, t: usize) -> u32 {
+        (self.regs[(t * TIMER_STRIDE + TIMER_SYNC as usize) / 4] >> SYNCO_SEL_SHIFT) & 3
+    }
+
+    /// Reload timer `t` with PHASE and commit shadow registers, then
+    /// forward the sync_out pulse when SYNCO_SEL selects sync_in forward
+    /// (mcpwm_reg.h: 0 sync_in). `visited` guards timer-to-timer loops.
+    fn do_sync(&mut self, t: usize, visited: &mut [bool; 3]) {
+        if visited[t] {
+            return;
+        }
+        visited[t] = true;
+        let sync = self.regs[(t * TIMER_STRIDE + TIMER_SYNC as usize) / 4];
+        self.timer_count[t] = (sync >> PHASE_SHIFT) & 0xFFFF;
+        self.commit(t, Self::EV_SYNC);
+        if self.synco_sel(t) == 0 {
+            self.propagate_sync_out(t, visited);
+        }
+    }
+
+    /// Emit timer `t`'s sync_out pulse to every timer whose SYNCISEL
+    /// selects it (1 timer0, 2 timer1, 3 timer2) with SYNCI_EN set, plus
+    /// the capture timer when CAP_SYNCI_SEL selects it.
+    fn propagate_sync_out(&mut self, t: usize, visited: &mut [bool; 3]) {
+        for u in 0..NTIMER {
+            if self.syncisel(u) == t as u32 + 1
+                && self.regs[(u * TIMER_STRIDE + TIMER_SYNC as usize) / 4] & SYNCI_EN != 0
+            {
+                self.do_sync(u, visited);
+            }
+        }
+        self.cap_sync_from_timer(t);
+    }
+
+    /// Capture-timer sync from a timer sync_out pulse (CAP_SYNCI_SEL 1..3
+    /// = timer0..2, mcpwm_reg.h): reload the capture timer with
+    /// CAP_TIMER_PHASE when armed. External selections (4..6) are sampled
+    /// in `tick_capture`; SEL 0 never fires.
+    pub fn cap_sync_from_timer(&mut self, t: usize) {
+        let cfg = self.regs[CAP_TIMER_CFG as usize / 4];
+        if cfg & CAP_SYNCI_EN != 0 && (cfg >> CAP_SYNCI_SEL_SHIFT) & 7 == t as u32 + 1 {
+            self.cap_timer = self.regs[CAP_TIMER_PHASE as usize / 4];
+        }
+    }
+
+    /// True when any timer arms an external sync input (tick gate).
+    pub fn sync_armed(&self) -> bool {
+        (0..NTIMER).any(|t| {
+            self.regs[(t * TIMER_STRIDE + TIMER_SYNC as usize) / 4] & SYNCI_EN != 0
+                && matches!(self.syncisel(t), 4..=6)
+        })
+    }
+
+    /// Advance the timer-sync submodule by one SoC step: sample the selected
+    /// external matrix input (SYNCISEL 4 SYNC0, 5 SYNC1, 6 SYNC2 at
+    /// `sync_base` + 0/1/2, group 0 = 160, group 1 = 169, gpio_sig_map.h
+    /// PWMx_SYNCn_IN_IDX, with EXTERNAL_SYNCI invert); a rising edge with
+    /// SYNCI_EN reloads timer t with PHASE (same load as SYNC_SW) and
+    /// forwards sync_out when SYNCO_SEL selects sync_in. Internal
+    /// selections (1/2/3) are driven from tick()/SW writes, not here.
+    /// Sampled even with the timers stopped, like the fault inputs.
     pub fn tick_sync<F: Fn(u32) -> u32>(&mut self, sync_base: u32, input: &F) {
+        let cfg = self.regs[TIMER_SYNCI_CFG as usize / 4];
         for t in 0..NTIMER {
-            let lvl = input(sync_base + t as u32) & 1;
+            let sel = (cfg >> (t * 3)) & 7;
+            let ext = match sel {
+                4 => 0,
+                5 => 1,
+                6 => 2,
+                _ => {
+                    continue;
+                }
+            };
+            let mut lvl = input(sync_base + ext) & 1;
+            if cfg & (1 << (9 + ext)) != 0 {
+                lvl ^= 1;
+            }
             let rising = lvl == 1 && self.prev_sync[t] == 0;
             self.prev_sync[t] = lvl;
-            if rising && self.regs[(t * TIMER_STRIDE) + TIMER_SYNC as usize / 4] & SYNCI_EN != 0 {
-                let sync = self.regs[(t * TIMER_STRIDE) + TIMER_SYNC as usize / 4];
-                self.timer_count[t] = (sync >> PHASE_SHIFT) & 0xFFFF;
-                self.commit(t, Self::EV_SYNC);
+            if rising && self.regs[(t * TIMER_STRIDE + TIMER_SYNC as usize) / 4] & SYNCI_EN != 0 {
+                self.do_sync(t, &mut [false; 3]);
             }
         }
     }
 
     /// Advance the fault submodule by one SoC step: sample the FAULT0..2
     /// matrix inputs (`fault_base` + k, group 0 = 163, group 1 = 172),
-    /// latch enter/exit interrupts, and drive CBC/OST trip actions.
-    /// CBC forces while its event is ongoing (CBCPULSE refresh-moment
-    /// selection is not modeled: the force applies immediately on trigger,
-    /// matching the reset CBCPULSE = immediate behavior); OST latches
-    /// until a CLR_OST rising edge. Called regardless of the PWM timers.
+    /// latch enter (INT 9/10/11) / exit (INT 12/13/14) interrupts, and drive
+    /// CBC/OST trip actions. CBC forces while its event is ongoing (CBCPULSE
+    /// refresh-moment selection is not modeled: the force applies immediately
+    /// on trigger, matching the reset CBCPULSE = immediate behavior); OST
+    /// latches until a CLR_OST rising edge. Called regardless of the PWM
+    /// timers.
     pub fn tick_fault<F: Fn(u32) -> u32>(&mut self, fault_base: u32, input: &F) {
         let det = self.regs[FAULT_DETECT as usize / 4];
         let mut events = 0u32;
@@ -844,8 +975,8 @@ impl Mcpwm {
         }
     }
 
-    /// Interrupt pending = raw & enabled (capture channels latch; timer
-    /// event interrupts are not modeled).
+    /// Interrupt pending = raw & enabled (TEZ/TEP/TEA/TEB, fault enter/exit,
+    /// and capture channels all latch into `int_raw` at their event sites).
     pub fn int_pending(&self) -> bool {
         (self.int_raw & self.regs[INT_ENA as usize / 4]) != 0
     }
@@ -896,7 +1027,7 @@ impl Mcpwm {
     /// behavior); with an event method the value stages (visible on read,
     /// SHDW_FULL-style pending) until `commit`; with disable it stages but
     /// never commits. Covers CFG0 period, TSTMP_A/B, GENERATOR0/1, DT
-    /// FED/RED; everything else (prescale, methods, INSEL/OUTSWAP, FORCE)
+    /// FED/RED; everything else (prescale, methods, OUTSWAP, INSEL, FORCE)
     /// stores immediately. STMP_CFG SHDW_FULL bits (8, 9) are HW-owned and
     /// masked out of writes (read overlays the live pending state).
     fn shadow_store(&mut self, offset: u32, value: u32) {
@@ -1033,6 +1164,8 @@ impl Mcpwm {
                     // Timer sync: a SYNC_SW write reloads the counter with
                     // PHASE (external SYNCI_EN reloads via tick_sync; the
                     // level-triggered write matches what the driver emits).
+                    // SW toggling always generates sync_out (mcpwm_reg.h),
+                    // regardless of SYNCO_SEL.
                     if offset >= TIMER_SYNC
                         && offset < TIMER_SYNC + NTIMER as u32 * TIMER_STRIDE as u32
                         && (offset - TIMER_SYNC).is_multiple_of(TIMER_STRIDE as u32)
@@ -1041,6 +1174,7 @@ impl Mcpwm {
                         let t = ((offset - TIMER_SYNC) / TIMER_STRIDE as u32) as usize;
                         self.timer_count[t] = (value >> PHASE_SHIFT) & 0xFFFF;
                         self.commit(t, Self::EV_SYNC);
+                        self.propagate_sync_out(t, &mut [false; 3]);
                     }
                     // gen_force: direct force of generator A/B output level.
                     if offset >= OPER_BASE0

@@ -273,8 +273,16 @@ impl Esp32S3 {
         // eFuse is OTP (never wiped by reset): preserve it so encrypted
         // devices keep their key across reboots.
         let efuse = self.soc.efuse_snapshot();
+        // PSRAM retains across CPU/system resets (only deep sleep powers
+        // the octal-RAM array down — see wake(), which zeroes it back).
+        let psram = self.soc.psram_snapshot();
+        // RTC domain (slow/fast memory, ULP + touch state) survives CPU
+        // resets on silicon — only a power-down loses it.
+        let rtc = self.soc.snapshot_rtc();
         self.soc = Soc::new();
         self.soc.restore_efuse(efuse);
+        self.soc.restore_psram(psram);
+        self.soc.restore_rtc(rtc);
         self.asleep = false;
         self.boot_denied = false;
         self.sleep_remaining = 0;
@@ -385,6 +393,11 @@ impl Esp32S3 {
         // Digital-pad hold (DIG_PAD_HOLD): held pads keep driving across
         // the reboot like silicon; unheld pads reset with the digital core.
         self.soc.restore_gpio_hold(gpio_hold);
+        // Deep sleep powers the PSRAM array down: contents are lost
+        // (silicon does not retain), so wipe the snapshot-restored copy
+        // back to erased zeros. Light sleep / WDT / software resets keep
+        // PSRAM (handled in reset()).
+        self.soc.psram_wipe();
         // Deep-sleep reset reason: `esp_sleep_get_wakeup_cause` only reads
         // the wakeup-cause register when the PRO reason is DEEPSLEEP (5).
         self.soc.set_reset_cause(
