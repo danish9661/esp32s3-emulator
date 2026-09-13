@@ -313,6 +313,13 @@ async function loadFlash(bytes, keyHex) {
   } else {
     emu.load_flash(bytes);
   }
+  // Gallery entries that need an attached virtual SD card opt in via
+  // `"sdspi": true` in manifest.json (mirrors run_flash SPI_SDSPI=1:
+  // same FAT16 volume SDMMC formatted, over the GPSPI2 SDSPI path).
+  const needsSdspi = currentGalleryItem && currentGalleryItem.sdspi === true;
+  if (needsSdspi) {
+    emu.spi_sdspi_attach_sdmmc_image(0);
+  }
 
   if (typeof PeripheralBridge !== 'undefined') {
     bridge = new PeripheralBridge(emu);
@@ -355,6 +362,7 @@ async function loadFlash(bytes, keyHex) {
 els.firmware.addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
+  currentGalleryItem = null;
   const buf = await file.arrayBuffer();
   loadFlash(new Uint8Array(buf));
 });
@@ -367,6 +375,7 @@ async function loadFromUrl(url, keyHex) {
 }
 
 // ── Gallery ──
+let currentGalleryItem = null;
 try {
   const res = await fetch('./firmware/manifest.json');
   if (res.ok) {
@@ -375,6 +384,7 @@ try {
       const opt = document.createElement('option');
       opt.value = `./firmware/${item.file}`;
       opt.dataset.key = item.key || '';
+      opt.dataset.sdspi = item.sdspi ? '1' : '';
       opt.textContent = item.name;
       els.gallery.appendChild(opt);
     }
@@ -385,6 +395,7 @@ els.gallery.addEventListener('change', async (e) => {
   const sel = e.target.selectedOptions[0];
   const url = e.target.value;
   if (!url) return;
+  currentGalleryItem = { sdspi: sel.dataset.sdspi === '1' };
   try {
     setStatus(`loading ${url}…`);
     await loadFromUrl(url, sel.dataset.key || null);

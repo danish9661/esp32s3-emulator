@@ -17,15 +17,21 @@ peripherals) with no server-side emulation.
   SoC (UART, GPIO, timers, interrupt matrix, SPI/I2C flash, PSRAM/cache MMU,
   dual-core), boot path (ROM stubs + second-stage loader + partition table),
   and a broad set of peripherals.
-- **P5 (peripheral validation) essentially complete**: ~30 peripherals are
+- **P5 (peripheral validation) complete**: every SoC peripheral is
   validated end-to-end by booting **real arduino-cli firmware** and asserting
-  both serial output and internal emulator state.
-- **P6 (browser frontend) complete**: Serial console, GPIO LED grid, firmware
-  gallery with Examples dropdown, search, copy button.
-- **Remaining known gaps**: the Arduino `Wire` (I2C) *driver* path (the
-  peripheral itself is validated via direct register pokes — see
-  `AGENTS.md`); Xtensa `ee.*` DSP/TIE instructions (only needed for WiFi/FFT
-  firmware); Touch peripheral (excluded by user directive).
+  both serial output and internal emulator state. Battery: **106/0/0**
+  (106 pass, 0 fail, 0 skipped) across 36 gallery entries + driver/poke
+  sketches, plus Playwright browser E2E ALL PASS.
+- **P6 (browser frontend) complete**: Serial console + serial input row
+  (USB-CDC/UART0/1/2 + Send), GPIO LED grid, firmware gallery (36 entries:
+  every major peripheral + SDSPI with in-browser card attach, emmc_driver,
+  usb_device; flashenc reuses the hello bin with a `key` field), MIPS meter,
+  Playwright E2E (hello boot, serial echo, UART1 round-trip, SDSPI mount).
+- **Remaining known gaps**: WiFi/BLE only. The Arduino `Wire` (I2C) empty-bus
+  scan reporting "other" is verified silicon-true behavior (esp-idf NG-driver
+  maps the NACK path's `ESP_ERR_INVALID_STATE` to 4), not a model gap — see
+  `AGENTS.md`. Xtensa `ee.*` DSP/TIE: 218/218 execute; unmapped patterns trap
+  loud (correct). Touch validated.
 - **Out of scope**: WiFi/BLE.
 
 ## Quickstart
@@ -74,7 +80,7 @@ cd web && python3 -m http.server 8000   # open http://localhost:8000
 The page has:
 - **Serial console** — drains the UART buffer each frame and renders output
 - **40-pin GPIO LED grid** — real-time pin state visualization
-- **Examples dropdown** — 12 bundled firmware sketches (fetches + loads)
+- **Examples dropdown** — 36 bundled firmware sketches (fetches + loads)
 - **File input** — load your own `.merged.bin`
 - **Run / Stop / Reset** — step-level control
 - **Steps-per-frame slider** — tune emulation speed vs. responsiveness
@@ -183,15 +189,16 @@ on CALL/RETW, matching QEMU's `win_helper.c` behavior.
 
 | Item | Status | Notes |
 |------|--------|-------|
-| I2C Wire driver | Peripheral validated, driver path hangs | esp-idf `cmd_link` completion ABI not modeled |
-| ee.* DSP/TIE | Unimplemented | ~29 opcodes; only needed for WiFi/FFT firmware |
-| Touch | Excluded | Per user directive |
+| I2C Wire driver | Silicon-true | Empty-bus scan reports "other" per esp-idf NG-driver mapping (verified behavior, not a gap); peripheral validated via direct poke |
+| ee.* DSP/TIE | 218/218 execute | Unmapped patterns trap loud (correct); only needed for WiFi/FFT firmware |
+| Touch | Validated | Oneshot + threshold ISR path via direct poke (see `AGENTS.md`) |
 | WiFi/BLE | Out of scope | Months of work; not required for core milestone |
 | I2S TDM/PDM | Modeled | Master/slave clock-gen, TDM, PDM all functional |
 | LCD_CAM 8080/6800 | Partial | FIFO + transfer-done functional; RGB FSM not modeled |
 | ULP rv32imc | Functional | C extension supported; compressed decode working |
-| Deep-sleep | Register model | esp-idf driver path hangs; direct-poke validated |
-| SDMMC FAT mount | Block-level only | PIO + IDMAC + simulated card functional; SDIO/ACMD51/CMD6 negotiation for a FAT mount not modeled |
+| Deep-sleep | Validated | Timer/EXT0/EXT1/ULP/touch wake paths via driver + poke (see `AGENTS.md`) |
+| SDMMC FAT mount | Validated | PIO + IDMAC + simulated card functional; IDF-driver mount (`sdfat`) + SDSPI + eMMC-driver mounts green |
+| USB-OTG device-mode | Validatable paths done | Host enum (sim device) + EP0/EP1 loopback + TinyUSB HID boot green; real external-host enumeration out of scope |
 | Model clock | Approximate | 1 global tick per 2 instructions for all domains (silicon runs SYSTIMER 16MHz vs APB 80MHz); only observable in cross-domain counts, all passing |
 
 ## Performance

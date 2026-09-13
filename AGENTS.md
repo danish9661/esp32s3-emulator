@@ -79,24 +79,29 @@ Core design:
         FreeRTOS/Arduino behavior. **P5 COMPLETE**: every SoC peripheral is
         modeled and validated (see status log). Driver-path validated via
         arduino-cli: RNG, SYSTIMER, RMT, GDMA, SigmaDelta, LEDC, EFUSE, SHA,
-        AES, RSA, HMAC, DS, WDT, I2S, SPI, MCPWM, PCNT, TWAI/CAN, LCD_CAM.
-        Direct-register-poke validated (peripheral correct, driver ABI not
-        modeled): I2C (Wire driver documented known limitation — root-caused
-        to esp-idf i2c driver's internal `cmd_link`/`xQueueGenericSendFromISR`
-        init ABI; `s_i2c_transaction_start` returns 0x103 never 0x105 so
-        `endTransmission` returns "other" not "NACK"), RTC_IO, ULP (rv32im
-        core), SDMMC (simulated card + IDMAC), Deep-sleep, LP_I2C, LP_UART,
-        ECDSA, and register-store stubs (SENSITIVE/WCL/PERI_BACKUP/SYSCON/
-        PARLIO-assist). Xtensa LX7 ISA audit passed (only `ee.*` DSP/TIE
-        extensions unimplemented). OTA boot-slot selection implemented; ROM
-        coverage sufficient (5+ real sketches boot). Touch excluded per user
-        directive.
+        AES (ECB/CBC/XTS chaining), RSA, HMAC, DS, WDT, I2S, SPI, MCPWM,
+        PCNT, TWAI/CAN, LCD_CAM, Touch, ULP (rv32imc core), SDMMC (simulated
+        card + IDMAC), Deep-sleep, LP_I2C, LP_UART, ECDSA, USB-OTG host
+        enumeration, eMMC simulated card, flash-encryption pipeline. I2C
+        Wire *driver* behavior verified silicon-true (empty-bus scan
+        reports "other" per the esp-idf NG-driver mapping — peripheral
+        validated via direct poke). Xtensa LX7 ISA audit passed (218/218
+        `ee.*` DSP/TIE executing, incl. `ee_srs_accx`; unmapped patterns
+        trap loud, correct). OTA boot-slot selection implemented; ROM
+        coverage sufficient (5+ real sketches boot). Battery 106/0/0,
+        gallery 36 entries, Playwright E2E ALL PASS.
 - [x] **P6 — Frontend polish**: serial console UI, GPIO/LED visualization,
-      example firmware gallery.
+      example firmware gallery (36 entries: every major peripheral + SDSPI
+      with in-browser card attach, emmc_driver, usb_device; flashenc reuses
+      the hello bin with a `key` field; serial input row + MIPS meter).
 - [ ] WiFi/BLE: OUT OF SCOPE for now (months of work; not required for the
       core milestone).
 
-Scope updates (2026-09-12): Touch validated after all (see status log);
+Scope updates (2026-09-14): P5/P6 done — battery 106/0/0 (0 skipped),
+gallery 36/36 in-wasm-validatable entries, Playwright E2E ALL PASS
+(hello boot, MIPS, serial echo, UART1 round-trip, SDSPI mount). Earlier
+scoping notes below are HISTORICAL (superseded where they conflict):
+Touch validated after all (see status log);
 `ee.*` now 218/218 executing (incl. `ee_srs_accx`); eMMC simulated card,
 flash-encryption pipeline, and USB-OTG host enumeration landed (see status
 log). Still out: WiFi/BLE, USB-OTG device-mode enumeration (external host),
@@ -4117,3 +4122,22 @@ IDF-driver MMC mount, `ee.*` unmapped patterns (loud trap, correct).
     the battery's `--build` path is the source of truth, committed bins
     are cache. Proofs: 106/0/0 full `--build`; workspace + wasm32 green;
     clippy `-D warnings` clean; fmt clean.
+  - 2026-09-14: **Gallery 34→36 + in-browser SDSPI (P6 hygiene)**. New
+    `Emulator::spi_sdspi_attach_sdmmc_image(chan)` bridge API (mirrors
+    `run_flash` SPI_SDSPI=1) + `"sdspi": true` manifest flag plumbed
+    through `loadFlash`/gallery-select (file-input uploads stay cardless).
+    Gallery +2: `emmc_driver` (IDF-driver FAT mount) + `usb_device`
+    (TinyUSB HID boot) bins copied to `web/firmware/`; sdspi entry gains
+    the flag (secure_boot excluded: needs the SECURE_BOOT_EN burn, which
+    the browser cannot provide — same class as the Touch/TOUCH_INJECT
+    exclusion). `web/pkg` rebuilt via wasm-pack (API-compat grep: all 12
+    `emu.*` calls resolve in the d.ts; `node --check` clean; all 36
+    gallery bins present). Playwright E2E extended with Test 5
+    (`sdspi-inwasm-mount`: select the sdspi gallery entry in-wasm →
+    `SDSPI FAT READ PASS`) → **ALL PASS incl. the new test** (37 gallery
+    options, `11.2 MIPS`, zero page errors). Cautionary tale: a full
+    `--build` battery also rewrites timestamp-only bins
+    (efuse/hello/ledc/lightsleep/periph/uart_echo — PASS with or without
+    the tree change, proven via stash A/B) — reverted so the commit holds
+    only behavior-changing files. Proofs: Playwright ALL PASS, clippy
+    `-D warnings` clean, fmt clean.

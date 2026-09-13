@@ -21,10 +21,11 @@
 //! `dw0[30]=eof`, `dw0[31]=owner`. The transfer copies `length` bytes between
 //! `buf_addr` and the connected peripheral.
 //!
-//! For `peri_sel == 9` (RMT, the only GDMA consumer modeled so far) the
-//! destination is the RMT TX item RAM: `RMTMEM_BASE + ch*0x100` (each RMT
-//! channel block is 0x100 bytes / 64 items). RMT then transmits from that
-//! RAM exactly as it does for CPU-written items, raising its own `tx_end`.
+//! For `peri_sel == 9` (RMT) the destination is the RMT TX item RAM:
+//! `RMTMEM_BASE + ch*0x100` (each RMT channel block is 0x100 bytes /
+//! 64 items). RMT then transmits from that RAM exactly as it does for
+//! CPU-written items, raising its own `tx_end`. Other consumers (SPI2/3,
+//! UHCI, LCD_CAM, ADC, SHA, AES, I2S) are routed in `soc.rs`'s GDMA walk.
 //! After the walk, `out_done` (int bit 0) and `out_eof`/`out_total_eof`
 //! (bits 1/3) are asserted so the firmware GDMA ISR (and any registered
 //! `gdma` tx-event callback, e.g. the esp-idf RMT driver) can run.

@@ -193,6 +193,14 @@ impl Emulator {
         self.inner.soc.i2c_inject_rx(chan as usize, bytes);
     }
 
+    /// Attach the SPI-mode SD card (SDSPI) on `chan` (0=GPSPI2, 1=GPSPI3),
+    /// sharing the SDMMC card image (same FAT16 volume, so SPI `SD.begin`
+    /// mounts what SDMMC formatted). Mirrors the `run_flash` SPI_SDSPI=1
+    /// flow; idempotent within a boot (re-attaching resets card state).
+    pub fn spi_sdspi_attach_sdmmc_image(&mut self, chan: u32) {
+        self.inner.soc.spi_sdspi_attach_sdmmc_image(chan as usize);
+    }
+
     /// Stage one camera frame (bytes, packed LE into words) for LCD_CAM
     /// capture. One frame per call; each `CAM_START` capture consumes the
     /// next staged frame.

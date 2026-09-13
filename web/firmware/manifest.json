@@ -134,6 +134,15 @@
   },
   {
     "name": "sdspi — SPI-mode SD FAT mount + R/W",
-    "file": "esp32s3_sdspi.merged.bin"
+    "file": "esp32s3_sdspi.merged.bin",
+    "sdspi": true
+  },
+  {
+    "name": "emmc_driver — eMMC IDF-driver FAT mount + R/W",
+    "file": "esp32s3_emmc_driver.merged.bin"
+  },
+  {
+    "name": "usb_device — TinyUSB HID device stack boot",
+    "file": "esp32s3_usb_device.merged.bin"
   }
 ]

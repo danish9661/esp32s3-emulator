@@ -10,8 +10,9 @@
 //! starts the transform and `AES_STATE`(0x4c) reads idle (0) — the computation
 //! is modeled synchronously.
 //!
-//! ECB is fully implemented (the validated path); CBC/CTR/CFB/OFB are accepted
-//! by the register model but currently behave as ECB (no IV chaining modeled).
+//! ECB is fully implemented (the validated path); CBC/CTR/CFB/OFB/XTS chaining
+//! is implemented via the `chain`/`iv` state below (validated by the AES-CBC
+//! and AES-XTS battery sketches) — the old "behaves as ECB" note was stale.
 
 use alloc::vec;
 use alloc::vec::Vec;

@@ -6,6 +6,9 @@ Serves web/ over HTTP, loads index.html in Chromium, and asserts:
   3. serial input box echoes typed text ('>> ...' terminal echo)
   4. uart_echo firmware round-trips a byte injected via UART1
      (firmware prints "[uart1] rx ..."), proving usb/uart_inject_rx works
+  5. sdspi gallery entry boots in-wasm to 'SDSPI FAT READ PASS'
+     (proves the `"sdspi": true` manifest flag wires the virtual SD card
+     through the new `spi_sdspi_attach_sdmmc_image` bridge call)
 
 Fails loudly on any page error. Exits 0 on PASS, 1 on FAIL.
 """
@@ -126,6 +129,27 @@ try:
 
         real_errors = [e for e in errors if "favicon" not in e.lower()]
         check("no-page-errors", len(real_errors) == 0, f"({real_errors[:3]!r})" if real_errors else "")
+
+        # --- Test 5: sdspi gallery entry mounts the virtual SD card ---
+        page.click("#stop")
+        page.select_option("#gallery", value="./firmware/esp32s3_sdspi.merged.bin")
+        page.wait_for_function(
+            "() => !document.getElementById('run').disabled",
+            timeout=120000,
+        )
+        page.click("#run")
+        try:
+            page.wait_for_function(
+                "() => document.getElementById('console').textContent.includes('SDSPI FAT READ PASS')",
+                timeout=240000,
+            )
+            check("sdspi-inwasm-mount", True)
+        except Exception:
+            tail = page.eval_on_selector("#console", "el => el.textContent.slice(-800)")
+            check("sdspi-inwasm-mount", False, f"(tail={tail!r})")
+
+        real_errors = [e for e in errors if "favicon" not in e.lower()]
+        check("no-page-errors-final", len(real_errors) == 0, f"({real_errors[:3]!r})" if real_errors else "")
         browser.close()
 finally:
     server.terminate()
