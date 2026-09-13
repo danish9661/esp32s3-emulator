@@ -112,6 +112,26 @@ impl Emulator {
         self.inner.take_uart_tx(0)
     }
 
+    /// Push host-typed bytes into UART `n`'s RX FIFO (serial console input,
+    /// `n` = 0/1/2). The firmware reads them like bytes from a serial
+    /// terminal (e.g. the `uart_echo` sketch's `Serial1.read`, MicroPython's
+    /// UART0 REPL). Caps at the 128-byte hardware FIFO depth — silicon drops
+    /// overrun bytes the same way, so paste long text in chunks.
+    pub fn uart_inject_rx(&mut self, n: u32, bytes: &[u8]) {
+        for &b in bytes {
+            self.inner.soc.uart_inject_rx(n as usize, b);
+        }
+    }
+
+    /// Push host-typed bytes into the USB-Serial-JTAG RX FIFO (serial console
+    /// input for firmware whose `Serial` is USB-CDC, the Arduino default on
+    /// S3). Same 128-byte-class FIFO semantics as the UART path.
+    pub fn usb_inject_rx(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.inner.soc.usb_inject_rx(b);
+        }
+    }
+
     /// Bitmask of GPIO output levels: bit `i` is the driven level of GPIO `i`.
     /// Drive the LED / pin visualization from this.
     pub fn gpio_output(&self) -> u32 {

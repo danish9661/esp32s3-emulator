@@ -3969,3 +3969,64 @@ IDF-driver MMC mount, `ee.*` unmapped patterns (loud trap, correct).
     rebuild + verify within one harness. Proofs: 39 suites green, clippy
     `-D warnings` clean, fmt clean, wasm32 clean, SPI-adjacent battery
     14/14 (spi*/sdspi/sdmmc/sdfat/emmc/tempdev/quaddev).
+  - 2026-09-13: **Web UI serial input + MIPS meter (P6) + Playwright E2E**.
+    `Emulator` gains `uart_inject_rx(n, bytes)` (UART0/1/2 RX FIFO) +
+    `usb_inject_rx(bytes)` (USB-CDC RX FIFO, the Arduino `Serial` default),
+    mirroring the existing `run_flash` UART0_INJECT/USB_INJECT harness paths
+    (128-byte HW FIFO caps, chunked pastes). `web/index.html` gains a serial
+    input row (port selector USB-CDC/UART0/1/2 + text box + Send; Enter sends
+    with trailing newline for `readStringUntil`/REPL readers) and a `#mips`
+    meter (`web/style.css` `.serial-input-row`/`.mips`); `web/main.js`
+    `tick()` accumulates `step_batch` instruction counts and reports smoothed
+    MIPS every 0.5 s, `sendSerial()` chunk-injects at 96 B + terminal-echoes
+    (`» …`). `web/pkg` rebuilt via wasm-pack (gitignored, local-only).
+    Validated headlessly with committed `tools/webui_playwright.py` (python
+    Playwright + system Chrome, serves `web/` on 8129): hello `boot OK`,
+    live `8.9 MIPS` reading, serial terminal echo, and a real `uart_echo`
+    round-trip (`RXREADY` → inject `Z` on UART1 → `[uart1] rx`) → ALL PASS,
+    zero page errors. clippy `-D warnings`/fmt clean. Pre-existing note:
+    6 battery cases (flashread/i2c_poke/rmt/gpio_interrupt/mcpwm/mcpwm_fault)
+    fail identically with and without this change (verified via stash A/B)
+    — unrelated rot, not a regression.
+  - 2026-09-13: **Tri-batch verdict: SPI-adjacent 15/15 + USB/I2S/LCD 9/9,
+    gallery 33→34, SB sign/verify pipeline proven, hard-trio assessed
+    (battery 97/0/0 + 6 pre-existing fails)**. Full `--build`-less battery:
+    97 pass / 6 fail where the 6 (flashread HIGH-ODD, i2c_poke, rmt,
+    gpio_interrupt, mcpwm, mcpwm_fault) fail identically with and without
+    current-tree changes (stash A/B — unrelated rot, not regression).
+    Targeted SPI-adjacent: spi/spi_driver/spidev/spi_dma/spi_slave/
+    spi_slave_dma/spi_wide/spi_quaddev/tempdev/sdmmc/sdfat/sdspi/emmc/
+    psram_qspi/virtual_demo 15/15. USB/I2S/LCD: uhci/usb_serial/usb_otg/
+    usb_host/i2s/i2s_driver/lcd_cam/camcap/gdb 9/9 (NODE harnesses
+    virtual_demo/camcap/gdb green). Gallery: `esp32s3_sdspi.merged.bin`
+    copied to `web/firmware/` + manifest entry (33→34 entries); web/pkg
+    untouched (no bridge API changed).
+    - **Secure-boot signed-image pipeline: PROVEN working, no model gap.**
+      Fresh `espsecure.py` v5.3.1 ECDSA-P256 flow reproduced offline
+      (`generate-signing-key --version 2` + `sign-data --version 2` +
+      `signature-info-v2`/`verify-signature` both valid); the 8 KB blob
+      (4 KB data + 4 KB sig sector, magic E7/ver 3/sha 0/curve 2,
+      digest = SHA256(data)) verifies `Valid` through
+      `secure_boot::verify_image` and the 1-byte-tampered copy `Invalid`
+      (temp integration test since removed). Boot-time enforcement already
+      exists (`boot_from_flash` deny-latch + machine tests). Remaining
+      work is wiring, not research: burn SECURE_BOOT_EN in a harness +
+      boot a signed app image — small, unblocked.
+    - **IDF-driver eMMC mount: actionable path found (docs, not code).**
+      Web research (IDF storage/emmc example + SDMMC + FATFS guides,
+      v5.3.4–v6.0): target is an Arduino sketch calling
+      `esp_vfs_fat_sdmmc_mount` over the SDMMC host against the in-model
+      MMC card (CMD1/CMD2/CMD3/CMD7/CMD9/EXT_CSD/SWITCH already modeled +
+      poke-validated, 4 MB image). Open question is only whether the IDF
+      probe sequence issues anything the card model lacks (e.g. extra
+      SWITCH/CMD6 args, bus-width negotiation) — answerable by running the
+      sketch and reading the failure, same loop as SDSPI. Small/medium,
+      unblocked.
+    - **USB-OTG device-mode vs real host: stays out (correctly scoped).**
+      The ask needs a USB-host counterparty (bus reset, SETUP/IN/OUT,
+      descriptors, address/config, class drivers); host-mode enumeration
+      against the SIMULATED device is done + validated, and device-side
+      EP0/EP1 loopback is validated without a host — but real enumeration
+      against an external host (TinyUSB stack, MSC/HID/CDC classes) is
+      weeks of work with no offline harness. Zero in-tree firmware needs
+      it (all `Serial` via validated USB-Serial-JTAG). No action.

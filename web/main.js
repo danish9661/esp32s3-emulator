@@ -14,7 +14,11 @@ const els = {
   steps: document.getElementById('steps'),
   stepsVal: document.getElementById('stepsVal'),
   status: document.getElementById('status'),
+  mips: document.getElementById('mips'),
   console: document.getElementById('console'),
+  serialInput: document.getElementById('serialInput'),
+  serialSend: document.getElementById('serialSend'),
+  serialPort: document.getElementById('serialPort'),
   gpio: document.getElementById('gpio'),
   vdev: document.getElementById('vdev'),
   searchInput: document.getElementById('searchInput'),
@@ -252,6 +256,10 @@ let flashBytes = null;
 let flashKeyHex = null;
 let timer = null;
 let totalSteps = 0;
+// ── MIPS meter state ──
+let mipsSteps = 0;
+let mipsLastT = performance.now();
+let mipsShown = 0;
 
 function tick() {
   const n = parseInt(els.steps.value, 10);
@@ -264,6 +272,16 @@ function tick() {
   appendSerial(emu.uart_read());
   renderGpio();
   if (bridge) bridge.dispatch();
+  // MIPS = emulated instructions per wall second, smoothed over ~0.5 s.
+  mipsSteps += executed;
+  const now = performance.now();
+  const elapsed = now - mipsLastT;
+  if (elapsed >= 500) {
+    mipsShown = (mipsSteps / (elapsed / 1000)) / 1e6;
+    mipsSteps = 0;
+    mipsLastT = now;
+    if (els.mips) els.mips.textContent = `${mipsShown.toFixed(1)} MIPS`;
+  }
   setStatus(`pc=0x${emu.pc().toString(16)}  steps=${totalSteps.toLocaleString()}`);
 }
 
@@ -327,6 +345,10 @@ async function loadFlash(bytes, keyHex) {
   els.run.disabled = false;
   els.stop.disabled = true;
   els.reset.disabled = false;
+  // Reset the MIPS meter for the fresh run.
+  mipsSteps = 0;
+  mipsLastT = performance.now();
+  if (els.mips) els.mips.textContent = '';
 }
 
 // ── File input ──
@@ -393,6 +415,54 @@ els.reset.addEventListener('click', () => {
 els.steps.addEventListener('input', () => {
   els.stepsVal.textContent = els.steps.value;
 });
+
+// ── Serial input (host → firmware) ──
+// Sends the typed line to the selected port's RX FIFO. Enter appends the
+// newline the firmware's line readers (`readStringUntil`, REPL) wait for;
+// Shift+Enter sends without it. The FIFO caps at the 128-byte hardware
+// depth (silicon drops overrun bytes), so long pastes are chunked.
+function sendSerial() {
+  if (!emu || !els.serialInput) return;
+  let text = els.serialInput.value;
+  if (!text) return;
+  if (!/\r|\n$/.test(text)) text += '\n';
+  const bytes = new TextEncoder().encode(text);
+  const port = els.serialPort ? els.serialPort.value : 'usb';
+  const CHUNK = 96; // stay under the 128-byte FIFO with margin
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    const slice = bytes.slice(i, i + CHUNK);
+    if (port === 'usb') {
+      emu.usb_inject_rx(slice);
+    } else {
+      emu.uart_inject_rx(parseInt(port, 10), slice);
+    }
+  }
+  // Echo what we sent (terminal-style) so the user sees it even if the
+  // firmware doesn't echo.
+  appendSerial(new TextEncoder().encode(`» ${text}`));
+  els.serialInput.value = '';
+  els.serialInput.focus();
+}
+
+if (els.serialSend) els.serialSend.addEventListener('click', sendSerial);
+if (els.serialInput) els.serialInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendSerial();
+  }
+});
+
+// Keep the input placeholder in sync with the selected port so it is
+// always obvious where keystrokes will go.
+function updateSerialPlaceholder() {
+  if (!els.serialInput) return;
+  const port = els.serialPort ? els.serialPort.value : 'usb';
+  const name = port === 'usb' ? 'USB-CDC (Serial)' : `UART${port}`;
+  els.serialInput.placeholder = `Send to ${name}, Enter = send + newline…`;
+}
+
+if (els.serialPort) els.serialPort.addEventListener('change', updateSerialPlaceholder);
+updateSerialPlaceholder();
 
 // ── Init ──
 initGpio();

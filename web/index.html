@@ -29,6 +29,7 @@
       <span id="stepsVal">40000</span>
     </label>
     <span id="status" class="status"></span>
+    <span id="mips" class="mips" title="Emulated instructions per second"></span>
   </section>
 
   <main>
@@ -49,6 +50,19 @@
         </div>
       </div>
       <pre id="console" class="console"></pre>
+      <div class="serial-input-row">
+        <label class="serial-port" title="Which port receives your keystrokes — must match the port your firmware reads (e.g. uart_echo reads UART1, hello/Serial reads USB-CDC)">
+          Send to:
+          <select id="serialPort">
+            <option value="usb" selected>USB-CDC</option>
+            <option value="0">UART0</option>
+            <option value="1">UART1</option>
+            <option value="2">UART2</option>
+          </select>
+        </label>
+        <input type="text" id="serialInput" class="serial-input" placeholder="Type serial input, Enter = send + newline…" />
+        <button id="serialSend" class="tb-btn send" title="Send (Enter)">⏎ Send</button>
+      </div>
     </section>
 
     <aside class="sidebar">

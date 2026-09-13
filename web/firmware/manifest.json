@@ -131,5 +131,9 @@
   {
     "name": "lightsleep — light sleep resume",
     "file": "esp32s3_lightsleep.merged.bin"
+  },
+  {
+    "name": "sdspi — SPI-mode SD FAT mount + R/W",
+    "file": "esp32s3_sdspi.merged.bin"
   }
 ]
