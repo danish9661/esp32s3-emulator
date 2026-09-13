@@ -61,7 +61,7 @@ void setup() {
   uint32_t rb = *S(SPI_DATA_BUF);
   Serial.printf("SPI QUAD roundtrip=%08lX\n", (unsigned long)rb);
 
-  bool ok = (single == 0) && (q == 0x10111213UL) && (rb == 0xDEADBEEFUL);
+  bool ok = (single == 0) && (q == 0x13121110UL) && (rb == 0xDEADBEEFUL);
   Serial.println(ok ? "SPI QUADDEV PASS" : "SPI QUADDEV FAIL");
   Serial.println("SPI QUADDEV DONE");
 }

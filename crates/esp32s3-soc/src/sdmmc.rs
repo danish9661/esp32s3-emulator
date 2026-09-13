@@ -1039,6 +1039,12 @@ impl Sdmmc {
         self.regs[self.idx(RINTSTS)]
     }
 
+    /// Whole-card storage image (FAT16 preformatted): shared with the
+    /// SDSPI card so `SD.begin` mounts the same filesystem over SPI.
+    pub fn storage_image(&self) -> Vec<u8> {
+        self.storage.clone()
+    }
+
     pub fn read32(&mut self, offset: u32) -> u32 {
         match offset {
             CDETECT => 0, // bit0=0 means card present

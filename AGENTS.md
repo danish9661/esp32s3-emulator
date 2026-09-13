@@ -3882,3 +3882,90 @@ IDF-driver MMC mount, `ee.*` unmapped patterns (loud trap, correct).
     - Proofs: workspace green, clippy `-D warnings` clean, fmt clean,
       wasm32 clean, targeted battery (usb_otg/usb_host/sdmmc/sdfat/
       emmc) 5/5 green.
+  - 2026-09-13: **Enforcement batch: SB boot gate, USB EP1 echo, SDSPI
+    scoping (battery 102/0/0)**.
+    - **Secure-boot boot enforcement — CLOSED beyond fail-closed**
+      (`machine.rs`): `boot_from_flash` now verifies the app region
+      (OTA-selected slot → end of flash, decrypted view when flash-enc
+      is on) via `secure_boot::verify_image` when SECURE_BOOT_EN is
+      burned. Signed boots (deny latch clear); unsigned refuses with
+      reason "unsigned"; bad CRC/digest/signature refuses (reason
+      "bad-signature" for Unsupported, else "unsigned"). New
+      `secure_boot_deny_reason()` accessor + machine test
+      `secure_boot_signed_image_boots_and_tampered_refuses` (genuine
+      `espsecure.py` blob padded at 0x10000: valid boots, 1-byte tamper
+      refuses). Caught en route: `verify_image` rejected the padded
+      flash (region 0x10000..0x20000 = data+sigsec+FF pad failed the
+      multiple-of-4K check) — now trims trailing erased sectors before
+      the length checks (digest unaffected). Prior fail-closed-only
+      note superseded.
+    - **USB device bulk/interrupt — CLOSED via EP1 echo**
+      (`usb_otg.rs`): after the EP0 SETUP stage, device-mode DFIFO0
+      writes accumulate EP1-OUT payload (`dev_ep1_out`, 256-B cap) and
+      DFIFO0 reads past the EP0 IN payload serve it back (echo); new
+      `dev_setup_done` latch routes SETUP vs OUT (the W1C-clearable
+      XFRC flag could not — cleared flag re-routed OUT writes into
+      SETUP, proven by a 0-vs-0xDDCCBBAA unit failure). Unit test
+      `dev_ep1_out_payload_echoes_on_in_reads` + `esp32s3_usb_otg`
+      sketch `OTG ECHO OK` leg (battery markers extended). Real host
+      enumeration + STALL matrix + scheduling/DMA stay out (no
+      counterparty — limitation stands, narrower now).
+    - **SDSPI full mount — SCOPED no-change (properly this time)**.
+      Re-audited the deferred LE-remodel call with header evidence and
+      REVERSED it: the MSB model is silicon-correct
+      (`spi_struct.h` has ONE `ms_dlen` shared by both directions;
+      `spi_ll.h` programs usr_mosi|usr_miso+doutdin = full duplex on
+      one window; `wr_bit_order`/`rd_bit_order` in CTRL select
+      MSB/LSB-first per direction). The odd one is the ARDUINO BYTE
+      PATH (`spiTransferByteNL` writes `data_buf[0]` as a LOW byte —
+      waveform probe: W0=0x40→wire zeros, W0=0x40<<24→0x40 on wire),
+      not the model. An LE remodel would break every word-staging user
+      (IDF driver, GDMA, slave, all sketches/tests) to serve one byte
+      path — wrong trade, documented in `spi.rs` header instead. A
+      staged in-model SDSPI card (CMD0/8/55/41 unit-proven) was built
+      then REVERTED out of tree (nothing committed): the firmware reads
+      zeros at the register for the same byte-lane reason, so no
+      validatable path exists without the remodel. SDIO stays at the
+      CMD52/53 piece (prior entry).
+    - Proofs: 39 suites green, clippy `-D warnings` clean, fmt clean,
+      wasm32 clean, targeted battery
+      (usb_otg/usb_host/sdmmc/sdfat/emmc/ecdsa) 6/6 green; full
+      `--build` battery 102/0/0.
+  - 2026-09-13: **SDSPI full mount VALIDATED (LE-remodel reversal-of-reversal,
+    battery 103/0/0)**. The `esp32s3_sdspi` sketch (real Arduino `SD` lib over
+    GPSPI2: `SD.begin(10)` + FAT `open`/`readString` + write/read-back through
+    the in-model card sharing the SDMMC FAT16 image) now prints
+    `SDSPI BEGIN OK` / `SIZE MB=4` / `TYPE=3` / `ROOT OK` / `HELLO.TXT` /
+    `SDSPI FAT READ PASS` / `SDSPI FAT WRITE PASS` / `SDSPI DONE` (battery
+    entry `sdspi|SPI_SDSPI=1|...|`, new sketches dir committed with
+    `.ino`+merged bins, `run_flash` gains `SPI_SDSPI=1` attach via
+    `spi_sdspi_attach_sdmmc_image`). Root cause was the BYTE LANE, not CS:
+    the prior entry's "MSB model is silicon-correct" verdict was WRONG —
+    re-audited against `spi_ll_write_buffer`/`spi_ll_read_buffer` (plain
+    LE-word `memcpy` per 32-bit chunk, NOT a shift register): the Arduino
+    byte path writes `data_buf[0]` as a plain LOW byte and reads the LOW
+    byte back, so `collect_mosi`/`data_bit`/MISO-pack/slave/DMA staging all
+    move to LE (`byte % 4`, not `3 - (byte % 4)`). Evidence that forced the
+    reversal: the W0 probe showed `W0=0x000000ff` on every live CMD0 poll
+    (LOW byte, never `0xff000000`), and a unit probe with `W0=0x40`
+    produced MOSI `[00]` while `W0=0x40000000` produced `[40]` — the BE
+    model shifted zeros for every real firmware byte. The feared blast
+    radius did NOT materialize: word-staging users are unaffected in
+    practice (IDF `spidev` completion-only + zeros, GDMA LE `read32`/
+    `to_le_bytes` round-trips, slave DMA byte-exact through DRAM, MCPWM
+    waveform test re-staged to the LOW byte and still shifts 0xA5 on the
+    pins). Sketches updated to the LE lane: `tempdev` MAX6675 read adds
+    doutdin (USER bit 0, like the Arduino lane) + `MSB_16_SET` byte-swap
+    (probed live: single-shot injection is consumed by the FIRST transfer,
+    so a pre-transfer manual xfer in a probe eats it — verify within one
+    harness); `quaddev` expects `0x13121110` (LE word of pattern bytes);
+    `spi_slave` preloads `0x0000C3A5`; `virtual_demo` stages/reads the LOW
+    byte. Cautionary tales: (1) the "CS never driven HIGH" theory was a
+    phantom — GPIO10 IS driven (OUT 0x400 during init, LOW only while
+    selected; the 20× 0xFF power-up clocks run deselected by design);
+    (2) ` Spi::complete`'s W1C-clear vs stale-`pending_miso` comment was
+    edited for accuracy (no behavior change); (3) stale release binaries
+    and cross-harness (run_flash vs probe) state comparisons mislead —
+    rebuild + verify within one harness. Proofs: 39 suites green, clippy
+    `-D warnings` clean, fmt clean, wasm32 clean, SPI-adjacent battery
+    14/14 (spi*/sdspi/sdmmc/sdfat/emmc/tempdev/quaddev).

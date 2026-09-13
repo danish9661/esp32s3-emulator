@@ -59,16 +59,24 @@ static uint16_t tmp102_read(uint8_t addr) {
 }
 
 // MAX6675-style SPI read: two full-duplex bytes clock out the 16-bit frame.
-// NOTE: the transfer must set usr_miso (without usr_mosi there is no MISO
+// NOTE: the transfer must set usr_mosi (without usr_mosi there is no MISO
 // window — proven by the virtual_demo register-poke path, which sets both).
+// Set doutdin (bit 0, like the Arduino `transfer()` lane: USER=0x18000001)
+// so both bytes share one 16-bit window, like every other firmware path.
+// LE lane (matches `spi_ll_write_buffer`'s memcpy): MISO stream bytes land
+// as W0 byte 0/1, so W0 = 0x2003 for the [03,20] frame — byte-swap like the
+// HAL's `spiTransferWord` does (`MSB_16_SET` when rd_bit_order == 0) to
+// recover the big-endian frame 0x0320 (probed live: raw LOW half reads
+// 0x2003 without the swap).
 static uint16_t max6675_read() {
   SPI[0xE8 / 4] = 1;
   SPI[0x1C / 4] = 15;  // 16 bits
-  SPI[0x10 / 4] = (1u << 27) | (1u << 28);  // usr_mosi | usr_miso
+  SPI[0x10 / 4] = (1u << 27) | (1u << 28) | 1u;  // usr_mosi | usr_miso | doutdin
   SPI[0x98 / 4] = 0;
   SPI[0x00 / 4] = (1u << 24);
   while (SPI[0x00 / 4] & (1u << 24)) {}
-  return (uint16_t)((SPI[0x98 / 4] >> 16) & 0xFFFFu);  // MISO word, MSB word
+  uint16_t w = (uint16_t)(SPI[0x98 / 4] & 0xFFFFu);
+  return (uint16_t)((w >> 8) | (w << 8));  // MSB_16_SET: LE word -> BE frame
 }
 
 void setup() {

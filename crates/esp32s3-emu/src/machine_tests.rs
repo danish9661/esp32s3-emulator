@@ -1349,7 +1349,9 @@ fn spi2_shifts_out_0xa5_on_gpio_pins() {
     // Firmware: route FSPICLK (101) -> GPIO1, FSPID (103) -> GPIO2,
     // FSPICS0 (110) -> GPIO3, then run an 8-bit MOSI-only CPU transfer of
     // 0xA5 on GPSPI2 at (clkdiv_pre+1)*(clkcnt_n+1) = 2 APB cycles per bit
-    // and stash.  The host samples the pins and recovers the bit stream.
+    // and stash. LE lane (matches `spi_ll_write_buffer`'s memcpy): the
+    // byte is staged as a plain LOW byte. The host samples the pins and
+    // recovers the bit stream.
     const STASH: u32 = 0x3FC8_0100;
     let mut a = Asm::new(IRAM_BASE);
     let l_spi = a.offset();
@@ -1376,8 +1378,8 @@ fn spi2_shifts_out_0xa5_on_gpio_pins() {
     a.s32i(4, 2, 0x0C); // SPI_CLOCK: clkdiv_pre=0, clkcnt_n=1 -> 2 cyc/bit
     a.movi_n(4, 7);
     a.s32i(4, 2, 0x1C); // SPI_MS_DLEN: 8 data bits
-    a.li(4, 0xA5 << 24);
-    a.s32i(4, 2, 0x98); // SPI_W0: left-aligned MSB-first data
+    a.li(4, 0xA5);
+    a.s32i(4, 2, 0x98); // SPI_W0: LOW byte (LE lane, what the HAL writes)
     a.li(4, 1 << 27);
     a.s32i(4, 2, 0x10); // SPI_USER: usr_mosi
     a.movi_n(4, 1);
@@ -4311,12 +4313,48 @@ fn secure_boot_enabled_denies_boot_and_parks_cpus() {
     assert!(m.soc.secure_boot_enabled(), "SECURE_BOOT_EN burned");
     m.boot_from_flash(&[0xFF; 0x1000]);
     assert!(m.secure_boot_rejected(), "boot refused");
+    assert_eq!(m.secure_boot_deny_reason(), Some("unsigned"));
     let pc0 = m.cpu[0].pc;
     for _ in 0..100 {
         m.step();
     }
     assert_eq!(m.cpu[0].pc, pc0, "CPUs parked");
     assert!(m.soc.take_uart_tx(0).is_empty(), "no output when denied");
+}
+
+/// Secure-boot enforcement: a genuinely `espsecure.py`-signed app region
+/// boots even with SECURE_BOOT_EN burned (verified through the ECDSA
+/// model); a tampered byte refuses with the bad-signature reason.
+#[test]
+fn secure_boot_signed_image_boots_and_tampered_refuses() {
+    use esp32s3_soc::secure_boot::{Sbv2Verdict, verify_image};
+    const SIGNED: &[u8] = include_bytes!("../../esp32s3-soc/tools/sbtest_data_signed.bin");
+    assert_eq!(verify_image(SIGNED), Sbv2Verdict::Valid);
+    const EFUSE_BASE: u32 = 0x6000_7000;
+    // Valid image boots with the gate burned (deny latch stays clear).
+    let mut m = Esp32S3::new();
+    for (i, w) in [0u32, 0, 0, 0, 0, 1 << 20, 0, 0].iter().enumerate() {
+        m.soc.write32(EFUSE_BASE + (i as u32) * 4, *w);
+    }
+    m.soc.write32(EFUSE_BASE + 0x1D4, 0x2);
+    // Boot the signed TEST blob directly: secure_boot_app_verdict slices
+    // the app region (factory slot when no OTA table) and verifies it, so
+    // pad the blob at the app offset like a real flash image.
+    let mut flash = [0xFFu8; 0x20000];
+    flash[0x10000..0x10000 + SIGNED.len()].copy_from_slice(SIGNED);
+    m.boot_from_flash(&flash);
+    assert!(!m.secure_boot_rejected(), "signed image boots");
+    assert_eq!(m.secure_boot_deny_reason(), None);
+    // Tamper one data byte: digest mismatch refuses the boot.
+    let mut bad = flash;
+    bad[0x10000] ^= 0xFF;
+    let mut m2 = Esp32S3::new();
+    for (i, w) in [0u32, 0, 0, 0, 0, 1 << 20, 0, 0].iter().enumerate() {
+        m2.soc.write32(EFUSE_BASE + (i as u32) * 4, *w);
+    }
+    m2.soc.write32(EFUSE_BASE + 0x1D4, 0x2);
+    m2.boot_from_flash(&bad);
+    assert!(m2.secure_boot_rejected(), "tampered image refused");
 }
 
 /// Light-sleep GPIO wakeup (RTCIO PINn WAKEUP_ENABLE + level): a held-high

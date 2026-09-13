@@ -10,7 +10,7 @@
 #define SPI2_BASE 0x60024000u
 #define SPI_SLAVE_REG (*(volatile uint32_t*)(SPI2_BASE + 0xE0))
 #define SPI_SLAVE1_REG (*(volatile uint32_t*)(SPI2_BASE + 0xE4))
-#define SPI_W0 (*(volatile uint32_t*)(SPI2_BASE + 0x98))
+#define SPI_W0 (*(volatile uint32_t*)(SPI2_BASE + 0x98)) // LE lane: LOW half
 #define SPI_INT_RAW (*(volatile uint32_t*)(SPI2_BASE + 0x3C))
 #define SPI_INT_CLR (*(volatile uint32_t*)(SPI2_BASE + 0x38))
 
@@ -26,7 +26,7 @@ static int poll_done() {
 void setup() {
   Serial.begin(115200);
   SPI_SLAVE_REG = (1 << 26);  // slave_mode (spi_struct.h `slave`)
-  SPI_W0 = 0xA5C30000;        // TX preload for the master-read half
+  SPI_W0 = 0x0000C3A5;        // TX preload for the master-read half (LE lane)
   SPI_INT_CLR = (1 << 12);
   Serial.println("SPI SLAVE READY");
   if (!poll_done()) {
@@ -38,7 +38,7 @@ void setup() {
   SPI_INT_CLR = (1 << 12);
   // Reload the TX buffer: the master-write captured into the shared data
   // buffer, so the master-read half shifts out whatever is preloaded now.
-  SPI_W0 = 0xA5C30000;
+  SPI_W0 = 0x0000C3A5;
   Serial.println("SPI SLAVE TX-REQ");
   if (!poll_done()) {
     Serial.println("SPI SLAVE TIMEOUT");

@@ -87,6 +87,16 @@ void setup() {
   Serial.println(status_ok ? "OTG STATUS OK" : "OTG STATUS MISMATCH");
   if (!status_ok) return;
 
+  // Device EP1 echo (bulk-style data without a host): stage two OUT words
+  // past the completed SETUP, read them back (echo), expect exact bytes.
+  *O(0x1000) = 0xDDCCBBAAu;
+  *O(0x1000) = 0x44332211u;
+  uint32_t e0 = *O(0x1000);
+  uint32_t e1 = *O(0x1000);
+  bool echo_ok = e0 == 0xDDCCBBAAu && e1 == 0x44332211u;
+  Serial.println(echo_ok ? "OTG ECHO OK" : "OTG ECHO MISMATCH");
+  if (!echo_ok) return;
+
   bool quiet = *O(0x014) == 0;  // GINTSTS: no host, no events
   Serial.println(quiet ? "OTG PASS" : "OTG FAIL");
 }

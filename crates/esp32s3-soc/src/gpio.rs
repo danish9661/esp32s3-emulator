@@ -1,14 +1,15 @@
 //! ESP32-S3 GPIO peripheral model.
 //!
 //! Register layout per the S3 `soc/esp32s3/register/soc/gpio_struct.h`
-//! (NOT the classic-ESP32 layout): OUT at 0x04, ENABLE at 0x20, STRAP at
-//! 0x38, IN at 0x3C, STATUS at 0x44, pin[54] at 0x74, status_next at
-//! 0x14C, func_in_sel_cfg[256] at 0x154 (the UART/USB/SPI signal-input
-//! matrix — the app's GPIO init reads entries for its signal routing),
-//! func_out_sel_cfg[54] at 0x554 (peripheral signal output select; 128 =
-//! default GPIO_OUT drive), clock_gate at 0x62C, date at 0x700. The
-//! window must cover 0x704 or the app's FUNC_OUT_SEL writes for pins
-//! (e.g. pinMode(2) → 0x55C) panic the dispatch.
+//! (NOT the classic-ESP32 layout): OUT at 0x04, OUT1 at 0x10, ENABLE at
+//! 0x20, ENABLE1 at 0x2C, STRAP at 0x38, IN at 0x3C, IN1 at 0x40, STATUS at
+//! 0x44, pin[54] at 0x74, status_next at 0x14C, func_in_sel_cfg[256] at
+//! 0x154 (the UART/USB/SPI signal-input matrix — the app's GPIO init reads
+//! entries for its signal routing), func_out_sel_cfg[54] at 0x554
+//! (peripheral signal output select; 128 = default GPIO_OUT drive),
+//! clock_gate at 0x62C, date at 0x700. The window must cover 0x704 or the
+//! app's FUNC_OUT_SEL writes for pins (e.g. pinMode(2) → 0x55C) panic the
+//! dispatch.
 
 /// First FUNC_OUT_SEL_CFG register (GPIO_FUNC_OUT_SEL_CFG_REG, one per
 /// pin, 4-byte stride; value 128 = default GPIO_OUT drive).
@@ -18,10 +19,25 @@ pub const GPIO_FUNC_OUT_SEL_0: u32 = 0x554;
 pub const GPIO_OUT: u32 = 0x04;
 pub const GPIO_OUT_W1TS: u32 = 0x08;
 pub const GPIO_OUT_W1TC: u32 = 0x0C;
+/// Upper bank (pins 32..53) output + enable + input: S3 TRM gpio_struct.h
+/// `out1`/`out1_w1ts`/`out1_w1tc`, `enable1`/`enable1_w1ts`/`enable1_w1tc`,
+/// `in1` (22-bit `data` fields). The Arduino HAL's `gpio_ll_set_level`
+/// writes `out1_w1ts`/`out1_w1tc` for pins >= 32 — without these the model
+/// drops every GPIO>=32 level change.
+pub const GPIO_OUT1: u32 = 0x10;
+pub const GPIO_OUT1_W1TS: u32 = 0x14;
+pub const GPIO_OUT1_W1TC: u32 = 0x18;
 pub const GPIO_ENABLE: u32 = 0x20;
 pub const GPIO_ENABLE_W1TS: u32 = 0x24;
 pub const GPIO_ENABLE_W1TC: u32 = 0x28;
+pub const GPIO_ENABLE1: u32 = 0x2C;
+pub const GPIO_ENABLE1_W1TS: u32 = 0x30;
+pub const GPIO_ENABLE1_W1TC: u32 = 0x34;
 pub const GPIO_STRAP: u32 = 0x38;
+/// Upper-bank input (pins 32..53): TRM gpio_struct.h `in1` (22-bit `data`).
+/// The HAL's `gpio_ll_get_level` reads `in1.data` for pins >= 32 — without
+/// this the model returns 0 for every upper-bank input read.
+pub const GPIO_IN1: u32 = 0x40;
 pub const GPIO_PIN_0: u32 = 0x74;
 pub const GPIO_FUNC_IN_SEL_0: u32 = 0x154;
 pub const GPIO_IN: u32 = 0x3C;
@@ -82,14 +98,13 @@ pub struct Gpio {
 impl Gpio {
     pub fn new() -> Self {
         let mut regs = [0u32; REG_COUNT];
-        // TRM GPIO_FUNC_OUT_SEL_CFG: reset default 0x80 selects the GPIO
-        // output function (vs a peripheral signal). Our window initializes
-        // to 0, which would make every pin follow signal 0 instead of
-        // GPIO_OUT — so output-enabled pins would never reflect their
-        // driven level (breaks GPIO LED visualization and digitalRead of an
-        // OUTPUT pin). Seed the default.
+        // TRM GPIO_FUNC_OUT_SEL_CFG: reset default 0x100 (SIG_GPIO_OUT_IDX)
+        // disconnects the peripheral and drives GPIO_OUT. (0x80 is merely
+        // GPIO_OUT_IDX on the classic ESP32, NOT the S3 sentinel — probed
+        // live: the S3 ROM leaves 0x100 behind and `pinMatrixOutDetach`
+        // writes 0x100; masking to 8 bits breaks every detached pin.)
         for i in 0..PIN_COUNT {
-            regs[(GPIO_FUNC_OUT_SEL_0 / 4) as usize + i] = 0x80;
+            regs[(GPIO_FUNC_OUT_SEL_0 / 4) as usize + i] = 0x100;
         }
         regs[(GPIO_STRAP / 4) as usize] = STRAP_FLASH_BOOT;
         regs[(GPIO_IN / 4) as usize] = STRAP_FLASH_BOOT;
@@ -129,9 +144,16 @@ impl Gpio {
             // driven value (the pad level), so digitalRead() of an OUTPUT
             // pin returns GPIO_OUT like real silicon; non-enabled pins keep
             // their input state (strap bits for the boot ROM check).
+            // Upper-bank pins (>= 32) live in OUT1/ENABLE1/IN1.
             let mut v = self.regs[(GPIO_IN / 4) as usize] as u64;
             let out = self.regs[(GPIO_OUT / 4) as usize] as u64;
             let en = self.regs[(GPIO_ENABLE / 4) as usize] as u64;
+            v = (v & !en) | (out & en);
+            v as u32
+        } else if offset == GPIO_IN1 {
+            let mut v = self.regs[(GPIO_IN1 / 4) as usize] as u64;
+            let out = self.regs[(GPIO_OUT1 / 4) as usize] as u64;
+            let en = self.regs[(GPIO_ENABLE1 / 4) as usize] as u64;
             v = (v & !en) | (out & en);
             v as u32
         } else if offset == GPIO_PCPU_INT {
@@ -157,8 +179,12 @@ impl Gpio {
         match offset {
             GPIO_OUT_W1TS => self.regs[(GPIO_OUT / 4) as usize] |= value,
             GPIO_OUT_W1TC => self.regs[(GPIO_OUT / 4) as usize] &= !value,
+            GPIO_OUT1_W1TS => self.regs[(GPIO_OUT1 / 4) as usize] |= value,
+            GPIO_OUT1_W1TC => self.regs[(GPIO_OUT1 / 4) as usize] &= !value,
             GPIO_ENABLE_W1TS => self.regs[(GPIO_ENABLE / 4) as usize] |= value,
             GPIO_ENABLE_W1TC => self.regs[(GPIO_ENABLE / 4) as usize] &= !value,
+            GPIO_ENABLE1_W1TS => self.regs[(GPIO_ENABLE1 / 4) as usize] |= value,
+            GPIO_ENABLE1_W1TC => self.regs[(GPIO_ENABLE1 / 4) as usize] &= !value,
             GPIO_STATUS_W1TS => self.regs[(GPIO_STATUS / 4) as usize] |= value,
             GPIO_STATUS_W1TC => self.regs[(GPIO_STATUS / 4) as usize] &= !value,
             GPIO_STATUS1_W1TS => self.regs[(GPIO_STATUS1 / 4) as usize] |= value,
@@ -224,33 +250,51 @@ impl Gpio {
         self.prev = cur;
     }
 
-    /// Is pin `i`'s output driver enabled (GPIO_ENABLE)?
+    /// Is pin `i`'s output driver enabled (GPIO_ENABLE / ENABLE1)?
     pub fn enabled(&self, i: usize) -> bool {
         // u64 shift: GPIO bits live above 31 (46 pins).
-        self.regs[(GPIO_ENABLE / 4) as usize] as u64 & (1u64 << i) != 0
+        if i < 32 {
+            self.regs[(GPIO_ENABLE / 4) as usize] as u64 & (1u64 << i) != 0
+        } else {
+            self.regs[(GPIO_ENABLE1 / 4) as usize] as u64 & (1u64 << (i - 32)) != 0
+        }
     }
 
-    /// Pin `i` GPIO_OUT register bit.
+    /// Pin `i` GPIO_OUT register bit (OUT1 bank for pins >= 32).
     pub fn out_bit(&self, i: usize) -> u32 {
         // u64 shift: GPIO bits live above 31 (46 pins).
-        ((self.regs[(GPIO_OUT / 4) as usize] as u64 >> i) & 1) as u32
+        if i < 32 {
+            ((self.regs[(GPIO_OUT / 4) as usize] as u64 >> i) & 1) as u32
+        } else {
+            ((self.regs[(GPIO_OUT1 / 4) as usize] as u64 >> (i - 32)) & 1) as u32
+        }
     }
 
-    /// GPIO matrix output signal selected for pin `i` (FUNC_OUT_SEL [7:0];
-    /// 128 = the pin follows GPIO_OUT instead of a peripheral signal). Bit 7
-    /// is the GPIO-drive sentinel, so the low byte is returned intact — a
-    /// `& 0x7F` mask would strip the 0x80 sentinel and force every pin onto
-    /// signal 0.
+    /// GPIO matrix output signal selected for pin `i` (FUNC_OUT_SEL_CFG
+    /// `func_sel` [8:0], NOT just the low byte: SIG_GPIO_OUT_IDX = 256 =
+    /// 0x100 disconnects the peripheral and drives GPIO_OUT — the value
+    /// `gpio_ll_matrix_out_default` / `pinMatrixOutDetach` writes, and what
+    /// the S3 ROM leaves behind). The reset default is 0x100, not 0x80
+    /// (0x80 is merely GPIO_OUT_IDX on the classic ESP32). Returns the
+    /// full 9-bit selector so callers can test `== 256`.
     pub fn out_sel(&self, i: usize) -> u32 {
         let reg = self.regs[(GPIO_FUNC_OUT_SEL_0 / 4) as usize + i];
-        reg & 0xFF
+        reg & 0x1FF
     }
 
     /// Snapshot of the output-pin state (host LED visualization later).
+    /// Upper-bank pins (>= 32) read OUT1/ENABLE1.
     pub fn output(&self) -> u32 {
         // u64 shifts: GPIO bits live above 31 (46 pins).
         let out = self.regs[(GPIO_OUT / 4) as usize] as u64;
         let en = self.regs[(GPIO_ENABLE / 4) as usize] as u64;
+        (out & en) as u32
+    }
+
+    /// Upper-bank (pins 32..45) output snapshot for the host LED grid.
+    pub fn output1(&self) -> u32 {
+        let out = self.regs[(GPIO_OUT1 / 4) as usize] as u64;
+        let en = self.regs[(GPIO_ENABLE1 / 4) as usize] as u64;
         (out & en) as u32
     }
 
@@ -304,12 +348,21 @@ impl Gpio {
 
     /// Current logical level (0/1) of GPIO `pin`: the driven output if the pin
     /// is output-enabled, else its input/strap state (GPIO_IN loopback).
+    /// Upper-bank pins (>= 32) use OUT1/ENABLE1/IN1.
     pub fn pin_level(&self, pin: u32) -> u32 {
-        let inp = self.regs[(GPIO_IN / 4) as usize] as u64;
-        let out = self.regs[(GPIO_OUT / 4) as usize] as u64;
-        let en = self.regs[(GPIO_ENABLE / 4) as usize] as u64;
-        let v = (inp & !en) | (out & en);
-        ((v >> pin) & 1) as u32
+        if pin < 32 {
+            let inp = self.regs[(GPIO_IN / 4) as usize] as u64;
+            let out = self.regs[(GPIO_OUT / 4) as usize] as u64;
+            let en = self.regs[(GPIO_ENABLE / 4) as usize] as u64;
+            let v = (inp & !en) | (out & en);
+            ((v >> pin) & 1) as u32
+        } else {
+            let inp = self.regs[(GPIO_IN1 / 4) as usize] as u64;
+            let out = self.regs[(GPIO_OUT1 / 4) as usize] as u64;
+            let en = self.regs[(GPIO_ENABLE1 / 4) as usize] as u64;
+            let v = (inp & !en) | (out & en);
+            ((v >> (pin - 32)) & 1) as u32
+        }
     }
 }
 

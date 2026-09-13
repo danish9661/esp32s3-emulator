@@ -7,7 +7,7 @@ use esp32s3_soc::spi::*;
 fn setup_mosi(spi: &mut Spi, byte: u8) {
     spi.write32(SPI_CLOCK, 0x1000); // clkdiv_pre=0, clkcnt_n=1 -> 2 cyc/bit
     spi.write32(SPI_MS_DLEN, 7);
-    spi.write32(SPI_DATA_BUF, u32::from(byte) << 24);
+    spi.write32(SPI_DATA_BUF, u32::from(byte));
     spi.write32(SPI_USER, 1 << 27); // usr_mosi
     spi.write32(SPI_CLK_GATE, 1);
 }
@@ -49,7 +49,7 @@ fn clock_divider_prescaler() {
     let mut s = Spi::new(0);
     s.write32(SPI_CLOCK, (1 << 18) | (1 << 12)); // pre=1, n=1 -> 3 cyc/bit
     s.write32(SPI_MS_DLEN, 7);
-    s.write32(SPI_DATA_BUF, 0x80 << 24);
+    s.write32(SPI_DATA_BUF, 0x80);
     s.write32(SPI_USER, 1 << 27);
     s.write32(SPI_CLK_GATE, 1);
     s.write32(SPI_CMD, 1 << 24);
@@ -95,7 +95,7 @@ fn equ_sysclk_fast_clock() {
     let mut s = Spi::new(0);
     s.write32(SPI_CLOCK, 1 << 31);
     s.write32(SPI_MS_DLEN, 7);
-    s.write32(SPI_DATA_BUF, 0xFF << 24);
+    s.write32(SPI_DATA_BUF, 0xFF);
     s.write32(SPI_USER, 1 << 27);
     s.write32(SPI_CLK_GATE, 1);
     s.write32(SPI_CMD, 1 << 24);
@@ -113,7 +113,7 @@ fn clk_gate_halts_transfer() {
     let mut s = Spi::new(0);
     s.write32(SPI_CLOCK, 0x1000);
     s.write32(SPI_MS_DLEN, 7);
-    s.write32(SPI_DATA_BUF, 0x55 << 24);
+    s.write32(SPI_DATA_BUF, 0x55);
     s.write32(SPI_USER, 1 << 27);
     s.write32(SPI_CMD, 1 << 24);
     assert_eq!(sample(&mut s), (0, 0), "no clock without clk_en");
@@ -143,8 +143,9 @@ fn mosi_transfer_exposes_tx_and_injected_miso() {
     assert_eq!(s.read32(SPI_CMD) & (1 << 24), 0, "usr self-clears");
     // The host reads back exactly what the firmware transmitted.
     assert_eq!(s.take_last_tx(), Some(vec![0xA5]));
-    // And the injected MISO byte is shifted into the buffer MSB-first.
-    assert_eq!(s.read32(SPI_DATA_BUF) >> 24, 0x3C);
+    // And the injected MISO byte lands in the buffer's LOW byte (LE lane,
+    // matching `spi_ll_read_buffer`'s memcpy: `data_buf[0] & 0xFF`).
+    assert_eq!(s.read32(SPI_DATA_BUF) & 0xFF, 0x3C);
     // No leftover transfer pending.
     assert_eq!(s.take_last_tx(), None);
 }
@@ -157,7 +158,7 @@ fn slave_inject_write_captures_rx_and_raises_done() {
     s.write32(SPI_SLAVE, 1 << 26); // slave_mode
     assert!(s.is_slave());
     s.slave_inject_write(&[0x11, 0x22]);
-    assert_eq!(s.read32(SPI_DATA_BUF), 0x1122_0000);
+    assert_eq!(s.read32(SPI_DATA_BUF), 0x0000_2211);
     assert_eq!(s.read32(SPI_SLAVE1) & 0x3FFFF, 16);
     assert_eq!(
         s.read32(SPI_INT_RAW) & (1 << 12),
@@ -175,7 +176,7 @@ fn slave_inject_write_captures_rx_and_raises_done() {
 fn slave_take_read_returns_preloaded_tx() {
     let mut s = Spi::new(0);
     s.write32(SPI_SLAVE, 1 << 26);
-    s.write32(SPI_DATA_BUF, 0xA5C3_0000);
+    s.write32(SPI_DATA_BUF, 0x0000_C3A5);
     let got = s.slave_take_read(2);
     assert_eq!(got, vec![0xA5, 0xC3]);
     assert_eq!(s.read32(SPI_SLAVE1) & 0x3FFFF, 16);
@@ -318,7 +319,7 @@ fn quad_fake_device_serves_pattern_and_round_trips() {
     for _ in 0..256 {
         s.tick(1);
     }
-    assert_eq!(s.read32(SPI_DATA_BUF), 0x10111213, "quad window at addr");
+    assert_eq!(s.read32(SPI_DATA_BUF), 0x1312_1110, "quad window at addr");
     // MOSI write at addr 0x20 commits into the store; read-back matches.
     s.write32(SPI_DATA_BUF, 0xDEADBEEF);
     s.write32(SPI_USER, (1 << 30) | (1 << 27)); // usr_addr + usr_mosi
@@ -344,7 +345,7 @@ fn sequential_halfduplex_miso_returns_injected_byte() {
     let mut s = Spi::new(0);
     s.write32(SPI_CLOCK, 0x1000); // 2 cyc/bit
     s.write32(SPI_MS_DLEN, 7); // d = 8 bits per direction
-    s.write32(SPI_DATA_BUF, 0x40 << 24); // MOSI byte (CMD0-ish)
+    s.write32(SPI_DATA_BUF, 0x40); // MOSI byte (CMD0-ish, LE lane: LOW byte)
     s.write32(SPI_USER, (1 << 27) | (1 << 28)); // mosi+miso, NO doutdin
     s.write32(SPI_CLK_GATE, 1);
     s.inject_miso(&[0x01]); // idle-high response
@@ -353,8 +354,157 @@ fn sequential_halfduplex_miso_returns_injected_byte() {
         s.tick(1);
     }
     assert_eq!(s.read32(SPI_CMD) & (1 << 24), 0, "usr clears");
-    assert_eq!(s.read32(SPI_DATA_BUF) >> 24, 0x01, "MISO byte lands");
+    assert_eq!(s.read32(SPI_DATA_BUF) & 0xFF, 0x01, "MISO byte lands");
     // MOSI event stream is the first d bits (the byte we sent).
     let tx = s.take_last_tx().unwrap();
     assert_eq!(tx, vec![0x40], "MOSI first half");
+}
+
+/// SDSPI card: CMD0 answers R1 idle (0x01), CMD8 echoes R7, ACMD41 goes
+/// ready (0x00) on the second poll — the exact bytes sd_diskio.cpp gates
+/// its init on. Full-duplex byte path like the Arduino `transfer()` lane
+/// (`spiStartBus` sets usr_mosi|usr_miso|doutdin, so USER=0x18000001 —
+/// proven by the live SDSPI probe over the real sketch). LE word order
+/// (stream byte `i` is word byte `i % 4`, matching `spi_ll_write_buffer`'s
+/// memcpy): byte transfers stage the byte as a plain LOW byte and read the
+/// LOW byte back.
+#[test]
+fn sdspi_card_answers_init_sequence() {
+    let mut s = Spi::new(0);
+    s.write32(SPI_CLOCK, 0x1000);
+    s.write32(SPI_CLK_GATE, 1);
+    s.sdspi_attach(8);
+    assert!(s.sdspi_attached());
+    // CS-gated framing: the card samples MOSI only while SS is LOW. Unit
+    // tests hold it selected for the whole sequence (real firmware drives
+    // it per-transfer from the SS pin — see `Spi::complete`).
+    s.sdspi_select(true);
+    // Helper: one 8-bit full-duplex transfer of `b` (LOW byte, doutdin
+    // set = shared MOSI/MISO window, like `spiTransferByteNL`).
+    let mut xfer = |b: u8| -> u8 {
+        s.write32(SPI_DATA_BUF, b as u32);
+        s.write32(SPI_MS_DLEN, 7);
+        s.write32(SPI_USER, (1 << 27) | (1 << 28) | 1);
+        s.write32(SPI_CMD, 1 << 24);
+        for _ in 0..64 {
+            s.tick(1);
+        }
+        assert_eq!(s.read32(SPI_CMD) & (1 << 24), 0, "usr clears");
+        (s.read32(SPI_DATA_BUF) & 0xFF) as u8
+    };
+    // CMD0 frame: response surfaces on the NEXT byte's clocks (silicon
+    // Ncr=1, pop-then-route — the frame's own 6th byte returns the STALE
+    // head 0xFF; the R1 follows on the first poll, exactly what the
+    // driver's `transfer(0xFF)` poll loop absorbs).
+    for &b in &[0x40u8, 0, 0, 0, 0, 0x95] {
+        xfer(b);
+    }
+    assert_eq!(xfer(0xFF), 0x01, "CMD0 R1 idle");
+    // CMD8 (arg 0x1AA): R1 on the first poll, then the 4-byte R7 echo.
+    for &b in &[0x48u8, 0, 0, 0x01, 0xAA, 0x87] {
+        xfer(b);
+    }
+    assert_eq!(xfer(0xFF), 0x01, "CMD8 R1");
+    assert_eq!(xfer(0xFF), 0x00);
+    assert_eq!(xfer(0xFF), 0x00);
+    assert_eq!(xfer(0xFF), 0x01);
+    assert_eq!(xfer(0xFF), 0xAA, "R7 echo");
+    // CMD55 + ACMD41 twice: busy then ready.
+    for &b in &[0x77u8, 0, 0, 0, 0, 0x01] {
+        xfer(b);
+    }
+    assert_eq!(xfer(0xFF), 0x01, "CMD55 R1");
+    for &b in &[0x69u8, 0x40, 0x10, 0, 0, 0x01] {
+        xfer(b);
+    }
+    assert_eq!(xfer(0xFF), 0x01, "ACMD41 busy");
+    for &b in &[0x77u8, 0, 0, 0, 0, 0x01] {
+        xfer(b);
+    }
+    assert_eq!(xfer(0xFF), 0x01, "CMD55 R1 again");
+    for &b in &[0x69u8, 0x40, 0x10, 0, 0, 0x01] {
+        xfer(b);
+    }
+    assert_eq!(xfer(0xFF), 0x00, "ACMD41 ready");
+}
+
+/// SDSPI card: single-block write round-trips through the FAT-shared
+/// storage (CMD24 + 0xFE token + 512 data + CRC-16 -> 0x05 data-accepted,
+/// then CMD17 reads the same bytes back). Mirrors the `sdWriteSector` /
+/// `sdReadSector` path that the `sdspi` sketch's FAT write exercises.
+#[test]
+fn sdspi_card_write_then_read_round_trips() {
+    let mut s = Spi::new(0);
+    s.write32(SPI_CLOCK, 0x1000);
+    s.write32(SPI_CLK_GATE, 1);
+    s.sdspi_attach(8);
+    s.sdspi_select(true);
+    // Helper: one 8-bit full-duplex transfer of `b` (LOW byte, doutdin
+    // set, like the Arduino `transfer()` lane). 8 data bits at 2 APB
+    // cycles/bit = 16 cycles; 64 ticks is ample margin.
+    let mut xfer = |b: u8| -> u8 {
+        s.write32(SPI_DATA_BUF, b as u32);
+        s.write32(SPI_MS_DLEN, 7);
+        s.write32(SPI_USER, (1 << 27) | (1 << 28) | 1);
+        s.write32(SPI_CMD, 1 << 24);
+        for _ in 0..64 {
+            s.tick(1);
+        }
+        assert_eq!(s.read32(SPI_CMD) & (1 << 24), 0, "usr clears");
+        (s.read32(SPI_DATA_BUF) & 0xFF) as u8
+    };
+    // Leave idle state (CMD0 + two ACMD41s) so CMD24/CMD17 are accepted.
+    // Pop-then-route (silicon Ncr=1): each frame's R1 surfaces on the NEXT
+    // byte's clocks, i.e. the first poll after the 6-byte frame. The poll
+    // byte itself is NOT collected (0xFF idle is skipped; a non-start byte
+    // with an empty collector is dropped) so framing stays aligned.
+    for &b in &[0x40u8, 0, 0, 0, 0, 0x95] {
+        xfer(b);
+    }
+    assert_eq!(xfer(0xFF), 0x01, "CMD0 R1");
+    for i in 0..2 {
+        for &b in &[0x77u8, 0, 0, 0, 0, 0x01] {
+            xfer(b);
+        }
+        assert_eq!(xfer(0xFF), 0x01, "CMD55 R1");
+        for &b in &[0x69u8, 0x40, 0x10, 0, 0, 0x01] {
+            xfer(b);
+        }
+        // Round 0 answers busy (0x01), round 1 ready (0x00, leaves idle).
+        assert_eq!(xfer(0xFF), if i == 0 { 0x01 } else { 0x00 }, "ACMD41 R1");
+    }
+    // CMD24 (arg = LBA 2): R1 0x00 on the first poll after the frame, then
+    // the write payload stages 0x05.
+    for &b in &[0x58u8, 0, 0, 0, 0x02, 0x01] {
+        xfer(b);
+    }
+    assert_eq!(xfer(0xFF), 0x00, "CMD24 R1");
+    // Payload: token + 512 data bytes (0xA5) + 2 CRC bytes. The CRC value
+    // is irrelevant to the card (it accepts unconditionally, like the
+    // model documents). Under pop-then-route the completing CRC byte pops
+    // the pre-completion head (0xFF) and only then stages 0x05+busy — so
+    // the CRC byte returns 0xFF with no suppression, and the 0x05 surfaces
+    // FIRST (it pops ahead of the busy line — the busy bytes follow).
+    assert_eq!(xfer(0xFE), 0xFF, "token clocks idle");
+    for _ in 0..512 {
+        xfer(0xA5);
+    }
+    assert_eq!(xfer(0x12), 0xFF, "crc1 clocks idle");
+    assert_eq!(xfer(0x34), 0xFF, "crc2 clocks idle");
+    assert_eq!(xfer(0xFF), 0x05, "data accepted");
+    assert_eq!(xfer(0xFF), 0x00, "busy byte 1");
+    assert_eq!(xfer(0xFF), 0x00, "busy byte 2");
+    // CMD17 (arg = LBA 2): R1 0x00 on the first poll, then the 0xFE token,
+    // 512 echoed bytes, and CRC-16 stream out on subsequent polls.
+    for &b in &[0x51u8, 0, 0, 0, 0x02, 0x01] {
+        xfer(b);
+    }
+    assert_eq!(xfer(0xFF), 0x00, "CMD17 R1");
+    assert_eq!(xfer(0xFF), 0xFE, "data token");
+    for _ in 0..512 {
+        assert_eq!(xfer(0xFF), 0xA5, "echoed byte");
+    }
+    // CRC-16/XMODEM over 512 0xA5 bytes = 0x42BE (cross-checked in Python).
+    assert_eq!(xfer(0xFF), 0x42, "crc hi");
+    assert_eq!(xfer(0xFF), 0xBE, "crc lo");
 }

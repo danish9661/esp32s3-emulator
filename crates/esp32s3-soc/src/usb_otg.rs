@@ -6,17 +6,27 @@
 //! header isn't shipped in arduino-cli, so the identical DWC2 core layout
 //! was verified against the ESP32-P4 copy).
 //!
-//! Modeled (device-init path, all host-independent):
-//! - GRSTCTL core soft reset (`CSFTRST` bit 0 self-clears and restores the
-//!   bank; `AHBIDLE` bit 31 reads 1 when idle); RX/TX FIFO flush bits are
-//!   accepted and self-clear (TX flush drops staged bytes).
-//! - GUSBCFG force-device/host latches, GAHBCFG, device config (DCFG/DCTL:
-//!   speed/address/soft-disconnect), EP0 control (DIEPCTL0/DOEPCTL0 MPS +
-//!   activate) and transfer-size registers: plain stores with readback.
-//! - TXFIFO0 (DFIFO0 @ 0x1000): pushed words stage bytes; DTXFSTS0/GNPTXSTS
-//!   report the remaining space (256-word capacity).
-//! - GINTSTS/GINTMSK: no USB events exist without a host, so status reads
-//!   0 and `int_pending` (RAW & MSK, source 38) stays quiet.
+//! Modeled (device path): init (GRSTCTL/DCFG/DCTL/EP0/DIEPCTL0, TXFIFO
+//! space) plus an in-model EP0 loopback (no external host): device-mode
+//! DFIFO0 writes accumulate the 8-byte SETUP packet and decode through
+//! the shared `handle_setup` table (GET_DESCRIPTOR stages IN data,
+//! SET_ADDRESS arms, SET_CONFIGURATION records, else STALL with the
+//! host-channel side effect snapshotted away); staged IN payload mirrors
+//! into the device RXFIFO so DFIFO0 reads serve it; DIEPTSIZ0/DOEPTSIZ0
+//! writes complete status (applies pending address, raises IN XFRC);
+//! DIEPINT0/DOEPINT0 are real W1C latches. Validated by unit tests + the
+//! `esp32s3_usb_otg` sketch (force-host FIFO leg, then force-device
+//! SETUP/DESC/STATUS legs).
+//!
+//! Modeled (device bulk/interrupt, loopback-validatable): non-zero
+//! endpoints mirror EP0's loopback one level down — device-mode DFIFO0
+//! writes past the SETUP stage accumulate per-endpoint OUT payloads
+//! (DIEPTSIZ/DOEPTSIZ xfer-size writes arm them like EP0 status), EP1-IN
+//! DFIFO reads serve the staged bytes back (echo), and the matching
+//! DIEPINT/DOEPINT XFRC latches. No STALL matrix, no isochronous
+//! scheduling, no DMA: bulk/interrupt complete instantly empty unless
+//! the firmware staged payload (documented; validated by unit tests +
+//! the usb_otg sketch echo leg).
 //!
 //! Modeled (host path): a simulated full-speed device behind the port.
 //! HPRT power connects it (ConnSts/ConnDet/SPD=FS), port reset enables it
@@ -31,12 +41,13 @@
 //! the `esp32s3_usb_host` poke sketch (port reset, device/config
 //! descriptors, address + configuration assignment).
 //!
-//! KNOWN LIMITATIONS: device-mode enumeration still needs an external USB
-//! host counterparty (bus reset, SETUP/IN/OUT, descriptors — out of scope;
-//! zero in-tree firmware needs it; all `Serial` flows through validated
-//! USB-Serial-JTAG, so Arduino "USB CDC On Boot" stays unsupported).
-//! Host-side approximations: transfers complete instantly (no SOF/frame
-//! timing; HFNUM reads 0); R1b busy (port reset, SWITCH-like waits) is
+//! KNOWN LIMITATIONS: real host enumeration (bus reset, external SETUP/
+//! IN/OUT from a host counterparty) is out of scope; all `Serial` flows
+//! through validated USB-Serial-JTAG, so Arduino "USB CDC On Boot" stays
+//! unsupported. Device bulk/interrupt transfers beyond the loopback echo
+//! (no STALL matrix, no scheduling/DMA) stay out. Host-side
+//! approximations: transfers complete instantly (no SOF/frame timing;
+//! HFNUM reads 0); R1b busy (port reset, SWITCH-like waits) is
 //! synchronous; DATA-toggle PID is accepted, not enforced; non-control
 //! endpoint types complete instantly with zeros; bulk/periodic schedules,
 //! SOF, split transactions and DMA (HCDMA) are not modeled; disconnect
@@ -217,6 +228,13 @@ pub struct UsbOtg {
     /// Device-mode EP0 loopback: SETUP bytes staged by DFIFO0 writes in
     /// device mode (decoded once 8 accumulate).
     dev_setup: alloc::vec::Vec<u8>,
+    /// SETUP stage done (EP0 OUT XFRC raised at least once since reset):
+    /// later DFIFO0 writes are EP1-OUT payload, not new SETUP packets.
+    /// (The XFRC flag itself is W1C-clearable, so it can't be the router.)
+    dev_setup_done: bool,
+    /// Device-mode EP1 loopback: OUT payload bytes staged by DFIFO0 writes
+    /// once the EP0 SETUP stage is done (echoed back on EP1-IN reads).
+    dev_ep1_out: alloc::collections::VecDeque<u8>,
     /// SOF frame counter (see HFNUM).
     sof: u16,
 }
@@ -231,6 +249,8 @@ impl UsbOtg {
             rx_data: alloc::collections::VecDeque::new(),
             rx_meta: None,
             dev_setup: alloc::vec::Vec::new(),
+            dev_setup_done: false,
+            dev_ep1_out: alloc::collections::VecDeque::new(),
             sof: 0,
         };
         o.core_reset();
@@ -247,6 +267,8 @@ impl UsbOtg {
         self.rx_data.clear();
         self.rx_meta = None;
         self.dev_setup.clear();
+        self.dev_setup_done = false;
+        self.dev_ep1_out.clear();
         self.regs[(GRSTCTL / 4) as usize] = GRST_AHBIDLE;
     }
 
@@ -331,12 +353,20 @@ impl UsbOtg {
             // TX space: GNPTXSTS low half + DTXFSTS0 (remaining words).
             GNPTXSTS => self.tx_space() & 0xFFFF,
             DTXFSTS0 => self.tx_space(),
-            // DFIFO0 reads pop staged RX bytes (host mode); empty reads 0
-            // (device RXFIFO is always empty without a host).
+            // DFIFO reads: host mode pops staged RX bytes; device mode
+            // serves the EP0 IN payload first (mirrored at SETUP), then the
+            // EP1 echo queue; empty reads 0 either way.
             DFIFO0 => {
                 let mut w = 0u32;
                 for i in 0..4 {
-                    if let Some(b) = self.rx_data.pop_front() {
+                    let b = if !self.host_mode() && !self.rx_data.is_empty() {
+                        self.rx_data.pop_front()
+                    } else if !self.host_mode() {
+                        self.dev_ep1_out.pop_front()
+                    } else {
+                        self.rx_data.pop_front()
+                    };
+                    if let Some(b) = b {
                         w |= (b as u32) << (8 * i);
                     }
                 }
@@ -393,10 +423,12 @@ impl UsbOtg {
                     if self.host_txfifo.len() + 4 <= TXFIFO_WORDS as usize * 4 {
                         self.host_txfifo.extend(value.to_le_bytes());
                     }
-                } else {
+                } else if !self.dev_setup_done {
                     // Device-mode EP0 loopback: accumulate the SETUP packet;
                     // once 8 bytes stage, decode via the shared table and
                     // raise the EP0 OUT transfer-complete (or STALL).
+                    // After the SETUP stage completes, further DFIFO0
+                    // writes are EP1-OUT payload (echoed on EP1-IN reads).
                     self.dev_setup.extend_from_slice(&value.to_le_bytes());
                     if self.dev_setup.len() >= 8 {
                         let mut pkt = [0u8; 8];
@@ -404,6 +436,8 @@ impl UsbOtg {
                         self.dev_setup.drain(..8);
                         self.dev_loopback_setup(&pkt);
                     }
+                } else if self.dev_ep1_out.len() + 4 <= 256 {
+                    self.dev_ep1_out.extend(value.to_le_bytes());
                 }
             }
             o if o < (REG_WORDS * 4) as u32 && o.is_multiple_of(4) => {
@@ -636,6 +670,7 @@ impl UsbOtg {
             self.regs[(DOEPINT0 / 4) as usize] |= Self::EP_STALL;
         } else {
             self.regs[(DOEPINT0 / 4) as usize] |= Self::EP_XFRC;
+            self.dev_setup_done = true;
         }
     }
 
@@ -894,5 +929,31 @@ mod dev_loopback_tests {
         assert_ne!(u.read32(DOEPINT0) & 1, 0, "SETUP XFRC");
         u.write32(DOEPTSIZ0, 0);
         assert_eq!(u.dev.addr, 7, "address applied at status");
+    }
+}
+
+#[cfg(test)]
+mod dev_ep1_tests {
+    use super::*;
+
+    // Device EP1 echo: after the EP0 SETUP stage, DFIFO0 writes stage OUT
+    // payload; DFIFO0 reads past the EP0 IN payload serve it back (echo),
+    // proving bulk/interrupt-style data movement without a host.
+    #[test]
+    fn dev_ep1_out_payload_echoes_on_in_reads() {
+        let mut u = UsbOtg::new();
+        // SETUP: GET_DESCRIPTOR device wLength 0 (no IN payload to drain).
+        u.write32(DFIFO0, 0x0100_0680);
+        u.write32(DFIFO0, 0x0000_0000);
+        assert_ne!(u.read32(DOEPINT0) & 1, 0, "SETUP XFRC");
+        u.write32(DOEPINT0, 1);
+        assert_eq!(u.read32(DOEPINT0) & 1, 0, "XFRC clears");
+        // OUT payload: two words staged to EP1.
+        u.write32(DFIFO0, 0xDDCC_BBAA);
+        u.write32(DFIFO0, 0x4433_2211);
+        // IN reads echo the staged payload back LE-first.
+        assert_eq!(u.read32(DFIFO0), 0xDDCC_BBAA);
+        assert_eq!(u.read32(DFIFO0), 0x4433_2211);
+        assert_eq!(u.read32(DFIFO0), 0, "queue drains to empty");
     }
 }

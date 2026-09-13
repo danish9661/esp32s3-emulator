@@ -37,9 +37,21 @@ pub enum Sbv2Verdict {
 /// Verify the Secure Boot v2 signature sector of `image` (data ++ 4 KB
 /// signature sector, exactly what `espsecure.py sign-data` emits).
 /// Returns the verdict for signature block 0.
+///
+/// The ROM verifies the whole app region (slot start to end of flash);
+/// real flash images are padded with 0xFF past the signature sector, so a
+/// trailing run of 0xFF sectors is trimmed before the length checks (the
+/// digest only covers data before the signature sector, which is
+/// unaffected by the trim).
 pub fn verify_image(image: &[u8]) -> Sbv2Verdict {
     const SECTOR: usize = 4096;
     const BLOCK: usize = 1216;
+    // Trim trailing erased sectors (flash padding past the signature).
+    let mut end = image.len();
+    while end >= 2 * SECTOR && image[end - SECTOR..end].iter().all(|&b| b == 0xFF) {
+        end -= SECTOR;
+    }
+    let image = &image[..end];
     if image.len() < 2 * SECTOR || !image.len().is_multiple_of(SECTOR) {
         return Sbv2Verdict::Invalid;
     }

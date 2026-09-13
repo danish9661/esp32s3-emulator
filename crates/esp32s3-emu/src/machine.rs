@@ -30,12 +30,16 @@ pub struct Esp32S3 {
     /// halted, no instructions executed).
     asleep: bool,
     /// Secure-boot rejection latch (fail-closed): set by `boot_from_flash`
-    /// when eFuse SECURE_BOOT_EN is set. The ROM stub performs no signature
-    /// verification, so the boot is refused and both CPUs park (no ticks,
+    /// when eFuse SECURE_BOOT_EN is set. With a signed bootloader image the
+    /// ROM path verifies the app region via `secure_boot::verify_image`
+    /// (ECDSA-P256 through the ECDSA model); without one — or when the
+    /// signature fails — the boot is refused and both CPUs park (no ticks,
     /// no output) instead of insecurely booting. Cleared on the next
-    /// allowed boot. Signed-image boot needs the espsecure signing
-    /// pipeline (out of scope: no offline flow produces signed images).
+    /// allowed boot. `boot_deny_reason` records which check refused.
     boot_denied: bool,
+    /// Why the last boot was refused (`None` when allowed): "unsigned" (no
+    /// signature sector) or "bad-signature" (present but invalid).
+    boot_deny_reason: Option<&'static str>,
     /// Remaining steps to fast-forward while `asleep`.
     sleep_remaining: u64,
     /// Light (resume, clocks gated) vs deep (reboot) sleep for the current
@@ -61,6 +65,7 @@ impl Esp32S3 {
             flash: Vec::new(),
             asleep: false,
             boot_denied: false,
+            boot_deny_reason: None,
             sleep_remaining: 0,
             sleep_light: false,
             last_console_byte: None,
@@ -285,6 +290,7 @@ impl Esp32S3 {
         self.soc.restore_rtc(rtc);
         self.asleep = false;
         self.boot_denied = false;
+        self.boot_deny_reason = None;
         self.sleep_remaining = 0;
         self.sleep_light = false;
         self.last_console_byte = None;
@@ -302,6 +308,38 @@ impl Esp32S3 {
     /// (eFuse SECURE_BOOT_EN set): both CPUs are parked with no output.
     pub fn secure_boot_rejected(&self) -> bool {
         self.boot_denied
+    }
+
+    /// Why the last boot was refused (`None` when allowed): "unsigned" (no
+    /// signature sector found at the app image end) or "bad-signature"
+    /// (sector present but CRC/digest/ECDSA check failed).
+    pub fn secure_boot_deny_reason(&self) -> Option<&'static str> {
+        self.boot_deny_reason
+    }
+
+    /// Secure-boot verdict for the app region of `flash` (the bytes the
+    /// ROM would verify: from the OTA-selected slot to the end of flash).
+    /// Unsigned images (no 0xE7 magic) report `Invalid`; the caller maps
+    /// that to the "unsigned" deny reason.
+    fn secure_boot_app_verdict(&self, flash: &[u8]) -> esp32s3_soc::secure_boot::Sbv2Verdict {
+        use esp32s3_soc::secure_boot::{Sbv2Verdict, verify_image};
+        // Mirror the slot selection boot_from_flash applies below (OTA
+        // otadata or the factory offset), honoring flash encryption the
+        // same way.
+        let decrypted;
+        let view: &[u8] = if self.soc.flash_enc_enabled() {
+            decrypted = self.soc.flash_image_decrypted();
+            &decrypted
+        } else {
+            flash
+        };
+        let app_off =
+            crate::partition::select_ota_boot_offset(view).unwrap_or(rom_stub::APP_FLASH_OFFSET);
+        let region = match view.get(app_off as usize..) {
+            Some(r) => r,
+            None => return Sbv2Verdict::Invalid,
+        };
+        verify_image(region)
     }
 
     /// Remaining steps to fast-forward while in deep-sleep.
@@ -432,16 +470,27 @@ impl Esp32S3 {
     /// to the ROM reset vector. The ROM stub (rom_stub.rs) loads the app
     /// image from flash offset `APP_FLASH_OFFSET` and jumps to its entry.
     pub fn boot_from_flash(&mut self, flash: &[u8]) {
-        // Secure-boot fail-closed gate: with SECURE_BOOT_EN burned, the
-        // mask-ROM would verify the bootloader signature before loading
-        // anything. The stub performs no verification, so refuse the boot
-        // (parked CPUs, no output) instead of insecurely booting an
-        // unverified image. Default eFuse (all zero) boots normally.
+        // Secure-boot enforcement: with SECURE_BOOT_EN burned, the mask-ROM
+        // verifies the bootloader/app signature before loading anything.
+        // The app region (from the OTA-selected slot to the end of flash)
+        // is verified via `secure_boot::verify_image` — the offline port of
+        // the ROM's espsecure check, through the ECDSA model. Unsigned or
+        // bad-signature images are refused (parked CPUs, no output);
+        // default eFuse (all zero) boots normally.
         if self.soc.secure_boot_enabled() {
-            self.boot_denied = true;
-            return;
+            let verdict = self.secure_boot_app_verdict(flash);
+            if verdict != esp32s3_soc::secure_boot::Sbv2Verdict::Valid {
+                self.boot_denied = true;
+                self.boot_deny_reason = Some(match verdict {
+                    esp32s3_soc::secure_boot::Sbv2Verdict::Unsupported => "bad-signature",
+                    _ => "unsigned",
+                });
+                return;
+            }
+            // Verified: fall through and boot the image.
         }
         self.boot_denied = false;
+        self.boot_deny_reason = None;
         self.flash = flash.to_vec();
         self.soc.load_flash_image(0, flash);
         // Encrypted devices: parse/map from a decrypted view (the ROM

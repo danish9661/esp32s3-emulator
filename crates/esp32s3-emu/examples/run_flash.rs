@@ -229,6 +229,14 @@ fn main() {
         println!("[host] provisioned fake quad-SPI device on GPSPI2");
     }
 
+    // SPI-mode SD card (sdspi-sketch support): SPI_SDSPI=1 attaches the
+    // in-model card on GPSPI2 sharing the SDMMC FAT16 image, so the
+    // Arduino `SD` library mounts the same volume the SDMMC path uses.
+    if env::var("SPI_SDSPI").is_ok() {
+        m.soc.spi_sdspi_attach_sdmmc_image(0);
+        println!("[host] attached SDSPI card on GPSPI2 (SDMMC image)");
+    }
+
     // Step budget in INSTRUCTIONS (`step_fast` executes whole blocks and
     // reports how many instructions ran): one old loop iteration stepped a
     // single instruction per core (2/cross-core pair), so the old 48M-step

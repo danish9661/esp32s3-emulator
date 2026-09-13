@@ -66,14 +66,16 @@ uint8_t i2c_read_byte(uint8_t addr) {
 
 // One full-duplex SPI byte exchange via register pokes (sets usr_mosi+usr_miso
 // so the model shifts the injected MISO into the data buffer). Returns MISO.
+// LE lane (matches `spi_ll_write_buffer`'s memcpy): the byte is staged as a
+// plain LOW byte and read back from the LOW byte.
 uint8_t spi_xfer(uint8_t tx) {
   SPI[0xE8 / 4] = 1;                       // CLK_GATE: clk_en
   SPI[0x1C / 4] = 7;                       // MS_DLEN: 8 bits (0-based)
-  SPI[0x98 / 4] = (uint32_t)tx << 24;      // DATA_BUF W0: MOSI, left-aligned
+  SPI[0x98 / 4] = (uint32_t)tx;            // DATA_BUF W0: MOSI, LE lane
   SPI[0x10 / 4] = (1u << 27) | (1u << 28); // USER: usr_mosi | usr_miso
   SPI[0x00 / 4] = (1u << 24);              // CMD: usr (self-clears)
   while (SPI[0x00 / 4] & (1u << 24)) {}
-  return (uint8_t)((SPI[0x98 / 4] >> 24) & 0xFFu); // MISO from data buffer
+  return (uint8_t)(SPI[0x98 / 4] & 0xFFu); // MISO from data buffer, LE lane
 }
 
 void setup() {

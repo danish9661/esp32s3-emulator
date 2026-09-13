@@ -954,12 +954,20 @@ impl Soc {
                 continue;
             }
             let sel = self.gpio.out_sel(i);
-            // A pin drives its GPIO_OUT bit when FUNC_OUT_SEL selects the
-            // GPIO function. The matrix encodes this two ways: the 0x80
-            // sentinel (our documented default) and 0 (what pinMode leaves /
-            // writes for a plain digital output). Any other value is a
-            // peripheral matrix signal, whose level comes from signal_level.
-            let bit = if sel == 0x80 || sel == 0 {
+            // A pin drives its GPIO_OUT bit when FUNC_OUT_SEL_CFG selects
+            // the GPIO function: SIG_GPIO_OUT_IDX = 256 = 0x100 (what the
+            // S3 ROM leaves behind and `pinMatrixOutDetach` writes).
+            // `pinMode`+`gpio_config` never touches FUNC_OUT_SEL, so 0x100
+            // is also what a plain digital output reads. VALUE 0 also
+            // selects GPIO_OUT on silicon (the reset Reception: FUNC_OUT_SEL
+            // powers up 0 before the ROM writes 0x100 — and hand-assembled
+            // machine tests write small signal numbers that must not route
+            // to SPICLK_OUT_IDX). Any other value is a peripheral matrix
+            // signal, whose level comes from signal_level. (The old
+            // `sel == 0x80 || sel == 0` test was the CLASSIC-ESP32 sentinel;
+            // on S3, 0x80 = SIG_IN_FUNC80, a peripheral. Probed live: FSEL10
+            // read 0x100 after detach and the SS pin never drove HIGH.)
+            let bit = if sel == 0x100 || sel == 0 {
                 self.gpio.out_bit(i)
             } else {
                 self.signal_level(sel)
@@ -1026,6 +1034,25 @@ impl Soc {
     /// virtual-SPI-flash frontends.
     pub fn spi_quad_fake_provision(&mut self, chan: usize, pattern: &[u8]) {
         self.spi[chan].quad_fake_provision(pattern);
+    }
+
+    /// Attach the SPI-mode SD card (SDSPI) on `chan` with `blocks`
+    /// 512-byte blocks (host frontend for the Arduino `SD` library path).
+    pub fn spi_sdspi_attach(&mut self, chan: usize, blocks: usize) {
+        self.spi[chan].sdspi_attach(blocks);
+    }
+
+    /// Attach the SPI-mode SD card with a preformatted image (shares the
+    /// SDMMC FAT16 bytes so `SD.begin` mounts a real filesystem).
+    pub fn spi_sdspi_attach_image(&mut self, chan: usize, image: &[u8]) {
+        self.spi[chan].sdspi_attach_image(image);
+    }
+
+    /// Attach the SDSPI card sharing the SDMMC card image (same FAT16
+    /// volume, so SPI `SD.begin` mounts what SDMMC formatted).
+    pub fn spi_sdspi_attach_sdmmc_image(&mut self, chan: usize) {
+        let img = self.sdmmc.storage_image();
+        self.spi[chan].sdspi_attach_image(&img);
     }
 
     /// Quad/dual wire-mode level of `chan` (0 single, 1 dual, 2 quad —
@@ -1588,7 +1615,8 @@ impl Soc {
     /// (e.g. MCPWM 160..165) the loopback level is that peripheral's output,
     /// not GPIO_OUT — matching real silicon where a peripheral-driven pad is
     /// readable via digitalRead (TRM GPIO matrix). Pins driving GPIO_OUT
-    /// (FUNC_OUT_SEL 0x80 or 0) loop back the GPIO_OUT bit.
+    /// (FUNC_OUT_SEL_CFG 0x100 = SIG_GPIO_OUT_IDX, or 0 — see `gpio_output`)
+    /// loop back the GPIO_OUT bit.
     pub fn gpio_in_readback(&self) -> u32 {
         let mut v = self.gpio.raw_in();
         for i in 0..self.gpio.pin_count() {
@@ -1596,7 +1624,7 @@ impl Soc {
                 continue;
             }
             let sel = self.gpio.out_sel(i);
-            let driven = if sel == 0x80 || sel == 0 {
+            let driven = if sel == 0x100 || sel == 0 {
                 self.gpio.out_bit(i)
             } else {
                 self.signal_level(sel)
@@ -1789,6 +1817,22 @@ impl Soc {
                             value
                         };
                         self.spi[n].write32(off, v);
+                        // Latch the SS-pin level for the SDSPI card's
+                        // CS gate: the Arduino `SD` driver bit-bangs SS as
+                        // plain GPIO (pinMode OUTPUT + digitalWrite HIGH/
+                        // LOW around each `sdSelectCard`). The pin stays on
+                        // the GPIO function the whole time (the driver never
+                        // routes a peripheral there — FSEL10 reads 0x100
+                        // from boot through init, probed live), so plain
+                        // `gpio_out_bit` IS the driven SS level. Sample on
+                        // every SPI write (cheap: two array reads); the
+                        // card consumes it at `complete()`. SS pin = GPIO10
+                        // in the `sdspi` sketch wiring (SCK=12, MISO=13,
+                        // MOSI=11, SS=10).
+                        if n == 0 {
+                            let low = self.gpio.enabled(10) && self.gpio.out_bit(10) == 0;
+                            self.spi[0].set_sdspi_cs(low);
+                        }
                         0
                     } else {
                         self.spi[n].read32(off)
