@@ -341,6 +341,16 @@ impl Asm {
         );
     }
 
+    /// s32c1i t, s, off (LSX op0=2 r=14; generated.rs OPCODE_S32C1I):
+    /// compare-and-swap with SCOMPARE1 — the spinlock primitive both cores
+    /// use (esp_cpu_compare_and_set / FreeRTOS portMUX). `t` supplies the
+    /// new value and receives the old; the store happens iff mem == SCOMPARE1.
+    pub fn s32c1i(&mut self, t: u8, s: u8, off: u32) {
+        self.insn(
+            (((off >> 2) & 0xFF) << 16) | (14 << 12) | ((s as u32) << 8) | ((t as u32) << 4) | 2,
+            3,
+        );
+    }
     /// l32e t, s, off: physical-addressing load (window spill/fill handlers;
     /// RRR op0=0 op1=9 op2=0, offset = sext4(r)<<2 at [15:12], s=[11:8],
     /// t=[7:4] — generated.rs OPCODE_L32E; semantics = l32i on the bus).

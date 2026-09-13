@@ -147,6 +147,19 @@ impl Emulator {
         self.inner.soc.spi_inject_miso(chan as usize, bytes);
     }
 
+    /// Provision the host fake quad-SPI device store on `chan` (persistent
+    /// pattern for wide-mode USR transfers; see `Spi::quad_fake_provision`).
+    pub fn spi_quad_fake_provision(&mut self, chan: u32, pattern: &[u8]) {
+        self.inner
+            .soc
+            .spi_quad_fake_provision(chan as usize, pattern);
+    }
+
+    /// Quad/dual wire-mode level of `chan` (0 single, 1 dual, 2 quad).
+    pub fn spi_quad_mode(&self, chan: u32) -> u32 {
+        self.inner.soc.spi_quad_mode(chan as usize)
+    }
+
     /// Take the MOSI byte stream of the most recent SPI transfer on `chan`
     /// (0=GPSPI2, 1=GPSPI3). Call this when an `EVT_SPI_XFER` event arrives.
     pub fn spi_take_tx(&mut self, chan: u32) -> Vec<u8> {

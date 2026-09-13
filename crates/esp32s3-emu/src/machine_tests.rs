@@ -3141,7 +3141,9 @@ fn usb_otg_reset_and_fifo_page_routing() {
     assert_eq!(m.soc.read32(USB_OTG_BASE + 0x010) & 1, 0, "self-clears");
     assert_ne!(m.soc.read32(USB_OTG_BASE + 0x010) & (1 << 31), 0, "AHBIDLE");
     assert_eq!(m.soc.read32(USB_OTG_BASE + 0x800), 0, "bank restored");
-    // TXFIFO staging via the second page.
+    // TXFIFO staging via the second page (host mode stages TXFIFO; device
+    // mode stages the EP0 loopback instead — force host like the sketch).
+    m.soc.write32(USB_OTG_BASE + 0x00C, 1 << 29); // GUSBCFG force-host
     m.soc.write32(USB_OTG_FIFO_PAGE, 0xA5A5_A5A5);
     m.soc.write32(USB_OTG_FIFO_PAGE, 0x5A5A_5A5A);
     assert_eq!(m.soc.read32(USB_OTG_BASE + 0x914), 256 - 2);
@@ -4965,4 +4967,92 @@ fn rtc_slow_memory_survives_reset() {
         0x1234_5678,
         "RTC slow mem retained across reset"
     );
+}
+
+/// Dual-core spinlock contention via s32c1i (the primitive behind
+/// esp_cpu_compare_and_set / FreeRTOS portMUX): both cores run the same
+/// acquire loop on one lock word; each core that wins bumps its own
+/// counter, releases, and repeats. The serialized step() interleaves the
+/// cores instruction-by-instruction, so the CAS is race-free by
+/// construction — but the test pins the full contention path (acquire /
+/// release / progress on BOTH cores, no deadlock, no lost increments).
+#[test]
+fn dual_core_spinlock_contention_makes_progress() {
+    use crate::asm::Asm;
+    use crate::rom_stub::APP_FLASH_OFFSET;
+    use esp32s3_soc::memmap::SYSTEM_BASE;
+
+    const CORE1_CODE: u32 = IRAM_BASE + 0x200;
+    const LOCK: u32 = 0x3FC8_0400;
+    const CNT0: u32 = 0x3FC8_0404;
+    const CNT1: u32 = 0x3FC8_0408;
+    const ITERS: u32 = 50;
+
+    // Shared acquire/release fragment, parameterized by counter address.
+    // a8 = LOCK addr, a9 = 0 (expected), a10 = core id (new owner),
+    // a11 = counter addr, a12 = ITERS.
+    // acquire: wsr scompare1,0; s32c1i new; bnez old,acquire (old!=0 taken).
+    // body: l32i cnt; addi +1; s32i cnt.
+    // release: s32i 0 -> LOCK. loop ITERS times, then self-loop.
+    fn lock_loop(base: u32, core_id: u32, cnt: u32) -> alloc::vec::Vec<u8> {
+        let mut a = Asm::new(base);
+        a.li(8, LOCK as i32);
+        a.li(12, ITERS as i32);
+        let outer = a.pc();
+        let acq = a.pc();
+        a.movi_n(9, 0);
+        a.wsr(12, 9); // SCOMPARE1 = 0 (expect unlocked)
+        a.li(10, core_id as i32);
+        a.s32c1i(10, 8, 0); // old = LOCK; LOCK = id iff old == 0
+        a.bnez(10, acq); // old != 0 (held) -> spin
+        a.li(11, cnt as i32);
+        a.l32i(3, 11, 0);
+        a.addi(3, 3, 1);
+        a.s32i(3, 11, 0); // CNT += 1 (critical section)
+        a.s32i(9, 8, 0); // LOCK = 0 (release; plain store)
+        a.addi(12, 12, -1);
+        a.bnez(12, outer);
+        let done = a.pc();
+        a.j(done);
+        a.bytes().to_vec()
+    }
+
+    let core0 = lock_loop(IRAM_BASE, 1, CNT0);
+    // Prefix: release core 1 first, then run the lock loop. Rebuild so the
+    // release precedes the loop bytes (lock_loop starts at IRAM_BASE).
+    let mut rel = Asm::new(IRAM_BASE);
+    rel.li(6, CORE1_CODE as i32);
+    rel.li(7, (SYSTEM_BASE + 4) as i32);
+    rel.s32i(6, 7, 0); // release core 1
+    let mut core0img = rel.bytes().to_vec();
+    // Rebase the loop after the release prefix.
+    let loop0 = lock_loop(IRAM_BASE + core0img.len() as u32, 1, CNT0);
+    core0img.extend_from_slice(&loop0);
+    let _ = core0;
+    let core1 = lock_loop(CORE1_CODE, 2, CNT1);
+
+    let img = esp_app_image_multi(IRAM_BASE, &[(IRAM_BASE, &core0img), (CORE1_CODE, &core1)]);
+    let mut flash = std::vec![0xFFu8; 0x200_000];
+    flash[APP_FLASH_OFFSET as usize..APP_FLASH_OFFSET as usize + img.len()].copy_from_slice(&img);
+
+    let mut m = Esp32S3::new();
+    m.boot_from_flash(&flash);
+    for _ in 0..400_000 {
+        if m.soc.read32(CNT0) == ITERS && m.soc.read32(CNT1) == ITERS {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.soc.read32(CNT0), ITERS, "core 0 did all iterations");
+    assert_eq!(m.soc.read32(CNT1), ITERS, "core 1 did all iterations");
+    // Drain: the break fires the moment the last counter lands, possibly
+    // mid-release on the other core (its plain-store release hasn't run
+    // yet — the lock word still holds its id, which is correct, not stuck).
+    for _ in 0..1000 {
+        if m.soc.read32(LOCK) == 0 {
+            break;
+        }
+        m.step();
+    }
+    assert_eq!(m.soc.read32(LOCK), 0, "lock released at end");
 }

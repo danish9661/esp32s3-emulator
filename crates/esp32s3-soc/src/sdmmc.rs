@@ -270,6 +270,12 @@ pub struct Sdmmc {
     serve_ssr: bool,
     /// Set when the next data command serves CMD8 SEND_EXT_CSD (MMC).
     serve_extcsd: bool,
+    /// SDIO function-0 CCCR (256 B, function-0 CIS at 0x1000) for CMD52
+    /// byte I/O. Only function 0 exists (no WiFi/BT function behind the
+    /// bus — out-of-scope class); CMD52 reads/writes round-trip here and
+    /// CMD53 block mode is rejected as unsupported (R1 error), which is
+    /// exactly what a function-less card reports.
+    cccr: [u8; 256],
     /// RPMB partition selected (EXT_CSD PARTITION_CONFIG access == 3).
     rpmb_selected: bool,
     /// Provisioned RPMB authentication key (None until a 0x0001 programs
@@ -400,6 +406,7 @@ impl Sdmmc {
             serve_switch: false,
             serve_ssr: false,
             serve_extcsd: false,
+            cccr: [0u8; 256],
             rpmb_selected: false,
             rpmb_key: None,
             rpmb_counter: 0,
@@ -575,10 +582,39 @@ impl Sdmmc {
                 resp[2] = 0x1357_2468;
                 resp[3] = 0x0000_00AA;
             }
-            12 | 13 | 16 | 17 | 18 | 23 | 24 | 25 | 32 | 33 | 38 | 52 => {
+            12 | 13 | 16 | 17 | 18 | 23 | 24 | 25 | 32 | 33 | 38 => {
                 // Status-bearing commands (STOP, STATUS, BLOCKLEN,
-                // single/multi read/write, ERASE_GROUP_*, ERASE, IO_RW).
+                // single/multi read/write, ERASE_GROUP_*, ERASE).
                 resp[0] = self.r1(is_acmd);
+            }
+            52 => {
+                // IO_RW_DIRECT (SDIO function-0 CCCR byte I/O, no data
+                // phase on the DWMMC data path — the byte rides the R5
+                // response). Arg: rw[31], func[30:28], raw[27] (read-after-
+                // write), addr[25:9], data[7:0]. Only function 0 exists;
+                // other functions report the R5 ERROR/COM_CRC bits like a
+                // function-less card. R5 = R1 live status with the read
+                // byte in [15:8] (sd_protocol_defs.h R5 layout).
+                let rw_flag = (arg >> 31) & 1;
+                let func = (arg >> 28) & 7;
+                let reg = ((arg >> 9) & 0x1_FFFF) as usize;
+                let dat = (arg & 0xFF) as u8;
+                if func == 0 && reg < 256 {
+                    if rw_flag != 0 {
+                        self.cccr[reg] = dat;
+                    }
+                    resp[0] = self.r1(is_acmd) | ((self.cccr[reg] as u32) << 8);
+                } else {
+                    // No function behind the bus: R5 flags the error
+                    // (ERROR bit 11 + FUNCTION_NUMBER bits, no data).
+                    resp[0] = self.r1(is_acmd) | (1 << 11) | (func << 4);
+                }
+            }
+            53 => {
+                // IO_RW_EXTENDED (SDIO block mode): unsupported — no
+                // function behind the bus. Report live status with the R5
+                // ERROR bit rather than hanging the driver in a data wait.
+                resp[0] = self.r1(is_acmd) | (1 << 11);
             }
             51 => {
                 // SEND_SCR (ACMD51, R1 + 8-byte data): live status + SCR data.
@@ -1600,5 +1636,37 @@ mod rpmb_tests {
         write_frames(&mut d, &w);
         let r = read_frames(&mut d, 512);
         assert_eq!(result_of(&r), 0x0004, "ADDR_FAIL out of range");
+    }
+}
+
+#[cfg(test)]
+mod sdio_tests {
+    use super::tests::issue;
+    use super::*;
+
+    /// CMD52 SDIO function-0 CCCR byte I/O round-trips through the R5
+    /// response (write then read-back); unknown functions flag R5 ERROR;
+    /// CMD53 block mode reports ERROR instead of hanging a data wait.
+    #[test]
+    fn sdio_cmd52_cccr_round_trip_and_cmd53_rejected() {
+        let mut d = Sdmmc::new();
+        issue(
+            &mut d,
+            52,
+            (1 << 31) | (0x02 << 9) | 0x42,
+            true,
+            false,
+            false,
+        );
+        issue(&mut d, 52, 0x02 << 9, true, false, false);
+        assert_eq!((d.read32(RESP0) >> 8) & 0xFF, 0x42, "CCCR read-back");
+        issue(&mut d, 52, (1 << 28) | (0x02 << 9), true, false, false);
+        assert_ne!(
+            d.read32(RESP0) & (1 << 11),
+            0,
+            "R5 ERROR for missing function"
+        );
+        issue(&mut d, 53, 0, true, false, false);
+        assert_ne!(d.read32(RESP0) & (1 << 11), 0, "CMD53 rejected");
     }
 }

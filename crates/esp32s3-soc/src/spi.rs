@@ -70,7 +70,6 @@ const USER_USR_ADDR: u32 = 1 << 30;
 const USER_USR_DUMMY: u32 = 1 << 29;
 const USER_USR_MISO: u32 = 1 << 28;
 const USER_USR_MOSI: u32 = 1 << 27;
-const USER_DOUTDIN: u32 = 1 << 0;
 // USER1 fields (TRM SPI_USER1).
 const USER1_ADDR_BITLEN_SHIFT: u32 = 27;
 const USER1_DUMMY_CYCLELEN_SHIFT: u32 = 0;
@@ -92,8 +91,21 @@ const SLAVE_MODE: u32 = 1 << 26;
 // length in slave FD/HD mode), last_command[25:18], last_addr[31:26].
 pub const SPI_SLAVE1: u32 = 0xE4;
 const SLAVE1_DATA_BITLEN_MASK: u32 = (1 << 18) - 1;
-// CTRL bits (TRM SPI_CTRL): idle MOSI polarity (d_pol).
+// CTRL bits (TRM SPI_CTRL, spi_reg.h): idle MOSI polarity (d_pol),
+// quad/dual read enables (fread_quad/fread_dual) and their command-phase
+// mirrors (fcmd_quad/fcmd_dual), plus address-phase mirrors
+// (faddr_quad/faddr_dual). The GPSPI USR engine serializes every phase
+// single-line (only the byte flow is firmware-observable — no external
+// device samples the extra wires, and no IDF SPI-master driver flow sets
+// these bits), so they are accepted as R/W config with no timing effect;
+// they DO route into `spi_quad_mode()` for the host fake-device hook.
 const CTRL_D_POL: u32 = 1 << 20;
+const CTRL_FREAD_QUAD: u32 = 1 << 15;
+const CTRL_FREAD_DUAL: u32 = 1 << 14;
+const CTRL_FCMD_QUAD: u32 = 1 << 9;
+const CTRL_FCMD_DUAL: u32 = 1 << 8;
+const CTRL_FADDR_QUAD: u32 = 1 << 6;
+const CTRL_FADDR_DUAL: u32 = 1 << 5;
 // CLK_GATE bits (TRM SPI_CLK_GATE).
 const CLK_GATE_CLK_EN: u32 = 1 << 0;
 // Interrupt registers (TRM SPI_DMA_INT_*, NOT the classic-ESP32 SLV layout):
@@ -134,7 +146,10 @@ struct Txn {
     total_bits: u64,
     cmd_bits: u64,
     addr_bits: u64,
-    /// Data phase width in bits (MOSI+MISO count when !doutdin).
+    /// Data phase width in bits: `d` (MS_DLEN+1) ALWAYS (spi_struct.h has a
+    /// single `ms_data_bitlen` for master CPU and DMA transfers; MOSI and
+    /// MISO share the window — the Arduino polling path spiTransferByteNL
+    /// programs usr_mosi|usr_miso + doutdin, i.e. full duplex).
     data_bits: u64,
     have_mosi: bool,
     have_miso: bool,
@@ -184,10 +199,12 @@ pub struct Spi {
     /// GDMA-staged TX bytes for a DMA-backed master transfer (fed by the
     /// GDMA `out` walk, consumed by `dma_trigger`).
     dma_tx: Vec<u8>,
-    /// Captured RX bytes of the last DMA-backed transfer (served to the
-    /// GDMA `in` walk via `dma_rx_word`; overwritten per transfer, never
-    /// drained, so the IN link may start before or after completion).
+    /// Captured RX bytes of the last DMA transfer's captured RX bytes (served
+    /// to the GDMA `in` walk via `dma_rx_word`; overwritten per transfer,
+    /// never drained, so the IN link may start before/after completion).
     dma_rx: Vec<u8>,
+    /// Host fake quad-SPI device store (see `quad_fake_provision`).
+    quad_fake: Option<Vec<u8>>,
 }
 
 impl Spi {
@@ -200,12 +217,70 @@ impl Spi {
             pending_miso: None,
             dma_tx: Vec::new(),
             dma_rx: Vec::new(),
+            quad_fake: None,
         }
     }
 
     /// Inject MISO bytes for the next transfer (host virtual device response).
     pub fn inject_miso(&mut self, bytes: &[u8]) {
         self.pending_miso = Some(bytes.to_vec());
+    }
+
+    /// Quad/dual wire-mode level from SPI_CTRL (spi_reg.h FREAD/FCMD/
+    /// FADDR_QUAD/DUAL): 0 = single, 1 = dual, 2 = quad (quad wins when
+    /// both set). The USR engine still serializes single-line; this only
+    /// feeds the host fake-device hook (`quad_fake_*`) so firmware that
+    /// programs wide modes observes the matching device behavior.
+    pub fn quad_mode(&self) -> u32 {
+        let ctrl = self.regs[(SPI_CTRL / 4) as usize];
+        if ctrl & (CTRL_FREAD_QUAD | CTRL_FCMD_QUAD | CTRL_FADDR_QUAD) != 0 {
+            2
+        } else if ctrl & (CTRL_FREAD_DUAL | CTRL_FCMD_DUAL | CTRL_FADDR_DUAL) != 0 {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Host fake quad-SPI device: a fixed 256-byte pattern store the host
+    /// pre-loads (`quad_fake_provision`) and the firmware reads through
+    /// USR MISO transfers. Reads wrap the store (offset modulo length);
+    /// writes (MOSI) update it in place so a write/read-back round-trips.
+    /// `None` until provisioned — MISO then stays zeros (no device).
+    /// Separate from `pending_miso` (one-shot injection): this is the
+    /// persistent wide-mode device behind the quad hook.
+    pub fn quad_fake_provision(&mut self, pattern: &[u8]) {
+        self.quad_fake = Some(pattern.to_vec());
+    }
+
+    /// Serve a MISO data phase from the fake quad device (called at
+    /// transaction completion when `quad_mode() != 0` and no one-shot
+    /// `pending_miso` is staged). `addr` selects the start offset so
+    /// address-phase reads land at the right pattern window.
+    fn quad_fake_read(&self, addr: u32, nbytes: usize) -> Option<Vec<u8>> {
+        let store = self.quad_fake.as_ref()?;
+        if store.is_empty() || nbytes == 0 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(nbytes);
+        for i in 0..nbytes {
+            out.push(store[((addr as usize) + i) % store.len()]);
+        }
+        Some(out)
+    }
+
+    /// Commit a MOSI data phase into the fake quad device (write path of
+    /// the round-trip): bytes land at `addr` modulo the store length.
+    fn quad_fake_write(&mut self, addr: u32, bytes: &[u8]) {
+        if let Some(store) = self.quad_fake.as_mut() {
+            if store.is_empty() {
+                return;
+            }
+            for (i, &b) in bytes.iter().enumerate() {
+                let k = ((addr as usize) + i) % store.len();
+                store[k] = b;
+            }
+        }
     }
 
     /// True when the controller is in slave mode (SPI_SLAVE.slave_mode).
@@ -331,8 +406,9 @@ impl Spi {
         }
     }
 
-    /// Finish the transaction: sample MISO (no device -> zeros, or the host
-    /// injected bytes) into the data buffer, latch trans_done, and clear
+    /// Finish the transaction: sample MISO (no device -> zeros, one-shot
+    /// host injection, or the fake quad-device store when a wide mode is
+    /// programmed) into the data buffer, latch trans_done, and clear
     /// CMD.usr (self-clearing, TRM SPI_CMD.usr). Captures the MOSI bytes for
     /// the host event queue. DMA-backed transfers capture MISO into `dma_rx`
     /// (served to the GDMA `in` walk) instead of the data buffer.
@@ -341,19 +417,39 @@ impl Spi {
         let have_miso = self.txn.as_ref().is_some_and(|t| t.have_miso);
         let dma = self.txn.as_ref().is_some_and(|t| t.dma);
         let data_bits = self.txn.as_ref().map_or(0, |t| t.data_bits);
+        // MISO window width is data_bits in every mode (one shared `d`-bit
+        // window; MOSI and MISO overlap per spi_struct.h ms_dlen).
+        let miso_bits = data_bits;
+        let addr_value = self.txn.as_ref().map_or(0, |t| t.addr_value);
+        let quad = self.quad_mode();
+        let mosi_bytes = if have_mosi {
+            self.txn.as_ref().map(Self::collect_mosi)
+        } else {
+            None
+        };
         if dma {
             // MISO byte stream over the data phase (zeros unless injected).
-            let nbytes = data_bits.div_ceil(8) as usize;
+            let nbytes = miso_bits.div_ceil(8) as usize;
             let mut rx = vec![0u8; nbytes];
             if let Some(miso) = self.pending_miso.take() {
                 for (i, b) in miso.iter().enumerate().take(nbytes) {
                     rx[i] = *b;
                 }
+            } else if quad != 0
+                && let Some(fake) = self.quad_fake_read(addr_value, nbytes)
+            {
+                rx = fake;
             }
             self.dma_rx = rx;
         } else if have_miso {
             let mut buf = [0u32; DATA_WORDS];
-            if let Some(miso) = self.pending_miso.take() {
+            let staged = self.pending_miso.take().or_else(|| {
+                (quad != 0).then(|| {
+                    let nbytes = miso_bits.div_ceil(8) as usize;
+                    self.quad_fake_read(addr_value, nbytes).unwrap_or_default()
+                })
+            });
+            if let Some(miso) = staged {
                 // Shift the injected MISO bytes (MSB-first) into the
                 // left-aligned data buffer.
                 let mut bitpos = 0u32;
@@ -373,8 +469,13 @@ impl Spi {
                 .copy_from_slice(&buf);
         }
         if have_mosi {
-            if let Some(t) = self.txn.as_ref() {
-                self.last_tx = Some(Self::collect_mosi(t));
+            if let Some(mosi) = mosi_bytes {
+                // Fake quad-device write path: MOSI data phases commit into
+                // the provisioned store so a write/read-back round-trips.
+                if quad != 0 && self.quad_fake.is_some() {
+                    self.quad_fake_write(addr_value, &mosi);
+                }
+                self.last_tx = Some(mosi);
             }
         } else {
             self.last_tx = Some(Vec::new());
@@ -385,19 +486,12 @@ impl Spi {
     }
 
     /// Extract the MOSI byte stream from a finished transaction's left-aligned
-    /// data buffer (MSB-first). For full-duplex (doutdin) the MOSI portion is
-    /// the first half of the data bits; for half-duplex MOSI it is the whole
-    /// data phase. The host reads this on an `EVT_SPI_XFER` event.
+    /// data buffer (MSB-first): the shared `d`-bit window (MOSI and MISO
+    /// overlap per spi_struct.h ms_dlen). The host reads this on an
+    /// `EVT_SPI_XFER` event.
     fn collect_mosi(t: &Txn) -> Vec<u8> {
-        let bits = if t.have_mosi {
-            if t.have_miso {
-                t.data_bits / 2
-            } else {
-                t.data_bits
-            }
-        } else {
-            0
-        };
+        // MOSI bit count is data_bits whenever MOSI is enabled.
+        let bits = if t.have_mosi { t.data_bits } else { 0 };
         let nbytes = bits.div_ceil(8);
         let nwords = t.buf.len();
         let mut out = Vec::with_capacity(nbytes as usize);
@@ -483,16 +577,8 @@ impl Spi {
         };
         let have_mosi = user & USER_USR_MOSI != 0;
         let have_miso = user & USER_USR_MISO != 0;
-        let doutdin = user & USER_DOUTDIN != 0;
         let data_bits = if have_mosi || have_miso {
-            let d = (ms_dlen & MS_DLEN_DATA_BITLEN_MASK) as u64 + 1;
-            if doutdin {
-                d
-            } else if have_mosi && have_miso {
-                2 * d
-            } else {
-                d
-            }
+            (ms_dlen & MS_DLEN_DATA_BITLEN_MASK) as u64 + 1
         } else {
             0
         };

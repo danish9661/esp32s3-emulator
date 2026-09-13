@@ -37,6 +37,7 @@ pub mod rtc;
 pub mod rtc_i2c;
 pub mod rtc_io;
 pub mod sdmmc;
+pub mod secure_boot;
 pub mod sha;
 pub mod sigmadelta;
 pub mod soc;

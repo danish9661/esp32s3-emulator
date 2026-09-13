@@ -3770,3 +3770,115 @@ IDF-driver MMC mount, `ee.*` unmapped patterns (loud trap, correct).
     - Proofs: 39 suites green (incl. 34 mcpwm), clippy `-D warnings`
       clean, fmt clean, wasm32 clean, firmware `mcpwm`/`mcpwm_sync`/
       `mcpwm_cap` all PASS (cap `period=10000` unchanged).
+  - 2026-09-13: **Tri-batch: SPI duplex fix, quad hook, tempdev, dual-core
+    CAS, SB verdicts (all but WiFi/BLE; battery 101/0/0)**.
+    - **SPI full-duplex correction (real model bug)**. `spi_ll.h`
+      `spi_ll_write_buffer`/`spi_ll_read_buffer` are little-endian word
+      memcpys over ONE shared `ms_data_bitlen` window (`spi_struct.h`
+      has a single `ms_dlen` — no separate mosi/miso lengths exist), and
+      `esp32-hal-spi.c` `spiTransferByteNL` programs
+      usr_mosi|usr_miso+doutdin. So MOSI+MISO always overlap on one
+      `d`-bit window (my 2*`d` "sequential" theory was wrong — the sniff
+      proved USER=0x18000001 with doutdin SET). Removed the split
+      (`plan()`/`collect_mosi`/`complete()` all use `d` directly; `duplex`
+      field + USER_DOUTDIN const deleted) + new regression test
+      `sequential_halfduplex_miso_returns_injected_byte` (name kept —
+      asserts the shared-window byte lands).
+    - **Quad-SPI hook + sketch** (`spi.rs`): CTRL FREAD/FCMD/FADDR
+      QUAD/DUAL bits (spi_reg.h) decode into `quad_mode()` (quad wins);
+      engine still serializes single-line (no wire counterparty), but a
+      provisioned 256-B store serves MISO at the address-phase window
+      and commits MOSI writes (round-trip). `Soc`/`wasm-bridge` expose
+      `spi_quad_fake_provision`/`spi_quad_mode`; `run_flash`
+      `SPI_QUADDEV=1` provisions incrementing bytes. New
+      `esp32s3_spi_quaddev` sketch (single=0, read=0x10111213,
+      roundtrip=DEADBEEF → `SPI QUADDEV PASS`, battery entry) + 2 unit
+      tests (mode decode, pattern+round-trip). Sketch lesson: MISO-only
+      has no window — set usr_mosi (virtual_demo precedent); read the
+      MSB word (`>>16`, proven by sniff), not the low half.
+    - **Fake temp devices + sketch** (`esp32s3_tempdev`, battery entry
+      `I2C_TEMP_RX=1900 SPI_TEMP_RX=0320`): TMP102-style I2C read
+      (pointer + 2-byte READ via `i2c_inject_rx`, raw 0x1900 = 25.00 C)
+      and MAX6675-style SPI frame (16-bit usr_mosi|usr_miso via
+      `spi_inject_miso`, raw 0x0320 = 25.00 C) → `TEMPDEV PASS`. Uses
+      only existing host hooks (no model change); `run_flash` gains
+      `I2C_TEMP_RX`/`SPI_TEMP_RX` hex parsers. Distinct from the TSENS
+      `temp` sketch (internal sensor vs bus devices).
+    - **Dual-core spinlock test** (`machine_tests.rs`,
+      `dual_core_spinlock_contention_makes_progress`): both cores run a
+      wsr-SCOMPARE1/s32c1i acquire + counter + plain-store release loop
+      ×50 via new `Asm::s32c1i` (LSX op0=2 r=14). Pins the CAS path both
+      cores' real firmware uses (portMUX). Caught en route: break-on-
+      counters can fire mid-release (LOCK=id is correct, not stuck —
+      drain before asserting); unused `a0`/`core0` locals removed.
+    - **SB verdicts (both scoped, evidence in-tree)**:
+      (1) SDSPI/SD-over-SPI: NO validatable path — the Arduino
+      `transfer()` byte path writes `data_buf[0]` as a low byte
+      (`spiTransferByteNL`) while the model shifts an MSB-left-aligned
+      word (waveform probe: W0=0x40→wire zeros, W0=0x40<<24→0x40 on
+      wire). A card was built and unit-proven (CMD0/8/55/41) but the
+      firmware reads zeros at the register (W0=0x01 proven, `r`=00) —
+      closing it needs an LE shift-register remodel (touches every SPI
+      sketch/test), deferred as documented. Staged code reverted out of
+      tree (nothing committed for SDSPI).
+      (2) SDIO function host: no validatable path — `sdmmc.rs` CMD5
+      already RTOs (mem-only card, driver-verified `sdfat` mount) and
+      CMD52 is in the status-bearing list (live R1); full CCCR/CIS
+      function init needs a WiFi/BT function behind the bus (out of
+      scope class). No code change; limitation stands.
+    - **RSA battery fix (harness, not model)**: `rsa` entry now builds
+      from its real srcdir (`esp32s3_rsa/esp32s3_rsa_poke`, was a stale
+      `binrel` that `--build` overwrote with the wrong sketch's image
+      → `missing [PASS]`). Full `--build` battery: 99 pass + 1 fail →
+      root-caused to that stale bin; rebuilt bin passes standalone.
+      Battery now 101/0/0 (+quaddev, +tempdev).
+    - Proofs: 39 suites green, clippy `-D warnings` clean, fmt clean,
+      wasm32 clean, targeted battery
+      (spi_quaddev/tempdev/mcpwm*/rsa) 10/10 green.
+  - 2026-09-13: **Deferred-scope batch: SDIO CMD52/53, USB-OTG EP0
+    loopback, SBv2 verify (all but WiFi/BLE)**.
+    - **SDIO function host — CLOSED with a validatable piece**
+      (`sdmmc.rs`): CMD52 IO_RW_DIRECT on function 0 round-trips the new
+      256-B `cccr` store through the R5 response (read byte in [15:8]
+      per `sd_protocol_defs.h` R5 layout; arg = rw[31]/func[30:28]/
+      addr[25:9]/data[7:0]); unknown functions flag R5 ERROR+func bits
+      (what a function-less card reports); CMD53 block mode reports
+      ERROR instead of hanging a data wait (nothing behind the bus —
+      WiFi/BT function stays out-of-scope class). Unit test
+      `sdio_cmd52_cccr_round_trip_and_cmd53_rejected` green. Note: this
+      supersedes the prior "CMD52 is in the status-bearing list" note
+      (it now has its own R5 arm above that list).
+    - **USB-OTG device-mode EP0 — CLOSED via in-model loopback**
+      (`usb_otg.rs`, was "needs external host"): device-mode DFIFO0
+      writes accumulate the 8-byte SETUP packet and decode through the
+      SHARED `handle_setup` table (GET_DESCRIPTOR stages IN data,
+      SET_ADDRESS arms, SET_CONFIGURATION records, else STALL with the
+      host-channel side effect snapshotted away); staged IN payload
+      mirrors into the device RXFIFO so DFIFO0 reads serve it;
+      DIEPTSIZ0/DOEPTSIZ0 writes complete status (applies pending
+      address, raises IN XFRC); DIEPINT0/DOEPINT0 are now real W1C
+      latches (were hardwired 0). 2 unit tests (descriptor round-trip
+      + W1C, STALL + SET_ADDRESS apply) + `esp32s3_usb_otg` sketch
+      extended (force-host FIFO leg, then force-device SETUP/DESC/
+      STATUS legs → `OTG SETUP/DESC/STATUS OK`, battery markers
+      extended). Caught en route: (1) TX-flush must clear BOTH stagings
+      (host_txfifo survived → stale 252-space failure); (2) the old
+      machine test staged TXFIFO in device mode (now force-host first).
+      Device bulk/interrupt transfers + real host enumeration stay out
+      (no counterparty — limitation stands, narrower now).
+    - **Secure-boot-v2 verify — CLOSED end-to-end** (new
+      `secure_boot.rs` + `tools/sbtest_data_signed.bin` fixture): parses
+      the real `espsecure.py` ECDSA-P256 layout (magic E7/ver 3/sha 0,
+      digest[4..36] = SHA256 minus sig sector, curve 2, LE pubkey/r/s,
+      zlib CRC over [..1196]) and verifies through the ECDSA model
+      register pokes (QX/QY/R/S LE limbs, START, RESULT). Fixture is a
+      genuine `espsecure.py sign-data` blob (`verify-signature` also
+      passes on it). Root-caused en route: the digest is a RAW hash
+      (big-endian int, like `Prehashed`) while Q/R/S fields are LE
+      bytes — so Z alone needs BE-word packing (full 3-axis matrix +
+      python twin proved it; feeding Z as LE words fails a genuine
+      signature). 3 tests (valid/tampered/CRC). `hmac::sha256` made
+      `pub` for the digest (was `pub(crate)`).
+    - Proofs: workspace green, clippy `-D warnings` clean, fmt clean,
+      wasm32 clean, targeted battery (usb_otg/usb_host/sdmmc/sdfat/
+      emmc) 5/5 green.

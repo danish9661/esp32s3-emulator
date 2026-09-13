@@ -1020,6 +1020,20 @@ impl Soc {
         self.spi[chan].inject_miso(bytes);
     }
 
+    /// Provision the host fake quad-SPI device store on `chan` (a fixed
+    /// pattern the firmware reads/writes through wide-mode USR transfers;
+    /// see `Spi::quad_fake_provision`). The wasm bridge exposes this for
+    /// virtual-SPI-flash frontends.
+    pub fn spi_quad_fake_provision(&mut self, chan: usize, pattern: &[u8]) {
+        self.spi[chan].quad_fake_provision(pattern);
+    }
+
+    /// Quad/dual wire-mode level of `chan` (0 single, 1 dual, 2 quad —
+    /// see `Spi::quad_mode`).
+    pub fn spi_quad_mode(&self, chan: usize) -> u32 {
+        self.spi[chan].quad_mode()
+    }
+
     /// Host-driven SPI slave master-write: capture `bytes` into the slave's
     /// data buffer on `chan` (0=GPSPI2, 1=GPSPI3), recording the bitlen and
     /// raising trans_done. Only acts when the controller is in slave mode.

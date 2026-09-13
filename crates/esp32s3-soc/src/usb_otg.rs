@@ -214,6 +214,9 @@ pub struct UsbOtg {
     rx_data: alloc::collections::VecDeque<u8>,
     /// Pending GRXSTSP entry (channel, byte count, dpid), if any.
     rx_meta: Option<(u8, u16, u8)>,
+    /// Device-mode EP0 loopback: SETUP bytes staged by DFIFO0 writes in
+    /// device mode (decoded once 8 accumulate).
+    dev_setup: alloc::vec::Vec<u8>,
     /// SOF frame counter (see HFNUM).
     sof: u16,
 }
@@ -227,6 +230,7 @@ impl UsbOtg {
             host_txfifo: alloc::collections::VecDeque::new(),
             rx_data: alloc::collections::VecDeque::new(),
             rx_meta: None,
+            dev_setup: alloc::vec::Vec::new(),
             sof: 0,
         };
         o.core_reset();
@@ -242,6 +246,7 @@ impl UsbOtg {
         self.host_txfifo.clear();
         self.rx_data.clear();
         self.rx_meta = None;
+        self.dev_setup.clear();
         self.regs[(GRSTCTL / 4) as usize] = GRST_AHBIDLE;
     }
 
@@ -298,7 +303,13 @@ impl UsbOtg {
             // No bus events without a host: device/endpoint interrupt and
             // packet-status registers read 0; RXFIFO pops read 0 (empty).
             GINTSTS => self.host_gintsts(),
-            DSTS | DAINT | DIEPINT0 | DOEPINT0 => 0,
+            DSTS | DAINT => 0,
+            // Device-mode EP0 interrupt flags: the loopback driver (see
+            // `dev_loopback_*`) raises XFRC on each completed stage; STALL
+            // latches when the SETUP packet is not a handled standard
+            // request. W1C via the matching INT register write.
+            DIEPINT0 => self.regs[(DIEPINT0 / 4) as usize],
+            DOEPINT0 => self.regs[(DOEPINT0 / 4) as usize],
             // GRXSTSP pops the pending RX packet status (0 when none).
             GRXSTSP => {
                 if let Some((ch, bcnt, dpid)) = self.rx_meta.take() {
@@ -340,10 +351,11 @@ impl UsbOtg {
     pub fn write32(&mut self, offset: u32, value: u32) {
         match offset {
             GRSTCTL => {
-                // RX/TX FIFO flushes self-clear (TX flush drops staged
-                // bytes); a core soft reset restores the bank.
+                // RX/TX FIFO flushes self-clear (both TX stagings drop);
+                // a core soft reset restores the bank.
                 if value & GRST_TXFFLSH != 0 {
                     self.txfifo.clear();
+                    self.host_txfifo.clear();
                 }
                 if value & GRST_CSFTRST != 0 {
                     self.core_reset();
@@ -352,9 +364,28 @@ impl UsbOtg {
                 }
             }
             // GINTSTS is computed live (host bits) — writes ignored.
-            // DSTS/DAINT/DIEPINT0/DOEPINT0 are read-only.
-            GINTSTS | DSTS | DAINT | DIEPINT0 | DOEPINT0 | GRXSTSP | HAINT => {}
+            // DSTS/DAINT are read-only; EP0 interrupt flags are W1C.
+            GINTSTS | DSTS | DAINT | GRXSTSP | HAINT => {}
+            DIEPINT0 | DOEPINT0 => {
+                let w = (offset / 4) as usize;
+                self.regs[w] &= !value;
+            }
             HPRT => self.hprt_write(value),
+            // Device-mode EP0 loopback (no external host): the firmware
+            // itself stages a SETUP packet by writing its 8 bytes to DFIFO0
+            // in device mode; the controller decodes it immediately (same
+            // `handle_setup` table as the host path: GET_DESCRIPTOR stages
+            // IN data, SET_ADDRESS arms, SET_CONFIGURATION records, else
+            // STALL) and raises the matching EP0 interrupt flag
+            // (DOEPINT0 XFRC for the SETUP stage, STALL on reject). The IN
+            // data stage is served by reading DFIFO0 (device RXFIFO pop,
+            // like silicon's EP0 IN FIFO); the status stage completes on
+            // the DIEPTSIZ0/DOEPTSIZ0 xfer-size write like the host path's
+            // ChEna. See the `dev_loopback_*` machine tests.
+            DOEPTSIZ0 | DIEPTSIZ0 => {
+                self.regs[(offset / 4) as usize] = value;
+                self.dev_loopback_status();
+            }
             DFIFO0 => {
                 if self.host_mode() {
                     // Host-mode OUT/SETUP payload staging (1024-byte cap
@@ -362,9 +393,17 @@ impl UsbOtg {
                     if self.host_txfifo.len() + 4 <= TXFIFO_WORDS as usize * 4 {
                         self.host_txfifo.extend(value.to_le_bytes());
                     }
-                } else if self.txfifo.len() + 4 <= TXFIFO_WORDS as usize * 4 {
-                    // TXFIFO0 push (little-endian word); overfill is dropped.
-                    self.txfifo.extend_from_slice(&value.to_le_bytes());
+                } else {
+                    // Device-mode EP0 loopback: accumulate the SETUP packet;
+                    // once 8 bytes stage, decode via the shared table and
+                    // raise the EP0 OUT transfer-complete (or STALL).
+                    self.dev_setup.extend_from_slice(&value.to_le_bytes());
+                    if self.dev_setup.len() >= 8 {
+                        let mut pkt = [0u8; 8];
+                        pkt.copy_from_slice(&self.dev_setup[..8]);
+                        self.dev_setup.drain(..8);
+                        self.dev_loopback_setup(&pkt);
+                    }
                 }
             }
             o if o < (REG_WORDS * 4) as u32 && o.is_multiple_of(4) => {
@@ -568,6 +607,53 @@ impl UsbOtg {
         }
         false
     }
+
+    // EP0 interrupt flag bits (usb_dwc DIEPINT0/DOEPINT0 layout):
+    // XFRC[0] = transfer completed, STALL[3] = STALL response.
+    const EP_XFRC: u32 = 1 << 0;
+    const EP_STALL: u32 = 1 << 3;
+
+    /// Device-mode EP0 loopback SETUP stage: decode the staged 8-byte
+    /// packet through the shared `handle_setup` table (channel id unused
+    /// there — endpoint 0), then mirror the staged IN payload into the
+    /// device RXFIFO so DFIFO0 reads serve it, and raise the EP0 OUT
+    /// transfer-complete (or STALL on reject). The firmware then drives
+    /// the IN/status stages with DIEPTSIZ0/DOEPTSIZ0 writes (see
+    /// `dev_loopback_status`).
+    fn dev_loopback_setup(&mut self, pkt: &[u8; 8]) {
+        // Reuse the host-path table with a dummy channel: HCINT_STALL on
+        // reject would raise a host interrupt, so snapshot + clear any
+        // host-channel side effect first (host channels are idle in
+        // device mode; the raise only touches ch0's bits).
+        let hc0 = self.regs[self.hc_at(0, HCINT_OFF)];
+        let stalled = self.handle_setup(0, pkt);
+        self.regs[self.hc_at(0, HCINT_OFF)] = hc0;
+        // Mirror staged IN data into the device RXFIFO (DFIFO0 pops serve
+        // it, like silicon's EP0 IN FIFO on the bus).
+        self.rx_data.clear();
+        self.rx_data.extend(self.dev.in_data.iter().cloned());
+        if stalled {
+            self.regs[(DOEPINT0 / 4) as usize] |= Self::EP_STALL;
+        } else {
+            self.regs[(DOEPINT0 / 4) as usize] |= Self::EP_XFRC;
+        }
+    }
+
+    /// Device-mode EP0 status stage: a DIEPTSIZ0/DOEPTSIZ0 transfer-size
+    /// write completes the handshake — applies a pending SET_ADDRESS
+    /// (like the host path's status stage) and raises the EP0 IN
+    /// transfer-complete. Zero-length either way (control status carries
+    /// no payload on the loopback).
+    fn dev_loopback_status(&mut self) {
+        if self.host_mode() {
+            return;
+        }
+        if self.dev.addr_armed {
+            self.dev.addr = self.dev.addr_pending;
+            self.dev.addr_armed = false;
+        }
+        self.regs[(DIEPINT0 / 4) as usize] |= Self::EP_XFRC;
+    }
 }
 
 impl Default for UsbOtg {
@@ -622,7 +708,10 @@ mod tests {
     #[test]
     fn txfifo_staging_reports_space() {
         let mut u = UsbOtg::new();
+        // Device mode (reset default): DFIFO0 writes stage the EP0 SETUP
+        // packet, not the TXFIFO — space stays full.
         assert_eq!(u.read32(DTXFSTS0), TXFIFO_WORDS);
+        u.write32(GUSBCFG, GUSBCFG_FORCE_HOST); // host mode stages TXFIFO
         for i in 0..4u32 {
             u.write32(DFIFO0, 0x1111_1111 * (i + 1));
         }
@@ -752,5 +841,58 @@ mod tests {
         hc_xfer(&mut u, 7, false, 2, 0);
         hc_clear(&mut u);
         assert_eq!(u.dev.configured, 1);
+    }
+}
+
+#[cfg(test)]
+mod dev_loopback_tests {
+    use super::*;
+
+    // Device-mode EP0 loopback: stage a GET_DESCRIPTOR(DEVICE) SETUP via
+    // DFIFO0, expect DOEPINT0 XFRC; DFIFO0 reads serve the 18-byte device
+    // descriptor; the transfer-size write completes status (DIEPINT0 XFRC).
+    #[test]
+    fn dev_loopback_get_descriptor_device() {
+        let mut u = UsbOtg::new();
+        // Write the 8 SETUP bytes as two LE words: [80 06 00 01 | 00 00 12 00]
+        // = GET_DESCRIPTOR device, wLength 18.
+        u.write32(DFIFO0, 0x0100_0680);
+        u.write32(DFIFO0, 0x0012_0000);
+        assert_ne!(u.read32(DOEPINT0) & 1, 0, "SETUP XFRC");
+        // IN data stage: 18 descriptor bytes pop via DFIFO0.
+        let mut got = [0u8; 18];
+        for chunk in got.chunks_mut(4) {
+            let w = u.read32(DFIFO0);
+            for (i, b) in chunk.iter_mut().enumerate() {
+                *b = ((w >> (8 * i)) & 0xFF) as u8;
+            }
+        }
+        assert_eq!(&got, &DEV_DESC, "device descriptor round-trip");
+        // Status stage: transfer-size write raises IN XFRC.
+        u.write32(DIEPTSIZ0, 0);
+        assert_ne!(u.read32(DIEPINT0) & 1, 0, "status XFRC");
+        u.write32(DIEPINT0, 1);
+        u.write32(DOEPINT0, 1);
+        assert_eq!(u.read32(DIEPINT0) & 1, 0, "W1C clears");
+        assert_eq!(u.read32(DOEPINT0) & 1, 0, "W1C clears");
+    }
+
+    // Unknown SETUP request STALLs (DOEPINT0 STALL, no XFRC); SET_ADDRESS
+    // applies at the status-stage write.
+    #[test]
+    fn dev_loopback_stall_and_set_address() {
+        let mut u = UsbOtg::new();
+        // Vendor request 0xFF: not handled -> STALL.
+        u.write32(DFIFO0, 0x0000_FFC0);
+        u.write32(DFIFO0, 0x0000_0000);
+        assert_ne!(u.read32(DOEPINT0) & (1 << 3), 0, "STALL latched");
+        assert_eq!(u.read32(DOEPINT0) & 1, 0, "no XFRC on STALL");
+        u.write32(DOEPINT0, 1 << 3);
+        // SET_ADDRESS 7: addr applies at the status write.
+        u.write32(DFIFO0, 0x0007_0000 | ((0x05u32) << 8));
+        u.write32(DFIFO0, 0x0000_0000);
+        assert_ne!(u.read32(DOEPINT0) & 1, 0, "SETUP XFRC");
+        u.write32(DOEPTSIZ0, 0);
+        assert_eq!(u.dev.addr, 7, "address applied at status");
     }
 }

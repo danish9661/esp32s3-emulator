@@ -128,6 +128,31 @@ fn main() {
         println!("[host] injected touch pad {pad} = {val}");
     }
 
+    // Fake temperature devices (tempdev-sketch support): I2C_TEMP_RX=<hex>
+    // pre-injects the I2C thermometer read bytes (e.g. 1900 = TMP102
+    // 25.00 C), SPI_TEMP_RX=<hex> the next SPI thermometer frame bytes
+    // (e.g. 0320 = MAX6675 25.00 C). Same hooks the virtual-demo browser
+    // harness uses (i2c_inject_rx / spi_inject_miso).
+    fn parse_hex_bytes(s: &str) -> Vec<u8> {
+        let h: Vec<char> = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        (0..h.len() / 2)
+            .map(|i| {
+                let pair: String = [h[2 * i], h[2 * i + 1]].iter().collect();
+                u8::from_str_radix(&pair, 16).unwrap_or(0)
+            })
+            .collect()
+    }
+    if let Ok(hex) = env::var("I2C_TEMP_RX") {
+        let b = parse_hex_bytes(&hex);
+        m.soc.i2c_inject_rx(0, &b);
+        println!("[host] injected I2C temp bytes {b:02x?}");
+    }
+    if let Ok(hex) = env::var("SPI_TEMP_RX") {
+        let b = parse_hex_bytes(&hex);
+        m.soc.spi_inject_miso(0, &b);
+        println!("[host] injected SPI temp bytes {b:02x?}");
+    }
+
     // Brown-out injection for BOD sketches: BOD_INJECT=1 holds the
     // low-voltage condition so an enabled detector trips (interrupt
     // after int_wait, chip reset after rst_wait with rst_ena).
@@ -194,6 +219,15 @@ fn main() {
     let i2c_slave_xchg = env::var("I2C_SLAVE_XCHG").is_ok();
     let mut i2c_slave_wrote = false;
     let mut i2c_slave_read = false;
+
+    // Fake quad-SPI device store (quaddev-sketch support): SPI_QUADDEV=1
+    // provisions a 256-byte incrementing pattern (byte i = i) on GPSPI2
+    // before boot, matching the sketch's expected address windows.
+    if env::var("SPI_QUADDEV").is_ok() {
+        let pat: Vec<u8> = (0..=255u16).map(|i| i as u8).collect();
+        m.soc.spi_quad_fake_provision(0, &pat);
+        println!("[host] provisioned fake quad-SPI device on GPSPI2");
+    }
 
     // Step budget in INSTRUCTIONS (`step_fast` executes whole blocks and
     // reports how many instructions ran): one old loop iteration stepped a

@@ -63,7 +63,7 @@ CASES=(
 "uart_flow||UART FLOW PASS|"
 "uart_multi||MULTI_UART PASS|"
 "usb_serial||USB TEST|"
-"usb_otg||OTG RESET OK;OTG CFG OK;OTG EP0 OK;OTG FIFO OK;OTG PASS|"
+"usb_otg||OTG RESET OK;OTG CFG OK;OTG EP0 OK;OTG FIFO OK;OTG SETUP OK;OTG DESC OK;OTG STATUS OK;OTG PASS|"
 "aes||AES DONE;AES CBC PASS;AES XTS PASS|"
 "aes_gcm||AES GCM PASS;AES GCM DONE|"
 "aes_poke||AES POKE PASS|"
@@ -75,6 +75,8 @@ CASES=(
 "spi_slave|SPI_SLAVE_XCHG=1|SPI SLAVE DONE|"
 "spi_slave_dma|SPI_SLAVE_XCHG=1|SPI SLAVE DMA RX OK;SPI SLAVE DMA DONE;SPI SLAVE DMA PASS|"
 "spi_wide||SPI_WIDE PASS|"
+"spi_quaddev|SPI_QUADDEV=1|SPI QUADDEV PASS;SPI QUADDEV DONE|"
+"tempdev|I2C_TEMP_RX=1900 SPI_TEMP_RX=0320|TEMPDEV PASS;TEMPDEV DONE|"
 "flashread||FLASHREAD TABLE MAGIC OK;FLASHREAD APP MAGIC OK;FLASHREAD NVS ERASED OK;FLASHREAD PASS|"
 "i2c||I2C DONE|"
 "i2c_poke||I2C POKE PASS|"
@@ -123,7 +125,7 @@ CASES=(
 "lightsleep_uart|UART0_INJECT=Z UART0_MARKER=UART-SLEEP-ARMED|LIGHTSLEEP UART PASS|55000000"
 "hmac||HMAC DONE;OK|"
 "ds||DS DONE;OK|"
-"rsa||RSA POKE PASS||esp32s3_rsa/esp32s3_rsa_poke/esp32s3_rsa_poke.merged.bin"
+"rsa||RSA POKE PASS|"
 "ecdsa||ECDSA DONE|"
 "i2s||I2S POKE PASS|"
 "i2s_driver||I2S DRIVER LOOPBACK PASS|300000000"
@@ -217,6 +219,7 @@ for c in "${CASES[@]}"; do
     hello_opi) srcdir="$SK/esp32s3_hello"; fqbn="$fqbn:FlashMode=opi,PSRAM=opi"; bin="$srcdir/esp32s3_hello_opi.merged.bin"; inobin="esp32s3_hello.ino.merged.bin";;
     touch_denoise) srcdir="$SK/esp32s3_touch"; bin="$srcdir/esp32s3_touch.merged.bin"; inobin="esp32s3_touch.ino.merged.bin";;
     flashenc) srcdir="$SK/esp32s3_hello"; bin="$srcdir/esp32s3_hello.merged.bin"; inobin="esp32s3_hello.ino.merged.bin";;
+    rsa) srcdir="$SK/esp32s3_rsa/esp32s3_rsa_poke"; bin="$srcdir/esp32s3_rsa_poke.merged.bin"; inobin="esp32s3_rsa_poke.ino.merged.bin";;
   esac
   if [[ -n "$binrel" ]]; then
     bin="$SK/$binrel"

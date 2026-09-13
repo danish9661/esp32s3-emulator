@@ -282,3 +282,79 @@ fn slave_dma_flags_and_done_bits() {
     s.write32(SPI_INT_CLR, (1 << 8) | (1 << 9));
     assert_eq!(s.read32(SPI_INT_RAW) & ((1 << 8) | (1 << 9)), 0);
 }
+
+/// Quad-mode decode from SPI_CTRL FREAD/FCMD/FADDR bits (spi_reg.h):
+/// quad wins over dual, dual over single, default single.
+#[test]
+fn quad_mode_decodes_ctrl_bits() {
+    let mut s = Spi::new(0);
+    assert_eq!(s.quad_mode(), 0, "single by default");
+    // CTRL @ 0x08: FREAD_DUAL[14], FREAD_QUAD[15], FCMD/FADDR mirrors.
+    s.write32(SPI_CTRL, 1 << 14);
+    assert_eq!(s.quad_mode(), 1, "dual");
+    s.write32(SPI_CTRL, (1 << 14) | (1 << 15));
+    assert_eq!(s.quad_mode(), 2, "quad wins over dual");
+    s.write32(SPI_CTRL, 1 << 6); // FADDR_QUAD alone
+    assert_eq!(s.quad_mode(), 2, "addr-phase quad counts");
+}
+
+/// Fake quad device: provisioned pattern serves MISO when a wide mode is
+/// programmed (address-selected window), unprovisioned stays zeros, and
+/// single-line mode never consults the store.
+#[test]
+fn quad_fake_device_serves_pattern_and_round_trips() {
+    let mut s = Spi::new(0);
+    let pat: Vec<u8> = (0..64u8).collect();
+    s.quad_fake_provision(&pat);
+    // 4-byte MISO read at addr 0x10 with FREAD_QUAD -> pattern[0x10..].
+    s.write32(SPI_CLOCK, 0x1000);
+    s.write32(SPI_ADDR, 0x10);
+    s.write32(SPI_USER1, 23 << 27); // 24-bit address
+    s.write32(SPI_MS_DLEN, 31); // 32 data bits
+    s.write32(SPI_USER, (1 << 30) | (1 << 28)); // usr_addr + usr_miso
+    s.write32(SPI_CTRL, 1 << 15); // FREAD_QUAD
+    s.write32(SPI_CLK_GATE, 1);
+    s.write32(SPI_CMD, 1 << 24);
+    for _ in 0..256 {
+        s.tick(1);
+    }
+    assert_eq!(s.read32(SPI_DATA_BUF), 0x10111213, "quad window at addr");
+    // MOSI write at addr 0x20 commits into the store; read-back matches.
+    s.write32(SPI_DATA_BUF, 0xDEADBEEF);
+    s.write32(SPI_USER, (1 << 30) | (1 << 27)); // usr_addr + usr_mosi
+    s.write32(SPI_CMD, 1 << 24);
+    for _ in 0..256 {
+        s.tick(1);
+    }
+    s.write32(SPI_USER, (1 << 30) | (1 << 28));
+    s.write32(SPI_CMD, 1 << 24);
+    for _ in 0..256 {
+        s.tick(1);
+    }
+    assert_eq!(s.read32(SPI_DATA_BUF), 0xDEADBEEF, "write/read-back");
+}
+
+/// Sequential half-duplex (mosi+miso WITHOUT doutdin): the 8-bit MOSI byte
+/// shifts out first, then the MISO byte shifts in — the Arduino polling
+/// path (spiTransferByteNL programs usr_mosi|usr_miso, doutdin clear).
+/// Proven by the SDSPI probe: USER=0x18000001 must return the injected
+/// MISO byte, not zeros.
+#[test]
+fn sequential_halfduplex_miso_returns_injected_byte() {
+    let mut s = Spi::new(0);
+    s.write32(SPI_CLOCK, 0x1000); // 2 cyc/bit
+    s.write32(SPI_MS_DLEN, 7); // d = 8 bits per direction
+    s.write32(SPI_DATA_BUF, 0x40 << 24); // MOSI byte (CMD0-ish)
+    s.write32(SPI_USER, (1 << 27) | (1 << 28)); // mosi+miso, NO doutdin
+    s.write32(SPI_CLK_GATE, 1);
+    s.inject_miso(&[0x01]); // idle-high response
+    s.write32(SPI_CMD, 1 << 24);
+    for _ in 0..64 {
+        s.tick(1);
+    }
+    assert_eq!(s.read32(SPI_CMD) & (1 << 24), 0, "usr clears");
+    assert_eq!(s.read32(SPI_DATA_BUF) >> 24, 0x01, "MISO byte lands");
+    // MOSI event stream is the first d bits (the byte we sent).
+    let tx = s.take_last_tx().unwrap();
+    assert_eq!(tx, vec![0x40], "MOSI first half");
+}
