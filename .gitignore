@@ -19,3 +19,7 @@ help/
 # generated sketch artifacts (rebuilt by tools/build_ota.sh)
 tools/sketches/*/*.ino.elf
 tools/sketches/esp32s3_ota_update/ota_slot1_image.h
+
+# Secure-boot dev key + intermediate signed app (rebuilt by tools/build_secure_boot.sh)
+tools/sketches/esp32s3_secure_boot/secure_boot_signing_key.pem
+tools/sketches/esp32s3_secure_boot/app_signed.bin

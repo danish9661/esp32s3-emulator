@@ -4030,3 +4030,90 @@ IDF-driver MMC mount, `ee.*` unmapped patterns (loud trap, correct).
       against an external host (TinyUSB stack, MSC/HID/CDC classes) is
       weeks of work with no offline harness. Zero in-tree firmware needs
       it (all `Serial` via validated USB-Serial-JTAG). No action.
+  - 2026-09-14: **Hard trio CLOSED (all three, battery 100/0/0 + 6
+    pre-existing fails)**.
+    - **Secure-boot signed pipeline — CLOSED end-to-end.** New
+      `tools/build_secure_boot.sh` (build hello → `espsecure.py
+      generate-signing-key --version 2 --scheme ecdsa256` dev key →
+      `sign-data --version 2` → reassemble merged image with the SIGNED
+      app at 0x10000) + `tools/sketches/esp32s3_secure_boot/` (plain
+      hello source; the signing, not the firmware, is under test) +
+      `SECURE_BOOT_EN=1` fixture in `run_flash.rs` (burns BLK0 word 5 /
+      REPEAT_DATA4 bit 20 through the real PGM path, mirroring the
+      machine-test burn) + battery entry
+      `secure_boot|SECURE_BOOT_EN=1|Hello;boot OK|`. Signed image boots
+      to `Hello`/`boot OK` with the gate armed; unsigned parks both CPUs
+      with no output (STUCK at 0x40000400). Two real gotchas closed en
+      route: (1) the default `--version 2` key is RSA (ver 2/curve 225 →
+      model `Unsupported`) — must pass `--scheme ecdsa256` explicitly
+      for the P-256 path the ECDSA model covers; (2)
+      `signature-info-v2` on the whole 4 MB merged image reports
+      "absent" (it hashes only the app region) — verify the app region
+      (digest match + `verify_image` Valid), not the tool's merged-image
+      verdict. Dev key (`secure_boot_signing_key.pem`, gitignored) and
+      `app_signed.bin` are rebuild artifacts, NOT committed (like OTA's
+      generated header); the `.ino` + `.merged.bin` + script are.
+    - **IDF-driver eMMC mount — CLOSED end-to-end.** New
+      `tools/sketches/esp32s3_emmc_driver/` (real Arduino `SD_MMC` stack:
+      `setPins` + `begin` → `esp_vfs_fat_sdmmc_mount` MMC probe →
+      FATFS) + battery entry `emmc_driver|...|60000000`. Result on the
+      FIRST run, zero model changes: `BEGIN OK` / `SIZE MB=4` /
+      `TYPE=3` / `ROOT OK` / `HELLO.TXT` read + write/read-back →
+      `EMMC DRIVER FAT READ/WRITE PASS` / `DONE`. The in-model MMC card
+      (CMD1 personality switch, EXT_CSD, SWITCH, shared block I/O —
+      previously poke-only) already answers everything the IDF probe
+      needs. TYPE=3 is CORRECT silicon behavior here (Arduino
+      `cardType()` keys off the OCR CCS bit, not `is_mmc`), documented
+      in-sketch. Prior "IDF-driver MMC mount unreachable" note
+      superseded (that was the Arduino stack never attempting MMC;
+      calling the SDMMC path directly reaches it).
+    - **USB-OTG device-mode — CLOSED as far as offline-validatable.**
+      New `tools/sketches/esp32s3_usb_device/` (real Arduino TinyUSB
+      `USBHIDKeyboard` + `USB.begin()`, `kb.write('a')`) + battery entry
+      `usb_device|...|60000000`: `STACK UP` / `WRITE=1` / `PASS` /
+      `DONE` on the first run, zero model changes. Sketch lesson: HID
+      `KEY_*` macros don't exist in this core version (`press(KEY_A)`
+      fails compile) and `releaseAll()` returns void — use
+      `kb.write('a')`. What this proves: the TinyUSB stack initializes
+      the DWC2 core and stages HID reports without faulting. What stays
+      out (correctly scoped, no offline harness possible): real
+      enumeration against an EXTERNAL host (bus reset, SETUP/IN/OUT,
+      descriptors, address/config, MSC/HID/CDC classes) — weeks of work
+      with an external counterparty; host-mode enumeration against the
+      SIMULATED device (`usb_host`) + device EP0/EP1 loopback
+      (`usb_otg`) + this device-stack boot (`usb_device`) together cover
+      every validatable USB-OTG path. Zero in-tree firmware needs more
+      (all `Serial` via validated USB-Serial-JTAG).
+    - Proofs: 100/0/0 + the same 6 pre-existing fails (flashread
+      HIGH-ODD, i2c_poke, rmt, gpio_interrupt, mcpwm, mcpwm_fault —
+      stash-A/B proven unrelated rot); workspace + wasm32 green,
+      clippy `-D warnings` clean, fmt clean.
+  - 2026-09-14: **Stale-binary rot retired: 6 "pre-existing fails" were all
+    stale `.merged.bin` artifacts, battery now 106/0/0.** The 6 fails
+    (flashread HIGH-ODD, i2c_poke, rmt, gpio_interrupt, mcpwm,
+    mcpwm_fault) reproduced identically with and without tree changes
+    (stash A/B) — but the A/B only proved the RUST tree was innocent; the
+    real culprit was committed-but-stale firmware binaries (bins rebuilt
+    2026-09-13 17:36, sources newer). Per-case ground truth from fresh
+    runs: flashread HIGH-ODD = stale image (fresh bin passes all but the
+    last leg at 96M, needs the committed STEPS budget — battery entry
+    unchanged); i2c_poke raw=0/sr=0x4C000 = pre-clock-gating binary (Aug
+    SYSCON work made I2C0 tick-gated on EN0.7, the old sketch never
+    enables it — current .ino already has the `EN0 |= (1<<7)` RMW, the
+    committed bin predated it); rmt TIMEOUT = pre-enable binary
+    (current .ino has `EN0 |= (1<<9)`); gpio count=1 = pre-enable binary;
+    mcpwm sync cnt=74 + fault ev=0/enter=0 (idle=0!) = pre-enable binaries
+    (current .ino files enable EN0.17/20). Fix was407: `--build` the 6,
+    all green with ZERO source changes (`./tools/run_battery.sh --build
+    flashread i2c_poke rmt gpio_interrupt mcpwm mcpwm_fault` → 13/13),
+    then a full `--build` battery → **106/0/0, 0 skipped**. CAUTIONARY
+    TALE: a `--build` full run also rewrote 8 timestamp-only bins
+    (efuse/hello/ledc/lightsleep/periph/psram_opi+psram_qspi/uart_echo —
+    byte-identical rebuilds) plus secure_boot (key-regenerated signature,
+    still PASS); all reverted except the 6 stale + secure_boot so the
+    commit contains only behavior-changing binaries. LESSON (process):
+    "fails identically with/without my change" does NOT mean "not rot" —
+    always `--build` the failing case before declaring pre-existing rot;
+    the battery's `--build` path is the source of truth, committed bins
+    are cache. Proofs: 106/0/0 full `--build`; workspace + wasm32 green;
+    clippy `-D warnings` clean; fmt clean.

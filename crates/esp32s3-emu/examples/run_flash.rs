@@ -51,6 +51,20 @@ fn main() {
     let flash = fs::read(&path).expect("read flash image");
 
     let mut m = Esp32S3::new();
+    // Secure-boot fixture: SECURE_BOOT_EN=1 burns eFuse SECURE_BOOT_EN
+    // (BLK0 word 5 = REPEAT_DATA4 bit 20) through the real PGM path before
+    // boot, so `boot_from_flash` verifies the app region's signature sector
+    // (fail-closed: unsigned/bad-signature boots park the CPUs with no
+    // output). Pair with a genuinely `espsecure.py sign-data`-signed image
+    // (see tools/sketches/esp32s3_secure_boot/) for the allow path.
+    if env::var("SECURE_BOOT_EN").is_ok() {
+        const EFUSE_BASE: u32 = 0x6000_7000;
+        for (i, w) in [0u32, 0, 0, 0, 0, 1 << 20, 0, 0].iter().enumerate() {
+            m.soc.write32(EFUSE_BASE + (i as u32) * 4, *w);
+        }
+        m.soc.write32(EFUSE_BASE + 0x1D4, 0x2); // PGM bit, BLK_NUM 0
+        println!("[host] SECURE_BOOT_EN burned (fail-closed gate armed)");
+    }
     // Flash-encryption fixture: FLASHENC_KEY=<64 hex> provisions the eFuse
     // XTS key + crypt count, then uniformly encrypts the whole image
     // (every 16-byte block at its absolute offset, like esptool) before

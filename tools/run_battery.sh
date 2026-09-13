@@ -55,6 +55,7 @@ CASES=(
 "nvs||NVS PASS|"
 "coredump|PANIC_CONTINUE=1|COREDUMP CRASHING;COREDUMP boot 1;COREDUMP PASS|"
 "flashenc|FLASHENC_KEY=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f|Hello from ESP32-S3!;boot OK|"
+"secure_boot|SECURE_BOOT_EN=1|Hello from ESP32-S3!;boot OK|"
 "periph|ADC_INJECT_MV=825|boot OK|"
 "uart_echo|UART_INJECT=hello|[uart1] rx 'h'|"
 "uart_tout|UART_INJECT=Z|UART TOUT OK|"
@@ -114,7 +115,9 @@ CASES=(
 "sdfat||SD BEGIN OK;SD FAT READ PASS;SD FAT WRITE PASS;SD DONE|60000000"
 "sdspi|SPI_SDSPI=1|SDSPI BEGIN OK;SDSPI FAT READ PASS;SDSPI FAT WRITE PASS;SDSPI DONE|"
 "emmc||EMMC RPMB PASS;EMMC PASS;EMMC DONE|"
+"emmc_driver||EMMC DRIVER BEGIN OK;EMMC DRIVER FAT READ PASS;EMMC DRIVER FAT WRITE PASS;EMMC DRIVER DONE|60000000"
 "usb_host||USB HOST PORT OK;USB HOST DESC OK;USB HOST CFG OK;USB HOST STR OK;USB HOST SOF OK;USB HOST ENUM PASS;USB HOST DONE|"
+"usb_device||USB DEVICE STACK UP;USB DEVICE PASS;USB DEVICE DONE|60000000"
 "deepsleep_poke||DEEPSLEEP PASS|"
 "deepsleep||DEEPSLEEP START;DEEPSLEEP WOKE;DEEPSLEEP PASS|50000000"
 "deepsleep_ext0||DEEPSLEEP EXT0 START;DEEPSLEEP EXT0 WOKE;DEEPSLEEP EXT0 PASS|50000000"
@@ -237,6 +240,11 @@ for c in "${CASES[@]}"; do
     if [[ "$name" == "ota_update" ]]; then
       # Two-pass build (slot-1 image embedded into the updater).
       if ! "$ROOT/tools/build_ota.sh" >/tmp/battery_build.log 2>&1; then
+        echo "FAIL $name (compile)"; tail -3 /tmp/battery_build.log; fail=$((fail+1)); continue
+      fi
+    elif [[ "$name" == "secure_boot" ]]; then
+      # Sign-then-reassemble build (signed hello app + merged flash image).
+      if ! "$ROOT/tools/build_secure_boot.sh" >/tmp/battery_build.log 2>&1; then
         echo "FAIL $name (compile)"; tail -3 /tmp/battery_build.log; fail=$((fail+1)); continue
       fi
     elif ! arduino-cli compile --fqbn "$fqbn" --build-path "$srcdir/build" "$srcdir" >/tmp/battery_build.log 2>&1; then
