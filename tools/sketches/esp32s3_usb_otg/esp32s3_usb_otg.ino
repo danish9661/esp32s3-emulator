@@ -97,6 +97,11 @@ void setup() {
   Serial.println(echo_ok ? "OTG ECHO OK" : "OTG ECHO MISMATCH");
   if (!echo_ok) return;
 
+  // Clear the EP0 IN/OUT stages we drove (real ISRs W1C every flag they
+  // handle — `handle_ep_irq` clears via DEPINTx); then the core must read
+  // quiet: no host, no pending events.
+  *O(0x908) = 1u;  // DIEPINT0.XFRC (status stage)
+  *O(0xB08) = 1u;  // DOEPINT0.XFRC (SETUP stage)
   bool quiet = *O(0x014) == 0;  // GINTSTS: no host, no events
   Serial.println(quiet ? "OTG PASS" : "OTG FAIL");
 }

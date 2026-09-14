@@ -2821,6 +2821,189 @@ mod cpu_tests {
     }
 
     #[test]
+    fn ee_fused_valu_new_rows_add_min_max() {
+        // GAS-probed 2026-09-14 (q0,a2,q3,q4,q5 forms): the E0-row
+        // extensions decode from the full (b1[1:0],b2[6:4]) table and the
+        // E4/E5/E8-row stores from their row tables.
+        // ee.vmax.s16.ld.incp q0, a2, q3, q4, q5 = 2f 2d 93 e0.
+        let (cpu, _) = ee_run_mem(0xE093_2D2F, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 10);
+            }
+            c.qregs[4] = [1; 16];
+            c.qregs[5] = [2; 16];
+        });
+        assert_eq!(cpu.qregs[0], [10; 16]);
+        assert_eq!(cpu.qregs[3], [2; 16], "max(1,2) = 2");
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+        // ee.vmin.s32.ld.incp q0, a2, q3, q4, q5 = 2f 2e b3 e0.
+        let (cpu, _) = ee_run_mem(0xE0B3_2E2F, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 10);
+            }
+            for i in 0..4 {
+                crate::ee::set_q_u32(c, 4, i, 100);
+                crate::ee::set_q_u32(c, 5, i, 7);
+            }
+        });
+        assert_eq!(cpu.qregs[0], [10; 16]);
+        for i in 0..4 {
+            assert_eq!(crate::ee::q_u32(&cpu, 3, i), 7, "min(100,7) lane {i}");
+        }
+        // ee.vmax.s16.st.incp q0, a2, q3, q4, q5 = 2f 23 8b e4 stores
+        // q0 then writes max(q4,q5) into q3.
+        let (cpu, mut bus) = ee_run_mem(0xE48B_232F, 4, |c, _| {
+            c.set_reg(2, 0x4000_3000);
+            c.qregs[0] = [9; 16];
+            for i in 0..8 {
+                crate::ee::set_q_u16(c, 4, i, 30);
+                crate::ee::set_q_u16(c, 5, i, 40);
+            }
+        });
+        for i in 0..16 {
+            assert_eq!(bus.read8(0x4000_3000 + i as u32), 9);
+        }
+        for i in 0..8 {
+            assert_eq!(crate::ee::q_u16(&cpu, 3, i), 40, "max(30,40) lane {i}");
+        }
+        assert_eq!(cpu.reg(2), 0x4000_3010);
+        // ee.vmin.s8.st.incp q0, a2, q3, q4, q5 = 2f 22 83 e5.
+        let (cpu, mut bus) = ee_run_mem(0xE583_222F, 4, |c, _| {
+            c.set_reg(2, 0x4000_3000);
+            c.qregs[0] = [7; 16];
+            c.qregs[4] = [5; 16];
+            c.qregs[5] = [50; 16];
+        });
+        for i in 0..16 {
+            assert_eq!(bus.read8(0x4000_3000 + i as u32), 7);
+        }
+        assert_eq!(cpu.qregs[3], [5; 16], "min(5,50) = 5");
+        // ee.vsubs.s32.st.incp q0, a2, q3, q4, q5 = 2f 22 8b e8
+        // (E8 row, b2[3] set — disjoint from src.q.ld.xp).
+        let (cpu, mut bus) = ee_run_mem(0xE88B_222F, 4, |c, _| {
+            c.set_reg(2, 0x4000_3000);
+            c.qregs[0] = [7; 16];
+            for i in 0..4 {
+                crate::ee::set_q_u32(c, 4, i, 100);
+                crate::ee::set_q_u32(c, 5, i, 30);
+            }
+        });
+        for i in 0..16 {
+            assert_eq!(bus.read8(0x4000_3000 + i as u32), 7);
+        }
+        for i in 0..4 {
+            assert_eq!(crate::ee::q_u32(&cpu, 3, i), 70, "100-30 lane {i}");
+        }
+    }
+
+    #[test]
+    fn ee_fused_vmul_unsigned_rows() {
+        // ee.vmul.u8.ld.incp q0, a2, q3, q4, q5 = 2f 2c e3 e0, SAR = 1:
+        // (200*2)>>1 = 200 truncated to u8.
+        let (cpu, _) = ee_run_mem(0xE0E3_2C2F, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 4);
+            }
+            c.qregs[4] = [200; 16];
+            c.qregs[5] = [2; 16];
+            c.set_sreg(crate::cpu::SR_SAR, 1);
+        });
+        assert_eq!(cpu.qregs[0], [4; 16]);
+        assert_eq!(cpu.qregs[3], [200; 16]);
+        // ee.vmul.u16.st.incp q0, a2, q3, q4, q5 = 2f 23 8b e5 stores
+        // q0 then writes (q4*q5)>>SAR into q3.
+        let (cpu, mut bus) = ee_run_mem(0xE58B_232F, 4, |c, _| {
+            c.set_reg(2, 0x4000_3000);
+            c.qregs[0] = [7; 16];
+            for i in 0..8 {
+                crate::ee::set_q_u16(c, 4, i, 1000);
+                crate::ee::set_q_u16(c, 5, i, 4);
+            }
+            c.set_sreg(crate::cpu::SR_SAR, 2);
+        });
+        for i in 0..16 {
+            assert_eq!(bus.read8(0x4000_3000 + i as u32), 7);
+        }
+        for i in 0..8 {
+            assert_eq!(crate::ee::q_u16(&cpu, 3, i), 1000, "(1000*4)>>2 lane {i}");
+        }
+    }
+
+    #[test]
+    fn ee_vsmulas_fused_load_then_mac() {
+        // ee.vsmulas.s8.qacc.ld.incp q0, a2, q3, q4, 0 = 2e ec 20 e0:
+        // MAC scalar q4.s8[0] = 2 across q3 = ones, then load mem into q0.
+        let (cpu, _) = ee_run_mem(0xE020_EC2E, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 10);
+            }
+            c.qregs[3] = [1; 16];
+            c.qregs[4] = [2; 16];
+        });
+        assert_eq!(cpu.qregs[0], [10; 16]);
+        for acc in 0..2 {
+            for i in 0..8 {
+                assert_eq!(crate::ee::acc_s20(&cpu, acc, i), 2, "acc{acc}[{i}]");
+            }
+        }
+        assert_eq!(cpu.reg(2), 0x4000_2010);
+        // ee.vsmulas.s16.qacc.ld.incp q0, a2, q3, q4, 2 = 2e ec 72 e0:
+        // scalar q4.s16[2] = 5, q3 lanes = 10 → 50 per 40-bit lane.
+        let (cpu, _) = ee_run_mem(0xE072_EC2E, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            for i in 0..16 {
+                b.write8(0x4000_2000 + i as u32, 3);
+            }
+            for i in 0..8 {
+                crate::ee::set_q_u16(c, 3, i, 10);
+                crate::ee::set_q_u16(c, 4, i, 0);
+            }
+            crate::ee::set_q_u16(c, 4, 2, 5);
+        });
+        for acc in 0..2 {
+            for i in 0..4 {
+                assert_eq!(crate::ee::acc_s40(&cpu, acc, i), 50, "acc{acc}[{i}]");
+            }
+        }
+    }
+
+    #[test]
+    fn ee_vmulas_ldbc_qup_mac_broadcast_slide() {
+        // ee.vmulas.s8.qacc.ldbc.incp.qup q0, a2, q3, q4, q5, q6
+        // = 2e e9 56 e0: MAC q3*q4 into QACC, broadcast mem byte 9 into
+        // q0, AR += 1, slide qs0(=q5) by SAR_BYTE with qs1(=q6) fill.
+        let (cpu, _) = ee_run_mem(0xE056_E92E, 4, |c, b| {
+            c.set_reg(2, 0x4000_2000);
+            b.write8(0x4000_2000, 9);
+            c.qregs[3] = [1; 16];
+            c.qregs[4] = [2; 16];
+            c.qregs[5] = [3; 16];
+            c.qregs[6] = [7; 16];
+            c.sar_byte = 4;
+        });
+        assert_eq!(cpu.qregs[0], [9; 16]);
+        for acc in 0..2 {
+            for i in 0..8 {
+                assert_eq!(crate::ee::acc_s20(&cpu, acc, i), 2, "acc{acc}[{i}]");
+            }
+        }
+        assert_eq!(cpu.reg(2), 0x4000_2001);
+        // Slide: q5[i] = old q5[i+4] for i < 12, q6 fill after.
+        for i in 0..12 {
+            assert_eq!(cpu.qregs[5][i], 3);
+        }
+        for i in 12..16 {
+            assert_eq!(cpu.qregs[5][i], 7, "slide fill [{i}]");
+        }
+        // MAC sources untouched by the slide.
+        assert_eq!(cpu.qregs[4], [2; 16]);
+    }
+
+    #[test]
     fn ee_r2bf_butterfly_sums_and_differences() {
         // ee.fft.r2bf.s16 q0, q1, q2, q3, 0 = 64 14 cc.
         let (cpu, _) = ee_run_mem(0xCC1464, 3, |c, _| {

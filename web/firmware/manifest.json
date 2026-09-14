@@ -142,7 +142,12 @@
     "file": "esp32s3_emmc_driver.merged.bin"
   },
   {
-    "name": "usb_device — TinyUSB HID device stack boot",
+    "name": "usb_device — TinyUSB HID live enum (REQ0 IN bytes)",
     "file": "esp32s3_usb_device.merged.bin"
+  },
+  {
+    "name": "touch — touch pad readout (needs TOUCH_INJECT fixture)",
+    "file": "esp32s3_touch.merged.bin",
+    "touch": "3:1877"
   }
 ]

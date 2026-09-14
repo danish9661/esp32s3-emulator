@@ -9,6 +9,9 @@ Serves web/ over HTTP, loads index.html in Chromium, and asserts:
   5. sdspi gallery entry boots in-wasm to 'SDSPI FAT READ PASS'
      (proves the `"sdspi": true` manifest flag wires the virtual SD card
      through the new `spi_sdspi_attach_sdmmc_image` bridge call)
+  6. touch gallery entry reads the injected pad counter in-wasm
+     ('TOUCH PASS' — proves the `"touch": "3:1877"` manifest flag wires
+     TOUCH_INJECT through the new `touch_inject` bridge call)
 
 Fails loudly on any page error. Exits 0 on PASS, 1 on FAIL.
 """
@@ -147,6 +150,26 @@ try:
         except Exception:
             tail = page.eval_on_selector("#console", "el => el.textContent.slice(-800)")
             check("sdspi-inwasm-mount", False, f"(tail={tail!r})")
+
+        # --- Test 6: touch gallery entry reads the injected pad counter ---
+        # (proves the `"touch": "3:1877"` manifest flag wires TOUCH_INJECT
+        # through the new `touch_inject` bridge call)
+        page.click("#stop")
+        page.select_option("#gallery", value="./firmware/esp32s3_touch.merged.bin")
+        page.wait_for_function(
+            "() => !document.getElementById('run').disabled",
+            timeout=120000,
+        )
+        page.click("#run")
+        try:
+            page.wait_for_function(
+                "() => document.getElementById('console').textContent.includes('TOUCH PASS')",
+                timeout=240000,
+            )
+            check("touch-inwasm-read", True)
+        except Exception:
+            tail = page.eval_on_selector("#console", "el => el.textContent.slice(-800)")
+            check("touch-inwasm-read", False, f"(tail={tail!r})")
 
         real_errors = [e for e in errors if "favicon" not in e.lower()]
         check("no-page-errors-final", len(real_errors) == 0, f"({real_errors[:3]!r})" if real_errors else "")

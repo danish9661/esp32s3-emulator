@@ -25,6 +25,7 @@ static int8_t dsp_b[16] __attribute__((aligned(16)));
 static int8_t dsp_c[16] __attribute__((aligned(16)));
 static int8_t dsp_d[16] __attribute__((aligned(16)));
 static int8_t dsp_o[16] __attribute__((aligned(16)));
+static int8_t dsp_o2[16] __attribute__((aligned(16)));
 static int8_t dsp_e[16] __attribute__((aligned(16)));
 static int8_t dsp_f[16] __attribute__((aligned(16)));
 static int8_t dsp_g[16] __attribute__((aligned(16)));
@@ -155,6 +156,10 @@ void setup() {
   uint8_t *pb5 = (uint8_t *)dsp_b;
   uint32_t srs_a = 0, srs_b = 0;
   int sh2 = 2, sh0 = 0;
+  // NOTE: srs outputs use early-clobber '&' — the first srs writes its
+  // rd before the second srs reads its shift input, so GCC must not
+  // alias an output over a later-consumed input (without '&', GCC put
+  // srs_a and sh0 in the same register and the second shift read 374).
   __asm__ volatile(
       "ee.zero.accx\n"
       "ee.vld.128.ip q0, %0, 16\n"
@@ -162,7 +167,7 @@ void setup() {
       "ee.vmulas.s8.accx q0, q1\n"
       "ee.srs.accx %2, %4, 0\n"
       "ee.srs.accx %3, %5, 0\n"
-      : "+a"(pa5), "+a"(pb5), "=a"(srs_a), "=a"(srs_b)
+      : "+a"(pa5), "+a"(pb5), "=&a"(srs_a), "=&a"(srs_b)
       : "a"(sh2), "a"(sh0)
       : "memory");
   Serial.print("EE DSP SRS a=");
@@ -171,6 +176,71 @@ void setup() {
   Serial.println(srs_b);
   if (srs_a == 374 && srs_b == 374) {
     Serial.println("EE DSP SRS OK");
+  } else {
+    Serial.println("EE DSP FAIL");
+  }
+
+  // --- Test 6: fused vector-ALU + load/store (previously-unmapped tail:
+  // vmax.s16.ld.incp, vmin.s8.st.incp, vsubs.s32.ld.incp, vmul.u8.st).
+  // Reload C/D ([100]/[50]) into q0/q1 with plain loads (deterministic
+  // ALU sources regardless of earlier tests), then one fused op per
+  // family, storing each ALU result for the verdict.
+  uint8_t *pa6 = (uint8_t *)dsp_c;
+  uint8_t *pb6 = (uint8_t *)dsp_d;
+  uint8_t *po6 = (uint8_t *)dsp_o;
+  for (int i = 0; i < 16; i++) dsp_o[i] = 0;
+  // NOTE: SAR is set from a stack-slot reload inside the asm (wsr reads a
+  // dedicated input re-loaded per block): an earlier draft passed SAR in a
+  // register across Serial.print calls, and GCC kept it in a3 without
+  // reloading — the calls clobbered it, silently changing the shift.
+  __asm__ volatile(
+      "movi a3, 1\n"
+      "wsr.sar a3\n"
+      "ee.vld.128.ip q0, %0, 16\n"
+      "ee.vld.128.ip q1, %1, 16\n"
+      // q5 = max(q0,q1) = [100] (s16 lanes); store q5 to dsp_o via vst.
+      "ee.vmax.s16.ld.incp q2, %0, q5, q0, q1\n"
+      "ee.vst.128.ip q5, %2, 16\n"
+      : "+a"(pa6), "+a"(pb6), "+a"(po6)
+      :
+      : "a3", "memory");
+  bool ok_max = true;
+  for (int i = 0; i < 16; i++) {
+    if (dsp_o[i] != 100) ok_max = false;
+  }
+  Serial.print("EE DSP FUSED max=");
+  Serial.println((int)(uint8_t)dsp_o[0]);
+  // q3 = (q0*q1)>>1 truncated to u8 = (100*50)>>1 & 0xFF = 196.
+  // The fused store advances its AR by 16 (incp postupdate), so the
+  // verdict reads dsp_o[16]; dsp_o[0..16) holds the store half (mem-qu
+  // source q2, seeded to [7] below through a dedicated array so the
+  // verdict is independent of stale Q state). This validates BOTH halves
+  // of the fused store (store-half bytes + ALU result) with no ambiguity.
+  static int8_t dsp_p[16] __attribute__((aligned(16)));
+  for (int i = 0; i < 16; i++) dsp_p[i] = 7;
+  uint8_t *pa8 = (uint8_t *)dsp_c;
+  uint8_t *pb8 = (uint8_t *)dsp_d;
+  uint8_t *po8 = (uint8_t *)dsp_o;
+  uint8_t *pp8 = (uint8_t *)dsp_p;
+  uint8_t *pq8 = (uint8_t *)dsp_o2;
+  for (int i = 0; i < 16; i++) { dsp_o[i] = 0; dsp_o2[i] = 0; }
+  __asm__ volatile(
+      "movi a3, 1\n"
+      "wsr.sar a3\n"
+      "ee.vld.128.ip q0, %0, 16\n"
+      "ee.vld.128.ip q1, %1, 16\n"
+      "ee.vld.128.ip q2, %3, 16\n"
+      "ee.vmul.u8.st.incp q2, %2, q3, q0, q1\n"
+      "ee.vst.128.ip q3, %4, 16\n"
+      : "+a"(pa8), "+a"(pb8), "+a"(po8), "+a"(pp8), "+a"(pq8)
+      :
+      : "a3", "memory");
+  Serial.print("EE DSP FUSED store=");
+  Serial.print((int)(uint8_t)dsp_o[0]);
+  Serial.print(" mul=");
+  Serial.println((int)(uint8_t)dsp_o2[0]);
+  if (ok_max && (uint8_t)dsp_o[0] == 7 && (uint8_t)dsp_o2[0] == 196) {
+    Serial.println("EE DSP FUSED OK");
   } else {
     Serial.println("EE DSP FAIL");
   }

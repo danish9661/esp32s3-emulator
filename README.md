@@ -20,10 +20,10 @@ peripherals) with no server-side emulation.
 - **P5 (peripheral validation) complete**: every SoC peripheral is
   validated end-to-end by booting **real arduino-cli firmware** and asserting
   both serial output and internal emulator state. Battery: **106/0/0**
-  (106 pass, 0 fail, 0 skipped) across 36 gallery entries + driver/poke
+  (106 pass, 0 fail, 0 skipped) across 37 gallery entries + driver/poke
   sketches, plus Playwright browser E2E ALL PASS.
 - **P6 (browser frontend) complete**: Serial console + serial input row
-  (USB-CDC/UART0/1/2 + Send), GPIO LED grid, firmware gallery (36 entries:
+  (USB-CDC/UART0/1/2 + Send), GPIO LED grid, firmware gallery (37 entries:
   every major peripheral + SDSPI with in-browser card attach, emmc_driver,
   usb_device; flashenc reuses the hello bin with a `key` field), MIPS meter,
   Playwright E2E (hello boot, serial echo, UART1 round-trip, SDSPI mount).
@@ -79,11 +79,16 @@ cd web && python3 -m http.server 8000   # open http://localhost:8000
 
 The page has:
 - **Serial console** — drains the UART buffer each frame and renders output
+- **Serial input row** — port selector (USB-CDC/UART0/1/2) + text box + Send;
+  Enter sends with trailing newline for `readStringUntil`/REPL readers
 - **40-pin GPIO LED grid** — real-time pin state visualization
-- **Examples dropdown** — 36 bundled firmware sketches (fetches + loads)
+- **Examples dropdown** — 37 bundled firmware sketches (fetches + loads),
+  incl. touch (in-browser `TOUCH_INJECT` fixture) and SDSPI (in-browser
+  card attach); flashenc reuses the hello bin with a `key` field
 - **File input** — load your own `.merged.bin`
 - **Run / Stop / Reset** — step-level control
 - **Steps-per-frame slider** — tune emulation speed vs. responsiveness
+- **MIPS meter** — smoothed emulated instructions per wall second
 
 ## Repository Layout
 

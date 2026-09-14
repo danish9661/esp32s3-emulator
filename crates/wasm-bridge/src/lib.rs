@@ -10,6 +10,7 @@
 use wasm_bindgen::prelude::*;
 
 use esp32s3_emu::Esp32S3;
+use xtensa_core::Bus;
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -199,6 +200,31 @@ impl Emulator {
     /// flow; idempotent within a boot (re-attaching resets card state).
     pub fn spi_sdspi_attach_sdmmc_image(&mut self, chan: u32) {
         self.inner.soc.spi_sdspi_attach_sdmmc_image(chan as usize);
+    }
+
+    /// Inject a touch counter value on pad 1..=14 (host frontend — drives
+    /// what the firmware reads from the touch STATUS registers). Mirrors
+    /// the `run_flash` TOUCH_INJECT=<pad>:<val> flow (e.g. `3:1877` for
+    /// the gallery touch entry); call after load, before Run.
+    pub fn touch_inject(&mut self, pad: u32, value: u32) {
+        self.inner.soc.touch_inject(pad as usize, value);
+    }
+
+    /// Burn eFuse SECURE_BOOT_EN (fail-closed gate) through the real PGM
+    /// path (BLK0 word 5 = REPEAT_DATA4 bit 20), mirroring the `run_flash`
+    /// SECURE_BOOT_EN=1 fixture and the machine-test burn. Call BEFORE
+    /// `load_flash` so `boot_from_flash` verifies the app region's
+    /// signature sector; pair with a genuinely `espsecure.py sign-data`-
+    /// signed image (see tools/sketches/esp32s3_secure_boot/). Unsigned
+    /// images with the gate armed park both CPUs with no output (verified
+    /// in-wasm: signed hello boots to `boot OK`, stock hello parks at 0
+    /// insns / 0 UART bytes).
+    pub fn secure_boot_enable(&mut self) {
+        const EFUSE_BASE: u32 = 0x6000_7000;
+        for (i, w) in [0u32, 0, 0, 0, 0, 1 << 20, 0, 0].iter().enumerate() {
+            self.inner.soc.write32(EFUSE_BASE + (i as u32) * 4, *w);
+        }
+        self.inner.soc.write32(EFUSE_BASE + 0x1D4, 0x2); // PGM bit, BLK_NUM 0
     }
 
     /// Stage one camera frame (bytes, packed LE into words) for LCD_CAM

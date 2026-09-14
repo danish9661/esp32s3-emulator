@@ -89,20 +89,20 @@ Core design:
         `ee.*` DSP/TIE executing, incl. `ee_srs_accx`; unmapped patterns
         trap loud, correct). OTA boot-slot selection implemented; ROM
         coverage sufficient (5+ real sketches boot). Battery 106/0/0,
-        gallery 36 entries, Playwright E2E ALL PASS.
+        gallery 37 entries, Playwright E2E ALL PASS.
 - [x] **P6 — Frontend polish**: serial console UI, GPIO/LED visualization,
-      example firmware gallery (36 entries: every major peripheral + SDSPI
-      with in-browser card attach, emmc_driver, usb_device; flashenc reuses
+      example firmware gallery (37 entries: every major peripheral + SDSPI
+      with in-browser card attach, emmc_driver, usb_device, touch with
+      in-browser TOUCH_INJECT fixture; flashenc reuses
       the hello bin with a `key` field; serial input row + MIPS meter).
 - [ ] WiFi/BLE: OUT OF SCOPE for now (months of work; not required for the
       core milestone).
 
 Scope updates (2026-09-14): P5/P6 done — battery 106/0/0 (0 skipped),
-gallery 36/36 in-wasm-validatable entries, Playwright E2E ALL PASS
+gallery 37/37 in-wasm-validatable entries, Playwright E2E ALL PASS
 (hello boot, MIPS, serial echo, UART1 round-trip, SDSPI mount). Earlier
 scoping notes below are HISTORICAL (superseded where they conflict):
-Touch validated after all (see status log — gallery-excluded by policy:
-needs TOUCH_INJECT, which the browser cannot provide);
+Touch validated after all (see status log);
 `ee.*` now 218/218 executing (incl. `ee_srs_accx`); eMMC simulated card,
 flash-encryption pipeline, USB-OTG host enumeration, IDF-driver eMMC mount
 (`emmc_driver`), USB-OTG device-stack boot (`usb_device`), and the
@@ -112,7 +112,7 @@ host (no offline harness possible; every validatable path — host enum of
 the simulated device, EP0/EP1 loopback, TinyUSB HID boot — is covered),
 `ee.*` unmapped patterns (loud trap, correct). Gallery-excluded by policy
 (needs a host fixture the browser cannot provide): `secure_boot`
-(SECURE_BOOT_EN burn), Touch (TOUCH_INJECT).
+(SECURE_BOOT_EN burn).
 
 ## Validation strategy
 
@@ -4226,3 +4226,118 @@ the simulated device, EP0/EP1 loopback, TinyUSB HID boot — is covered),
     in load-bearing docs (the 13 historical status-log mentions stay
     as history). Proofs: bundle check ALL PASS, freshness guard 0
     FAILs, clippy `-D warnings`/fmt clean.
+  - 2026-09-14: **Gallery 36→37: touch joins via in-browser TOUCH_INJECT
+    fixture (P6)**. New `Emulator::touch_inject(pad, value)` bridge API
+    (mirrors `run_flash` TOUCH_INJECT) + `"touch": "3:1877"` manifest flag
+    plumbed through gallery-select/`loadFlash` (file-input uploads stay
+    fixture-free), `esp32s3_touch.merged.bin` copied to `web/firmware/`.
+    `secure_boot_enable()` bridge API also added (mirrors the
+    SECURE_BOOT_EN=1 PGM burn; must precede `load_flash`) but
+    deliberately has NO gallery entry — the stock gallery secure_boot
+    image is unsigned, so arming the gate in-browser would brick the
+    demo (secure_boot stays battery-only; verified in-wasm instead via a
+    temporary node harness, since removed: signed hello + gate → `boot
+    OK` at 34.7M insns, stock hello + gate → parked at 0 insns / 0 UART
+    bytes, i.e. correct fail-closed deny). Playwright E2E extended with
+    Test 6 (`touch-inwasm-read`: select touch entry → `TOUCH PASS`) →
+    ALL PASS (38 gallery options, zero page errors). Docs synced to 37
+    everywhere (roadmap, README status + dropdown count, freshness-guard
+    comments); stale "Touch excluded" phrasing retired from load-bearing
+    docs (historical status-log lines stay as history). Proofs: Playwright
+    ALL PASS, clippy `-D warnings`/fmt clean, freshness guard 0 FAILs,
+    API-compat 13/13 `emu.*` calls in the d.ts.
+  - 2026-09-14: **ee.* 27 dead variants wired + USB-OTG device auto-enum
+    path (P5)**. Two workstreams landed in-tree (this commit).
+    - **ee.* (27/27 now reachable, was enum-only)**. Audit found 27
+      `OPCODE_EE_*` enum variants referenced NOWHERE in any decode path
+      (fused valu/vmul stores, vmax/vmin ld/st, vmul.u8/u16 ld/st, vsubs
+      st, vsmulas-fused, ldbc-qup) — the "218/218 executing" claim counted
+      enum entries, not reachable ones. GAS-probed all 27 words (q0,a2,q3,
+      q4,q5 forms) plus full qu/AR/qx/qy/sel sweeps; extended `decode_ee`
+      (E0-row full (op,width) table, E4/E5/E8 store rows on
+      (b3,b1[1:0],b2[3:0]) with mem-qu in b2[6:4], vsmulas b1=0xEC page,
+      ldbc.qup b2==0x56 page) + `exec_ee` arms (U8/U16 fused-vmul lanes,
+      vsmulas-fused with corrected qx/qy/sel map, ldbc-qup with
+      vsmulas-position MAC + full 3-bit slide). Stacked page bugs fixed en
+      route, each proven by probe: LDXQ stole the nibble-D row (fused
+      table now first); E0 page must span E0-E3 (mem-qu rides b3[1:0] —
+      caught live by real firmware `vmax.s16.ld.incp q2,...` = 0xE1950D8E
+      trapping); b1[7:4]/b2[6:4] are q-fields, not opcode consts (operand
+      sweeps proved it — an early (b1&0xF0)==0x20 gate missed real
+      firmware with qx=q0/qy=q1); E5 pairs split on the b2[3:0] nibble,
+      not b2[3] (which is mem-qu[0] — qu-odd words misdecoded); vsmulas
+      qx/qy/sel remapped (qy = raw[23]++raw[13:12], qx =
+      raw[15:14]++raw[0], s8 sel = b2[4]++b2[3:0]). 4 new lib KATs
+      (fused rows, unsigned vmul, vsmulas-fused, ldbc-qup slide);
+      unreferenced-variant count 27→0, all 27 GAS words decode to their
+      own names (harness-verified).
+    - **USB-OTG device auto-enum (model path proven, live run pending)**.
+      `usb_otg.rs` gains the device interrupt path the old model left at
+      zero: GINTSTS USBRST/ENUMDNE latches (W1C) + DSTS ENUMSPD=FS +
+      GRXSTSP SETUP_RX/SETUP_DONE pops + RXFIFO staging + DOEPINT0
+      STPKTRCVD/SETUP (W1C) + DAINT EP0 bits + DIEPCTL0 EPENA/DIEPTSIZ0 +
+      TXFE/XFRC IN completion with IN-capture + status-OUT completion +
+      per-endpoint DFIFO pages (EPn-IN @ +0x1000*n) + FDMOD gate. Soc
+      exposes `usb_host_bus_reset/setup/status_out/take_in`; `run_flash`
+      gains a staged `USB_HOST_ENUM=1` scenario (reset + 7 SETUPs against
+      the firmware's own descriptors); machine test
+      `usb_device_auto_enum_moves_descriptor` moves 18 bytes end to end.
+      `dcd_init` flow verified against the linked-ELF disassembly
+      (GINTMSK USBRST|ENUMDNE|OTGINT|WKUINT, DCFG FS|NZLSOHSK, FDMOD,
+      USB_WRAP plain store — all compatible). NOT yet proven: a full live
+      run against the real TinyUSB stack (the ISR consumes SETUP via
+      RXFIFO pops inside the RXFLVL handler and needs per-transfer
+      staging the sketch doesn't drive yet) — next step, explicitly
+      out of this commit.
+    - **Sketch fixes en route (all sketch-side, model was right)**:
+      ee_dsp SRS missing `&` early-clobber (GCC aliased srs_a over the
+      sh0 input → b=0; was failing on the committed bin too), SAR kept in
+      a3 across Serial.print calls (re-materialize `movi a3,1` in-block),
+      fused-st AR postupdate (+16) aliasing the following vst pointer
+      (separate output array + both-halves verdict: store=7, mul=196).
+      ee_dsp battery markers gain `EE DSP FUSED OK`; usb_otg sketch does
+      ISR-hygiene W1C before its quiet check (live OEPINT/IEPINT overlay
+      made the old check fail).
+    - Proofs: workspace 574/0, clippy 0, fmt clean, battery 106/0/0,
+      freshness guard 0 FAILs (usb_device/usb_otg/ee_dsp rebuilt).
+  - 2026-09-16: **USB-OTG device live auto-enum CLOSED (was "model proven,
+    live pending")**. `tools/sketches/esp32s3_usb_device` (TinyUSB
+    `USBHIDKeyboard` + `USB.begin()`) now enumerates REQ0 live under
+    `USB_HOST_ENUM=1`: `STACK UP` → harness bus-reset + ENUMDONE →
+    sketch `POLL RDV` → harness GET_DESCRIPTOR(device, 8) SETUP → ISR
+    schedules TSIZ=8 → IN payload completes → sketch `ENUM OK` +
+    `WRITE=1`/`PASS`/`DONE`, harness `8B capture [12,01,00,02,ef,02,
+    01,40]` + `status OUT closed`. Battery entry now asserts the live
+    markers (`USB_HOST_ENUM=1`, `RESET ENUMSPD`/`POLL RDV`/`ENUM OK`/
+    `PASS`/`DONE`, 60M STEPS); gallery manifest text updated to the live
+    demo. Root cause of the old `FAIL IN SCHED` was a HARNESS/sketch
+    rendezvous race, not a model gap — proven by single-step ground
+    truth (`m.step()` + probe TSIZ reads): the transfer schedules at
+    +2316 steps after stage and drains at +2423, all inside the
+    preempting core-1 ISR, while the sketch task resumes polling only at
+    ~+8856 (FreeRTOS `println` TX path between print call and harness
+    drain). So a task-side TSIZ-scheduled poll can NEVER observe the
+    transfer (TSIZ=8 lives ~107 steps while the task is preempted — the
+    same on silicon). Fix: the sketch prints `POLL RDV`, delays
+    `delay(20)` (millions of steps vs ~2.4k stage-to-complete), then
+    reads the latched `dev_in_mirror` payload (no TSIZ poll, no IN W1C —
+    the ISR owns the EP flags); the harness stages strictly on the POLL
+    marker + closes status-out exactly once on `ENUM OK` (uart_buf-local
+    `[status-out]` tag). Model `usb_otg.rs` itself was already correct
+    (all 14 lib + 4 emu USB tests green throughout); this commit only
+    adds rendezvous documentation (`usb_host_setup` DWC2
+    single-transaction note, `dev_in_maybe_complete` synchronous-drain
+    note) plus the harness matrix-route comment. Cautionary tales: (1) a
+    `git checkout -- tools/sketches` mid-session silently reverted the
+    .ino to the 111-line stack-boot version (no REQ0 path) while the
+    uncommitted model/harness stayed — always re-verify sketch strings
+    (`POLL RDV` in the merged bin) after any checkout; (2) `delay(50)`
+    between POLL print and wait does NOT help (the wait still starts
+    after the drain); only delay-then-mirror (no scheduled poll) is
+    race-free; (3) probe reads of GRXSTSP/DFIFO0 consume live state —
+    the `usbprobe.rs` diagnosis harness is deleted, use single-step
+    `m.step()` + TSIZ-edge logs for rendezvous timing.
+    - Proofs: live `ENUM OK` + `PASS`/`DONE` at 60M STEPS, `usb_host_
+      take_in` 8B correct on both observers, 39 suites green (574 tests),
+      clippy `-D warnings` clean, fmt clean, wasm32 clean, battery
+      usb quartet (usb_device/usb_otg/usb_host/usb_serial) green.

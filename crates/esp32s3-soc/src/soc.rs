@@ -55,7 +55,7 @@ use crate::twai::{TWAI_BASE, Twai};
 use crate::uart::Uart;
 use crate::uhci::{UHCI0_BASE, Uhci};
 use crate::ulp::{ULP_OFF_END, ULP_OFF_START, Ulp};
-use crate::usb_otg::{USB_OTG_BASE, USB_OTG_FIFO_PAGE, UsbOtg};
+use crate::usb_otg::{USB_OTG_BASE, USB_OTG_FIFO_PAGE, USB_OTG_FIFO_PAGES, UsbOtg};
 use crate::usb_serial_jtag::{USB_SERIAL_JTAG_INTR_SOURCE, UsbSerialJtag};
 
 /// A host-observable emulator event, drained once per animation frame and
@@ -887,6 +887,33 @@ impl Soc {
     /// (test/host frontend for removal-event paths).
     pub fn usb_otg_disconnect(&mut self) {
         self.usb_otg.host_disconnect();
+    }
+
+    /// Auto-enum host frontend: deliver one bus reset + enumeration-done
+    /// to the OTG device core (the silicon-true pair the DWC2 raises on
+    /// connect; the TinyUSB device ISR runs its bus-reset handler).
+    pub fn usb_host_bus_reset(&mut self) {
+        self.usb_otg.usb_host_bus_reset();
+    }
+
+    /// Auto-enum host frontend: deliver one 8-byte SETUP packet from the
+    /// host to the OTG device core (GRXSTSP SETUP_RX + SETUP_DONE pops,
+    /// RXFIFO bytes, DOEPINT0 STPKTRCVD + SETUP, DAINT OUT EP0).
+    pub fn usb_host_setup(&mut self, pkt: [u8; 8]) {
+        self.usb_otg.usb_host_setup(pkt);
+    }
+
+    /// Auto-enum host frontend: complete the OUT status stage on the OTG
+    /// device core (latches both XFRC flags, applies pending SET_ADDRESS).
+    pub fn usb_host_status_out(&mut self) {
+        self.usb_otg.usb_host_status_out();
+    }
+
+    /// Drain bytes the OTG device firmware pushed for IN stages (what the
+    /// host reads off the wire): assert the firmware answered from its own
+    /// descriptors.
+    pub fn usb_host_take_in(&mut self) -> alloc::vec::Vec<u8> {
+        self.usb_otg.usb_host_take_in()
     }
 
     /// Deliver one peer CAN frame into the TWAI RX buffer (virtual second
@@ -2887,9 +2914,9 @@ impl Soc {
             }
             0x600C_1000 => store_dispatch(is_write, off, value, &mut self.sensitive),
             0x600C_E000 => store_dispatch(is_write, off, value, &mut self.assist_debug),
-            USB_OTG_BASE | USB_OTG_FIFO_PAGE => {
-                // DWC core (0x60080000) + TXFIFO page (0x60081000, DFIFO0).
-                let base = if dev == USB_OTG_BASE { 0 } else { 0x1000 };
+            USB_OTG_BASE => {
+                // DWC core (0x60080000).
+                let base = 0;
                 if is_write {
                     // USB-OTG controller clock (EN0 bit 23): engine actions
                     // don't fire gated (bits masked out, config still lands)
@@ -2921,6 +2948,20 @@ impl Soc {
                     0
                 } else {
                     self.usb_otg.read32(base + off)
+                }
+            }
+            dev if (USB_OTG_FIFO_PAGE..USB_OTG_FIFO_PAGE + USB_OTG_FIFO_PAGES * 0x1000)
+                .contains(&dev) =>
+            {
+                // DWC per-endpoint IN TXFIFO pages (EPn-IN @ +0x1000*n).
+                // The generic dispatch only routes one page per arm, so a
+                // ranged arm covers EP0..EP5-IN (see USB_OTG_FIFO_PAGES).
+                let ep = ((dev - USB_OTG_FIFO_PAGE) / 0x1000) as usize;
+                if is_write {
+                    self.usb_otg.write_dfifo(ep, off, value);
+                    0
+                } else {
+                    self.usb_otg.read_dfifo(ep, off)
                 }
             }
             // USB_WRAP (OTG PHY wrapper, 0x60039000): plain store.

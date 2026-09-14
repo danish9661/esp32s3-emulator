@@ -80,7 +80,41 @@ pub fn decode_ee(insn: u32) -> Opcode {
             if (b0 & 0x0E) == 0x0E && (b1 & 0x0C) == 0x0C && ((b2 >> 4) & 7) == 0 {
                 return Opcode::OPCODE_EE_CMUL_S16_LD_INCP;
             }
-            if b3 == 0xE0 {
+            // NOTE: mem-qu rides b3[1:0] (qu[2:1]; GAS-probed: qu=q0/q2/
+            // q4/q6 -> b3=E0/E1/E2/E3, b1/b2 unchanged), so the page spans
+            // E0-E3 — an exact b3 == 0xE0 match would miss every qu>=q2
+            // word (caught live: real firmware `vmax.s16.ld.incp q2,...`
+            // = 0xE1950D8E trapped).
+            if (b3 & 0xFC) == 0xE0 {
+                // NOTE: b1 low nibble D (0x0D) is the shared LDXQ/LDF/STF
+                // key — but the fused-ld row also uses it ((1,1)=vmax.s16
+                // etc. GAS-probed 2026-09-14). The fused entry is the one
+                // whose (b1[1:0],b2[6:4]) cell is populated, so check the
+                // fused table FIRST and only fall through to LDXQ/LDF/STF
+                // on a miss (previously LDXQ stole the whole nibble-D row).
+                // Fused vector-ALU + load (op,width) in (b1[1:0], b2[6:4]).
+                if b1 & 0x0F == 0x0C || b1 & 0x0F == 0x0D || b1 & 0x0F == 0x0E || b1 & 0x0F == 0x0F
+                {
+                    match ((b1 & 3), ((b2 >> 4) & 7)) {
+                        (0, 1) => return Opcode::OPCODE_EE_VADDS_S8_LD_INCP,
+                        (1, 6) => return Opcode::OPCODE_EE_VSUBS_S8_LD_INCP,
+                        (0, 4) => return Opcode::OPCODE_EE_VMUL_S8_LD_INCP,
+                        (1, 2) => return Opcode::OPCODE_EE_VADDS_S16_LD_INCP,
+                        (3, 2) => return Opcode::OPCODE_EE_VMIN_S8_LD_INCP,
+                        (3, 1) => return Opcode::OPCODE_EE_VMAX_S8_LD_INCP,
+                        (1, 3) => return Opcode::OPCODE_EE_VADDS_S32_LD_INCP,
+                        (3, 3) => return Opcode::OPCODE_EE_VMUL_S16_LD_INCP,
+                        (1, 4) => return Opcode::OPCODE_EE_VSUBS_S16_LD_INCP,
+                        (1, 1) => return Opcode::OPCODE_EE_VMAX_S16_LD_INCP,
+                        (2, 1) => return Opcode::OPCODE_EE_VMAX_S32_LD_INCP,
+                        (2, 2) => return Opcode::OPCODE_EE_VMIN_S16_LD_INCP,
+                        (2, 3) => return Opcode::OPCODE_EE_VMIN_S32_LD_INCP,
+                        (0, 5) => return Opcode::OPCODE_EE_VMUL_U16_LD_INCP,
+                        (0, 6) => return Opcode::OPCODE_EE_VMUL_U8_LD_INCP,
+                        (1, 5) => return Opcode::OPCODE_EE_VSUBS_S32_LD_INCP,
+                        _ => {}
+                    }
+                }
                 if b1 & 0x0F == 0x0D {
                     return Opcode::OPCODE_EE_LDXQ_32;
                 }
@@ -92,19 +126,19 @@ pub fn decode_ee(insn: u32) -> Opcode {
                     }
                     return Opcode::OPCODE_EE_STF_64_IP;
                 }
-                // Fused vector-ALU + load (op,width) in (b1[1:0], b2[6:4]).
-                if b1 & 0x0F == 0x0C {
-                    return match ((b1 & 3), ((b2 >> 4) & 7)) {
-                        (0, 1) => Opcode::OPCODE_EE_VADDS_S8_LD_INCP,
-                        (1, 6) => Opcode::OPCODE_EE_VSUBS_S8_LD_INCP,
-                        (0, 4) => Opcode::OPCODE_EE_VMUL_S8_LD_INCP,
-                        (1, 2) => Opcode::OPCODE_EE_VADDS_S16_LD_INCP,
-                        (3, 2) => Opcode::OPCODE_EE_VMIN_S8_LD_INCP,
-                        (3, 1) => Opcode::OPCODE_EE_VMAX_S8_LD_INCP,
-                        (1, 3) => Opcode::OPCODE_EE_VADDS_S32_LD_INCP,
-                        (3, 3) => Opcode::OPCODE_EE_VMUL_S16_LD_INCP,
-                        (1, 4) => Opcode::OPCODE_EE_VSUBS_S16_LD_INCP,
-                        _ => Opcode::OPCODE_EE_UNIMPLEMENTED,
+                // Fused vector-scalar-MAC + load (s8/s16 qacc; GAS-probed
+                // 2026-09-14: b1 = 0xEC const; s8: b2 = 0x20..0x37 (sel =
+                // b2[4]++b2[3:0], 0..15), s16: b2 = 0x70..0x7F (sel =
+                // b2[3:0], lanes mask &3). The sel field aliases the width
+                // bits, so match the high nibble, not the full byte.
+                // (Safe: b1 = 0xEC selects fused cell (0,2)/(0,7), which is
+                // absent from the fused-ld table above, so no hijack.)
+                if (b1 & 0xFF) == 0xEC
+                    && ((b2 & 0xF0) == 0x20 || (b2 & 0xF0) == 0x30 || (b2 & 0xF0) == 0x70)
+                {
+                    return match b2 & 0xF0 {
+                        0x70 => Opcode::OPCODE_EE_VSMULAS_S16_QACC_LD_INCP,
+                        _ => Opcode::OPCODE_EE_VSMULAS_S8_QACC_LD_INCP,
                     };
                 }
             }
@@ -117,12 +151,50 @@ pub fn decode_ee(insn: u32) -> Opcode {
         if b3 == 0xE4 && (b0 & 0x0E) == 0x0E && (b1 & 0x0C) == 0x00 && (b2 & 0x08) == 0x00 {
             return Opcode::OPCODE_EE_CMUL_S16_ST_INCP;
         }
-        // Fused vector-ALU + store (b3 = 0xE4/0xE5).
-        if b3 & 0xFC == 0xE4 && (b1 & 0x0F == 0x02 || b1 & 0x0F == 0x03) {
-            return match ((b1 & 3), ((b2 >> 4) & 7)) {
-                (2, 0) => Opcode::OPCODE_EE_VADDS_S8_ST_INCP,
-                (3, 0) => Opcode::OPCODE_EE_VMUL_S8_ST_INCP,
+        // Fused vector-ALU + store (GAS-probed full table 2026-09-14,
+        // q0,a2,q3,q4,q5 forms; the operand sweeps prove b1[7:4]
+        // carries qx[1:0]/qy[2:1] and b2[6:4] carries mem-qu — NEITHER is
+        // an opcode const, so the family select is the b3 row + b1[1:0]
+        // cell + b2[3:0] nibble:
+        // E4 row (b2 nibble 0xB const): cell 2=vadds.s8, 0=vadds.s16,
+        // 1=vadds.s32, 3=vmax.s16.
+        // E5 row: (cell, nibble) (3,3)=vmul.s8 (0,3)=vmax.s32
+        // (0,B)=vmax.s8 (2,3)=vmin.s8 (3,B)=vmul.u16 (1,3)=vmin.s16
+        // (1,B)=vmin.s32 (2,B)=vmul.s16.
+        // E8 row (cell 0=vmul.u8, 1=vsubs.s16, 2=vsubs.s32, 3=vsubs.s8):
+        // gated on b2[7] + nibble 0xB, which separates it from r2bf.st
+        // (b2 = 0x38..0x3F, bit7 clear) and src.q.ld.xp (b2[3] clear).
+        // (Cautionary tale: an early draft gated E8 on (b1&0xF0)==0x20 —
+        // b1[7:4] is q-fields, so real firmware with qx=q0/qy=q1 missed
+        // it; and an (op,width)=(b1[1:0],b2[6:4]) table misread mem-qu as
+        // width and aliased E5 pairs through b2[3].)
+        if b3 == 0xE4 && (b1 & 0x0C) == 0x00 && (b2 & 0x0F) == 0x0B && (b0 & 0x0E) == 0x0E {
+            return match b1 & 3 {
+                2 => Opcode::OPCODE_EE_VADDS_S8_ST_INCP,
+                0 => Opcode::OPCODE_EE_VADDS_S16_ST_INCP,
+                1 => Opcode::OPCODE_EE_VADDS_S32_ST_INCP,
+                _ => Opcode::OPCODE_EE_VMAX_S16_ST_INCP,
+            };
+        }
+        if b3 == 0xE5 && (b0 & 0x0E) == 0x0E {
+            return match ((b1 & 3), b2 & 0x0F) {
+                (3, 0x3) => Opcode::OPCODE_EE_VMUL_S8_ST_INCP,
+                (0, 0x3) => Opcode::OPCODE_EE_VMAX_S32_ST_INCP,
+                (0, 0xB) => Opcode::OPCODE_EE_VMAX_S8_ST_INCP,
+                (1, 0x3) => Opcode::OPCODE_EE_VMIN_S16_ST_INCP,
+                (1, 0xB) => Opcode::OPCODE_EE_VMIN_S32_ST_INCP,
+                (2, 0x3) => Opcode::OPCODE_EE_VMIN_S8_ST_INCP,
+                (2, 0xB) => Opcode::OPCODE_EE_VMUL_S16_ST_INCP,
+                (3, 0xB) => Opcode::OPCODE_EE_VMUL_U16_ST_INCP,
                 _ => Opcode::OPCODE_EE_UNIMPLEMENTED,
+            };
+        }
+        if b3 == 0xE8 && (b2 & 0x80) != 0 && (b2 & 0x0F) == 0x0B && (b0 & 0x0E) == 0x0E {
+            return match b1 & 3 {
+                0 => Opcode::OPCODE_EE_VMUL_U8_ST_INCP,
+                1 => Opcode::OPCODE_EE_VSUBS_S16_ST_INCP,
+                2 => Opcode::OPCODE_EE_VSUBS_S32_ST_INCP,
+                _ => Opcode::OPCODE_EE_VSUBS_S8_ST_INCP,
             };
         }
         // Fused vector-MAC + load (b3 = 0xF0|qu[2:1]; b3 = 0x20|.. is the
@@ -226,6 +298,11 @@ pub fn decode_ee(insn: u32) -> Opcode {
     if b3 == 0xE0 && (b0 & 0x0E) == 0x0E && (b1 & 0x0E) == 0x00 {
         return Opcode::OPCODE_EE_SRC_Q_LD_IP;
     }
+    // NOTE: the fused-ST E8 row (vmul.u8/vsubs.*, b1 low nibble 2/3) is
+    // checked above, so reaching here with b3 == 0xE8 means the ld.xp
+    // form (b1 low nibble 0/1/2/3 with b2[3] clear, e.g. KAT word
+    // 0xE820432E with b1 = 0x43); the fused-ST row always sets b2[3],
+    // so testing b2[3] alone keeps the two E8 families disjoint.
     if b3 == 0xE8 && (b0 & 0x0E) == 0x0E && (b2 & 0x08) == 0x00 {
         return Opcode::OPCODE_EE_SRC_Q_LD_XP;
     }
@@ -243,14 +320,34 @@ pub fn decode_ee(insn: u32) -> Opcode {
         }
         return Opcode::OPCODE_EE_SRCXXP_2Q;
     }
-    // Vector-MAC broadcast-load (3-byte; b2[3:0] == 7 separates it from
-    // vzip which shares the b0/b1 nibbles).
+    // Vector-MAC broadcast-load (3-byte plain + 4-byte .qup tail;
+    // b2[3:0] == 7 separates both from vzip which shares the b0/b1
+    // nibbles; the .qup tail lives on the 0x20/0x30 b3 page with the
+    // slide operands).
     if b0 & 0x0F == 4 && b1 & 0x0F == 3 && b2 & 0x0F == 7 && b2 & 0x80 == 0x80 {
         return match ((b2 >> 6) & 1, (b2 >> 5) & 1) {
             (0, 1) => Opcode::OPCODE_EE_VMULAS_S8_QACC_LDBC_INCP,
             (0, 0) => Opcode::OPCODE_EE_VMULAS_S16_QACC_LDBC_INCP,
             (1, 1) => Opcode::OPCODE_EE_VMULAS_U8_QACC_LDBC_INCP,
             _ => Opcode::OPCODE_EE_VMULAS_U16_QACC_LDBC_INCP,
+        };
+    }
+    // Vector-MAC broadcast-load + Q-slide (4-byte .qup tail sharing
+    // the fused page: same E0 b3 as the fused loads, selected by
+    // b2 = 0x56 with the width in b1[1:0] (GAS-probed 2026-09-14:
+    // e8=s16 e9=s8 ea=u16 eb=u8, i.e. b1[1]=0 signed / 1 unsigned,
+    // b1[0]=0 16-bit / 1 8-bit), b1[3] const. Placed before the
+    // generic fused-ld rule below, which would otherwise claim b1
+    // low nibble 0x8/0x9 as vmulas-fused.
+    // NOTE: mem-qu rides b3[1:0] here too (GAS-probed: qu=q0/q2/q4/
+    // q6 -> b3=E0/E1/E2/E3), so the page spans E0-E3 like the fused
+    // loads above (same trap class as the vmax.s16.ld.incp miss).
+    if (b3 & 0xFC) == 0xE0 && b2 == 0x56 && (b1 & 0xF0) == 0xE0 && (b0 & 0x0E) == 0x0E {
+        return match ((b1 >> 1) & 1, b1 & 1) {
+            (0, 0) => Opcode::OPCODE_EE_VMULAS_S16_QACC_LDBC_INCP_QUP,
+            (0, 1) => Opcode::OPCODE_EE_VMULAS_S8_QACC_LDBC_INCP_QUP,
+            (1, 0) => Opcode::OPCODE_EE_VMULAS_U16_QACC_LDBC_INCP_QUP,
+            _ => Opcode::OPCODE_EE_VMULAS_U8_QACC_LDBC_INCP_QUP,
         };
     }
     // All format_32 families execute (218/218 opcodes, incl. srs.accx);
@@ -1259,16 +1356,58 @@ pub fn exec_ee<B: Bus>(cpu: &mut Cpu, bus: &mut B, opc: Opcode, raw: u32) -> boo
         ee_fused_valu(cpu, bus, raw, 0, Width::S32, false);
     } else if name == "ee_vmin_s8_ld_incp" {
         ee_fused_valu(cpu, bus, raw, 2, Width::S8, false);
+    } else if name == "ee_vmin_s16_ld_incp" {
+        ee_fused_valu(cpu, bus, raw, 2, Width::S16, false);
+    } else if name == "ee_vmin_s32_ld_incp" {
+        ee_fused_valu(cpu, bus, raw, 2, Width::S32, false);
     } else if name == "ee_vmax_s8_ld_incp" {
         ee_fused_valu(cpu, bus, raw, 3, Width::S8, false);
+    } else if name == "ee_vmax_s16_ld_incp" {
+        ee_fused_valu(cpu, bus, raw, 3, Width::S16, false);
+    } else if name == "ee_vmax_s32_ld_incp" {
+        ee_fused_valu(cpu, bus, raw, 3, Width::S32, false);
+    } else if name == "ee_vsubs_s32_ld_incp" {
+        ee_fused_valu(cpu, bus, raw, 1, Width::S32, false);
     } else if name == "ee_vmul_s8_ld_incp" {
         ee_fused_vmul(cpu, bus, raw, Width::S8, false);
     } else if name == "ee_vmul_s16_ld_incp" {
         ee_fused_vmul(cpu, bus, raw, Width::S16, false);
+    } else if name == "ee_vmul_u8_ld_incp" {
+        ee_fused_vmul(cpu, bus, raw, Width::U8, false);
+    } else if name == "ee_vmul_u16_ld_incp" {
+        ee_fused_vmul(cpu, bus, raw, Width::U16, false);
     } else if name == "ee_vadds_s8_st_incp" {
         ee_fused_valu(cpu, bus, raw, 0, Width::S8, true);
+    } else if name == "ee_vadds_s16_st_incp" {
+        ee_fused_valu(cpu, bus, raw, 0, Width::S16, true);
+    } else if name == "ee_vadds_s32_st_incp" {
+        ee_fused_valu(cpu, bus, raw, 0, Width::S32, true);
+    } else if name == "ee_vsubs_s8_st_incp" {
+        ee_fused_valu(cpu, bus, raw, 1, Width::S8, true);
+    } else if name == "ee_vsubs_s16_st_incp" {
+        ee_fused_valu(cpu, bus, raw, 1, Width::S16, true);
+    } else if name == "ee_vsubs_s32_st_incp" {
+        ee_fused_valu(cpu, bus, raw, 1, Width::S32, true);
+    } else if name == "ee_vmin_s8_st_incp" {
+        ee_fused_valu(cpu, bus, raw, 2, Width::S8, true);
+    } else if name == "ee_vmin_s16_st_incp" {
+        ee_fused_valu(cpu, bus, raw, 2, Width::S16, true);
+    } else if name == "ee_vmin_s32_st_incp" {
+        ee_fused_valu(cpu, bus, raw, 2, Width::S32, true);
+    } else if name == "ee_vmax_s8_st_incp" {
+        ee_fused_valu(cpu, bus, raw, 3, Width::S8, true);
+    } else if name == "ee_vmax_s16_st_incp" {
+        ee_fused_valu(cpu, bus, raw, 3, Width::S16, true);
+    } else if name == "ee_vmax_s32_st_incp" {
+        ee_fused_valu(cpu, bus, raw, 3, Width::S32, true);
     } else if name == "ee_vmul_s8_st_incp" {
         ee_fused_vmul(cpu, bus, raw, Width::S8, true);
+    } else if name == "ee_vmul_s16_st_incp" {
+        ee_fused_vmul(cpu, bus, raw, Width::S16, true);
+    } else if name == "ee_vmul_u8_st_incp" {
+        ee_fused_vmul(cpu, bus, raw, Width::U8, true);
+    } else if name == "ee_vmul_u16_st_incp" {
+        ee_fused_vmul(cpu, bus, raw, Width::U16, true);
     } else if name == "ee_fft_ams_s16_ld_incp" {
         ee_ams_ld(cpu, bus, raw);
     } else if name == "ee_fft_ams_s16_ld_incp_uaup" {
@@ -1287,7 +1426,15 @@ pub fn exec_ee<B: Bus>(cpu: &mut Cpu, bus: &mut B, opc: Opcode, raw: u32) -> boo
         } else {
             Width::U16
         };
-        ee_vmulas_ldbc(cpu, bus, raw, w);
+        // The 3-byte `.ldbc.incp` form (b0 low nibble 4) carries the CAL
+        // triple; the 4-byte `.qup` form (b0 low nibble E/F, b3 0x20/0x30
+        // page) aliases the CAL fields with its slide operands, so the
+        // MAC decodes from the post-MAC positions there.
+        if name.ends_with("_qup") {
+            ee_vmulas_ldbc_qup(cpu, bus, raw, w);
+        } else {
+            ee_vmulas_ldbc(cpu, bus, raw, w);
+        }
     } else if name.starts_with("ee_vmulas_") && name.ends_with("_qup") {
         let w = if name.contains("_s8_") {
             Width::S8
@@ -1412,6 +1559,10 @@ pub fn exec_ee<B: Bus>(cpu: &mut Cpu, bus: &mut B, opc: Opcode, raw: u32) -> boo
         ee_gpio(cpu, bus, raw, 3);
     } else if name.starts_with("ee_vsmulas_") && !name.contains("incp") {
         ee_vsmulas(cpu, name, raw);
+    } else if name == "ee_vsmulas_s8_qacc_ld_incp" {
+        ee_vsmulas_fused(cpu, bus, raw, Width::S8);
+    } else if name == "ee_vsmulas_s16_qacc_ld_incp" {
+        ee_vsmulas_fused(cpu, bus, raw, Width::S16);
     } else if name.starts_with("ee_srcmb_") && !name.contains("incp") {
         ee_srcmb(cpu, name, raw);
     } else if name.starts_with("ee_vmulas_")
@@ -2057,6 +2208,8 @@ fn ee_valu_fused_lanes(cpu: &mut Cpu, qz: usize, qx: usize, qy: usize, op: u8, w
 
 /// Fused vector multiply + load (QEMU `translate_vmul_s3` with
 /// addr_inc16); same mem/ALU/postupdate shape, SAR from standard SAR.
+/// U8/U16 lanes (QEMU `vmul_u8`/`vmul_u16` helpers) shift the widened
+/// unsigned product and truncate like the S8/S16 arms.
 fn ee_fused_vmul<B: Bus>(cpu: &mut Cpu, bus: &mut B, raw: u32, w: Width, is_st: bool) {
     let mem_qu = if is_st {
         ((raw >> 20) & 7) as usize
@@ -2088,15 +2241,79 @@ fn ee_fused_vmul<B: Bus>(cpu: &mut Cpu, bus: &mut B, raw: u32, w: Width, is_st: 
                 set_q_u8(cpu, qz, i, shr_trunc_i16(p, sar) as u8);
             }
         }
+        Width::U8 => {
+            for i in 0..16 {
+                let p = q_u8(cpu, qx, i) as u32 * q_u8(cpu, qy, i) as u32;
+                set_q_u8(cpu, qz, i, p.wrapping_shr(sar.min(31)) as u8);
+            }
+        }
         Width::S16 => {
             for i in 0..8 {
                 let p = q_s16(cpu, qx, i) as i32 * q_s16(cpu, qy, i) as i32;
                 set_q_u16(cpu, qz, i, p.wrapping_shr(sar.min(31)) as u16);
             }
         }
+        Width::U16 => {
+            for i in 0..8 {
+                let p = q_u16(cpu, qx, i) as u32 * q_u16(cpu, qy, i) as u32;
+                set_q_u16(cpu, qz, i, p.wrapping_shr(sar.min(31)) as u16);
+            }
+        }
         _ => unreachable!(),
     }
     cpu.set_reg(a, base.wrapping_add(16));
+}
+
+/// Fused vector-scalar-MAC + 128-bit load (QEMU
+/// `translate_vsmulas_qacc_s3` with addr_inc16): MAC first (scalar lane
+/// `sel` of qy widened across qx into both QACC halves), then mem128
+/// into qu, then AR += 16. Operand map GAS-probed 2026-09-14 on
+/// `q0,a2,q3,q4,sel` (+ full qx/qy/qu/AS sweeps): qu = raw[25:24]++
+/// raw[19] (qu[1:0]=b3[1:0], qu[2]=b2[3]), AR = raw[7:4],
+/// qx = raw[15:14]++raw[0] (qx[1:0]=b1[7:6], qx[2]=b0[0]),
+/// qy = raw[23]++raw[13:12] (qy[0]=b2[7], qy[2:1]=b1[4:3]),
+/// sel = s8: raw[20]++raw[19:16] (sel[0]=b2[4], sel[3:1]=b2[3:0]),
+/// s16: raw[19:16] (sel=b2[3:0], lanes mask &3).
+fn ee_vsmulas_fused<B: Bus>(cpu: &mut Cpu, bus: &mut B, raw: u32, w: Width) {
+    let qx = ((((raw >> 14) & 3) | (((raw) & 1) << 2)) & 7) as usize;
+    let qy = ((((raw >> 23) & 1) | (((raw >> 12) & 3) << 1)) & 7) as usize;
+    let sel = if matches!(w, Width::S16) {
+        ((raw >> 16) & 0xF) as usize
+    } else {
+        ((((raw >> 16) & 0xF) << 1) | ((raw >> 20) & 1)) as usize & 15
+    };
+    ee_vsmulas_lanes(cpu, qx, qy, sel, w);
+    let qu = ((((raw >> 19) & 1) | (((raw >> 24) & 3) << 1)) & 7) as usize;
+    let a = ar_t(raw);
+    let base = cpu.reg(a);
+    let aligned = base & !15;
+    let lo = ee_ld64(bus, aligned);
+    let hi = ee_ld64(bus, aligned.wrapping_add(8));
+    cpu.qregs[qu & 7][..8].copy_from_slice(&lo.to_le_bytes());
+    cpu.qregs[qu & 7][8..].copy_from_slice(&hi.to_le_bytes());
+    cpu.set_reg(a, base.wrapping_add(16));
+}
+
+/// Scalar-lane MAC shared by plain and fused vsmulas (QEMU
+/// `vsmulas_s3`: scalar qy[sel] widened across qx into both halves).
+fn ee_vsmulas_lanes(cpu: &mut Cpu, qx: usize, qy: usize, sel: usize, w: Width) {
+    if matches!(w, Width::S16) {
+        let s = q_s16(cpu, qy, sel & 3) as i64;
+        for i in 0..4 {
+            let lane = acc_s40(cpu, 0, i) + q_s16(cpu, qx, i) as i64 * s;
+            set_acc_s40(cpu, 0, i, lane.clamp(-0x007F_FFFF_FFFF, 0x007F_FFFF_FFFF));
+            let lane = acc_s40(cpu, 1, i) + q_s16(cpu, qx, i + 4) as i64 * s;
+            set_acc_s40(cpu, 1, i, lane.clamp(-0x007F_FFFF_FFFF, 0x007F_FFFF_FFFF));
+        }
+    } else {
+        let s = q_s8(cpu, qy, sel & 15) as i64;
+        for i in 0..8 {
+            let lane = acc_s20(cpu, 0, i) + q_s8(cpu, qx, i) as i64 * s;
+            set_acc_s20(cpu, 0, i, lane.clamp(-0x0007_FFFF, 0x0007_FFFF));
+            let lane = acc_s20(cpu, 1, i) + q_s8(cpu, qx, i + 8) as i64 * s;
+            set_acc_s20(cpu, 1, i, lane.clamp(-0x0007_FFFF, 0x0007_FFFF));
+        }
+    }
 }
 
 /// Radix-2 butterfly (QEMU `r2bf_s3`); qa0 at b1[7]++b2[5:4]<<1, qa1 at
@@ -2268,8 +2485,7 @@ fn ee_vmulas_qacc_fused_lanes(cpu: &mut Cpu, qx: usize, qy: usize, w: Width) {
 /// (8/16-bit from raw[21]) into qu, then AR += 1 (8-bit) or +2.
 /// qu = raw[13]++raw[15]++raw[20].
 fn ee_vmulas_ldbc<B: Bus>(cpu: &mut Cpu, bus: &mut B, raw: u32, w: Width) {
-    let (_, qx, qy) = cal_q(raw);
-    ee_vmulas_qacc_fused_lanes(cpu, qx, qy, w);
+    ee_vmulas_ldbc_mac(cpu, raw, w);
     let qu = (((raw >> 13) & 1) | (((raw >> 15) & 1) << 1) | (((raw >> 20) & 1) << 2)) as usize;
     let a = ar_t(raw);
     let base = cpu.reg(a);
@@ -2284,6 +2500,66 @@ fn ee_vmulas_ldbc<B: Bus>(cpu: &mut Cpu, bus: &mut B, raw: u32, w: Width) {
             set_q_u16(cpu, qu, i, v);
         }
         cpu.set_reg(a, base.wrapping_add(2));
+    }
+}
+
+/// MAC half shared by the ldbc and ldbc.qup fused forms. The plain
+/// `.ldbc.incp` word carries the CAL_DOUBLE_Q triple (true qx/qy at the
+/// CAL positions — verified by single-varying GAS sweeps against the
+/// in-model MAC). The `.qup` word reuses the vsmulas-fused operand
+/// positions instead (qx = raw[15:14]++raw[0], qy = raw[23]++
+/// raw[13:12] — GAS-probed 2026-09-14; the CAL fields alias the slide
+/// operands there, so CAL decodes garbage). `qup` selects the form.
+fn ee_vmulas_ldbc_mac(cpu: &mut Cpu, raw: u32, w: Width) {
+    let b3 = (raw >> 24) & 0xFF;
+    let (qx, qy) = if b3 == 0xE0 && (raw & 0x0F) >= 0x0E && ((raw >> 16) & 0xFF) == 0x56 {
+        // .qup tail (selected by the same b2 == 0x56 rule as the
+        // decoder): vsmulas-fused positions.
+        (
+            ((((raw >> 14) & 3) | (((raw) & 1) << 2)) & 7) as usize,
+            ((((raw >> 23) & 1) | (((raw >> 12) & 3) << 1)) & 7) as usize,
+        )
+    } else {
+        let (_, qx, qy) = cal_q(raw);
+        (qx, qy)
+    };
+    ee_vmulas_qacc_fused_lanes(cpu, qx, qy, w);
+}
+
+/// Fused vector-MAC + broadcast load + Q-slide (QEMU
+/// `translate_vmulas_qacc_s3` with addr_ldbc_inc1 + vmul_qup): MAC,
+/// then broadcast, then AR += 1/2, then qup-slide (qs0 by SAR_BYTE with
+/// qs1 fill). Operand map GAS-probed 2026-09-14
+/// (`qu,as,qx,qy,qs0,qs1` positional): qu = raw[19]++raw[25:24]
+/// (qu[0]=b2[3], qu[2:1]=b3[1:0]), AR = raw[7:4] (b0[7:4]),
+/// qs0 = raw[22:20] (full 3-bit b2[6:4] — GAS accepts odd slides;
+/// qu==qs0 is rejected by GAS as a duplicate), qs1 = raw[18:16].
+fn ee_vmulas_ldbc_qup<B: Bus>(cpu: &mut Cpu, bus: &mut B, raw: u32, w: Width) {
+    ee_vmulas_ldbc_mac(cpu, raw, w);
+    let qu = ((((raw >> 19) & 1) | (((raw >> 24) & 3) << 1)) & 7) as usize;
+    let a = ar_t(raw);
+    let base = cpu.reg(a);
+    let is8 = matches!(w, Width::S8 | Width::U8);
+    if is8 {
+        let v = bus.read8(base) as u8;
+        cpu.qregs[qu & 7] = [v; 16];
+        cpu.set_reg(a, base.wrapping_add(1));
+    } else {
+        let v = bus.read16(base & !1) as u16;
+        for i in 0..8 {
+            set_q_u16(cpu, qu, i, v);
+        }
+        cpu.set_reg(a, base.wrapping_add(2));
+    }
+    let qs0 = ((raw >> 20) & 7) as usize;
+    let qs1 = ((raw >> 16) & 7) as usize;
+    let sar = (cpu.sar_byte as usize).min(16);
+    let sb = cpu.qregs[qs1 & 7];
+    for i in 0..(16 - sar) {
+        cpu.qregs[qs0 & 7][i] = cpu.qregs[qs0 & 7][i + sar];
+    }
+    for i in 16 - sar..16 {
+        cpu.qregs[qs0 & 7][i] = sb[i - (16 - sar)];
     }
 }
 

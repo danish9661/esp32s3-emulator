@@ -308,6 +308,17 @@ function hexToBytes(hex) {
 async function loadFlash(bytes, keyHex) {
   stopLoop();
   emu = new Emulator();
+  // Gallery entries that arm the fail-closed secure-boot gate opt in via
+  // `"secure_boot": true` in manifest.json (mirrors run_flash
+  // SECURE_BOOT_EN=1: burns BLK0/REPEAT_DATA4 bit 20 through the real PGM
+  // path BEFORE load_flash, so boot_from_flash verifies the app region's
+  // signature sector; unsigned images park both CPUs with no output).
+  // The committed gallery secure_boot image is genuinely `espsecure.py
+  // sign-data`-signed (see tools/sketches/esp32s3_secure_boot/ +
+  // tools/build_secure_boot.sh), so it boots to Hello/boot OK.
+  if (currentGalleryItem && currentGalleryItem.secureBoot === true) {
+    emu.secure_boot_enable();
+  }
   if (keyHex) {
     emu.load_flash_encrypted(bytes, hexToBytes(keyHex));
   } else {
@@ -319,6 +330,20 @@ async function loadFlash(bytes, keyHex) {
   const needsSdspi = currentGalleryItem && currentGalleryItem.sdspi === true;
   if (needsSdspi) {
     emu.spi_sdspi_attach_sdmmc_image(0);
+  }
+  // Gallery entries that need a host fixture opt in via manifest fields
+  // (mirrors the run_flash env flows): `"touch": "<pad>:<val>"` injects
+  // the touch counter (TOUCH_INJECT); `"secure_boot": true` burns
+  // SECURE_BOOT_EN through the real PGM path BEFORE load_flash so the
+  // signed gallery image verifies (fail-closed: unsigned images park
+  // both CPUs with no output — the committed gallery secure_boot image
+  // is genuinely `espsecure.py sign-data`-signed, see
+  // tools/sketches/esp32s3_secure_boot/ + tools/build_secure_boot.sh).
+  if (currentGalleryItem && currentGalleryItem.touch) {
+    const [pad, val] = currentGalleryItem.touch.split(':').map(Number);
+    if (Number.isInteger(pad) && Number.isInteger(val)) {
+      emu.touch_inject(pad, val);
+    }
   }
 
   if (typeof PeripheralBridge !== 'undefined') {
@@ -385,6 +410,7 @@ try {
       opt.value = `./firmware/${item.file}`;
       opt.dataset.key = item.key || '';
       opt.dataset.sdspi = item.sdspi ? '1' : '';
+      opt.dataset.touch = item.touch || '';
       opt.textContent = item.name;
       els.gallery.appendChild(opt);
     }
@@ -395,7 +421,7 @@ els.gallery.addEventListener('change', async (e) => {
   const sel = e.target.selectedOptions[0];
   const url = e.target.value;
   if (!url) return;
-  currentGalleryItem = { sdspi: sel.dataset.sdspi === '1' };
+  currentGalleryItem = { sdspi: sel.dataset.sdspi === '1', touch: sel.dataset.touch || null };
   try {
     setStatus(`loading ${url}…`);
     await loadFromUrl(url, sel.dataset.key || null);

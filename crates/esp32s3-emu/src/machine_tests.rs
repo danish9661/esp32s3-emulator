@@ -4545,6 +4545,62 @@ fn usb_otg_strings_sof_and_disconnect() {
     assert_ne!(hprt & (1 << 3), 0, "enable-change latched");
 }
 
+/// USB-OTG device auto-enumeration at the machine level: force-device
+/// mode + controller clock, then the host frontend drives bus-reset and a
+/// full GET_DESCRIPTOR(DEVICE, 18 B) control transfer through the
+/// device-mode register flow (GRXSTSP pops + DFIFO SETUP bytes +
+/// STPKTRCVD/SETUP, TXFIFO push + DIEPTSIZ0 + DIEPCTL0 EPENA, XFRC
+/// completion, status OUT). The firmware-visible IN capture matches the
+/// loopback mirror (the descriptor table is shared with the host path),
+/// proving the device register path moves real bytes end to end.
+#[test]
+fn usb_device_auto_enum_moves_descriptor() {
+    const USB: u32 = 0x6008_0000;
+    let mut m = Esp32S3::new();
+    syscon_clk(&mut m, false, 23); // USB controller clock
+    // Force-device mode (GUSBCFG FDMOD, like the TinyUSB dcd_init).
+    m.soc.write32(USB + 0x00C, 1 << 30);
+    // Bus reset + enumdone: latched W1C, ENUMSPD full-speed.
+    m.soc.usb_host_bus_reset();
+    assert_ne!(m.soc.read32(USB + 0x014) & (1 << 12), 0, "USBRST");
+    assert_ne!(m.soc.read32(USB + 0x014) & (1 << 13), 0, "ENUMDNE");
+    assert_eq!(m.soc.read32(USB + 0x808) & 0x6, 3 << 1, "ENUMSPD FS");
+    m.soc.write32(USB + 0x014, (1 << 12) | (1 << 13));
+    assert_eq!(
+        m.soc.read32(USB + 0x014) & ((1 << 12) | (1 << 13)),
+        0,
+        "W1C"
+    );
+    // GET_DESCRIPTOR device wLength 18 through the device flow.
+    m.soc
+        .usb_host_setup([0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]);
+    assert_eq!((m.soc.read32(USB + 0x020) >> 17) & 0xF, 6, "SETUP_RX");
+    assert_eq!((m.soc.read32(USB + 0x020) >> 17) & 0xF, 4, "SETUP_DONE");
+    assert_eq!(m.soc.read32(USB + 0x1000), 0x0100_0680, "SETUP word 0");
+    assert_eq!(m.soc.read32(USB + 0x1000), 0x0012_0000, "SETUP word 1");
+    assert_ne!(m.soc.read32(USB + 0xB08) & (1 << 15), 0, "STPKTRCVD");
+    m.soc.write32(USB + 0xB08, (1 << 15) | (1 << 3));
+    // Firmware decodes the SETUP itself here (the TinyUSB control handler
+    // stages 18 descriptor bytes into TXFIFO0 in `edpt_schedule_packets`
+    // order: TSIZ first with the packed XFRSIZ|PKTCNT word, then EPENA,
+    // then the TXFE-driven FIFO push).
+    m.soc.write32(USB + 0x910, 18 | (1 << 19));
+    m.soc.write32(USB + 0x900, 1 << 31); // DIEPCTL0 EPENA
+    m.soc.write32(USB + 0x1000, 0x0403_0201);
+    m.soc.write32(USB + 0x1000, 0x0807_0605);
+    m.soc.write32(USB + 0x1000, 0x0C0B_0A09);
+    m.soc.write32(USB + 0x1000, 0x100F_0E0D);
+    m.soc.write32(USB + 0x1000, 0x0000_1211);
+    assert_ne!(m.soc.read32(USB + 0x908) & 1, 0, "IN XFRC");
+    // Status OUT completes the transfer.
+    m.soc.usb_host_status_out();
+    assert_ne!(m.soc.read32(USB + 0xB08) & 1, 0, "OUT XFRC");
+    let got = m.soc.usb_host_take_in();
+    assert_eq!(got.len(), 18, "18 IN bytes captured");
+    assert_eq!(&got[..8], &[1, 2, 3, 4, 5, 6, 7, 8], "payload order");
+    assert_eq!(&got[16..], &[17, 18], "last bytes");
+}
+
 /// UHCI SLIP framing through GDMA: with SEPER_EN set, OUT bytes frame
 /// (separators + escapes) onto the UART line, and IN bytes deframe back
 /// into DRAM (split pairs reassembled).

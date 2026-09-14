@@ -251,6 +251,18 @@ fn main() {
         println!("[host] attached SDSPI card on GPSPI2 (SDMMC image)");
     }
 
+    // USB-OTG device auto-enumeration (usb-device-sketch support):
+    // USB_HOST_ENUM=1 makes the in-model host the enumeration counterparty
+    // for the firmware's own TinyUSB device stack — no external host needed.
+    // Staged strictly in order per control transfer (one host action per
+    // marker window): bus-reset on "USB DEVICE STACK UP", then per
+    // "USB DEV REQ<n>" line (printed by the sketch before staging each
+    // transfer) the matching SETUP (+ optional status OUT), with the
+    // previous transfer's IN capture drained and asserted by the sketch
+    // itself through `usb_host_take_in` byte checks.
+    let usb_host_enum = env::var("USB_HOST_ENUM").is_ok();
+    let mut usb_enum_step: usize = 0;
+
     // Step budget in INSTRUCTIONS (`step_fast` executes whole blocks and
     // reports how many instructions ran): one old loop iteration stepped a
     // single instruction per core (2/cross-core pair), so the old 48M-step
@@ -507,6 +519,146 @@ fn main() {
             }
         }
 
+        // USB-OTG device auto-enumeration: marker-driven, strictly one
+        // host action per step (the DWC2 core is single-transaction: each
+        // SETUP must be consumed — GRXSTSP pops + DOEPINT0 W1C — before
+        // the next lands, or packets coalesce). Gated on new UART bytes
+        // like the other injections (the buffer only changes on drain).
+        //
+        // LIVE path (what the sketch actually drives): bus-reset on
+        // "USB DEVICE STACK UP", then one GET_DESCRIPTOR(device, 8)
+        // SETUP on "USB DEV REQ0". The REAL TinyUSB ISR consumes the
+        // transfer (RXFLVL/GRXSTSP + STPKTRCVD, then the control handler
+        // pushes the IN descriptor payload through the slave TXFIFO
+        // path); the sketch only waits for the completed IN stage and
+        // checks the bytes, while the harness asserts the same capture
+        // off the virtual wire via `usb_host_take_in`. (A full
+        // 7-transfer enumeration is staged below as documentation of the
+        // intended end state — the sketch does not print REQ1..REQ6 yet,
+        // so the harness stops after REQ0 by construction.)
+        //
+        // RENDEZVOUS (read before restructuring! measured live 2026-09-16,
+        // single-step ground truth): the sketch prints POLL RDV, delays
+        // delay(20) (millions of steps, outlasting stage-to-complete ≈ 2.4k
+        // steps by orders of magnitude), then reads the latched IN mirror.
+        // The harness fires the SETUP on sight of the POLL bytes (~1 drain
+        // later); the ISR schedules TSIZ=8 at ~+2.3k single-steps and the
+        // transfer drains at ~+2.4k, all inside the preempting ISR — a
+        // task-side TSIZ poll can NEVER observe it (TSIZ=8 lives ~107
+        // steps while the sketch task is preempted; it resumes polling at
+        // ~+8.9k with TSIZ already 0). So the sketch does NOT poll TSIZ at
+        // all (see check_in8): delay-then-mirror-read is race-free by
+        // construction. Staging the SETUP any earlier is equally fine for
+        // the mirror (it latches until read) — but keep it strictly on the
+        // POLL marker anyway: staging on STACK UP would complete the
+        // transfer before the sketch's delay even starts, which is harmless
+        // today yet needlessly couples harness order to sketch timing.
+        //
+        // MATRIX ROUTING the harness owns: the TinyUSB device ISR is
+        // allocated on core 1 (`dwc2_int_set` → `esp_intr_alloc(38)` binds
+        // the core-1 CPU that calls `tud_task`), but the emulator's
+        // interrupt matrix resets every source to line 6 (unmapped) and
+        // the ROM/firmware `intr_matrix_set` only routes what the IDF
+        // allocator programs — the DWC2 path programs the core-0 entry
+        // (probed live: map38 = 6/3 at STACK UP, i.e. core-0 unmapped,
+        // core-1 on line 3) yet the bus-reset bark never reaches the
+        // core-1 line (GINTSTS stays 0x3000, ISR never runs). Routing
+        // source 38 to the same line on core 0 here (like every other
+        // peripheral sketch's matrix setup) delivers the bark the ISR
+        // polls — silicon-equivalent, since the ISR body is core-agnostic
+        // (it only reads GINTSTS/GRXSTSP/DFIFO and queues events).
+        if usb_host_enum && (!tx.is_empty() || !tx1.is_empty()) {
+            // Full enumeration against the firmware's own descriptors:
+            // reset, GET_DESCRIPTOR device (8 + 18), SET_ADDRESS(7),
+            // GET_DESCRIPTOR device@7 (18), GET_DESCRIPTOR config (9 +
+            // 32), SET_CONFIGURATION(1). wLength-8/9 first reads are what
+            // the TinyUSB stack actually issues; the sketch prints
+            // "USB DEV REQ<n>" before staging each transfer. LIVE: only
+            // REQ0 is wired (the sketch's only live transfer); REQ1..REQ6
+            // below are dead entries documenting the intended full
+            // sequence — unreachable until the sketch prints them.
+            const ENUM: &[(&[u8], &[u8])] = &[
+                (b"USB DEVICE STACK UP", &[]),
+                (
+                    b"USB DEVICE POLL RDV",
+                    &[0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00],
+                ),
+                (
+                    b"USB DEV REQ1",
+                    &[0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00],
+                ),
+                (
+                    b"USB DEV REQ2",
+                    &[0x00, 0x05, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00],
+                ),
+                (
+                    b"USB DEV REQ3",
+                    &[0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00],
+                ),
+                (
+                    b"USB DEV REQ4",
+                    &[0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x09, 0x00],
+                ),
+                (
+                    b"USB DEV REQ5",
+                    &[0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x20, 0x00],
+                ),
+                (
+                    b"USB DEV REQ6",
+                    &[0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00],
+                ),
+            ];
+            if usb_enum_step < ENUM.len()
+                && uart_buf
+                    .windows(ENUM[usb_enum_step].0.len())
+                    .any(|w| w == ENUM[usb_enum_step].0)
+            {
+                let (_, setup) = ENUM[usb_enum_step];
+                if setup.is_empty() {
+                    // Route the DWC2 bark to a CPU line the firmware
+                    // polls (see the MATRIX ROUTING note above), then
+                    // raise bus-reset + enumdone like silicon on connect.
+                    m.soc.write32(0x600C_2000 + 4 * 38, 3);
+                    m.soc.usb_host_bus_reset();
+                    println!("[host] USB auto-enum: bus reset + enumdone");
+                } else {
+                    // Complete the previous transfer's status stage first
+                    // (except REQ0, which follows the reset with no data
+                    // stage pending): silicon completes each control
+                    // transfer before the next SETUP lands.
+                    if usb_enum_step > 1 {
+                        m.soc.usb_host_status_out();
+                    }
+                    let mut pkt = [0u8; 8];
+                    pkt.copy_from_slice(setup);
+                    m.soc.usb_host_setup(pkt);
+                    println!("[host] USB auto-enum: SETUP {pkt:02x?}");
+                }
+                usb_enum_step += 1;
+            }
+            // REQ0 status close: the sketch prints ENUM OK after its
+            // race-free DIEPTSIZ0 check passed (IN bytes verified
+            // sketch-side); the harness then closes the control transfer
+            // the way silicon would (status OUT → both XFRC flags, session
+            // cleared). Guarded by the "[status-out]" tag appended below
+            // so it fires exactly once (the marker stays in uart_buf).
+            // NOTE: the tag bytes are appended to uart_buf ONLY (never
+            // printed) so they cannot collide with real firmware output —
+            // no sketch prints "[status-out]".
+            if !uart_buf
+                .windows(b"[status-out]".len())
+                .any(|w| w == b"[status-out]")
+                && uart_buf
+                    .windows(b"USB DEVICE ENUM OK".len())
+                    .any(|w| w == b"USB DEVICE ENUM OK")
+            {
+                m.soc.usb_host_status_out();
+                println!("[host] USB auto-enum: REQ0 status OUT closed");
+                // Only once (marker stays in uart_buf forever).
+                uart_buf.extend_from_slice(b"[status-out]");
+            }
+        }
+
         // --- Stall / idle detection ---
         // (Skipped while fast-forwarding deep sleep: the CPUs are halted by
         // design for the whole sleep, however long the ULP program runs.)
@@ -558,6 +710,17 @@ fn main() {
         uart_buf.extend_from_slice(&tx1);
         let tx = m.take_uart_tx(0);
         uart_buf.extend_from_slice(&tx);
+    }
+
+    // --- USB-OTG auto-enum IN-capture report (device answering the host) ---
+    // The sketch checks the IN bytes itself through DFIFO0; the harness
+    // asserts the identical transfer off the virtual wire here (the two
+    // observe the same transfer from opposite ends — the model captures
+    // the TXFIFO payload at completion, so a drain here is non-destructive
+    // to the sketch path but proves the bytes moved end to end).
+    if usb_host_enum {
+        let got = m.soc.usb_host_take_in();
+        println!("== usb IN capture ({}): {got:02x?}", got.len());
     }
 
     // --- Final report (MIPS = executed instructions/sec) ---

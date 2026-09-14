@@ -13,3 +13,4 @@ wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1"
 esp32s3-emu = { path = "../esp32s3-emu" }
 esp32s3-soc = { path = "../esp32s3-soc" }
+xtensa-core = { path = "../xtensa-core" }

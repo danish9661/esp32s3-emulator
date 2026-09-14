@@ -145,6 +145,7 @@ dependencies = [
  "esp32s3-emu",
  "esp32s3-soc",
  "wasm-bindgen",
+ "xtensa-core",
 ]
 
 [[package]]

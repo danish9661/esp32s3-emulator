@@ -133,7 +133,9 @@ for name in battery_cases():
 
 # --- 2. gallery coverage ---
 # Gallery policy (documented 2026-09-14): the gallery is a curated subset,
-# not 1:1 with the battery. 36/36 entries are the in-wasm-validatable set;
+# not 1:1 with the battery. 37/37 entries are the in-wasm-validatable set
+# (touch joined via the in-browser TOUCH_INJECT fixture; flashenc reuses
+# the hello bin with a `key` field; serial input row + MIPS meter);
 # everything else is intentionally gallery-absent (needs host env/fixtures
 # the browser cannot provide, is a build variant sharing one source dir, or
 # was never promoted). Warn-only: a missing gallery entry is NEVER a FAIL.
@@ -155,7 +157,7 @@ covered = set()
 for e in man:
     covered.add(e["file"])
 # Gallery-coverage section is informational: the gallery is a curated
-# subset (36 entries), not 1:1 with the 106 battery cases. Report the
+# subset (37 entries), not 1:1 with the 106 battery cases. Report the
 # counts and stop — per-case "no gallery entry" lines would just restate
 # policy as noise.
 print(f"gallery entries: {len(mfiles)}, battery cases: {len(battery_cases())} (gallery is a curated subset; absence is policy, not rot)")
