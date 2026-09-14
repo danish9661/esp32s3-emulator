@@ -101,11 +101,18 @@ Scope updates (2026-09-14): P5/P6 done — battery 106/0/0 (0 skipped),
 gallery 36/36 in-wasm-validatable entries, Playwright E2E ALL PASS
 (hello boot, MIPS, serial echo, UART1 round-trip, SDSPI mount). Earlier
 scoping notes below are HISTORICAL (superseded where they conflict):
-Touch validated after all (see status log);
+Touch validated after all (see status log — gallery-excluded by policy:
+needs TOUCH_INJECT, which the browser cannot provide);
 `ee.*` now 218/218 executing (incl. `ee_srs_accx`); eMMC simulated card,
-flash-encryption pipeline, and USB-OTG host enumeration landed (see status
-log). Still out: WiFi/BLE, USB-OTG device-mode enumeration (external host),
-IDF-driver MMC mount, `ee.*` unmapped patterns (loud trap, correct).
+flash-encryption pipeline, USB-OTG host enumeration, IDF-driver eMMC mount
+(`emmc_driver`), USB-OTG device-stack boot (`usb_device`), and the
+secure-boot signed pipeline (`secure_boot`) all landed (see status log).
+Still out: WiFi/BLE, USB-OTG device-mode enumeration against an external
+host (no offline harness possible; every validatable path — host enum of
+the simulated device, EP0/EP1 loopback, TinyUSB HID boot — is covered),
+`ee.*` unmapped patterns (loud trap, correct). Gallery-excluded by policy
+(needs a host fixture the browser cannot provide): `secure_boot`
+(SECURE_BOOT_EN burn), Touch (TOUCH_INJECT).
 
 ## Validation strategy
 
@@ -4203,3 +4210,19 @@ IDF-driver MMC mount, `ee.*` unmapped patterns (loud trap, correct).
     `boot OK` (`NODE BOOT PASS`, 34.7M insns in 2.7s = 13.1 MIPS) and the
     Playwright E2E re-run incl. Test 5 (`sdspi-inwasm-mount`) → ALL PASS
     (`11.6 MIPS`, zero page errors).
+  - 2026-09-14: **CI browser-bundle check + Touch wording firm-up
+    (close-out leftovers)**. (1) New `tools/web_bundle_check.mjs`,
+    wired into the CI battery job: rebuilds `web/pkg` from current
+    sources into a temp dir (never clobbers the dev bundle), asserts
+    API-compat (all 12 `emu.*` calls in main.js resolve in the fresh
+    d.ts), asserts local `web/pkg` freshness vs `crates/` (FAIL = stale
+    bundle), and boots hello in-wasm (nodejs target) to `boot OK`
+    (34.7M insns). Green locally: ALL PASS. (2) Touch exclusion wording
+    firmed everywhere it matters: roadmap Scope-updates line now carries
+    the gallery-excluded-by-policy note (TOUCH_INJECT) inline, and the
+    freshness guard docstring + allow-list comment use the same
+    "host fixture the browser cannot provide" phrasing as the
+    secure_boot exclusion — no more bare "excluded per directive"
+    in load-bearing docs (the 13 historical status-log mentions stay
+    as history). Proofs: bundle check ALL PASS, freshness guard 0
+    FAILs, clippy `-D warnings`/fmt clean.

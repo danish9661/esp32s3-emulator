@@ -13,8 +13,9 @@ Checks (exit 0 always unless --strict; prints FAIL lines for CI):
      to an existing web/firmware/<file>, and every manifest file must be a
      committed sketch bin (warns on orphans either direction). secure_boot
      is intentionally gallery-absent (needs the SECURE_BOOT_EN burn, which
-     the browser cannot provide); touch needs TOUCH_INJECT. Both are
-     allow-listed, not failures.
+     the browser cannot provide). Gallery-excluded by the same policy class
+     (needs a host fixture the browser cannot provide): Touch
+     (TOUCH_INJECT). Both are allow-listed, not failures.
 
 Usage: tools/check_firmware_freshness.py [--strict]
 """

@@ -79,6 +79,11 @@ jobs:
         run: |
           curl -sSf https://raw.githubusercontent.com/drager/wasm-pack/master/installer/init.sh | sh
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Browser bundle check (rebuild web/pkg, boot hello in-wasm)
+        # web/pkg/ is gitignored and rots silently (Sep 2026: 13h stale);
+        # the battery never touches it (NODE harnesses build their own pkg).
+        run: node tools/web_bundle_check.mjs
+        timeout-minutes: 30
       - name: Run battery shard (rebuild + validate)
         run: ./tools/run_battery.sh --build --shard ${{ matrix.shard }}/4
         timeout-minutes: 300
