@@ -381,6 +381,24 @@ pub struct Soc {
     /// may change peripheral interrupt state) and by `write32()` / `inject_rx`
     /// paths that modify interrupt state between ticks.
     src_valid: bool,
+    /// Cached GPIO_IN pad-readback word, valid only while `rb_valid` is
+    /// true. `gpio_in_readback()` walks all 46 pins (enable + out_sel +
+    /// signal_level per pin); tick_timers calls it up to 9x per tick
+    /// (UART CTS x3, RMT RX, MCPWM cap/fault/sync x2 groups, GPIO IRQ,
+    /// PCNT-less dedic path...), and the inputs only change when firmware
+    /// writes GPIO/SPI/RMT/MCPWM/LCD_CAM registers or a peripheral tick
+    /// advances a waveform. Cleared at the START of every tick (before any
+    /// caller runs) and re-armed by the first caller; WITHIN a tick every
+    /// caller sees the same word. Sound because all `gpio_in_readback`
+    /// callers run inside `tick_timers` (the machine steps CPUs and ticks
+    /// strictly alternately — no CPU write can land mid-tick), and each
+    /// new tick clears the flag before re-reading. Callers OUTSIDE ticks
+    /// (MMIO reads, sleep/wake evaluation, tests) also share the flag,
+    /// which is safe for the same reason: any MMIO write that could move
+    /// a pad level clears it first (see `write32`).
+    cached_rb: u32,
+    /// Whether `cached_rb` is current (same invalidation as `src_valid`).
+    rb_valid: bool,
 
     /// Host-observable event queue (GPIO/SPI/I2C), drained once per frame by
     /// the wasm bridge and dispatched to virtual-peripheral JS objects.
@@ -481,6 +499,8 @@ impl Soc {
             loader_scratch_len: 0x6_0000,
             cached_src: 0,
             src_valid: false,
+            cached_rb: 0,
+            rb_valid: false,
             events: Vec::new(),
             last_gpio_out: 0,
             pending_spi_tx: [Vec::new(), Vec::new()],
@@ -1221,8 +1241,10 @@ impl Soc {
     pub fn tick_timers(&mut self, cycles: u64) {
         // Invalidate the per-step interrupt source bitmap cache.  Peripheral
         // tick() calls may change int_raw (alarm matches, timer overflows),
-        // so any cached bitmap from a previous step is stale.
+        // so any cached bitmap from a previous step is stale. The pad
+        // readback cache goes with it (waveform ticks move driven levels).
         self.src_valid = false;
+        self.rb_valid = false;
         for _ in 0..cycles {
             // ULP-RISC-V coprocessor: run one instruction per machine step when
             // released (the `core` sw_start bit). It has full access to the SoC
@@ -1617,7 +1639,49 @@ impl Soc {
     /// readable via digitalRead (TRM GPIO matrix). Pins driving GPIO_OUT
     /// (FUNC_OUT_SEL_CFG 0x100 = SIG_GPIO_OUT_IDX, or 0 — see `gpio_output`)
     /// loop back the GPIO_OUT bit.
-    pub fn gpio_in_readback(&self) -> u32 {
+    ///
+    /// PERF: up to 9 callers per tick share one 46-pin walk via the
+    /// `cached_rb`/`rb_valid` pair. The cache is valid for the CURRENT tick
+    /// only: `tick_timers` clears it at tick start, and `mmio32` clears it
+    /// on every MMIO write. Within one tick all callers share the word —
+    /// sound PROVIDED no caller runs after a state change in the same tick.
+    /// That holds for the tick-internal callers (UART CTS x3, RMT RX,
+    /// MCPWM cap/fault/sync, GPIO IRQ, PCNT-less dedic path: all sampled
+    /// from the same frozen peripheral state). The CAM overlay is the one
+    /// exception: `lcd_cam.tick()` advances capture state MID-tick (VSYNC
+    /// goes live on the first tick after CAM_START), so the overlay reads
+    /// the LIVE camera levels, never the cached word (see below).
+    pub fn gpio_in_readback(&mut self) -> u32 {
+        if self.rb_valid {
+            return self.cached_rb;
+        }
+        let v = self.gpio_in_readback_uncached();
+        self.cached_rb = v;
+        self.rb_valid = true;
+        v
+    }
+
+    /// Pad-readback WITH the live camera overlay (never cached). For the
+    /// CAM-sensor loopback path: the overlay reads capture state that
+    /// `lcd_cam.tick()` advances mid-tick, so sharing the frozen word
+    /// would pin VSYNC at its pre-tick value (proven by the CAM machine
+    /// test). All other callers use the cached `gpio_in_readback`.
+    pub fn gpio_in_readback_with_cam(&self) -> u32 {
+        self.gpio_in_readback_inner(true)
+    }
+
+    /// Uncached 46-pin pad-readback walk (see `gpio_in_readback`).
+    /// `skip_cam` skips the camera-sensor overlay: the overlay reads LIVE
+    /// capture state (`cam_driving`/`cam_input_level`), which `lcd_cam.tick`
+    /// advances mid-tick — caching it would freeze VSYNC at its pre-tick
+    /// value for every later caller in the same tick (proven by the CAM
+    /// machine test: VSYNC latched but invisible on the routed pad).
+    /// All other inputs are frozen within a tick, so they cache safely.
+    fn gpio_in_readback_uncached(&self) -> u32 {
+        self.gpio_in_readback_inner(false)
+    }
+
+    fn gpio_in_readback_inner(&self, with_cam: bool) -> u32 {
         let mut v = self.gpio.raw_in();
         for i in 0..self.gpio.pin_count() {
             if !self.gpio.enabled(i) {
@@ -1638,7 +1702,8 @@ impl Soc {
         // Camera sensor loopback: while a capture runs, pads whose input
         // routing selects a CAM signal read the sensor-driven level (like a
         // real sensor driving the pad). Gated on capturing (cold otherwise).
-        if self.lcd_cam.cam_driving() {
+        // LIVE overlay — skipped by the cached path (see `gpio_in_readback`).
+        if with_cam && self.lcd_cam.cam_driving() {
             for sig in [149, 150, 151, 152] {
                 // Pins 32+ are out of the u32 readback word (same limit as
                 // the RMT sampler above).
@@ -1723,6 +1788,12 @@ impl Soc {
         let base = addr & !3;
         let off = base & 0xFFF;
         let dev = base & !0xFFF;
+        // Any MMIO write can move a pad level (GPIO OUT/ENABLE/FUNC_SEL,
+        // an RMT/MCPWM/LEDC/SPI waveform register, ...), so the cached
+        // pad-readback word dies here. Reads never move levels.
+        if is_write {
+            self.rb_valid = false;
+        }
         match dev {
             UART0_BASE | UART1_BASE | UART2_BASE => {
                 let n = if dev == UART0_BASE {

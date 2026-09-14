@@ -2664,7 +2664,7 @@ fn lcd_cam_capture_delivers_injected_frame() {
     m.soc.tick_timers(2);
     assert_eq!(m.soc.read32(lc_int_raw) & (1 << 2), 1 << 2, "VSYNC latched");
     assert_eq!(
-        (m.soc.gpio_in_readback() >> 7) & 1,
+        (m.soc.gpio_in_readback_with_cam() >> 7) & 1,
         1,
         "VSYNC visible on routed pad"
     );

@@ -4173,3 +4173,33 @@ IDF-driver MMC mount, `ee.*` unmapped patterns (loud trap, correct).
     real gain, direction-stable. `verify OK` (hello `boot OK`). Native-only
     as always (profiles don't carry to wasm). Next: hot-path split to find
     what grew since the Sep 3 audit (tick_timers was 37.5% then).
+  - 2026-09-14: **Hot-path split: `gpio_in_readback` per-tick cache
+    (+0%, correctly rejected — documents the tick-cache hazard)**.
+    `tick_timers` calls the 46-pin `gpio_in_readback` walk up to 9x per
+    tick (UART CTS x3, RMT RX, MCPWM cap/fault/sync, GPIO IRQ, dedic
+    path); a `cached_rb`/`rb_valid` pair (cleared at tick start + on every
+    MMIO write) shares one walk per tick, with the CAM-sensor overlay
+    split into a never-cached `gpio_in_readback_with_cam` (the overlay
+    reads LIVE capture state that `lcd_cam.tick` advances mid-tick —
+    caching it froze VSYNC at its pre-tick value: INT_RAW latched but the
+    routed pad read 0, proven by the CAM machine test, now on the live
+    variant). Result: interleaved X-vs-Y (plain vs cache, pinned core,
+    back-to-back): 14.3–15.5 vs 14.6–15.5, NO direction-stable gain —
+    correctly REJECTED as noise (the walk is dwarfed by decode/exec;
+    single-tick cache hits save ~8 walks of ~46 cheap iterations each).
+    Behavior proven identical: full workspace green (39 suites), CAM test
+    green, 21-case battery subset green (hello/periph/uart/mcpwm*/ledc/
+    sdspi/sdfat/emmc/camcap/i2s_driver/uhci/tempdev/virtual_demo).
+    Lesson: the Sep-3 audit's `tick_timers` 37.5% share predates the
+    is_active gates + I2C batching; re-split before optimizing (the
+    remaining cost is decode/exec + interrupt scan, not GPIO walks).
+    Clippy `-D warnings`/fmt clean.
+  - 2026-09-14: **Browser bundle rebuilt + revalidated (P6 hygiene)**.
+    `web/pkg/` was stale (predating the SDSPI bridge API + gallery 36).
+    Rebuilt via wasm-pack 0.14.0 (web target, correct `../../web/pkg`
+    out-dir). Validated: API-compat grep (all 12 `emu.*` calls in main.js
+    resolve in the d.ts), `node --check` clean, all 36 gallery bins
+    present, plus a nodejs-target harness booting hello in-wasm to
+    `boot OK` (`NODE BOOT PASS`, 34.7M insns in 2.7s = 13.1 MIPS) and the
+    Playwright E2E re-run incl. Test 5 (`sdspi-inwasm-mount`) → ALL PASS
+    (`11.6 MIPS`, zero page errors).
