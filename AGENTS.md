@@ -4141,3 +4141,35 @@ IDF-driver MMC mount, `ee.*` unmapped patterns (loud trap, correct).
     the tree change, proven via stash A/B) — reverted so the commit holds
     only behavior-changing files. Proofs: Playwright ALL PASS, clippy
     `-D warnings` clean, fmt clean.
+  - 2026-09-14: **Maintenance guard: firmware-bin freshness + gallery
+    coverage (`tools/check_firmware_freshness.py`, warn-only)**. Closes the
+    process gap behind the stale-bin rot (bins are cache,
+    `--build` is truth): (1) freshness — every battery case's committed
+    `.merged.bin` must postdate its sketch sources (`.ino`/`.h` only;
+    `build/` outputs deliberately excluded — they are always newer and
+    would false-positive everything), mirroring `run_battery.sh`
+    resolution incl. variants (psram_*/hello_opi/touch_denoise/flashenc/
+    rsa/twai_driver-build-output, ota_update two-pass, secure_boot
+    sign-reassemble with hello-build outputs covered by the hello case);
+    (2) gallery coverage — manifest entries resolve to existing
+    `web/firmware/` bins, orphans reported (noting `web/firmware/*.bin`
+    are gitignored local copies — only `manifest.json` is tracked — so an
+    "orphan" is a leftover-copy hint; the `esp32s3_secure_boot` local copy
+    is the known one). Gallery is a curated 36-entry subset of the 106
+    battery cases by policy (in-wasm-validatable set; the rest need host
+    env/fixtures, share source dirs, or were never promoted) — absence is
+    informational, NEVER a FAIL. Wired into CI battery shards as a
+    warn-only step (`|| true`; `--strict` for local pre-commit). Current:
+    0 FAILs. Proofs: guard green locally, `ci.yml` whitespace-checked,
+    fmt clean.
+  - 2026-09-14: **PGO retrained (was stale since Sep 8) — native 15.1 →
+    23.5 MIPS (+56%)**. `tools/pgo/merged.profdata` 349KB → 375KB
+    (retrained over hello + periph via `tools/pgo.sh`; every crate source
+    is newer than the old profile). Rigor per the committed rules:
+    pinned core, interleaved pairs. Baseline current tree (plain release):
+    14.7–15.3 MIPS median ~15.1. Retrained PGO binary: 23.0–23.9 median
+    ~23.5. Interleaved plain-vs-PGO X-vs-Y (separate binaries, back-to-back
+    same core): plain 14.2–15.6 vs PGO 22.1–23.5 in ALL 6 pairs → +53–56%
+    real gain, direction-stable. `verify OK` (hello `boot OK`). Native-only
+    as always (profiles don't carry to wasm). Next: hot-path split to find
+    what grew since the Sep 3 audit (tick_timers was 37.5% then).

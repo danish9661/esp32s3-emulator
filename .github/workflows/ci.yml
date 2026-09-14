@@ -82,3 +82,8 @@ jobs:
       - name: Run battery shard (rebuild + validate)
         run: ./tools/run_battery.sh --build --shard ${{ matrix.shard }}/4
         timeout-minutes: 300
+      - name: Firmware-bin freshness + gallery guard (warn-only)
+        # Catches the 2026-09-14 rot class (stale committed .merged.bin vs
+        # newer sketch sources) without failing the build; strict mode is
+        # for local pre-commit use: tools/check_firmware_freshness.py --strict
+        run: python3 tools/check_firmware_freshness.py || true
