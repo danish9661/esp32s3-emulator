@@ -142,7 +142,7 @@
     "file": "esp32s3_emmc_driver.merged.bin"
   },
   {
-    "name": "usb_device — TinyUSB HID live enum (REQ0 IN bytes)",
+    "name": "usb_device — TinyUSB HID full enum (REQ0..REQ6, 85 IN bytes)",
     "file": "esp32s3_usb_device.merged.bin"
   },
   {

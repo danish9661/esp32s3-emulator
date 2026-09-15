@@ -203,7 +203,7 @@ on CALL/RETW, matching QEMU's `win_helper.c` behavior.
 | ULP rv32imc | Functional | C extension supported; compressed decode working |
 | Deep-sleep | Validated | Timer/EXT0/EXT1/ULP/touch wake paths via driver + poke (see `AGENTS.md`) |
 | SDMMC FAT mount | Validated | PIO + IDMAC + simulated card functional; IDF-driver mount (`sdfat`) + SDSPI + eMMC-driver mounts green |
-| USB-OTG device-mode | Validatable paths done | Host enum (sim device) + EP0/EP1 loopback + TinyUSB HID boot green; real external-host enumeration out of scope |
+| USB-OTG device-mode | Validatable paths done | Host enum (sim device) + EP0/EP1 loopback + TinyUSB HID boot + in-model-host full enumeration REQ0..REQ6 green; real external-host enumeration out of scope |
 | Model clock | Approximate | 1 global tick per 2 instructions for all domains (silicon runs SYSTIMER 16MHz vs APB 80MHz); only observable in cross-domain counts, all passing |
 
 ## Performance

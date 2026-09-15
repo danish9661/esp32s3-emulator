@@ -29,6 +29,68 @@
 // bDescriptorType, bcdUSB, MISC class triple, EP0 MPS 64.
 static const uint8_t want8[8] = { 18, 1, 0x00, 0x02, 0xEF, 0x02, 0x01, 64 };
 
+// Full-enumeration expectations, discovered live 2026-09-16 (discover_enum
+// probe: stage each SETUP after the previous transfer's status-out, wait
+// 20k macro-steps, read take_in + mirror — all six answer with TSIZ
+// drained and DOEP=0x8009):
+//   REQ1 GET_DESCRIPTOR device wLength 18 -> full 18B device descriptor
+//     [12,01,00,02,ef,02,01,40, 3a,30,01,10,00,01,01,02,03,01]
+//   REQ2 SET_ADDRESS(7) -> ZLP (0 IN bytes; SET_ADDRESS applies at status)
+//   REQ3 GET_DESCRIPTOR device wLength 18 (at the new address) -> same 18B
+//   REQ4 GET_DESCRIPTOR config wLength 9 -> [09,02,29,00,01,01,05,c0,fa]
+//     (9 = bLength, 2 = CONFIGURATION, 0x29 = 41 total ... — the HID
+//     config head; the wLength-9 prefix of the 41B full config below)
+//   REQ5 GET_DESCRIPTOR config wLength 32 -> 32B config 체인
+//     [09,02,29,00,01,01,05,c0,fa, 09,04,00,00,02,03,01,01,04,
+//      09,21,11,01,00,01,22,43,00, 07,05,01,03,40]
+//   REQ6 SET_CONFIGURATION(1) -> ZLP
+static const uint8_t want18[18] = {
+  18, 1, 0x00, 0x02, 0xEF, 0x02, 0x01, 64,
+  0x3A, 0x30, 0x01, 0x10, 0x00, 0x01, 0x01, 0x02, 0x03, 0x01
+};
+static const uint8_t wantCfg9[9] = { 9, 2, 0x29, 0x00, 0x01, 0x01, 0x05, 0xC0, 0xFA };
+static const uint8_t wantCfg32[32] = {
+  0x09, 0x02, 0x29, 0x00, 0x01, 0x01, 0x05, 0xC0, 0xFA,
+  0x09, 0x04, 0x00, 0x00, 0x02, 0x03, 0x01, 0x01, 0x04,
+  0x09, 0x21, 0x11, 0x01, 0x00, 0x01, 0x22, 0x43, 0x00,
+  0x07, 0x05, 0x01, 0x03, 0x40
+};
+
+// One live IN transfer: print the rendezvous line, wait for the ISR to
+// complete the transfer, then compare the latched mirror words against
+// `want` (`nwords` LE words from DFIFO0). A NULL `want` with `n == 0`
+// (SET_ADDRESS / SET_CONFIGURATION status-only transfers) skips the read
+// — there is no IN payload to check, and any DFIFO0 read would pop the
+// NEXT transfer's staged SETUP bytes. The delay outlasts
+// stage-to-complete (~2.4k steps, delay(20) = millions) by orders of
+// magnitude — see check_in8 for why a TSIZ poll cannot work here.
+// Returns false with a FAIL line naming the failed transfer.
+static bool enum_step(const char *tag, const uint8_t *want, uint32_t n) {
+  Serial.println(tag);
+  delay(20);
+  if (want == NULL || n == 0) {
+    Serial.print(tag);
+    Serial.println(" OK");
+    return true;
+  }
+  for (uint32_t i = 0; i < (n + 3) / 4; i++) {
+    uint32_t w = *O(0x1000);
+    for (uint32_t k = 0; k < 4 && 4 * i + k < n; k++) {
+      uint8_t b = (uint8_t)(w >> (8 * k));
+      if (b != want[4 * i + k]) {
+        Serial.print("USB DEVICE FAIL ");
+        Serial.print(tag);
+        Serial.print(" byte ");
+        Serial.println(4 * i + k);
+        return false;
+      }
+    }
+  }
+  Serial.print(tag);
+  Serial.println(" OK");
+  return true;
+}
+
 // Harness-detect is RACE-FREE by construction: read the bus-reset ISR's
 // register effects (handle_bus_reset programs DAINTMSK 0x10001,
 // DOEPMSK=DIEPMSK=0x9, GRXFSIZ 0x3E, DIEPTXF0 0x1000F0; all read 0 with no
@@ -92,25 +154,35 @@ void setup() {
   Serial.println("USB DEVICE STACK UP");
 
   // Live auto-enum path (needs USB_HOST_ENUM=1 on the harness): the
-  // bus-reset bark has run (live-detect above), the harness's status-out
-  // closes each transfer, and the sketch prints the result markers the
-  // battery asserts (ENUM OK / PASS / DONE). On early return the
-  // no-harness tail below runs instead (stack boot only).
+  // harness drives bus-reset + one SETUP per rendezvous line below, the
+  // ISR answers each from the firmware's own descriptors, and the sketch
+  // checks every IN byte (full 7-transfer enumeration: REQ0..REQ6). The
+  // harness closes each transfer's status stage on the matching OK line
+  // (single-transaction DWC2: next SETUP only after the previous status
+  // completes). Markers asserted by the battery entry below.
   do {
     if (!live_detect()) break;
     uint32_t enumspd = (*O(0x808) >> 1) & 3u;
     Serial.print("USB DEVICE RESET ENUMSPD=");
     Serial.println((unsigned long)enumspd);
-    // POLL RDV: the harness stages the REQ0 SETUP on THIS line (the
-    // transfer schedules ~2.3k steps later, all inside the ISR). The
-    // delay below outlasts stage-to-complete (~2.4k steps) by orders of
-    // magnitude, then the mirror read checks the latched payload — see
-    // check_in8 for why a TSIZ poll cannot work here.
+    bool ok = true;
+    // REQ0: GET_DESCRIPTOR device wLength 8 (the stack's first request).
+    // Rendezvous line doubles as the harness stage trigger (see above).
     Serial.println("USB DEVICE POLL RDV");
     delay(20);
-    bool ok = check_in8(want8);
+    ok = check_in8(want8);
     if (!ok) { Serial.println("USB DEVICE ENUM FAIL"); return; }
     Serial.println("USB DEVICE ENUM OK");
+    // REQ1..REQ6: the harness stages each SETUP on its rendezvous line
+    // and closes status on the OK line (see run_flash ENUM table).
+    if (ok) ok = enum_step("USB DEVICE REQ1", want18, 18);
+    if (ok) ok = enum_step("USB DEVICE REQ2", NULL, 0);
+    if (ok) ok = enum_step("USB DEVICE REQ3", want18, 18);
+    if (ok) ok = enum_step("USB DEVICE REQ4", wantCfg9, 9);
+    if (ok) ok = enum_step("USB DEVICE REQ5", wantCfg32, 32);
+    if (ok) ok = enum_step("USB DEVICE REQ6", NULL, 0);
+    if (!ok) { Serial.println("USB DEVICE ENUM FAIL"); return; }
+    Serial.println("USB DEVICE ENUM FULL OK");
   } while (0);
 
   // The stack is up and waiting for a host (which never arrives offline).

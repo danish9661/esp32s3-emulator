@@ -109,7 +109,8 @@ flash-encryption pipeline, USB-OTG host enumeration, IDF-driver eMMC mount
 secure-boot signed pipeline (`secure_boot`) all landed (see status log).
 Still out: WiFi/BLE, USB-OTG device-mode enumeration against an external
 host (no offline harness possible; every validatable path — host enum of
-the simulated device, EP0/EP1 loopback, TinyUSB HID boot — is covered),
+the simulated device, EP0/EP1 loopback, TinyUSB HID boot + in-model-host
+full enumeration REQ0..REQ6 — is covered),
 `ee.*` unmapped patterns (loud trap, correct). Gallery-excluded by policy
 (needs a host fixture the browser cannot provide): `secure_boot`
 (SECURE_BOOT_EN burn).
@@ -4341,3 +4342,22 @@ the simulated device, EP0/EP1 loopback, TinyUSB HID boot — is covered),
       take_in` 8B correct on both observers, 39 suites green (574 tests),
       clippy `-D warnings` clean, fmt clean, wasm32 clean, battery
       usb quartet (usb_device/usb_otg/usb_host/usb_serial) green.
+  - 2026-09-16 (follow-up): **USB-OTG full 7-transfer enumeration live
+    (was REQ0-only)**. The `USB DEV REQ1..REQ6` dead entries in
+    `run_flash.rs` are now wired: sketch prints one rendezvous line per
+    transfer (`POLL RDV`, `REQ1`..`REQ6`), delays `delay(20)`, checks the
+    latched mirror words; harness stages each SETUP on its line and
+    closes status-out on each `OK` (per-transfer `[status-out-N]` tags,
+    replacing the REQ0-only tag). All six extra transfers answer live
+    from the firmware's own descriptors (discover_enum probe, since
+    removed): REQ1/REQ3 full 18B device desc, REQ2 SET_ADDRESS ZLP,
+    REQ4 9B config head, REQ5 32B config chain, REQ6 SET_CONFIGURATION
+    ZLP — 85 IN bytes total in the harness capture, `ENUM FULL OK` +
+    `PASS`/`DONE`. Sketch lesson: ZLP transfers must NOT read DFIFO0
+    (any read pops the next transfer's staged SETUP bytes) — `enum_step`
+    skips the read for `n == 0`. Battery entry asserts all six `REQN
+    OK` + `ENUM FULL OK`; gallery text updated to the full demo.
+    - Proofs: `ENUM FULL OK` at 60M STEPS, 85B capture on both
+      observers, 39 suites green (574 tests), clippy `-D warnings`
+      clean, fmt clean, wasm32 clean, battery usb quartet green,
+      Playwright E2E ALL PASS (incl. gallery 38 options).

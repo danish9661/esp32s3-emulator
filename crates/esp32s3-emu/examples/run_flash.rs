@@ -584,27 +584,27 @@ fn main() {
                     &[0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00],
                 ),
                 (
-                    b"USB DEV REQ1",
+                    b"USB DEVICE REQ1",
                     &[0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00],
                 ),
                 (
-                    b"USB DEV REQ2",
+                    b"USB DEVICE REQ2",
                     &[0x00, 0x05, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00],
                 ),
                 (
-                    b"USB DEV REQ3",
+                    b"USB DEVICE REQ3",
                     &[0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00],
                 ),
                 (
-                    b"USB DEV REQ4",
+                    b"USB DEVICE REQ4",
                     &[0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x09, 0x00],
                 ),
                 (
-                    b"USB DEV REQ5",
+                    b"USB DEVICE REQ5",
                     &[0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0x20, 0x00],
                 ),
                 (
-                    b"USB DEV REQ6",
+                    b"USB DEVICE REQ6",
                     &[0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00],
                 ),
             ];
@@ -636,26 +636,37 @@ fn main() {
                 }
                 usb_enum_step += 1;
             }
-            // REQ0 status close: the sketch prints ENUM OK after its
-            // race-free DIEPTSIZ0 check passed (IN bytes verified
-            // sketch-side); the harness then closes the control transfer
-            // the way silicon would (status OUT → both XFRC flags, session
-            // cleared). Guarded by the "[status-out]" tag appended below
-            // so it fires exactly once (the marker stays in uart_buf).
+            // Per-transfer status close: the sketch prints "<TAG> OK" after
+            // it verified that transfer's IN bytes sketch-side; the harness
+            // then closes the control transfer the way silicon would
+            // (status OUT → both XFRC flags, session cleared) so the NEXT
+            // staged SETUP starts from a clean single-transaction state.
+            // Each close is guarded by its own "[status-out-N]" tag appended
+            // below so it fires exactly once (the marker stays in uart_buf).
             // NOTE: the tag bytes are appended to uart_buf ONLY (never
             // printed) so they cannot collide with real firmware output —
-            // no sketch prints "[status-out]".
-            if !uart_buf
-                .windows(b"[status-out]".len())
-                .any(|w| w == b"[status-out]")
-                && uart_buf
-                    .windows(b"USB DEVICE ENUM OK".len())
-                    .any(|w| w == b"USB DEVICE ENUM OK")
-            {
-                m.soc.usb_host_status_out();
-                println!("[host] USB auto-enum: REQ0 status OUT closed");
-                // Only once (marker stays in uart_buf forever).
-                uart_buf.extend_from_slice(b"[status-out]");
+            // no sketch prints "[status-out".
+            const CLOSES: &[(&[u8], &[u8])] = &[
+                (b"USB DEVICE ENUM OK", b"[status-out-0]"),
+                (b"USB DEVICE REQ1 OK", b"[status-out-1]"),
+                (b"USB DEVICE REQ2 OK", b"[status-out-2]"),
+                (b"USB DEVICE REQ3 OK", b"[status-out-3]"),
+                (b"USB DEVICE REQ4 OK", b"[status-out-4]"),
+                (b"USB DEVICE REQ5 OK", b"[status-out-5]"),
+                (b"USB DEVICE REQ6 OK", b"[status-out-6]"),
+            ];
+            for (marker, tag) in CLOSES {
+                if !uart_buf.windows(tag.len()).any(|w| w == *tag)
+                    && uart_buf.windows(marker.len()).any(|w| w == *marker)
+                {
+                    m.soc.usb_host_status_out();
+                    println!(
+                        "[host] USB auto-enum: status OUT closed ({})",
+                        String::from_utf8_lossy(marker)
+                    );
+                    // Only once (marker stays in uart_buf forever).
+                    uart_buf.extend_from_slice(tag);
+                }
             }
         }
 
