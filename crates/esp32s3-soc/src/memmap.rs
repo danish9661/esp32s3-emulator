@@ -176,6 +176,28 @@ pub const SYSTEM_BASE: u32 = 0x600C_0000;
 /// touching them during boot/init never panics.
 pub const I2S0_BASE: u32 = 0x6000_F000;
 pub const I2S1_BASE: u32 = 0x6002_D000;
+/// WiFi RF front-end (FE, DR_REG_FE_BASE) + FE2 (DR_REG_FE2_BASE):
+/// the closed PHY ROM's RF-cal routines (ram_iq_est_enable etc.)
+/// RMW these registers and poll IQ-estimate done bits. TEMP WIFI
+/// BRING-UP: plain register stores (see wifi.rs); bit-24-done
+/// semantics added only where a spin is proven (FE +0x174).
+pub const FE_BASE: u32 = 0x6000_6000;
+pub const FE2_BASE: u32 = 0x6000_5000;
+/// WiFi baseband (BB, DR_REG_BB_BASE) + NRX (DR_REG_NRX_BASE): same
+/// treatment (see wifi.rs).
+pub const BB_BASE: u32 = 0x6001_D000;
+pub const NRX_BASE: u32 = 0x6001_CC00;
+/// WiFi MAC block (no DR_REG_* symbol shipped for S3; address proven by
+/// the closed PHY ROM: `ram_iq_est_enable` polls `[0x6001C08C]` field
+/// [18:12] against a growing count — objdump-verified). One 4 KB page.
+pub const WIFI_MAC_BASE: u32 = 0x6001_C000;
+/// WiFi MAC control block (no public symbol; address proven by the WiFi
+/// driver HAL: `hal_init` RMWs `[0x60033D14]` setting bit 1, then polls
+/// bit 0 via `bbci` until the HW sets it — objdump-verified against the
+/// wifi-scan ELF; neighboring driver touches at +0x084/+0x400/+0x4A0
+/// decoded from the wifi-trace log after correcting its base+off
+/// double-add display bug). One 4 KB page.
+pub const WIFI_MAC_CTRL_BASE: u32 = 0x6003_3000;
 pub const SYSCON_BASE: u32 = 0x6002_6000; // sysclk/tick/out config (NOT peripheral clocks: those are SYSTEM_PERIP_CLK_EN0/1)
 pub const PERI_BACKUP_BASE: u32 = 0x6002_A000;
 pub const LCD_CAM_BASE: u32 = 0x6004_1000;

@@ -5,3 +5,6 @@ edition = "2024"
 
 [dependencies]
 xtensa-core = { path = "../xtensa-core" }
+
+[features]
+wifi-trace = []

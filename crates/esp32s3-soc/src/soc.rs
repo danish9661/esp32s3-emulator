@@ -57,6 +57,7 @@ use crate::uhci::{UHCI0_BASE, Uhci};
 use crate::ulp::{ULP_OFF_END, ULP_OFF_START, Ulp};
 use crate::usb_otg::{USB_OTG_BASE, USB_OTG_FIFO_PAGE, USB_OTG_FIFO_PAGES, UsbOtg};
 use crate::usb_serial_jtag::{USB_SERIAL_JTAG_INTR_SOURCE, UsbSerialJtag};
+use crate::wifi::Wifi;
 
 /// A host-observable emulator event, drained once per animation frame and
 /// dispatched to virtual-peripheral JS objects (Wokwi-style). This is a plain
@@ -298,6 +299,10 @@ pub struct Soc {
     /// ~200 us lock time elapses; the register is read-only on silicon for
     /// that bit, so writes to it only matter for arming the lock timer.
     pll: PllLock,
+    /// SENS2 RF-cal done storage @ 0x6000E04C (TEMP WIFI BRING-UP, see the
+    /// SENS2 mmio arm): plain store; the read arm overlays bit 24 once
+    /// armed (any nonzero write).
+    pll_cal4c: u32,
 
     // ── P5 register-store peripherals (configure-and-forget, no observable
     //    side-effects modeled — see regstore.rs). Bases from esp-idf
@@ -321,6 +326,10 @@ pub struct Soc {
     /// USB_WRAP (OTG PHY wrapper, DR_REG_USB_WRAP_BASE 0x60039000):
     /// plain register store (PHY test/pullup pokes never panic).
     usb_wrap: RegStore,
+    /// WiFi radio blocks (FE/FE2 @ 0x60006000/0x60005000, BB @ 0x6001D000,
+    /// NRX @ 0x6001CC00). TEMP WIFI BRING-UP scaffold: plain stores +
+    /// proven RF-cal done-bits (see wifi.rs).
+    wifi: Wifi,
     /// I2S audio controllers (I2S0 @ 0x6000F000, I2S1 @ 0x6002D000).
     /// Functional model: TX/RX FIFO + serial shift-out onto GPIO-matrix
     /// signals (BCK/WS/SD).
@@ -482,6 +491,7 @@ impl Soc {
             sdm: Sdm::new(),
             intc: Intc::new(),
             pll: PllLock::default(),
+            pll_cal4c: 0,
             sensitive: RegStore::new(0x1000),
             wcl: RegStore::new(0x1000),
             peri_backup: RegStore::new(0x1000),
@@ -490,6 +500,7 @@ impl Soc {
             assist_debug: RegStore::new(0x1000),
             usb_otg: UsbOtg::new(),
             usb_wrap: RegStore::new(0x1000),
+            wifi: Wifi::new(),
             lcd_cam: LcdCam::new(),
             appcpu_ctrl_a: 0,
             sys_clk_en0: 0xF9C1_E06F,
@@ -2564,9 +2575,15 @@ impl Soc {
                     self.adc.apb_read32(off)
                 }
             }
-            // SENS2 (TRM memory map): only SAR_PLL_FORCE_CTRL @ +0x40 is
-            // touched by the firmware (rtc_clk PLL power-up + lock poll);
-            // the rest of the page reads 0.
+            // SENS2 (TRM memory map): SAR_PLL_FORCE_CTRL @ +0x40 is touched
+            // by the firmware (rtc_clk PLL power-up + lock poll); +0x4C is
+            // the PHY RF-cal done poll (closed PHY ROM `txdc_cal_v70`:
+            // l32i.n a12,[a10=0x6000E04C]; bnone a12,a11(=0x1000000),spin
+            // — objdump-verified against the wifi-scan ELF; the register
+            // itself is undocumented, the address is 0x6000E04C and the
+            // polled bit is 24). +0x50 was an earlier misread of the same
+            // loop (a2 = 0x6000E050 belonged to a different ROM wait that
+            // already passes). The rest of the page reads 0.
             0x6000_E000 => {
                 if off == 0x40 {
                     if is_write {
@@ -2575,6 +2592,22 @@ impl Soc {
                     } else {
                         self.pll.read32()
                     }
+                } else if off == 0x4C {
+                    // TEMP WIFI BRING-UP: report RF-cal done (bit 24 set)
+                    // once the driver arms the sequence (any nonzero write
+                    // to this register); before the arm read back the
+                    // stored value (reset 0) so the poll spins only until
+                    // cal actually starts. Real silicon sets the bit from
+                    // its RF-cal FSM; refine if a later spin needs timing.
+                    if is_write {
+                        self.pll_cal4c = value;
+                        0
+                    } else {
+                        let v = self.pll_cal4c;
+                        if v != 0 { v | (1 << 24) } else { v }
+                    }
+                } else if off == 0x50 {
+                    0x0700_0000
                 } else {
                     0
                 }
@@ -2913,6 +2946,18 @@ impl Soc {
                 }
             }
             0x600C_1000 => store_dispatch(is_write, off, value, &mut self.sensitive),
+            // WiFi radio blocks (TEMP WIFI BRING-UP scaffold, see wifi.rs):
+            // FE/FE2 @ 0x60006000/0x60005000, BB @ 0x6001D000,
+            // NRX @ 0x6001CC00, MAC @ 0x6001C000, MAC-CTRL @ 0x60033000.
+            // Plain stores + proven RF-cal done-bits.
+            FE_BASE | FE2_BASE | BB_BASE | NRX_BASE | WIFI_MAC_BASE | WIFI_MAC_CTRL_BASE => {
+                if is_write {
+                    self.wifi.write32(dev, off, value);
+                    0
+                } else {
+                    self.wifi.read32(dev, off)
+                }
+            }
             0x600C_E000 => store_dispatch(is_write, off, value, &mut self.assist_debug),
             USB_OTG_BASE => {
                 // DWC core (0x60080000).
@@ -2968,7 +3013,21 @@ impl Soc {
             0x6003_9000 => store_dispatch(is_write, off, value, &mut self.usb_wrap),
             0x600D_0000 => store_dispatch(is_write, off, value, &mut self.wcl),
             // Everything else in the APB space: no model yet.
-            _ => 0,
+            // TEMP WIFI TRACE (remove before commit): count unmapped APB
+            // touches so the WiFi driver footprint can be discovered.
+            _ => {
+                #[cfg(feature = "wifi-trace")]
+                if (0x6000_0000..0x6010_0000).contains(&base) {
+                    extern crate std;
+                    std::eprintln!(
+                        "WIFI_TRACE {} {:#010x}={:#010x}",
+                        if is_write { "W" } else { "R" },
+                        base + off,
+                        if is_write { value } else { 0 }
+                    );
+                }
+                0
+            }
         }
     }
 }

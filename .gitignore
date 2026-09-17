@@ -23,3 +23,7 @@ tools/sketches/esp32s3_ota_update/ota_slot1_image.h
 # Secure-boot dev key + intermediate signed app (rebuilt by tools/build_secure_boot.sh)
 tools/sketches/esp32s3_secure_boot/secure_boot_signing_key.pem
 tools/sketches/esp32s3_secure_boot/app_signed.bin
+
+# Go gateway build output (rebuilt by tools/gateway/start-gateway.sh)
+tools/gateway/openhw-gw
+tools/gateway/openhw-gw.exe

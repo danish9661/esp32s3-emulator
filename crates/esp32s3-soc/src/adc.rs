@@ -356,6 +356,16 @@ impl Adc {
                 v |= self.tsens_raw as u32;
                 v
             }
+            // TEMP WIFI BRING-UP (phy RF-cal): the closed PHY ROM polls
+            // SENS2 0x6000E04C (NOT SENS 0x6000884C — objdump says
+            // `SENS+0x584C`, i.e. the 0x6000E000 page; the disassembler's
+            // `(SENS+0x584C)` annotation is relative to SENS_BASE because
+            // the literal is 0x6000E04C = SENS_BASE + 0x584C) for bit 24
+            // (`txdc_cal_v70`: l32i.n a12,[a10=0x6000E04C];
+            // bnone a12,a11(=0x1000000),spin). See the SENS2 arm in
+            // soc.rs, which reports the bit set. This SENS-page 0x4C
+            // (SAR_SLAVE_ADDR4) keeps plain store semantics.
+            0x4C => self.sens[0x4C / 4],
             _ if offset.is_multiple_of(4) && offset < (SENS_REGS * 4) as u32 => {
                 self.sens[(offset / 4) as usize]
             }
