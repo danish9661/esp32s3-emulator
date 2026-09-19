@@ -198,6 +198,14 @@ pub const WIFI_MAC_BASE: u32 = 0x6001_C000;
 /// decoded from the wifi-trace log after correcting its base+off
 /// double-add display bug). One 4 KB page.
 pub const WIFI_MAC_CTRL_BASE: u32 = 0x6003_3000;
+/// WiFi WDEV timer stamp / TSF block (`hal_tsf.o` in the closed `libpp.a`:
+/// `hal_enable_sta_tsf` RMWs `[0x60035028]` bit 27 (`movi a9,-13; slli 27`);
+/// `tsf_hal_set_tsf_enable/disable` touch `0x60035040`; TBTT early/interval
+/// touch `0x60035030/0x6003503C`; timer-target `0x60035068/0x60035070`;
+/// counter reads `0x60035000/0x60035018` — objdump-verified). Shares the
+/// 0x60035000 page with the RNG (`WDEV_RND_REG = 0x6003507C`); the RNG arm
+/// in soc.rs routes only +0x7C, this page covers the rest. One 4 KB page.
+pub const WDEV_BASE: u32 = 0x6003_5000;
 pub const SYSCON_BASE: u32 = 0x6002_6000; // sysclk/tick/out config (NOT peripheral clocks: those are SYSTEM_PERIP_CLK_EN0/1)
 pub const PERI_BACKUP_BASE: u32 = 0x6002_A000;
 pub const LCD_CAM_BASE: u32 = 0x6004_1000;

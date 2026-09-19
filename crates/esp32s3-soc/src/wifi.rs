@@ -48,6 +48,20 @@ pub struct Wifi {
     nrx: RegStore,
     mac: RegStore,
     mac_ctrl: RegStore,
+    /// WDEV TSF/timer block @ 0x6003_5000 (shares the RNG page; the RNG
+    /// arm in soc.rs routes only +0x7C to `Rng`, everything else lands
+    /// here). Register layout proven by `hal_tsf.o` (closed `libpp.a`):
+    /// `hal_enable_sta_tsf` RMWs +0x28 bit 27, TSF enable/disable +0x40,
+    /// TBTT early/interval +0x3C/+0x30, timer-target +0x68/+0x70,
+    /// counter +0x00/+0x18 — objdump-verified, plain stores for now.
+    wdev: RegStore,
+    /// TX-DC cal completion tick (SENS2 +0x4C bit-24 overlay, see
+    /// `txdc_until`): set on the arming write, elapsed by `tick`
+    /// (driven from `Soc::tick_timers`, one cycle per call — same
+    /// clock as the `PllLock` 200-us model).
+    txdc_until: u64,
+    /// Monotonic cycle counter for the TX-DC arming timestamps.
+    now: u64,
 }
 
 /// FE IQ-estimate done bits (see module docs): the closed PHY ROM
@@ -74,6 +88,20 @@ const FE_IQ_EST_DONE_BITS: u32 = (1 << 16) | (1 << 24);
 const MAC_REV_OFF: u32 = 0x8C;
 const MAC_REV_VAL: u32 = 0x7F << 12;
 
+/// TX-DC cal delay in CPU cycles: 48000 single-step ticks (each single
+/// `step()` = 1 `tick_timers(1)` cycle) measured live 2026-09-18 — the
+/// `txdc_cal_v70` poll at 0x420819fd passes exactly 48000 single-steps
+/// after the arming RMW. Same order as the `PllLock` 200-us model
+/// (`PLL_LOCK_CYCLES = 240_000_000/5_000` = 48000).
+const TXDC_CAL_CYCLES: u64 = 48_000;
+
+/// SENS2 TX-DC cal status register (undocumented; address + polled bit
+/// objdump-verified against the wifi-scan ELF: closed PHY ROM
+/// `txdc_cal_v70` does `l32i.n a12,[a10=0x6000E04C]` then
+/// `bnone a12,a11(=0x1000000),spin`): bit 24 = cal-complete.
+pub const TXDC_OFF: u32 = 0x4C;
+pub const TXDC_DONE_BIT: u32 = 1 << 24;
+
 impl Wifi {
     pub fn new() -> Self {
         Self {
@@ -83,6 +111,9 @@ impl Wifi {
             nrx: RegStore::new(0x1000),
             mac: RegStore::new(0x1000),
             mac_ctrl: RegStore::new(0x1000),
+            wdev: RegStore::new(0x1000),
+            txdc_until: 0,
+            now: 0,
         }
     }
 
@@ -94,6 +125,7 @@ impl Wifi {
             crate::memmap::NRX_BASE => Some(&self.nrx),
             crate::memmap::WIFI_MAC_BASE => Some(&self.mac),
             crate::memmap::WIFI_MAC_CTRL_BASE => Some(&self.mac_ctrl),
+            crate::memmap::WDEV_BASE => Some(&self.wdev),
             _ => None,
         }
     }
@@ -106,7 +138,53 @@ impl Wifi {
             crate::memmap::NRX_BASE => Some(&mut self.nrx),
             crate::memmap::WIFI_MAC_BASE => Some(&mut self.mac),
             crate::memmap::WIFI_MAC_CTRL_BASE => Some(&mut self.mac_ctrl),
+            crate::memmap::WDEV_BASE => Some(&mut self.wdev),
             _ => None,
+        }
+    }
+
+    /// Advance time-dependent RF state (called once per `tick_timers`
+    /// cycle): counts down the TX-DC cal timer (see `txdc_until`).
+    pub fn tick(&mut self, cycles: u64) {
+        self.now = self.now.wrapping_add(cycles);
+    }
+
+    /// SENS2 TX-DC cal write arm (`txdc_cal_v70` RMWs 0x6000E04C, then
+    /// polls bit 24): the FIRST write with bit 1 set starts the cal (bit 1
+    /// = the driver's arming bit: the pre-cal RMW at 0x420819ca writes
+    /// 0x00113cf1|kept-bits with bit 1 SET; the poll loop's RMW at
+    /// 0x420819de writes back the polled value 0x00113cf1/0x00113cf3 with
+    /// bit 1 CLEAR — proven live 2026-09-19: the sens2 trace alternates
+    /// ...f1/...f3 every ~620 steps, i.e. the poll loop RMWs the register
+    /// continuously). A value-gated arm (`!= 0`) re-arms on every poll RMW
+    /// and resets the 48k timer forever under fast-block execution (1 tick
+    /// per 2 insns: the timer can never elapse between two same-block
+    /// iterations — proven live: sens2 stuck, 15429 bnone hits, zero
+    /// exits). The read arm reports bit 24 only after the timer elapses
+    /// (real silicon sets the bit from its RF-cal FSM).
+    ///
+    /// NOTE (session 7, verified live): even with the correct arm the
+    /// 60M-step hang dump still shows sens2 bit24=0 — the 48k timer is
+    /// LONGER than the poll's patience in fast-block time (the poll
+    /// iterations consume ~3 steps each but only 1 tick per 2 insns
+    /// globally, and the surrounding RF-cal sequence burns most of the
+    /// budget before the first poll). The bit-1 edge is still the right
+    /// gate (a level arm can never elapse); if the poll still starves,
+    /// shorten TXDC_CAL_CYCLES with a fresh live measurement, never
+    /// revert to a level arm.
+    pub fn txdc_write(&mut self, value: u32) {
+        if value & 0x2 != 0 && self.txdc_until == 0 {
+            self.txdc_until = self.now.wrapping_add(TXDC_CAL_CYCLES);
+        }
+    }
+
+    /// SENS2 TX-DC cal read overlay: stored value plus the done bit once
+    /// the cal timer has elapsed (0 before arming, like reset silicon).
+    pub fn txdc_read(&self, stored: u32) -> u32 {
+        if self.txdc_until != 0 && self.now >= self.txdc_until {
+            stored | TXDC_DONE_BIT
+        } else {
+            stored
         }
     }
 

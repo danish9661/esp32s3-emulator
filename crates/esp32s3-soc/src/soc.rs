@@ -299,9 +299,10 @@ pub struct Soc {
     /// ~200 us lock time elapses; the register is read-only on silicon for
     /// that bit, so writes to it only matter for arming the lock timer.
     pll: PllLock,
-    /// SENS2 RF-cal done storage @ 0x6000E04C (TEMP WIFI BRING-UP, see the
-    /// SENS2 mmio arm): plain store; the read arm overlays bit 24 once
-    /// armed (any nonzero write).
+    /// SENS2 TX-DC cal raw store @ 0x6000E04C (WIFI BRING-UP, see the
+    /// SENS2 mmio arm + `Wifi::{txdc_write,txdc_read}`): plain store of
+    /// the last-written value; the read arm overlays bit 24 only after
+    /// the ~200-us cal timer (armed by any nonzero write) elapses.
     pll_cal4c: u32,
 
     // ── P5 register-store peripherals (configure-and-forget, no observable
@@ -1569,6 +1570,7 @@ impl Soc {
         }
         self.rtc.tick(cycles);
         self.pll.tick(cycles);
+        self.wifi.tick(cycles);
     }
 
     /// Internal SRAM access at `addr` (must be inside DRAM or IRAM window).
@@ -2593,18 +2595,25 @@ impl Soc {
                         self.pll.read32()
                     }
                 } else if off == 0x4C {
-                    // TEMP WIFI BRING-UP: report RF-cal done (bit 24 set)
-                    // once the driver arms the sequence (any nonzero write
-                    // to this register); before the arm read back the
-                    // stored value (reset 0) so the poll spins only until
-                    // cal actually starts. Real silicon sets the bit from
-                    // its RF-cal FSM; refine if a later spin needs timing.
+                    // WIFI BRING-UP: TX-DC cal done (bit 24, objdump-verified
+                    // against the wifi-scan ELF: closed PHY ROM `txdc_cal_v70`
+                    // does `l32i.n a12,[a10=0x6000E04C]` then `bnone
+                    // a12,a11(=0x1000000),spin`). The driver RMWs this
+                    // register BEFORE arming (0x420819ca: l32i_n; and with
+                    // 0xff000000; or 0x00113cf1; s32i_n — the RMW at
+                    // 0x420819c1..0x420819dc writes 0x00113cf1|kept-bits),
+                    // then polls bit 24 at 0x420819fb/fd. The write arm
+                    // therefore stores the value AND arms the cal timer in
+                    // `Wifi` (48000 cycles, measured live); the read arm
+                    // overlays bit 24 only after the timer elapses (real
+                    // silicon sets the bit from its RF-cal FSM). Reset
+                    // reads 0 so an unstarted poll spins, like silicon.
                     if is_write {
                         self.pll_cal4c = value;
+                        self.wifi.txdc_write(value);
                         0
                     } else {
-                        let v = self.pll_cal4c;
-                        if v != 0 { v | (1 << 24) } else { v }
+                        self.wifi.txdc_read(self.pll_cal4c)
                     }
                 } else if off == 0x50 {
                     0x0700_0000
@@ -2822,11 +2831,22 @@ impl Soc {
                 }
             }
             crate::rng::RNG_BASE => {
+                // Shared RNG/WDEV page (both bases are 0x6003_5000): the
+                // RNG data register (+0x7C = WDEV_RND_REG) belongs to Rng,
+                // everything else to the Wifi WDEV TSF/timer block.
+                if off == 0x7C {
+                    if is_write {
+                        self.rng.write32(off, value);
+                    } else {
+                        return self.rng.read32(off);
+                    }
+                    return 0;
+                }
                 if is_write {
-                    self.rng.write32(off, value);
+                    self.wifi.write32(crate::memmap::WDEV_BASE, off, value);
                     0
                 } else {
-                    self.rng.read32(off)
+                    self.wifi.read32(crate::memmap::WDEV_BASE, off)
                 }
             }
             // SYSTEM peripheral (0x600C0000): only APPCPU_CTRL_A @ +0x04 is
@@ -2949,7 +2969,9 @@ impl Soc {
             // WiFi radio blocks (TEMP WIFI BRING-UP scaffold, see wifi.rs):
             // FE/FE2 @ 0x60006000/0x60005000, BB @ 0x6001D000,
             // NRX @ 0x6001CC00, MAC @ 0x6001C000, MAC-CTRL @ 0x60033000.
-            // Plain stores + proven RF-cal done-bits.
+            // (WDEV @ 0x60035000 shares the RNG page and is routed by the
+            // RNG arm above, not here.) Plain stores + proven RF-cal
+            // done-bits.
             FE_BASE | FE2_BASE | BB_BASE | NRX_BASE | WIFI_MAC_BASE | WIFI_MAC_CTRL_BASE => {
                 if is_write {
                     self.wifi.write32(dev, off, value);
@@ -3012,22 +3034,9 @@ impl Soc {
             // USB_WRAP (OTG PHY wrapper, 0x60039000): plain store.
             0x6003_9000 => store_dispatch(is_write, off, value, &mut self.usb_wrap),
             0x600D_0000 => store_dispatch(is_write, off, value, &mut self.wcl),
-            // Everything else in the APB space: no model yet.
-            // TEMP WIFI TRACE (remove before commit): count unmapped APB
-            // touches so the WiFi driver footprint can be discovered.
-            _ => {
-                #[cfg(feature = "wifi-trace")]
-                if (0x6000_0000..0x6010_0000).contains(&base) {
-                    extern crate std;
-                    std::eprintln!(
-                        "WIFI_TRACE {} {:#010x}={:#010x}",
-                        if is_write { "W" } else { "R" },
-                        base + off,
-                        if is_write { value } else { 0 }
-                    );
-                }
-                0
-            }
+            // Everything else in the APB space: no model yet (reads 0 /
+            // writes dropped, like QEMU's unimplemented devices).
+            _ => 0,
         }
     }
 }
@@ -3682,6 +3691,74 @@ impl Soc {
 }
 
 impl Bus for Soc {
+    /// Atomic compare-and-swap WITHOUT an interleaving peripheral tick.
+    /// `s32c1i` (portMUX spinlocks) must read-compare-write as one bus
+    /// transaction: the default trait impl (read32, maybe write32) runs
+    /// `tick_timers` between the two only if the caller ticks — but the
+    /// Xtensa `step` path calls `int_pending` (which scans peripherals
+    /// but does not tick)... the REAL hazard is `run_fast_core`'s
+    /// `fast_maybe_tick`, which ticks INSIDE multi-op blocks. The exec
+    /// calls this hook directly, so no tick can slip between read and
+    /// write here regardless of driver. DRAM/IRAM fast paths only; MMIO
+    /// CAS falls back to read+write (device regs are not spinlock
+    /// words — no firmware CASes them).
+    #[inline(always)]
+    fn cas32(&mut self, addr: u32, compare: u32, val: u32) -> u32 {
+        let addr = ioblock_remap(addr);
+        // Fast path: aligned DRAM word (spinlock words live here).
+        if addr & 3 == 0 && in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE) {
+            let o = (addr - DRAM_BASE) as usize;
+            // SAFETY: o < SRAM_BASE_RANGE <= SRAM_BYTES, checked by in_range
+            let old = u32::from_le_bytes(unsafe {
+                [
+                    *self.sram.get_unchecked(o),
+                    *self.sram.get_unchecked(o + 1),
+                    *self.sram.get_unchecked(o + 2),
+                    *self.sram.get_unchecked(o + 3),
+                ]
+            });
+            if old == compare {
+                self.sram[o..o + 4].copy_from_slice(&val.to_le_bytes());
+            }
+            return old;
+        }
+        // IRAM-windowed DRAM (same backing, instruction-side alias).
+        if addr & 3 == 0 && in_range!(addr, IRAM_BASE, IRAM_WINDOW_SIZE) {
+            let o = (addr - IRAM_BASE) as usize;
+            if o < SRAM0_SIZE as usize {
+                let old = u32::from_le_bytes(unsafe {
+                    [
+                        *self.iram0.get_unchecked(o),
+                        *self.iram0.get_unchecked(o + 1),
+                        *self.iram0.get_unchecked(o + 2),
+                        *self.iram0.get_unchecked(o + 3),
+                    ]
+                });
+                if old == compare {
+                    self.iram0[o..o + 4].copy_from_slice(&val.to_le_bytes());
+                }
+                return old;
+            }
+            let o = (DIRAM_DATA_BASE - DRAM_BASE + (addr - DIRAM_INST_BASE)) as usize;
+            let old = u32::from_le_bytes([
+                self.sram[o],
+                self.sram[o + 1],
+                self.sram[o + 2],
+                self.sram[o + 3],
+            ]);
+            if old == compare {
+                self.sram[o..o + 4].copy_from_slice(&val.to_le_bytes());
+            }
+            return old;
+        }
+        // MMIO / flash / RTC: no firmware spinlocks here; plain RMW.
+        let old = self.read32(addr);
+        if old == compare {
+            self.write32(addr, val);
+        }
+        old
+    }
+
     fn int_pending(&mut self, cpu: usize) -> u32 {
         // Per-step cache: `tick_timers()` invalidates src_valid at the start
         // of each step.  The first int_pending call (core 0) recomputes the

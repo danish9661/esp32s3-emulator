@@ -404,12 +404,12 @@ pub(crate) fn execute<B: Bus>(
         Opcode::OPCODE_S32C1I => {
             // s32c1i t, s, imm: compare-and-swap with SCOMPARE1 (ISA RM
             // "Conditional Store"; QEMU translate_s32c1i uses an atomic
-            // cmpxchg; single-threaded here).
+            // cmpxchg). Single bus transaction via `Bus::cas32` — a
+            // separated read32/write32 lets the OTHER core's timer ISR
+            // slip between them and steal the lock word (both cores then
+            // own the portMUX spinlock; esp-idf hangs in the CAS retry).
             let addr = cpu.reg(o[1].value).wrapping_add(o[2].value);
-            let old = bus.read32(addr);
-            if old == cpu.sreg(SR_SCOMPARE1) {
-                bus.write32(addr, cpu.reg(o[0].value));
-            }
+            let old = bus.cas32(addr, cpu.sreg(SR_SCOMPARE1), cpu.reg(o[0].value));
             cpu.set_reg(o[0].value, old);
             Outcome::Seq
         }

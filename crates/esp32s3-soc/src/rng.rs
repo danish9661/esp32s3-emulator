@@ -17,8 +17,10 @@ const DATA_OFF: u32 = 0x7C; // WDEV_RND_REG
 const LCG_MULT: u64 = 1664525;
 const LCG_INC: u64 = 1013904223;
 
-// Cover 0x6003_5000..0x6003_5400 (the known RNG/WDEV register window).
-const REG_COUNT: usize = 0x400 / 4;
+// Cover the full 0x6003_5000 page (shared with the WiFi WDEV TSF/timer
+// block at +0x00..0x70; the RNG data register is at +0x7C). Plain stores
+// below +0x7C must not alias the data register (idx masks the full page).
+const REG_COUNT: usize = 0x1000 / 4;
 
 pub struct Rng {
     state: u32,
@@ -48,11 +50,11 @@ impl Rng {
     }
 
     fn idx(&self, offset: u32) -> usize {
-        ((offset & 0x3FF) / 4) as usize
+        ((offset & 0xFFF) / 4) as usize
     }
 
     pub fn read32(&mut self, offset: u32) -> u32 {
-        if (offset & 0x3FF) == DATA_OFF {
+        if (offset & 0xFFF) == DATA_OFF {
             // Advance the LCG and return the new state as "entropy".
             let next = (self.state as u64)
                 .wrapping_mul(LCG_MULT)

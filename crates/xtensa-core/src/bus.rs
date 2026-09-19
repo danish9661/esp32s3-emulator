@@ -11,6 +11,23 @@ pub trait Bus {
     fn write16(&mut self, addr: u32, val: u32);
     fn write32(&mut self, addr: u32, val: u32);
 
+    /// Atomic 32-bit compare-and-swap for `s32c1i` (ISA RM "Conditional
+    /// Store"): if `*addr == compare`, set `*addr = val`. Returns the OLD
+    /// word. The whole read-compare-write is ONE bus transaction — no
+    /// `tick_timers` runs inside it, so a core-0 timer ISR can never slip
+    /// between the read and the write and steal a lock word both cores
+    /// raced on (that interleaving corrupts `portMUX` spinlocks: core 0's
+    /// separated read32/write32 lets core 1's ISR write land first, then
+    /// core 0 overwrites it and both cores own the lock). The default
+    /// read-then-write is correct only for single-threaded test buses.
+    fn cas32(&mut self, addr: u32, compare: u32, val: u32) -> u32 {
+        let old = self.read32(addr);
+        if old == compare {
+            self.write32(addr, val);
+        }
+        old
+    }
+
     /// CPU interrupt lines currently asserted by the SoC for CPU `cpu`
     /// (bit n = line n high).  The CPU ORs this into its INTSET state when
     /// checking for pending interrupts and when reading `rsr.interrupt`
