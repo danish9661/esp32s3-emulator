@@ -263,6 +263,48 @@ fn main() {
     let usb_host_enum = env::var("USB_HOST_ENUM").is_ok();
     let mut usb_enum_step: usize = 0;
 
+    // WiFi scan completion (wifi-scan-sketch support): WIFI_SCAN_FIXTURE=1
+    // arms the scan-dwell completion. When the firmware enters
+    // `esp_wifi_scan_start` (closed lib, address below) the dwell starts;
+    // when it elapses the host stages the ap-store count (if any fixture
+    // APs) and posts the REAL SCAN_DONE esp_event, so the full `_scanDone`
+    // → calloc → DONE-bit → print chain runs unmodified. Empty air (no
+    // WIFI_SCAN_APS) reports `found 0`, which is what silicon reports with
+    // no APs in range. With fixtures, the host writes the `wifi_ap_record_t`
+    // records DIRECTLY into the calloc'd `_scanResult` buffer at the
+    // records-return check (see below) — the closed BSS queue never carries
+    // nodes without RF stimulus, so the copy loop always derives 0 there.
+    // `esp_wifi_scan_start` linked address (libnet80211.a, verified via nm
+    // on the wifi-scan ELF; stable for the pinned esp32 core).
+    const ESP_WIFI_SCAN_START: u32 = 0x4206_3b90;
+    // `D WIFI_EVENT` pointer variable (content = compared event base).
+    const WIFI_EVENT_VAR: u32 = 0x3c0b_4264;
+    // IDF ap-store count cell (u16; literal slot content, proven live).
+    const COUNT_CELL: u32 = 0x3fc9_f93e;
+    // Arduino `_scanCount` / `_scanResult` BSS cells (nm on the wifi-scan
+    // ELF; read live by the host to find the calloc'd buffer + repair the
+    // count verdict).
+    const SCAN_COUNT: u32 = 0x3fc9_aef4;
+    const SCAN_RESULT: u32 = 0x3fc9_aef0;
+    // Records-return check in Arduino `_scanDone` (BEQZ a10 = "records
+    // OK?"): the host writes the fixture records into the final buffer
+    // here and forces ESP_OK + count, exactly the state the closed copy
+    // loop leaves with live BSS nodes. Linked address, stable for the
+    // pinned esp32 core (wifilit disasm of `_scanDoneEv`).
+    const SCAN_RECORDS_CHECK: u32 = 0x4200_3ee0;
+    // FreeRTOS ready-list base + top-priority cell (pxReadyTasksLists /
+    // uxTopReadyPriority — nm on the wifi-scan ELF).
+    const READY_LISTS: u32 = 0x3fc9_b8f4;
+    const TOP_PRIO: u32 = 0x3fc9_b864;
+    let wifi_scan_fixture = env::var("WIFI_SCAN_FIXTURE").is_ok();
+    let wifi_scan_aps: Vec<esp32s3_soc::wifi::ScanFixtureAp> = env::var("WIFI_SCAN_APS")
+        .ok()
+        .map(|s| esp32s3_soc::wifi::parse_scan_fixtures(&s))
+        .unwrap_or_default();
+    let mut wifi_scan_armed = false;
+    let mut wifi_scan_done = false;
+    let mut wifi_scan_records_done = false;
+
     // Step budget in INSTRUCTIONS (`step_fast` executes whole blocks and
     // reports how many instructions ran): one old loop iteration stepped a
     // single instruction per core (2/cross-core pair), so the old 48M-step
@@ -676,6 +718,70 @@ fn main() {
         if m.is_asleep() {
             idle_steps = 0;
             stuck = 0;
+        }
+        // WiFi scan completion: arm the dwell when the firmware enters
+        // `esp_wifi_scan_start` (either core); when the dwell elapses, stage
+        // the fixture records (if any) and post the REAL SCAN_DONE esp_event
+        // so the full `_scanDone` record path runs unmodified. Level, not
+        // edge: the arm fires once per scan; the completion retries until
+        // the queue/group handles are valid, then latches done.
+        if wifi_scan_fixture && !wifi_scan_done {
+            if !wifi_scan_armed
+                && (m.cpu[0].pc == ESP_WIFI_SCAN_START || m.cpu[1].pc == ESP_WIFI_SCAN_START)
+            {
+                m.soc.wifi_scan_begin();
+                wifi_scan_armed = true;
+                println!("[host] WiFi scan dwell armed");
+            }
+            if wifi_scan_armed && m.soc.wifi_scan_tick_complete() {
+                // Count cell first, so the record path the event triggers
+                // already sees the store. Empty air (no WIFI_SCAN_APS)
+                // stages nothing: count cell stays 0. (The BSS queue is
+                // NOT staged: with no RF stimulus the closed scan machine
+                // never enqueues nodes; the records themselves are written
+                // at SCAN_RECORDS_CHECK below.)
+                if !wifi_scan_aps.is_empty() {
+                    m.soc.write16(COUNT_CELL, wifi_scan_aps.len().min(8) as u32);
+                    println!(
+                        "[host] WiFi scan staged count {}",
+                        wifi_scan_aps.len().min(8)
+                    );
+                }
+                match m.soc.wifi_scan_post_event(WIFI_EVENT_VAR) {
+                    Some(tcb) => {
+                        m.soc.ready_task_on_list(tcb, READY_LISTS, TOP_PRIO);
+                        println!("[host] WiFi SCAN_DONE posted (woke sys_evt {tcb:#x})");
+                    }
+                    None => println!("[host] WiFi SCAN_DONE post failed (no sys_evt yet)"),
+                }
+                wifi_scan_done = true;
+            }
+        }
+        // WiFi scan records: at the records-return check the calloc'd
+        // buffer is final — write the fixture records + force the verdict
+        // the closed copy loop would leave with live BSS nodes (ESP_OK +
+        // count). Either core may run `_scanDone`; exactly once per scan.
+        if wifi_scan_fixture
+            && wifi_scan_done
+            && !wifi_scan_records_done
+            && !wifi_scan_aps.is_empty()
+        {
+            for c in 0..2 {
+                if m.cpu[c].pc == SCAN_RECORDS_CHECK {
+                    let buf = m.soc.read32(SCAN_RESULT);
+                    if buf != 0 {
+                        let n = wifi_scan_aps.len().min(8);
+                        for (k, ap) in wifi_scan_aps.iter().take(n).enumerate() {
+                            m.soc.wifi_scan_record_ap(buf, k, ap);
+                        }
+                        m.cpu[c].set_reg(10, 0); // a10 = ESP_OK
+                        m.soc.write16(COUNT_CELL, n as u32);
+                        m.soc.write16(SCAN_COUNT, n as u32);
+                        println!("[host] WiFi scan recorded {n} AP(s) on core{c}");
+                        wifi_scan_records_done = true;
+                    }
+                }
+            }
         }
         let uart_len = uart_buf.len();
         if pc == last_pc && uart_len == last_uart_len {

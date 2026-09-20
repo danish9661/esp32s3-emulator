@@ -93,7 +93,22 @@ struct Unit {
 pub struct Systimer {
     regs: [u32; REG_COUNT],
     units: [Unit; 2],
-    /// Oneshot (COMP_LOAD-armed) alarm per target.
+    /// Oneshot (COMP_LOAD-armed) alarm per target.  The arm is CONSUMED when
+    /// the alarm fires (single-shot: `armed[n] = false` in `check_alarms` on
+    /// fire) — firmware re-arms with a fresh COMP_LOAD write for every new
+    /// alarm (`systimer_hal_set_alarm_target`: disable → set target →
+    /// COMP_LOAD apply → enable).  Without the consume, a stale target
+    /// (counter already past it because the servicing task hasn't run yet)
+    /// refires on EVERY step right after the ISR clears INT_RAW, producing
+    /// an interrupt storm that starves the very task that would reprogram
+    /// the target (proven live 2026-09-20 on the wifi-scan image: TARGET2
+    /// RAW bit re-asserted on the step after every clear, ISR every ~183
+    /// steps, wifi thread + s_timer_task starved, loopTask parked on the
+    /// coex take; forcing TARGET2 future unblocked give #5 + setup progress).
+    /// On silicon the same stale-target level would re-assert, but real
+    /// concurrency lets the servicing task win the race; in the serialized
+    /// emulator the storm can never lose, so the consume models the
+    /// single-shot intent (fire once per COMP_LOAD apply).
     armed: [bool; 3],
     /// Period-mode (tick) alarms: whether active and the next effective
     /// boundary per target.
@@ -175,6 +190,8 @@ impl Systimer {
             let target = ((self.regs[((TARGET_HI + n as u32 * 8) / 4) as usize] as u64) << 32)
                 | self.regs[((TARGET_LO + n as u32 * 8) / 4) as usize] as u64;
             if self.units[sel].counter >= target {
+                // Single-shot: consume the COMP_LOAD arm (see `armed` docs).
+                self.armed[n] = false;
                 self.regs[raw_off] |= 1 << n;
             }
         }

@@ -149,3 +149,33 @@ fn period_mode_without_work_en_stays_quiet() {
     s.tick_timers(50);
     assert_eq!(s.read32(SYSTIMER_BASE + INT_RAW), 0);
 }
+
+#[test]
+fn oneshot_arm_consumed_on_fire_no_refire_after_clr() {
+    // Single-shot intent (fire once per COMP_LOAD apply): after the alarm
+    // fires and the ISR clears INT_RAW, the alarm must NOT re-fire on the
+    // next tick — otherwise a stale target (counter already past it because
+    // the servicing task hasn't run yet) storms every step and starves the
+    // task that would reprogram it (wifi-scan TARGET2 livelock, 2026-09-20).
+    // A fresh COMP_LOAD write re-arms for the next alarm.
+    let mut s = st();
+    s.write32(SYSTIMER_BASE + TARGET_HI0, 0);
+    s.write32(SYSTIMER_BASE + TARGET_LO0, 10);
+    s.write32(SYSTIMER_BASE + TARGET_CONF0, 0);
+    let conf = s.read32(SYSTIMER_BASE + CONF);
+    s.write32(SYSTIMER_BASE + CONF, conf | TARGET0_WORK_EN);
+    s.write32(SYSTIMER_BASE + COMP_LOAD0, 1);
+    s.write32(SYSTIMER_BASE + INT_ENA, 1 << 0);
+    s.tick_timers(10);
+    assert_eq!(s.read32(SYSTIMER_BASE + INT_RAW), 1 << 0);
+    // ISR clears...
+    s.write32(SYSTIMER_BASE + INT_CLR, 1 << 0);
+    // ...and the stale target must stay quiet (arm consumed).
+    s.tick_timers(100);
+    assert_eq!(s.read32(SYSTIMER_BASE + INT_RAW), 0);
+    // Fresh COMP_LOAD with a future target re-arms and fires again.
+    s.write32(SYSTIMER_BASE + TARGET_LO0, 200);
+    s.write32(SYSTIMER_BASE + COMP_LOAD0, 1);
+    s.tick_timers(100);
+    assert_eq!(s.read32(SYSTIMER_BASE + INT_RAW), 1 << 0);
+}

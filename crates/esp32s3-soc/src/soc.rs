@@ -301,8 +301,8 @@ pub struct Soc {
     pll: PllLock,
     /// SENS2 TX-DC cal raw store @ 0x6000E04C (WIFI BRING-UP, see the
     /// SENS2 mmio arm + `Wifi::{txdc_write,txdc_read}`): plain store of
-    /// the last-written value; the read arm overlays bit 24 only after
-    /// the ~200-us cal timer (armed by any nonzero write) elapses.
+    /// the last-written value; the read arm overlays the proven bit-24
+    /// done bit via the one-shot latch in `Wifi`.
     pll_cal4c: u32,
 
     // ── P5 register-store peripherals (configure-and-forget, no observable
@@ -962,6 +962,348 @@ impl Soc {
         self.rng.reseed(seed);
     }
 
+    /// Find a task TCB by its first 8 name bytes (host frontend for WiFi
+    /// scan completion: locates `sys_evt`, the esp_event loop task, whose
+    /// event-wait queue IS the default loop's queue).
+    pub fn find_task_by_name(&mut self, name8: &[u8; 8]) -> Option<u32> {
+        use xtensa_core::Bus as _Bus;
+        let mut addr = 0x3FC9_0000u32;
+        while addr < 0x3FCF_0000 {
+            let mut nb = [0u8; 8];
+            for (k, b) in nb.iter_mut().enumerate() {
+                *b = self.read8(addr + 52 + k as u32) as u8;
+            }
+            if &nb == name8 {
+                // Sanity: prio sane + state/event containers in DRAM.
+                let prio = self.read32(addr + 44);
+                let ev_c = self.read32(addr + 40);
+                let st_c = self.read32(addr + 20);
+                let in_dram = |x: u32| (0x3FC8_0000..0x3FD0_0000).contains(&x) || x == 0;
+                if prio <= 25 && in_dram(ev_c) && in_dram(st_c) {
+                    return Some(addr);
+                }
+                // else: name matched but failed sanity — keep looking
+            }
+            addr += 4;
+        }
+        None
+    }
+
+    /// Post a raw queue item to a FreeRTOS queue with REAL
+    /// `xQueueGenericSend` head semantics (host frontend for the WiFi
+    /// SCAN_DONE esp_event post): memcpy `item` (itemsize bytes) to
+    /// pcWriteTo with wraparound at pcTail, advance pcWriteTo, bump
+    /// uxMessagesWaiting. The waiter wakeup is the HOST's follow-up (the
+    /// `sys_evt` task is unblocked via `queue_unblock_receiver`, then
+    /// readied — the tick ISR switches to it within a tick).
+    ///
+    /// Queue_t layout for this build (§8b): +0 pcHead, +4 pcWriteTo,
+    /// +8 pcTail, +12 pcReadFrom, +16 send-list (20B), +36 recv-list (20B),
+    /// +56 mw, +60 len, +64 itemsize.
+    pub fn queue_post_raw(&mut self, queue: u32, item: &[u8]) -> bool {
+        use xtensa_core::Bus as _Bus;
+        let len = self.read32(queue + 60);
+        let isz = self.read32(queue + 64);
+        let mw = self.read32(queue + 56);
+        if mw >= len || isz == 0 || item.len() != isz as usize {
+            return false;
+        }
+        let head = self.read32(queue);
+        let tail = self.read32(queue + 8);
+        if head == 0 || tail == 0 {
+            return false;
+        }
+        let mut wr = self.read32(queue + 4);
+        for b in item.iter() {
+            self.write8(wr, *b as u32);
+            wr += 1;
+            if wr >= tail {
+                wr = head;
+            }
+        }
+        self.write32(queue + 4, wr);
+        self.write32(queue + 56, mw + 1);
+        true
+    }
+
+    /// Unblock a task parked in `xQueueReceive` on `queue` with REAL
+    /// `xTaskRemoveFromEventList` semantics (host frontend for the WiFi
+    /// SCAN_DONE esp_event delivery): removes the head waiter (highest
+    /// priority — the list is priority-ordered) from the receive event
+    /// list, stamps nothing (plain queue, no event-item value), unlinks it
+    /// from its state list, and returns the woken TCB. The host readies it
+    /// via `ready_task_on_list` next (same step, same borrow).
+    ///
+    /// Returns `None` when the receive list is empty.
+    ///
+    /// NOTE (proven live 2026-09-20): waking the SCAN_DONE *event-group
+    /// waiter* (loopTask) directly is NOT enough — the Arduino `_scanDone` record path (get_ap_num/records + calloc into
+    /// `_scanResult`) only runs from the esp_event callback
+    /// (`_eventCallback` ← arduino_events task ← `sys_evt` ← default-loop
+    /// queue). The host must post the SCAN_DONE esp_event
+    /// (`wifi_scan_post_event`) and unblock `sys_evt`; the real chain then
+    /// sets the DONE bit itself via `setStatusBits`.
+    pub fn queue_unblock_receiver(&mut self, queue: u32) -> Option<u32> {
+        use xtensa_core::Bus as _Bus;
+        let list = queue + 36;
+        let end = list + 8;
+        let item = self.read32(end + 4);
+        if item == end || item == 0 {
+            return None;
+        }
+        let next = self.read32(item + 4);
+        let owner = self.read32(item + 12);
+        // Unlink from the event list.
+        let iprev = self.read32(item + 8);
+        if iprev != 0 {
+            self.write32(iprev + 4, next);
+        }
+        self.write32(next + 8, iprev);
+        let n = self.read32(list).wrapping_sub(1);
+        self.write32(list, n);
+        self.write32(item + 16, 0);
+        // Unlink from the delayed/suspended state list.
+        let st_item = owner + 4;
+        let sc = self.read32(st_item + 16);
+        if sc != 0 {
+            let sprev = self.read32(st_item + 8);
+            let snext = self.read32(st_item + 4);
+            if sprev != 0 {
+                self.write32(sprev + 4, snext);
+            }
+            self.write32(snext + 8, sprev);
+            let sn = self.read32(sc).wrapping_sub(1);
+            self.write32(sc, sn);
+            self.write32(st_item + 16, 0);
+        }
+        Some(owner)
+    }
+
+    /// Host-side TLSF carve: allocate `user_bytes` (already 4-aligned,
+    /// INCLUDING the IDF 4-byte block-owner prefix) from the main DRAM
+    /// heap and return the user pointer (what IDF hands out, i.e. owner
+    /// prefix + 4). Caller writes the record image at `ptr`, with the
+    /// owner word before it.
+    ///
+    /// Ground truth: `heap_caps_base.c` (owner prefix + `heap->caps`
+    /// match + `aligned_or_unaligned_alloc`), `multi_heap.c`
+    /// (`tlsf_create_with_pool(start+sizeof(heap_t))`, `block_to_ptr =
+    /// block+8`, `block_next = ptr+size-4`), `tlsf_block_functions.h`
+    /// (free bit 0, `block_header_overhead = 4`, `block_size_min = 12`),
+    /// `tlsf_control_functions.h` (`block_can_split = size >= 16+size`,
+    /// `mapping_insert` small/large, `search_suitable_block`,
+    /// `remove_free_block`, `block_split`, `block_trim_free`,
+    /// `block_mark_as_used`). Live image facts (wifi-scan ELF, sdkconfig
+    /// `HEAP_TASK_TRACKING=n`): `heap_t` = caps[3]+start+end+mux(8B)+
+    /// handle+next (36B); DRAM heap `handle=0x3fca0398`, pool
+    /// `handle+20`; owner prefix = current task handle (`pxCurrentTCBs`,
+    /// else 0).
+    ///
+    /// The carve mirrors `tlsf_malloc` exactly (index search, unlink,
+    /// split-if-fits with the remainder re-inserted, mark-used) so the
+    /// firmware's later `free()` walks a consistent pool. Best-fit would
+    /// also work; first-fit is what the model does and is equally valid
+    /// TLSF behavior. `free_bytes` accounting is NOT updated (the
+    /// firmware never reads it on this path; `multi_heap_get_info` is
+    /// only diagnostics).
+    ///
+    /// Returns 0 when no free block fits (caller falls back to empty-air
+    /// completion — same as silicon's allocation failure, which reports
+    /// `found 0` via the calloc guard in `_scanDone`).
+    pub fn wifi_heap_carve(&mut self, user_bytes: u32) -> u32 {
+        // Local bus shims: read/write through the Soc Bus impl without
+        // holding `&mut self` across the call (the Bus methods take
+        // `&mut self`, so `self.read32(x)` inside `self.write32(a, ...)`
+        // args double-borrows; these free functions take the reborrow).
+        fn r32(s: &mut Soc, a: u32) -> u32 {
+            use xtensa_core::Bus as _Bus;
+            s.read32(a)
+        }
+        fn w32(s: &mut Soc, a: u32, v: u32) {
+            use xtensa_core::Bus as _Bus;
+            s.write32(a, v);
+        }
+        const REGISTERED_HEAPS: u32 = 0x3fc9_b7ac;
+        const DRAM_START: u32 = 0x3fca_0398;
+        // 1. Find the DRAM heap (caps[0] has INTERNAL|8BIT|32BIT|DMA...).
+        let mut heap_t = r32(self, REGISTERED_HEAPS);
+        let mut handle = 0u32;
+        let mut guard = 0u32;
+        while heap_t != 0 && guard < 8 {
+            guard += 1;
+            let start = r32(self, heap_t + 12);
+            if start == DRAM_START {
+                handle = r32(self, heap_t + 28);
+                break;
+            }
+            heap_t = r32(self, heap_t + 32);
+        }
+        if handle == 0 {
+            return 0;
+        }
+        // 2. TLSF control at handle+20 (after multi_heap's heap_t header).
+        let tlsf = handle + 20;
+        // Recompute control->size like control_construct: sizeof(control_t)
+        // = block_null(16) + bitfield word(4) + size(4) + fl_bitmap(4) +
+        // sl_bitmap ptr(4) + blocks ptr(4) = 36; then sl_bitmap (4*fl_count)
+        // and blocks (4*fl_count*sl_count) follow, 4-aligned.
+        // control fields needed for mapping: re-read packed word.
+        let packed = r32(self, tlsf + 16);
+        let flc = packed & 0x1F;
+        let fls = (packed >> 5) & 0x7;
+        let sl2 = (packed >> 20) & 0x7;
+        let slc = 1u32 << sl2;
+        let small_block = 1u32 << fls;
+        // fl_bitmap @ tlsf+24, sl_bitmap ptr @ tlsf+28, blocks ptr @ tlsf+32.
+        let fl_bitmap = r32(self, tlsf + 24);
+        let sl_base = r32(self, tlsf + 28);
+        let bl_base = r32(self, tlsf + 32);
+        // 3. Adjust request like adjust_request_size (align 4, min 12).
+        let mut need = (user_bytes + 3) & !3;
+        if need < 12 {
+            need = 12;
+        }
+        // mapping_search: round up for large sizes.
+        let mut size = need;
+        if size >= small_block {
+            // fls_of(size): position of highest set bit (0-based).
+            let fl = 31 - size.leading_zeros();
+            let round = 1u32 << (fl - sl2);
+            size = (size + round - 1) & !(round - 1);
+        }
+        // mapping_insert(size) -> (fl, sl). Ground truth
+        // (tlsf_control_functions.h mapping_insert): large sizes use
+        // fl = tlsf_fls(size) = 31-clz (NOT 31-leading_zeros on the ROUNDED
+        // size — same thing), sl = (size >> (fl-sl_log2)) ^ (1<<sl_log2).
+        let (fl, sl) = if size < small_block {
+            (0, size / (small_block / slc))
+        } else {
+            let f = 31 - size.leading_zeros();
+            let s = (size >> (f - sl2)) ^ (1u32 << sl2);
+            (f - fls, s)
+        };
+        // search_suitable_block: sl_map masked from sl upward, then higher fl.
+        // NOTE: fl here counts from fl_index_shift; bitmap bit k = fl k.
+        // control->fl_index_count limits the search. The found block's
+        // (fl,sl) come from the SEARCH (sfl,ssl), NOT the request (fl,sl) —
+        // remove_free_block must unlink from the list the block was found
+        // on (else the request list's head is corrupted and the next
+        // malloc trips block_is_free on a used block).
+        let mut sfl = fl;
+        // First: masked sl in the request fl.
+        let mut sl_map = r32(self, sl_base + sfl * 4);
+        if sfl < flc {
+            sl_map &= !0u32 << sl;
+        }
+        if sfl >= flc || sl_map == 0 {
+            // Next-largest fl with any bit (fl_map masked above fl).
+            let mut fmap = fl_bitmap & (!0u32 << (fl + 1));
+            // Mask to valid fl bits.
+            if flc < 32 {
+                fmap &= (1u32 << flc) - 1;
+            }
+            if fmap == 0 {
+                return 0;
+            }
+            sfl = fmap.trailing_zeros();
+            sl_map = r32(self, sl_base + sfl * 4);
+        }
+        if sl_map == 0 {
+            return 0;
+        }
+        let bsl = sl_map.trailing_zeros();
+        let block = r32(self, bl_base + (sfl * slc + bsl) * 4);
+        let bfl = sfl;
+        if block == 0 {
+            return 0;
+        }
+        // Sanity: block must be free and big enough.
+        let bsize_word = r32(self, block + 4);
+        let bsize = bsize_word & !3;
+        if bsize_word & 1 == 0 || bsize < size {
+            return 0;
+        }
+        // remove_free_block(control, block, bfl, bsl).
+        let prev = r32(self, block + 8);
+        let next = r32(self, block + 12);
+        w32(self, next + 8, prev);
+        w32(self, prev + 12, next);
+        if r32(self, bl_base + (bfl * slc + bsl) * 4) == block {
+            w32(self, bl_base + (bfl * slc + bsl) * 4, next);
+        }
+        // block_trim_free: split remainder back into the pool.
+        // block_can_split = bsize >= sizeof(block_header_t)+size = 20+size.
+        if bsize >= 20 + size {
+            // remaining = offset_to_block(block_to_ptr(block), size-4)
+            //          = (block+8) + (size-4) = block+4+size.
+            let rem = block + 4 + size;
+            let remain_size = bsize - (size + 4);
+            // block_set_size(block, size): keep flags.
+            w32(self, block + 4, size | (bsize_word & 3));
+            // block_split's tail = block_mark_as_free(remaining):
+            // link_next(remaining) [rem.next.prev_phys = rem] +
+            // rem.next.prev_free=1 + rem.free=1. (block_set_size does NOT
+            // touch links/flags — the split helper does. All three are
+            // needed or the pool chain + free lists corrupt.)
+            let rem_next = rem + 4 + remain_size; // block_next(rem)
+            w32(self, rem_next, rem);
+            let rnw = r32(self, rem_next + 4);
+            w32(self, rem_next + 4, rnw | 2);
+            // block_set_size(remaining, remain_size) + free bit.
+            w32(self, rem + 4, remain_size | 1);
+            // block_link_next(block): next->prev_phys = block.
+            let nxt = block + 4 + bsize; // block_next(block) with OLD size = block+4+bsize
+            w32(self, nxt, block);
+            // block_set_prev_free(remaining) [prev block is used -> no-op
+            // value-wise: keep the free bit from above, ensure prev_free
+            // CLEAR since our used block precedes it].
+            w32(self, rem + 4, remain_size | 1);
+            // block_insert(remaining).
+            let (rfl, rsl) = if remain_size < small_block {
+                (0, remain_size / (small_block / slc))
+            } else {
+                let f = 31 - remain_size.leading_zeros();
+                let s = (remain_size >> (f - sl2)) ^ (1u32 << sl2);
+                (f - fls, s)
+            };
+            let cur = r32(self, bl_base + (rfl * slc + rsl) * 4);
+            w32(self, rem + 12, cur);
+            w32(self, rem + 8, tlsf);
+            w32(self, cur + 8, rem);
+            w32(self, bl_base + (rfl * slc + rsl) * 4, rem);
+            let slv = r32(self, sl_base + rfl * 4);
+            w32(self, sl_base + rfl * 4, slv | (1u32 << rsl));
+            w32(self, tlsf + 24, fl_bitmap | (1u32 << rfl));
+        }
+        // block_mark_as_used(block): next->prev_used; block used bit.
+        // NOTE: block_next MUST use the block's CURRENT size (post-trim),
+        // not the stale pre-split size — with the stale size the mark lands
+        // mid-pool and the recorded next block's prev_free bit is never
+        // cleared, so the firmware's later free() merges into our used
+        // block and trips block_is_free (proven live: postEvent's `new`
+        // aborted in block_trim_free).
+        let bsz_now = r32(self, block + 4) & !3;
+        let used_next = block + 4 + bsz_now; // block_next(block) = block+4+size
+        let unw = r32(self, used_next + 4);
+        w32(self, used_next + 4, unw & !2);
+        let bw = r32(self, block + 4);
+        w32(self, block + 4, (bw & !3) & !1);
+        // block_to_ptr(block) = block+8 = user pointer (owner prefix first).
+        let ptr = block + 8;
+        // Owner prefix = current task handle (pxCurrentTCBs[0]), else 0.
+        let owner = r32(self, 0x3fc9_b7e0);
+        w32(
+            self,
+            ptr,
+            if (0x3FC8_0000..0x3FD0_0000).contains(&owner) {
+                owner
+            } else {
+                0
+            },
+        );
+        ptr + 4
+    }
+
     /// Snapshot the PSRAM backing (CPU/system resets retain it).
     pub fn psram_snapshot(&self) -> alloc::boxed::Box<[u8]> {
         self.psram.clone()
@@ -995,6 +1337,271 @@ impl Soc {
     /// rst_ena, a chip reset after rst_wait more ticks).
     pub fn bod_inject(&mut self, low: bool) {
         self.rtc.bod_inject(low);
+    }
+
+    /// Arm the WiFi scan dwell (host frontend — the harness calls this when
+    /// the firmware enters `esp_wifi_scan_start`; see `wifi.rs`).
+    pub fn wifi_scan_begin(&mut self) {
+        self.wifi.wifi_scan_begin();
+    }
+
+    /// Poll the scan-dwell completion (host frontend — `true` exactly once
+    /// per armed scan, when the dwell budget elapses; see `wifi.rs`).
+    pub fn wifi_scan_tick_complete(&mut self) -> bool {
+        self.wifi.scan_tick_complete()
+    }
+
+    /// Complete a WiFi scan host-side, exactly as the closed scan state
+    /// machine would on beacon/probe-response reception — but at the
+    /// firmware boundary, with every post-boundary instruction unmodified.
+    ///
+    /// What this does (all verifiable in IDF/Arduino source, no invented
+    /// ABI — field offsets from `queue.c`/`event_groups.c`/`list.h`, §8b
+    /// TCB layout, Arduino `NetworkEvents` source):
+    /// 1. Discovers the Arduino `NetworkEvents` event group live: the
+    ///    `Network` object at `NETWORK_OBJ` holds the group handle at +4
+    ///    (objdump-verified: `setStatusBits`/`waitStatusBits` load
+    ///    `[Network+4]` then call `xEventGroupSetBits/WaitBits`).
+    /// 2. Applies REAL `xEventGroupSetBits(group, WIFI_SCAN_DONE_BIT)`
+    ///    semantics by hand (the host cannot call into firmware):
+    ///    `uxEventBits |= DONE`, then walks the unordered waiter list and
+    ///    unblocks every waiter whose ANY-bit matches (the waiter asked
+    ///    any-bit, see `waitStatusBits`), via REAL
+    ///    `vTaskRemoveFromUnorderedEventList` semantics: stamp the task's
+    ///    event item `uxEventBits | UNBLOCKED_DUE_TO_BIT_SET`, unlink both
+    ///    list items (readying is the host's follow-up via
+    ///    `ready_task_on_list`).  A woken waiter needs no immediate yield —
+    ///    the tick ISR performs the switch within a tick.
+    /// 3. Leaves the IDF ap store untouched (count cell stays 0 = empty
+    ///    air; fixture counts are staged separately by the host before the
+    ///    post — see `run_flash`).
+    ///
+    /// Returns the woken task (`Some(tcb)`) when a waiter was unblocked, or
+    /// `None` when the group handle is not yet valid (host retries next
+    /// step — the completion is level, not edge) or no waiter matched.  On
+    /// `Some` the host must call `ready_task_on_list(tcb, ...)` next (same
+    /// step, same borrow).
+    ///
+    /// SCOPE NOTE (proven live 2026-09-20): this wakes the SCAN_DONE
+    /// *event-group waiter* (loopTask) directly, which is enough for the
+    /// empty-air `found 0` completion — but it BYPASSES the Arduino
+    /// `_scanDone` record path (get_ap_num/records + calloc), which only
+    /// runs from the esp_event callback. For fixture records (N > 0) the
+    /// host must use `wifi_scan_post_event` instead (real SCAN_DONE post
+    /// through `sys_evt`); the real chain then sets the DONE bit itself.
+    /// (Kept for probe/empty-air use; `run_flash` uses the post path.)
+    ///
+    /// Event-group (EventGroup_t) layout for this build (TRACE=y,
+    /// STATIC+DYNAMIC=y, 32-bit ticks): +0 `uxEventBits`, +4
+    /// `xTasksWaitingForBits` List (20B: n, idx, end-val, end-next,
+    /// end-prev), +24 `uxEventGroupNumber`, +28 `ucStaticallyAllocated`.
+    /// ListItem (20B, no integrity bytes): +0 value, +4 next, +8 prev,
+    /// +12 owner, +16 container.
+    pub fn wifi_scan_complete_empty(&mut self, network_obj: u32) -> Option<u32> {
+        use xtensa_core::Bus as _Bus;
+        const DONE_BIT: u32 = 1 << 1; // Arduino WIFI_SCAN_DONE_BIT = BIT1
+        const UNBLOCKED_DUE_TO_BIT_SET: u32 = 0x0200_0000; // event_groups.h (32-bit)
+        const EVENT_IN_USE: u32 = 0x8000_0000; // taskEVENT_LIST_ITEM_VALUE_IN_USE (32-bit)
+        let group = self.read32(network_obj + 4);
+        if !(0x3FC8_0000..0x3FD0_0000).contains(&group) {
+            return None;
+        }
+        // 1. Set the bits.
+        let bits = self.read32(group) | DONE_BIT;
+        self.write32(group, bits);
+        // 2. Walk the unordered waiter list (head = end.next at +12).
+        let list = group + 4;
+        let end = list + 8;
+        let mut item = self.read32(end + 4);
+        let mut guard = 0u32;
+        let mut woken: Option<u32> = None;
+        while item != end && item != 0 && guard < 32 {
+            guard += 1;
+            let next = self.read32(item + 4);
+            let waited = self.read32(item);
+            // Waiters from xEventGroupWaitBits ask ANY-bit (see
+            // NetworkEvents::waitStatusBits: xClearOnExit=false,
+            // xWaitForAllBits=false).
+            if waited & bits != 0 {
+                let owner = self.read32(item + 12);
+                // Stamp the event item (value + IN_USE, like the kernel).
+                self.write32(item, bits | UNBLOCKED_DUE_TO_BIT_SET | EVENT_IN_USE);
+                // Unlink from the event list.
+                let iprev = self.read32(item + 8);
+                if iprev != 0 {
+                    self.write32(iprev + 4, next);
+                }
+                self.write32(next + 8, iprev);
+                let n = self.read32(list).wrapping_sub(1);
+                self.write32(list, n);
+                self.write32(item + 16, 0);
+                // Unlink from the delayed/suspended state list + ready.
+                let st_item = owner + 4;
+                let sc = self.read32(st_item + 16);
+                if sc != 0 {
+                    let sprev = self.read32(st_item + 8);
+                    let snext = self.read32(st_item + 4);
+                    if sprev != 0 {
+                        self.write32(sprev + 4, snext);
+                    }
+                    self.write32(snext + 8, sprev);
+                    let sn = self.read32(sc).wrapping_sub(1);
+                    self.write32(sc, sn);
+                    self.write32(st_item + 16, 0);
+                }
+                // NOTE: readying (list insert) is the HOST's job — it owns
+                // the ready-list base + top-priority cell (see
+                // `ready_task_on_list`); this fn only unblocks.
+                woken = Some(owner);
+            }
+            item = next;
+        }
+        woken
+    }
+
+    /// Post the WiFi SCAN_DONE esp_event into the default event-loop queue,
+    /// exactly as the closed `wifi_event_post(WIFI_EVENT, SCAN_DONE, ...)`
+    /// would on scan completion — but driven host-side at the firmware
+    /// boundary (see `wifi.rs` for the ground truth + why the post is
+    /// host-driven, not firmware-run).
+    ///
+    /// What this does, in order (all offsets proven live on the wifi-scan
+    /// image; every address is discovered live by the host — never
+    /// hardcoded image guesswork beyond the call):
+    /// 1. Locates `sys_evt` (the esp_event loop task) via
+    ///    `find_task_by_name`; its event-wait queue (`evC - 36`,
+    ///    `xTasksWaitingToReceive` offset) IS the default loop's queue
+    ///    (proven: len 32 = `CONFIG_ESP_EVENT_LOOP_QUEUE_SIZE`, itemsize 16
+    ///    = `sizeof(esp_event_post_instance_t)`).
+    /// 2. Appends one 16-byte post item `{allocated=0, set=0,
+    ///    base=<loaded WIFI_EVENT>, id=SCAN_DONE, val=0}` with REAL
+    ///    `xQueueGenericSend` head semantics (`queue_post_raw`). `base` is
+    ///    the LOADED event-base pointer (`read32(wifi_event_var)` — the
+    ///    dispatcher compares base POINTERS, and `WIFI_EVENT` the symbol is
+    ///    the pointer VARIABLE, proven live: `[0x3C0B4264]=0x3C0AAF7D`).
+    ///    The empty payload is silicon-true ENOUGH: the Arduino `_scanDone`
+    ///    record path re-reads the count/records from the ap store and
+    ///    ignores the event data (only the verbose log reads it);
+    ///    `allocated=0` means the task frees nothing (a host scratch
+    ///    pointer would corrupt the heap on free).
+    /// 3. Unblocks `sys_evt` (`queue_unblock_receiver`); the host readies
+    ///    it via `ready_task_on_list` next (same step, same borrow). The
+    ///    real chain then runs unmodified: `esp_event_loop_run` →
+    ///    `handler_execute` → `_arduino_event_cb` → `postEvent` (arduino
+    ///    queue) → arduino_events task → `_eventCallback` → `_scanDone` →
+    ///    get_ap_num/records → `setStatusBits(DONE)` → `waitStatusBits`
+    ///    returns → prints.
+    ///
+    /// Returns the woken `sys_evt` TCB on success. Returns `None` when
+    /// `sys_evt` is not found, not event-parked, the queue is full, or the
+    /// post item does not fit (host retries next step).
+    ///
+    /// `wifi_event_var` is the address of the `D WIFI_EVENT` pointer
+    /// variable (its CONTENT is the compared base); `SCAN_DONE` is
+    /// `WIFI_EVENT_SCAN_DONE = 1` (`esp_wifi_types_generic.h`:
+    /// `WIFI_READY = 0`, `SCAN_DONE` next).
+    pub fn wifi_scan_post_event(&mut self, wifi_event_var: u32) -> Option<u32> {
+        use xtensa_core::Bus as _Bus;
+        const SCAN_DONE_ID: u32 = 1;
+        let sys = self.find_task_by_name(b"sys_evt\0")?;
+        let ev_c = self.read32(sys + 40);
+        if ev_c == 0 {
+            return None;
+        }
+        let queue = ev_c.wrapping_sub(36);
+        // Sanity: itemsize must be 16 (esp_event_post_instance_t with
+        // POST_FROM_ISR flags) and the queue must have room.
+        if self.read32(queue + 64) != 16 {
+            return None;
+        }
+        let base = self.read32(wifi_event_var);
+        let mut item = [0u8; 16];
+        item[4..8].copy_from_slice(&base.to_le_bytes());
+        item[8..12].copy_from_slice(&SCAN_DONE_ID.to_le_bytes());
+        if !self.queue_post_raw(queue, &item) {
+            return None;
+        }
+        self.queue_unblock_receiver(queue)
+    }
+
+    /// Write ONE fixture AP directly into the Arduino `_scanResult` buffer
+    /// as a `wifi_ap_record_t` (92 bytes), exactly as the closed
+    /// `wifi_copy_ap_record` would have copied it — but without the BSS
+    /// queue (see `wifi.rs`: with no RF stimulus the closed scan machine
+    /// never enqueues nodes, and the copy loop skips everything when its
+    /// count is 0).
+    ///
+    /// Layout (arduino-lib 3.3.10 `esp_wifi_types_generic.h`, PROVEN by a
+    /// host g++ offsetof probe + the sketch's own codegen: `_scanDone`
+    /// calloc's 92 bytes/slot and `_getScanInfoByIndex` strides 92 via
+    /// addx2/subx8/addx4; `getNetworkInfo` reads ssid@6, bssid@0,
+    /// channel@39, rssi@44, authmode@48): bssid[6]@0, ssid[33]@6
+    /// (NUL-terminated: only `ssid_len` bytes written, then an explicit 0),
+    /// primary@39, second u32@40 (=0 NONE), rssi i8@44, authmode u32@48
+    /// (=3 WPA2_PSK), pairwise u32@52 (=4 CCMP), group u32@56 (=4 CCMP),
+    /// ant u32@60 (=0), flags u32@64 (=0), country[7]@68 (zeros),
+    /// he_ap[2]@80 (zeros), bandwidth u32@84 (=0 HT20), vht@88..89
+    /// (zeros). Total 92 bytes. (C enums are 4 bytes — the earlier 62-byte
+    /// packed guess read rssi/authmode 3-6 bytes early and printed
+    /// garbage/empty.)
+    /// `authmode`/`pairwise`/`group` must be nonzero-plausible: the sketch
+    /// prints `encType` via `encryptionType(i)` which reads authmode, and
+    /// a zeroed record would print OPEN for a WPA2 fixture (cosmetic, but
+    /// wrong — the record must describe the fixture).
+    ///
+    /// `out` is the `_scanResult` buffer address (read live from the
+    /// Arduino BSS by the host); `index` selects the 92-byte slot.
+    pub fn wifi_scan_record_ap(&mut self, out: u32, index: usize, ap: &crate::wifi::ScanFixtureAp) {
+        use xtensa_core::Bus as _Bus;
+        const REC_SIZE: u32 = 92;
+        let base = out + index as u32 * REC_SIZE;
+        for (k, b) in ap.bssid.iter().enumerate() {
+            self.write8(base + k as u32, *b as u32);
+        }
+        for k in 0..ap.ssid_len as usize {
+            self.write8(base + 6 + k as u32, ap.ssid[k] as u32);
+        }
+        // ssid NUL terminator (host buffer is zero-filled by calloc; on
+        // re-runs the slot may hold a stale longer SSID, so explicitly
+        // terminate at ssid_len).
+        self.write8(base + 6 + ap.ssid_len as u32, 0);
+        self.write8(base + 39, ap.chan as u32);
+        self.write32(base + 40, 0); // second = NONE
+        self.write8(base + 44, ap.rssi as u8 as u32);
+        self.write32(base + 48, 3); // authmode = WPA2_PSK
+        self.write32(base + 52, 4); // pairwise = CCMP
+        self.write32(base + 56, 4); // group = CCMP
+        self.write32(base + 60, 0); // ant = ANT0
+        self.write32(base + 64, 0); // phy/flags
+        // country@68, he@80, bw@84, vht@88 stay as the buffer holds
+        // (zeros from calloc).
+    }
+
+    /// Ready a task (host-side `prvAddTaskToReadyList` minimal form for the
+    /// scan completion): append the state item to the tail of the ready
+    /// list for the task's priority, bump the count, track top priority.
+    /// SRAM addresses for the ready lists live in ROM-data/high-DRAM; the
+    /// list base + top-priority cell are passed in (discovered live by the
+    /// host).
+    pub fn ready_task_on_list(&mut self, owner: u32, list_base: u32, top_prio: u32) {
+        use xtensa_core::Bus as _Bus;
+        let prio = self.read32(owner + 44);
+        let list = list_base + prio * 20;
+        // Insert at tail: before end marker (end.prev chain).
+        let end = list + 8;
+        let prev = self.read32(end + 8);
+        let item = owner + 4;
+        self.write32(item + 4, end);
+        self.write32(item + 8, prev);
+        self.write32(prev + 4, item);
+        self.write32(end + 8, item);
+        self.write32(item, 0);
+        self.write32(item + 16, list);
+        let n = self.read32(list) + 1;
+        self.write32(list, n);
+        if prio > self.read32(top_prio) {
+            self.write32(top_prio, prio);
+        }
     }
 
     /// Override the PSRAM MR2 density nibble on the SPI1 PSRAM device
@@ -2603,11 +3210,17 @@ impl Soc {
                     // 0xff000000; or 0x00113cf1; s32i_n — the RMW at
                     // 0x420819c1..0x420819dc writes 0x00113cf1|kept-bits),
                     // then polls bit 24 at 0x420819fb/fd. The write arm
-                    // therefore stores the value AND arms the cal timer in
-                    // `Wifi` (48000 cycles, measured live); the read arm
-                    // overlays bit 24 only after the timer elapses (real
-                    // silicon sets the bit from its RF-cal FSM). Reset
-                    // reads 0 so an unstarted poll spins, like silicon.
+                    // latches the one-shot in `Wifi` (first write per
+                    // invocation; value-agnostic — the poll loop RMWs every
+                    // pass so any value gate re-arms forever, proven live);
+                    // the read arm reports bit 24 once and consumes the
+                    // latch (immediate — any timed arm stalls under
+                    // `step_fast`, proven live; see `Wifi::txdc_read`).
+                    // NOTE: `txdc_read` CONSUMES the latch, so a
+                    // host/harness read between the arming write and the
+                    // firmware poll would swallow the done bit — only the
+                    // firmware poll path reads here in production; do NOT
+                    // add harness reads of this register.
                     if is_write {
                         self.pll_cal4c = value;
                         self.wifi.txdc_write(value);
