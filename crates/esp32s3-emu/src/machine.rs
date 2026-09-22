@@ -107,6 +107,24 @@ impl Esp32S3 {
             self.sleep_remaining = ticks.max(1);
             return StepResult::Ok;
         }
+        // Host-pool free interception (WiFi fixture support — same as the
+        // `run_fast_core` hook below; `step` is the precise single-step path
+        // the probes use, so it needs the identical skip). The call site is
+        // `call8 _ZdlPvj` (callee arg a2 = caller a10 by the windowed ABI:
+        // CALL8 rotates wb by 2, so callee-a2 aliases caller-a10 — read the
+        // CALLER's a10 BEFORE stepping, while wb still names it).
+        for c in 0..2 {
+            if self.cpu[c].pc == 0x4200_41f1 && self.soc.wifi_ard_free(self.cpu[c].reg(10)) {
+                self.cpu[c].pc = self.cpu[c].pc.wrapping_add(3);
+                // Advance past the call WITHOUT executing it: the callee
+                // frame was never entered, so no return address was pushed
+                // and no window rotation happened — execution continues at
+                // the caller's next instruction with a0/ra intact.
+                // (The intercepted free is a leak-by-design no-op; the
+                // firmware's delete-path return value is unused.)
+                return StepResult::Ok;
+            }
+        }
         let r = self.cpu[0].step(&mut self.soc);
         if self.soc.rom_boot_mode()
             && !(self.cpu[0].pc >= rom_stub::ROM_BASE && self.cpu[0].pc < rom_stub::ROM_END)
@@ -241,6 +259,61 @@ impl Esp32S3 {
                 return (StepResult::Ok, n);
             }
             let pc0 = self.cpu[core].pc;
+            // Host-pool free interception (WiFi fixture support — same as
+            // the `step` hook above): skip the `_ZdlPvj` call for host-pool
+            // pointers (leak-by-design no-op; caller arg a2 = caller a10).
+            // All other frees run unmodified.
+            if pc0 == 0x4200_41f1 && self.soc.wifi_ard_free(self.cpu[core].reg(10)) {
+                self.cpu[core].pc = pc0.wrapping_add(3);
+                n += 1;
+                continue;
+            }
+            // WiFi STA insider hooks (fixture support — the closed
+            // lwIP/net80211 stack has no live state): serve
+            // `esp_netif_get_ip_info` (0x4202e77c), `esp_wifi_sta_get_ap_
+            // info` (0x42064118), and `esp_wifi_disconnect` (0x4203c7d0)
+            // from staged fixture data. Caller args are windowed (callee
+            // a2/a3 = caller a10/a11): read BEFORE `step_one` while wb
+            // still names the caller. Hooks fire only while staged;
+            // unstaged they let the call run (fails soft like silicon).
+            // (Single-step `step` never reaches here — run_flash drives
+            // `step_fast` exclusively; the `step` hook above covers only
+            // the host-pool free for probe use.)
+            // NOTE: these pcs are CALLEE entries, so "skip" means fake-return
+            // to the caller (NOT pc+3, which would land mid-callee): the
+            // windowed CALL stored the return address in caller a8 (= future
+            // callee a0 — same phys slot after the ENTRY rotation, which we
+            // skip), encoded as (callinc<<30)|(addr & 0x3fffffff). Emulate
+            // RETW's jump ((pc & 0xc0000000)|(a0 & 0x3fffffff)) using caller
+            // a8 read BEFORE stepping (wb still names the caller), and stage
+            // the ESP_OK return in caller a10 (= future callee a2, which the
+            // caller reads as its return value).
+            if pc0 == 0x4202_e77c {
+                let out = self.cpu[core].reg(11);
+                let ra = self.cpu[core].reg(8);
+                if self.soc.wifi_hook_get_ip_info(out) {
+                    self.cpu[core].set_reg(10, 0);
+                    self.cpu[core].pc = (pc0 & 0xc000_0000) | (ra & 0x3fff_ffff);
+                    n += 1;
+                    continue;
+                }
+            } else if pc0 == 0x4206_4118 {
+                let out = self.cpu[core].reg(10);
+                let ra = self.cpu[core].reg(8);
+                if self.soc.wifi_hook_get_ap_info(out) {
+                    self.cpu[core].set_reg(10, 0);
+                    self.cpu[core].pc = (pc0 & 0xc000_0000) | (ra & 0x3fff_ffff);
+                    n += 1;
+                    continue;
+                }
+            } else if pc0 == 0x4203_c7d0 && self.soc.wifi_hook_disconnect() {
+                let ra = self.cpu[core].reg(8);
+                self.cpu[core].set_reg(10, 0);
+                self.cpu[core].pc = (pc0 & 0xc000_0000) | (ra & 0x3fff_ffff);
+                self.soc.wifi_notify_disconnect();
+                n += 1;
+                continue;
+            }
             let r = self.cpu[core].step_one(&mut self.soc);
             // `step_one` records the fetched length even on exception paths,
             // so no re-fetch is needed to verify fall-through advance.

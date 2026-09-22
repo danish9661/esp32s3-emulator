@@ -1118,3 +1118,45 @@ The pxContainer field of the state item = +4+16 = +20; event = +24+16 =
   - Validation: 39 suites green (575 tests), clippy `-D warnings` clean,
     fmt clean, wasm32 clean, `wifi_scan` battery entry PASS, freshness
     guard 0 FAILs. Full battery + remaining WiFi protocols next.
+
+- 2026-09-22 (session 20 — STA CONNECT phase lands: `status 3` +
+  `IP 192.168.4.2` + `SSID EmuNet` + `RSSI -50` + `after-disconnect 6` +
+  `DONE`; battery `wifi_sta` entry green, full battery 108/0/0):
+  - Fixture path: `WIFI_STA_CONN=1` + `WIFI_SCAN_APS` (first entry drives
+    the association). Host arms the dwell at `esp_wifi_connect` entry,
+    posts WIFI_EVENT_STA_CONNECTED (id 4, 48-byte `wifi_event_sta_
+    connected_t`) on the IDF bus → firmware's own `_onStaEvent` →
+    `postEvent` translates it to the arduino bus (host never posts
+    arduino directly — races wedge the queue, proven live). GOT_IP posts
+    on BOTH buses back-to-back (no consume-gate: gating on the CONNECTED
+    consume lets sys_evt drain+unpark, after which posts fail forever —
+    proven live sys_q=0x0 at all 331 attempts). Arduino GOT_IP (115)
+    carries the full 20-byte `ip_event_got_ip_t` at the info head (a flat
+    ip/mask/gw@0 layout corrupts the sized-delete → IN-PANIC 0x4037bf00).
+    WL_CONNECTED gates on the arduino half alone (IDF `_ip_event_cb` path
+    is dormant — no tcpip registration); IDF half is handler-veracity.
+  - Insider hooks in `run_fast_core` (per-op sampling — pre/post-step
+    sampling misses mid-block entry pcs): `esp_netif_get_ip_info`
+    (0x4202e77c) + `esp_wifi_sta_get_ap_info` (0x42064118) +
+    `esp_wifi_disconnect` (0x4203c7d0) served from staged fixture data.
+    Callee-entry skip = fake RETW return via caller a8 (NOT pc+3, which
+    lands mid-callee — proven live by the truncated UART). Caller args
+    are windowed (callee a2/a3 = caller a10/a11, read pre-step).
+  - Disconnect leg: hook latch → WIFI_EVENT_STA_DISCONNECTED (id 5,
+    reason 8 ASSOC_LEAVE = voluntary, no reconnect) + arduino 113 →
+    `after-disconnect 6` (WL_DISCONNECTED) + DONE. Early hook fire
+    (setup-time `WiFi.disconnect()`) is drained; the leg arms only after
+    both ap-record reads consumed (SSID+RSSI prove post-print position).
+    Budget: 150M STEPS (60M stalls mid-disconnect; 100M+ reaches DONE).
+  - Heap discipline: arduino queue holds POINTERS (itemsize 4); the
+    consumer frees with unsized `delete` (`_ZdlPvj` → `heap_caps_free`),
+    so host events live in a dedicated `ard_pool` backing (NOT DRAM —
+    outside every heap's bounds, so the free walk skips them) and the
+    machine intercepts their free as a no-op leak-by-design (4 slots/run
+    max). Raw-scratch/DARM pointers abort (proven live IN-PANIC).
+  - Sketch: `esp32s3_wifi_sta.ino` (begin → waitForConnectResult →
+    status/IP/SSID/RSSI → disconnect → after-disconnect → DONE).
+    Committed `.ino` + `.merged.bin` force-added (gitignored cache).
+  - Validation: suites green, clippy/fmt/wasm32 clean, `wifi_scan` +
+    `wifi_sta` PASS, full battery 108/0/0. Next: SoftAP / remaining WiFi
+    protocols, then gateway backhaul.

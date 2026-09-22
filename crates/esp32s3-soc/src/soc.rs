@@ -230,6 +230,15 @@ pub struct Soc {
     rtc_slow: Box<[u8; RTC_SLOW_SIZE as usize]>,
     rtc_fast: Box<[u8; RTC_FAST_SIZE as usize]>,
     rom_data: Box<[u8; ROM_DATA_SIZE as usize]>,
+    /// Host event-block pool for arduino-queue posts (see `wifi_ard_post`):
+    /// four 192-byte slots (768 B) the host wraps as fake heap blocks. Kept
+    /// as a SEPARATE backing (not inside `sram`) so the addresses are always
+    /// outside every heap's `[start, end]` bounds — `heap_caps_free` then
+    /// skips the host pointer in its registered-heap walk (no heap claims
+    /// it) and the event leaks by design (4 slots/run max) instead of
+    /// aborting in `assert_valid_block`. Reads/writes route through the Bus
+    /// impl below (`WIFI_ARD_POOL` range check before the DRAM check).
+    ard_pool: Box<[u8; 768]>,
     /// USB-Serial-JTAG (CDC-ACM console) controller. The boot ROM's console
     /// (uart_tx_one_char @ 0x40048C30) writes chars to the USB_SERIAL_JTAG FIFO
     /// (0x60038000), NOT UART0 — the S3's ROM messages come out of the USB-CDC
@@ -331,6 +340,44 @@ pub struct Soc {
     /// NRX @ 0x6001CC00). TEMP WIFI BRING-UP scaffold: plain stores +
     /// proven RF-cal done-bits (see wifi.rs).
     wifi: Wifi,
+    /// Image-specific addresses discovered live by the host (WiFi fixture
+    /// support): the `registered_heaps` SLIST head, the `pxCurrentTCBs`
+    /// (current-TCB-per-core) array, the `_ZL15_sta_network_if` STA-instance
+    /// static (nm per image — a bss pointer to the STAClass instance, NOT
+    /// the `B WiFi` object), and the `D WIFI_EVENT` / `D IP_EVENT` pointer
+    /// variables. All default to `None` = undiscovered (fixture calls fail
+    /// softly, like an allocation failure — never a wrong-address write);
+    /// the host sets per-image via `wifi_layout_*` before arming the dwell
+    /// (defaults for the pinned wifi-scan image live in the harness, not
+    /// here).
+    ///
+    /// Cached by the host after first discovery (the arduino_events queue
+    /// and waiter are stable once `Network.initEvents` runs).
+    wifi_reg_heaps: Option<u32>,
+    wifi_pxcur: Option<u32>,
+    wifi_network: Option<u32>,
+    wifi_event_var: Option<u32>,
+    wifi_ip_event_var: Option<u32>,
+    wifi_ard_queue: Option<u32>,
+    #[allow(dead_code)]
+    wifi_ard_waiter: Option<u32>,
+    /// Bump cursor into `WIFI_ARD_POOL` (see `wifi_ard_post`): slot index
+    /// 0..4, advanced per post, never wraps within a run (one host event
+    /// queued at a time in every fixture flow — same single-flight
+    /// discipline as the IDF-side scratch).
+    wifi_ard_slot: u32,
+    /// Staged STA fixture data (programmed by the host when it posts
+    /// GOT_IP; served back by the pc-intercept hooks below): the connected
+    /// AP record (92-byte `wifi_ap_record_t`) + the interface IP info
+    /// (12-byte ip/mask/gw). `None` until staged.
+    wifi_ap_record: Option<[u8; 92]>,
+    wifi_ip_info: Option<[u8; 12]>,
+    /// Served ap-record reads (SSID + RSSI = 2): the disconnect-leg arm
+    /// gate (see `wifi_hook_rssi_done`).
+    wifi_ap_reads: u32,
+    /// Latch set by the machine when the `esp_wifi_disconnect` hook fires;
+    /// consumed by the run_flash disconnect leg (one-shot arm).
+    wifi_disc_fired: bool,
     /// I2S audio controllers (I2S0 @ 0x6000F000, I2S1 @ 0x6002D000).
     /// Functional model: TX/RX FIFO + serial shift-out onto GPIO-matrix
     /// signals (BCK/WS/SD).
@@ -448,6 +495,7 @@ impl Soc {
             rtc_slow: Box::new([0; RTC_SLOW_SIZE as usize]),
             rtc_fast: Box::new([0; RTC_FAST_SIZE as usize]),
             rom_data: Box::new([0; ROM_DATA_SIZE as usize]),
+            ard_pool: Box::new([0; 768]),
             uarts: [Uart::new(), Uart::new(), Uart::new()],
             uhci: Uhci::new(),
             usb: UsbSerialJtag::new(),
@@ -502,6 +550,18 @@ impl Soc {
             usb_otg: UsbOtg::new(),
             usb_wrap: RegStore::new(0x1000),
             wifi: Wifi::new(),
+            wifi_reg_heaps: None,
+            wifi_pxcur: None,
+            wifi_network: None,
+            wifi_event_var: None,
+            wifi_ip_event_var: None,
+            wifi_ard_queue: None,
+            wifi_ard_waiter: None,
+            wifi_ard_slot: 0,
+            wifi_ap_record: None,
+            wifi_ip_info: None,
+            wifi_ap_reads: 0,
+            wifi_disc_fired: false,
             lcd_cam: LcdCam::new(),
             appcpu_ctrl_a: 0,
             sys_clk_en0: 0xF9C1_E06F,
@@ -1043,6 +1103,34 @@ impl Soc {
     /// queue). The host must post the SCAN_DONE esp_event
     /// (`wifi_scan_post_event`) and unblock `sys_evt`; the real chain then
     /// sets the DONE bit itself via `setStatusBits`.
+    /// True when `queue` has a parked receive waiter (non-empty receive
+    /// event list). Side-effect-free probe so host retries never mutate
+    /// state (posting into a waiter-less queue would bump `mw` with nobody
+    /// to consume it, wedging the queue at `len` — proven live by the STA
+    /// pending storm, where every-step retries filled `sys_evt` to 32/32).
+    pub fn queue_recv_waiting(&mut self, queue: u32) -> bool {
+        use xtensa_core::Bus as _Bus;
+        let list = queue + 36;
+        let end = list + 8;
+        let item = self.read32(end + 4);
+        item != end && item != 0
+    }
+
+    /// sys_evt's event-wait queue handle (0 while undiscovered): the
+    /// default esp_event loop queue `sys_evt` blocks on (`evC - 36`).
+    /// Side-effect-free probe for TEMP-DIAG logging (never mutates).
+    pub fn sys_evt_queue(&mut self) -> u32 {
+        use xtensa_core::Bus as _Bus;
+        let Some(sys) = self.find_task_by_name(b"sys_evt\0") else {
+            return 0;
+        };
+        let ev_c = self.read32(sys + 40);
+        if ev_c == 0 {
+            return 0;
+        }
+        ev_c.wrapping_sub(36)
+    }
+
     pub fn queue_unblock_receiver(&mut self, queue: u32) -> Option<u32> {
         use xtensa_core::Bus as _Bus;
         let list = queue + 36;
@@ -1123,16 +1211,26 @@ impl Soc {
             use xtensa_core::Bus as _Bus;
             s.write32(a, v);
         }
-        const REGISTERED_HEAPS: u32 = 0x3fc9_b7ac;
-        const DRAM_START: u32 = 0x3fca_0398;
-        // 1. Find the DRAM heap (caps[0] has INTERNAL|8BIT|32BIT|DMA...).
-        let mut heap_t = r32(self, REGISTERED_HEAPS);
+        // 1. Find the DRAM heap: first registered heap whose caps carry
+        // DEFAULT (1<<12 = 0x1000, `heap_caps_match` for MALLOC_CAP_DEFAULT
+        // — what `malloc`/`calloc`/`new` use) AND 8BIT (1<<2 — byte
+        // accesses; excludes the RTC-exec pool at caps0=0x8000). The scan
+        // image's main pool reads caps0=0x10580f (DEFAULT|INTERNAL|
+        // 32BIT|8BIT|DMA|...). (An earlier attempt matched INTERNAL
+        // (0x800) at the wrong struct offset — `heap_t` starts with
+        // caps[3] (NO_PRIOS=3, `heap_private.h`), NOT start/end; the dump
+        // showed the `start` word where caps[0] was expected. Match caps
+        // the way the IDF allocator does.)
+        let Some(reg_heaps) = self.wifi_reg_heaps else {
+            return 0;
+        };
+        let mut heap_t = r32(self, reg_heaps);
         let mut handle = 0u32;
         let mut guard = 0u32;
         while heap_t != 0 && guard < 8 {
             guard += 1;
-            let start = r32(self, heap_t + 12);
-            if start == DRAM_START {
+            let caps0 = r32(self, heap_t);
+            if caps0 & 0x1004 == 0x1004 {
                 handle = r32(self, heap_t + 28);
                 break;
             }
@@ -1148,12 +1246,27 @@ impl Soc {
         // sl_bitmap ptr(4) + blocks ptr(4) = 36; then sl_bitmap (4*fl_count)
         // and blocks (4*fl_count*sl_count) follow, 4-aligned.
         // control fields needed for mapping: re-read packed word.
+        // Bitfield layout (`tlsf_control_functions.h struct control_t`,
+        // LSB-first): fl_index_count:5 [4:0], fl_index_shift:3 [7:5],
+        // fl_index_max:6 [13:8], sl_index_count:6 [19:14],
+        // sl_index_count_log2:3 [22:20], small_block_size:8 [30:23].
+        // (Two earlier revisions mis-decoded this — first sl2=0/small=32
+        // from bits [22:20]/[7:5]-as-value, then sl2=3/small=32 from the
+        // right fields but the wrong small: small_block_size is its OWN
+        // 8-bit field [30:23], NOT 1<<fls. The probe `packed=0x10320eaa`
+        // decodes to fls=5/sl2=3/small=32 ONLY by the 1<<fls coincidence
+        // (real small=0x20=32 here — same value, but the field is
+        // authoritative). Ground truth is the header above, verified by
+        // decoding the live word.)
         let packed = r32(self, tlsf + 16);
-        let flc = packed & 0x1F;
+        let _flc = packed & 0x1F;
         let fls = (packed >> 5) & 0x7;
-        let sl2 = (packed >> 20) & 0x7;
-        let slc = 1u32 << sl2;
-        let small_block = 1u32 << fls;
+        let slc = (packed >> 14) & 0x3F;
+        let mut sl2 = 0u32;
+        while (1u32 << sl2) < slc {
+            sl2 += 1;
+        }
+        let small_block = (packed >> 23) & 0xFF;
         // fl_bitmap @ tlsf+24, sl_bitmap ptr @ tlsf+28, blocks ptr @ tlsf+32.
         let fl_bitmap = r32(self, tlsf + 24);
         let sl_base = r32(self, tlsf + 28);
@@ -1173,14 +1286,17 @@ impl Soc {
         }
         // mapping_insert(size) -> (fl, sl). Ground truth
         // (tlsf_control_functions.h mapping_insert): large sizes use
-        // fl = tlsf_fls(size) = 31-clz (NOT 31-leading_zeros on the ROUNDED
-        // size — same thing), sl = (size >> (fl-sl_log2)) ^ (1<<sl_log2).
+        // fl = tlsf_fls(size) = 31-clz, sl = (size >> (fl-sl_log2)) ^
+        // (1<<sl_log2), then fl -= (fl_index_shift - 1) (the -1 is real:
+        // fls=7 pools place a 0x210 block at fl=4, proven by the live
+        // free-list audit — without the -1 the request lands at fl=5 and
+        // misses it).
         let (fl, sl) = if size < small_block {
             (0, size / (small_block / slc))
         } else {
             let f = 31 - size.leading_zeros();
             let s = (size >> (f - sl2)) ^ (1u32 << sl2);
-            (f - fls, s)
+            (f - fls + 1, s)
         };
         // search_suitable_block: sl_map masked from sl upward, then higher fl.
         // NOTE: fl here counts from fl_index_shift; bitmap bit k = fl k.
@@ -1189,19 +1305,17 @@ impl Soc {
         // remove_free_block must unlink from the list the block was found
         // on (else the request list's head is corrupted and the next
         // malloc trips block_is_free on a used block).
+        // search_suitable_block (tlsf_control_functions.h): masked sl in
+        // the request fl; else fl_map masked above fl, ffs for the next fl,
+        // then ffs over the FULL sl_map (no sl mask — the size check below
+        // guards fit). Indices are raw bitmap positions (no flc masking —
+        // the bitmaps only ever carry valid lists).
         let mut sfl = fl;
         // First: masked sl in the request fl.
-        let mut sl_map = r32(self, sl_base + sfl * 4);
-        if sfl < flc {
-            sl_map &= !0u32 << sl;
-        }
-        if sfl >= flc || sl_map == 0 {
+        let mut sl_map = r32(self, sl_base + sfl * 4) & (!0u32 << sl);
+        if sl_map == 0 {
             // Next-largest fl with any bit (fl_map masked above fl).
-            let mut fmap = fl_bitmap & (!0u32 << (fl + 1));
-            // Mask to valid fl bits.
-            if flc < 32 {
-                fmap &= (1u32 << flc) - 1;
-            }
+            let fmap = fl_bitmap & (!0u32 << (fl + 1));
             if fmap == 0 {
                 return 0;
             }
@@ -1258,13 +1372,14 @@ impl Soc {
             // value-wise: keep the free bit from above, ensure prev_free
             // CLEAR since our used block precedes it].
             w32(self, rem + 4, remain_size | 1);
-            // block_insert(remaining).
+            // block_insert(remaining): same mapping_insert with the
+            // fl_index_shift - 1 correction (see above).
             let (rfl, rsl) = if remain_size < small_block {
                 (0, remain_size / (small_block / slc))
             } else {
                 let f = 31 - remain_size.leading_zeros();
                 let s = (remain_size >> (f - sl2)) ^ (1u32 << sl2);
-                (f - fls, s)
+                (f - fls + 1, s)
             };
             let cur = r32(self, bl_base + (rfl * slc + rsl) * 4);
             w32(self, rem + 12, cur);
@@ -1290,8 +1405,14 @@ impl Soc {
         w32(self, block + 4, (bw & !3) & !1);
         // block_to_ptr(block) = block+8 = user pointer (owner prefix first).
         let ptr = block + 8;
-        // Owner prefix = current task handle (pxCurrentTCBs[0]), else 0.
-        let owner = r32(self, 0x3fc9_b7e0);
+        // Owner prefix = current task handle (pxCurrentTCBs[0] —
+        // discovered live via the `sys_evt` TCB scan: TCBs live in DRAM and
+        // carry their stack pointer at +48, so any TCB-shaped hit yields the
+        // core-0 current TCB cell), else 0.
+        let owner = match self.wifi_pxcur {
+            Some(pxcur) => r32(self, pxcur),
+            None => 0,
+        };
         w32(
             self,
             ptr,
@@ -1343,6 +1464,319 @@ impl Soc {
     /// the firmware enters `esp_wifi_scan_start`; see `wifi.rs`).
     pub fn wifi_scan_begin(&mut self) {
         self.wifi.wifi_scan_begin();
+    }
+
+    /// Read the STA `_esp_netif` pointer live (host frontend for the GOT_IP
+    /// fixture): read the STAClass instance from the `_ZL15_sta_network_if`
+    /// static (address programmed per-image via `wifi_layout_set`; nm:
+    /// 0x3fc9ae6c wifi-sta, 0x3fc9ae7c wifi-scan) and return its
+    /// `NetworkInterface::_esp_netif` field (vtable @0, `_esp_netif` @4 —
+    /// `NetworkInterface.h`, arduino-lib 3.3.10). The sketch's own
+    /// `localIP()` reads the ip_info through this same pointer, so host and
+    /// firmware agree by construction. Returns 0 while undiscovered/null
+    /// (host retries — level, not edge). (An earlier DRAM-scan revision
+    /// matched vtable-in-flash + `_interface_id == 0` at +24 and returned a
+    /// garbage pointer into the arduino-event queue area — proven live by
+    /// the GOT_IP storm + dropped waiter.)
+    pub fn wifi_sta_netif(&mut self) -> u32 {
+        use xtensa_core::Bus as _Bus;
+        let Some(sta_if) = self.wifi_network else {
+            return 0;
+        };
+        let inst = self.read32(sta_if);
+        if inst == 0 || !(0x3FC8_0000..0x3FD0_0000).contains(&inst) {
+            return 0;
+        }
+        let netif = self.read32(inst + 4);
+        if !(0x3FC8_0000..0x3FD0_0000).contains(&netif) {
+            return 0;
+        }
+        netif
+    }
+
+    /// True when the arduino event queue is drained (mw==0), discovering
+    /// it first if needed (side-effect-free probe for gating stage-2
+    /// posts: GOT_IP must not be posted while the CONNECTED arduino event
+    /// is still queued, or the consumer wedges — proven live by the
+    /// GOT_IP `idf=false` storm while ard mw=1). Discovers lazily because
+    /// the run_flash stage-1 path never calls `wifi_ard_queue_discover`
+    /// itself (the firmware's own postEvent drives the arduino half).
+    pub fn wifi_ard_idle(&mut self) -> bool {
+        use xtensa_core::Bus as _Bus;
+        let q = match self.wifi_ard_queue {
+            Some(q) => q,
+            None => {
+                let q = self.wifi_ard_queue_discover();
+                if q == 0 {
+                    return false;
+                }
+                q
+            }
+        };
+        self.read32(q + 56) == 0
+    }
+
+    /// Discover the arduino `_arduino_event_queue` + its parked waiter
+    /// (host frontend — call once the dwell fires; the queue is stable once
+    /// `Network.initEvents` runs): scans DRAM for the `len==32,
+    /// itemsize==4` queue whose receive waiter is the `arduino_events`
+    /// task, and caches both. Returns the queue handle (0 = not yet
+    /// created — host retries, level not edge).
+    ///
+    /// Ground truth (`NetworkEvents.cpp`, arduino-lib 3.3.10):
+    /// `_arduino_event_queue = xQueueCreate(32, sizeof(arduino_event_t *))`
+    /// and the `arduino_events` task blocks in `xQueueReceive` on it with
+    /// `portMAX_DELAY` (proven live: queue @0x3fcecd0c, waiter
+    /// `arduino_events`, on the STA image).
+    pub fn wifi_ard_queue_discover(&mut self) -> u32 {
+        use xtensa_core::Bus as _Bus;
+        if let Some(q) = self.wifi_ard_queue {
+            return q;
+        }
+        let mut addr = 0x3FC9_0000u32;
+        while addr < 0x3FCF_0000 {
+            // Queue storage overlay: `pcHead`(+0)/`pcTail`(+8) hold
+            // `memset`-painted garbage (0x0/0xa5a5a5a5) until the first wrap
+            // copies real storage pointers over them — so `head`/`tail` are
+            // UNRELIABLE as a discovery filter (they wrongly reject the real
+            // queue). Match on `len==32` (+60) + the parked `arduino_`
+            // waiter instead; the storage pointers are re-read live at post
+            // time (see `wifi_ard_post`).
+            if self.read32(addr + 60) == 32 && self.read32(addr + 64) == 4 {
+                let head = self.read32(addr);
+                let tail = self.read32(addr + 8);
+                if head != 0 && tail != 0 && (0x3FC8_0000..0x3FD0_0000).contains(&head) {
+                    let list = addr + 36;
+                    let end = list + 8;
+                    let item = self.read32(end + 4);
+                    if item != end && item != 0 {
+                        let owner = self.read32(item + 12);
+                        let mut nb = [0u8; 8];
+                        for (k, b) in nb.iter_mut().enumerate() {
+                            *b = self.read8(owner + 52 + k as u32) as u8;
+                        }
+                        if &nb == b"arduino_" {
+                            self.wifi_ard_queue = Some(addr);
+                            self.wifi_ard_waiter = Some(owner);
+                            return addr;
+                        }
+                    }
+                }
+            }
+            addr += 4;
+        }
+        0
+    }
+
+    /// Post one `arduino_event_t` (event_id + 44-byte info union) into the
+    /// arduino queue and wake + ready its waiter (host frontend — the
+    /// arduino-side half of every WiFi/IP fixture post). Full 188-byte
+    /// `arduino_event_t` (event_id u32 @0 + info union @4..188 —
+    /// `postEvent` memsets/copies 188, ground truth above), posted as a
+    /// POINTER into the queue ring (itemsize 4 — the queue holds
+    /// `arduino_event_t *`). The real chain (`_checkForEvent` →
+    /// `_cbEventList` dispatch → `_onStaArduinoEvent` / `_eventCallback` →
+    /// status bits) runs unmodified. Returns false while the queue is
+    /// undiscovered/full (host retries — level, not edge).
+    ///
+    /// POOL NOTE: the pointer targets a host slot in the dedicated
+    /// `ard_pool` backing (NOT DRAM, NOT heap — outside every heap's bounds
+    /// by construction, so `heap_caps_free` skips it; the machine
+    /// intercepts the free as a no-op leak-by-design, see `wifi_ard_free`).
+    /// A live `wifi_heap_carve` is unusable (pool exhausted at dwell time:
+    /// 47/47 blocks used, 12 free bytes, proven by the physical pool walk);
+    /// raw DRAM scratch aborts the consumer's unsized `delete` on garbage
+    /// header words (proven live IN-PANIC at 0x4037bf00). 4 slots/run max.
+    pub fn wifi_ard_post(
+        &mut self,
+        event_id: u32,
+        info: &[u8; 44],
+        list_base: u32,
+        top_prio: u32,
+    ) -> bool {
+        use xtensa_core::Bus as _Bus;
+        let queue = self.wifi_ard_queue_discover();
+        if queue == 0 {
+            return false;
+        }
+        // Side-effect-free gating FIRST (a failed post must not consume
+        // anything, or every-step retries wedge the queue; the same
+        // pending-storm class as the sys_evt queue fill).
+        if !self.queue_recv_waiting(queue) {
+            return false;
+        }
+        // Full 188-byte `arduino_event_t` (event_id u32 @0 + info union
+        // @4..188 — `postEvent` memsets/copies 188, ground truth above).
+        // Posted as a POINTER into the queue ring (itemsize 4 — the queue
+        // holds `arduino_event_t *`, `xQueueCreate(32,
+        // sizeof(arduino_event_t *))`, ground truth above).
+        let len = self.read32(queue + 60);
+        let isz = self.read32(queue + 64);
+        let mw = self.read32(queue + 56);
+        if mw >= len || isz != 4 {
+            return false;
+        }
+        // Slot = host bump cursor (never reused within a run — each post
+        // consumes a fresh slot, so a still-queued event's block can never
+        // be stomped by a later post; 4 slots cover every fixture flow).
+        // The 188-byte event is written PLAIN (no heap header — the block
+        // is never freed: the machine intercepts `heap_caps_free` on host
+        // slots, see `wifi_ard_free`, as a no-op leak-by-design).
+        if self.wifi_ard_slot >= Self::WIFI_ARD_SLOTS {
+            return false;
+        }
+        let slot = self.wifi_ard_slot;
+        self.wifi_ard_slot += 1;
+        let ev = Self::WIFI_ARD_POOL + slot * Self::WIFI_ARD_SLOT;
+        self.write32(ev, event_id);
+        for (k, b) in info.iter().enumerate() {
+            self.write8(ev + 4 + k as u32, *b as u32);
+        }
+        // Queue holds POINTERS: post &ev with xQueueGenericSend semantics.
+        let head = self.read32(queue);
+        let tail = self.read32(queue + 8);
+        if head == 0 || tail == 0 {
+            return false;
+        }
+        let mut wr = self.read32(queue + 4);
+        for k in 0..4 {
+            self.write8(wr + k, (ev >> (8 * k)) & 0xFF);
+        }
+        wr += 4;
+        if wr >= tail {
+            wr = head;
+        }
+        self.write32(queue + 4, wr);
+        self.write32(queue + 56, mw + 1);
+        // Wake + ready the waiter (same unlink semantics as
+        // `queue_unblock_receiver`, then ready-list insert).
+        let woken = match self.queue_unblock_receiver(queue) {
+            Some(t) => t,
+            None => return false,
+        };
+        self.ready_task_on_list(woken, list_base, top_prio);
+        true
+    }
+
+    /// Set the image-specific WiFi fixture addresses (host frontend — the
+    /// harness discovers these per-image, e.g. via ELF symbols at build
+    /// time, and sets them before arming the dwell; see the field docs).
+    /// Any `None` leaves a previous value alone (so the harness can set a
+    /// subset); the scan path fails softly while undiscovered.
+    pub fn wifi_layout_set(
+        &mut self,
+        reg_heaps: Option<u32>,
+        pxcur: Option<u32>,
+        network: Option<u32>,
+        event_var: Option<u32>,
+        ip_event_var: Option<u32>,
+    ) {
+        if reg_heaps.is_some() {
+            self.wifi_reg_heaps = reg_heaps;
+        }
+        if pxcur.is_some() {
+            self.wifi_pxcur = pxcur;
+        }
+        if network.is_some() {
+            self.wifi_network = network;
+        }
+        if event_var.is_some() {
+            self.wifi_event_var = event_var;
+        }
+        if ip_event_var.is_some() {
+            self.wifi_ip_event_var = ip_event_var;
+        }
+    }
+
+    /// Stage the connected-AP record + interface IP info the pc-intercept
+    /// hooks serve back (`wifi_hook_get_ap_info` / `wifi_hook_get_ip_info`
+    /// below). Called by the host when it posts GOT_IP, from the same
+    /// fixture AP + LAN the event payloads carry (single source of truth —
+    /// the sketch's `SSID()`/`RSSI()`/`localIP()` then agree with the
+    /// posted events by construction).
+    pub fn wifi_stage_sta_data(&mut self, ap: &crate::wifi::ScanFixtureAp, ip: [u8; 4]) {
+        // 92-byte `wifi_ap_record_t` (same layout as `wifi_scan_record_ap`
+        // below): bssid@0, ssid@6 (+NUL), primary@39, rssi@44,
+        // authmode@48 = WPA2_PSK, pairwise/group@52/56 = CCMP.
+        let mut rec = [0u8; 92];
+        rec[0..6].copy_from_slice(&ap.bssid);
+        let n = (ap.ssid_len as usize).min(32);
+        rec[6..6 + n].copy_from_slice(&ap.ssid[..n]);
+        rec[6 + n] = 0;
+        rec[39] = ap.chan;
+        rec[44] = ap.rssi as u8;
+        rec[48..52].copy_from_slice(&3u32.to_le_bytes());
+        rec[52..56].copy_from_slice(&4u32.to_le_bytes());
+        rec[56..60].copy_from_slice(&4u32.to_le_bytes());
+        self.wifi_ap_record = Some(rec);
+        let mut info = [0u8; 12];
+        info[0..4].copy_from_slice(&ip);
+        info[4..8].copy_from_slice(&[255, 255, 255, 0]);
+        info[8..12].copy_from_slice(&[192, 168, 4, 1]);
+        self.wifi_ip_info = Some(info);
+    }
+
+    /// pc-intercept hook for `esp_netif_get_ip_info` (0x4202e77c): the
+    /// closed lwIP stack has no live netif state (no DHCP/client stack
+    /// runs), so serve the staged fixture IP info directly. `out` is the
+    /// caller's `esp_netif_ip_info_t*` (ip@0/mask@4/gw@8); writes 12 bytes
+    /// and reports whether it fired (caller then skips the call).
+    /// Returns false while unstaged (caller lets the call run — it fails
+    /// soft like silicon with no lease, `localIP()` → 0.0.0.0).
+    pub fn wifi_hook_get_ip_info(&mut self, out: u32) -> bool {
+        use xtensa_core::Bus as _Bus;
+        let Some(info) = self.wifi_ip_info else {
+            return false;
+        };
+        for (k, b) in info.iter().enumerate() {
+            self.write8(out + k as u32, *b as u32);
+        }
+        true
+    }
+
+    /// pc-intercept hook for `esp_wifi_sta_get_ap_info` (0x42064118):
+    /// serve the staged 92-byte `wifi_ap_record_t` into the caller's
+    /// buffer. Returns false while unstaged (caller lets the call run —
+    /// fails soft like silicon with no association).
+    pub fn wifi_hook_get_ap_info(&mut self, out: u32) -> bool {
+        use xtensa_core::Bus as _Bus;
+        let Some(rec) = self.wifi_ap_record else {
+            return false;
+        };
+        for (k, b) in rec.iter().enumerate() {
+            self.write8(out + k as u32, *b as u32);
+        }
+        // Count served reads: SSID() + RSSI() = 2 (the BSSID leg, if the
+        // sketch called it, would be a 3rd). The run_flash disconnect leg
+        // arms once both post-WL_CONNECTED reads consumed (proves the
+        // sketch reached the post-RSSI `WiFi.disconnect()`).
+        self.wifi_ap_reads += 1;
+        true
+    }
+
+    /// True once the sketch consumed both post-WL_CONNECTED ap reads
+    /// (SSID + RSSI) — the disconnect-leg arm gate (see run_flash).
+    pub fn wifi_hook_rssi_done(&self) -> bool {
+        self.wifi_ap_reads >= 2
+    }
+
+    /// pc-intercept hook for `esp_wifi_disconnect` (0x4203c7d0): the closed
+    /// scan/connect machine has no live association to tear down, so report
+    /// success immediately (caller then skips the call AND posts the
+    /// disconnect events — see the run_flash disconnect leg).
+    pub fn wifi_hook_disconnect(&mut self) -> bool {
+        self.wifi_ap_record.is_some()
+    }
+
+    /// Take the disconnect-hook latch (true once per hook fire).
+    pub fn wifi_take_disconnect(&mut self) -> bool {
+        core::mem::replace(&mut self.wifi_disc_fired, false)
+    }
+
+    /// Record a disconnect-hook fire (machine calls this alongside the
+    /// hook skip).
+    pub fn wifi_notify_disconnect(&mut self) {
+        self.wifi_disc_fired = true;
     }
 
     /// Poll the scan-dwell completion (host frontend — `true` exactly once
@@ -1459,6 +1893,55 @@ impl Soc {
         woken
     }
 
+    /// Post a 16-byte event item into the default esp_event loop queue
+    /// (host frontend — shared by all WiFi/IP fixture completions): finds
+    /// `sys_evt`, appends `{allocated=0, set=0, base, id, val=0}` with REAL
+    /// `xQueueGenericSend` head semantics, and unblocks the waiter. The
+    /// real chain then runs unmodified (`esp_event_loop_run` →
+    /// `handler_execute` → arduino `_eventCallback` → status bits).
+    ///
+    /// `base_var` is the address of the event-base POINTER VARIABLE (its
+    /// CONTENT is the compared base — e.g. `D WIFI_EVENT` / `D IP_EVENT`;
+    /// proven live: `[0x3C0B4264]=0x3C0AAF7D`). `allocated=0` means the
+    /// task frees nothing (a host scratch pointer would corrupt the heap).
+    ///
+    /// Returns the woken `sys_evt` TCB on success; `None` when `sys_evt`
+    /// is not found/parked, the queue is full, or the item does not fit
+    /// (host retries next step — the completion is level, not edge).
+    pub fn wifi_post_event(&mut self, base_var: u32, id: u32) -> Option<u32> {
+        use xtensa_core::Bus as _Bus;
+        let sys = self.find_task_by_name(b"sys_evt\0")?;
+        let ev_c = self.read32(sys + 40);
+        if ev_c == 0 {
+            return None;
+        }
+        let queue = ev_c.wrapping_sub(36);
+        // Sanity: itemsize must be 16 (esp_event_post_instance_t with
+        // POST_FROM_ISR flags) and the queue must have room.
+        if self.read32(queue + 64) != 16 {
+            return None;
+        }
+        let base = self.read32(base_var);
+        let mut item = [0u8; 16];
+        item[4..8].copy_from_slice(&base.to_le_bytes());
+        item[8..12].copy_from_slice(&id.to_le_bytes());
+        // Waiter gating IS required: posting while sys_evt is momentarily
+        // unparked (between loop iterations) bumps mw with nobody consuming
+        // — every-step retries then wedge the queue at len 32/32 and the
+        // TCB is never found again (proven live: GOT_IP storm filled
+        // sys_evt to 32/32, sys_evt unfindable, WL_CONNECTED never
+        // arrives). Gate on the parked waiter; retry next step otherwise
+        // (level, not edge). The waiter re-parks one step later and the
+        // post lands then.
+        if !self.queue_recv_waiting(queue) {
+            return None;
+        }
+        if !self.queue_post_raw(queue, &item) {
+            return None;
+        }
+        self.queue_unblock_receiver(queue)
+    }
+
     /// Post the WiFi SCAN_DONE esp_event into the default event-loop queue,
     /// exactly as the closed `wifi_event_post(WIFI_EVENT, SCAN_DONE, ...)`
     /// would on scan completion — but driven host-side at the firmware
@@ -1501,23 +1984,132 @@ impl Soc {
     /// `WIFI_EVENT_SCAN_DONE = 1` (`esp_wifi_types_generic.h`:
     /// `WIFI_READY = 0`, `SCAN_DONE` next).
     pub fn wifi_scan_post_event(&mut self, wifi_event_var: u32) -> Option<u32> {
-        use xtensa_core::Bus as _Bus;
         const SCAN_DONE_ID: u32 = 1;
+        self.wifi_post_event(wifi_event_var, SCAN_DONE_ID)
+    }
+
+    /// Post a scratch-payload event item into the default esp_event loop
+    /// queue (host frontend — shared by all WiFi/IP fixture completions
+    /// that carry event data): copies `payload` into the fixed host
+    /// scratch region past the end of the main DRAM heap (see
+    /// `WIFI_SCRATCH`), then appends `{allocated=0, set=1, base, id,
+    /// val=ptr}` with REAL `xQueueGenericSend` head semantics and unblocks
+    /// the waiter. The real chain then runs unmodified (`esp_event_loop_run`
+    /// → `handler_execute` hands `&post.data.val` (the scratch pointer) to
+    /// every registered handler → arduino `_eventCallback` → status bits).
+    /// `allocated=0` means the loop frees nothing afterwards — the scratch
+    /// is a deliberate, documented fixture window (same class as the
+    /// scan-record calloc the firmware itself never frees until
+    /// `scanDelete`).
+    ///
+    /// Why scratch and not `wifi_heap_carve`: the carve walks the live
+    /// TLSF free lists (correct but fragile across images — the STA image
+    /// needs a mapping-index fix the scan image does not); the scratch
+    /// region is image-independent and read-only-safe (handlers only
+    /// `memcpy` OUT of it). `wifi_heap_carve` is kept for probe use.
+    ///
+    /// `base_var` is the event-base POINTER VARIABLE (content = compared
+    /// base); `netif_ptr` is prepended by the caller into the payload where
+    /// the IDF struct expects it (e.g. `ip_event_got_ip_t.esp_netif`).
+    ///
+    /// Returns the woken `sys_evt` TCB on success (like `wifi_post_event`;
+    /// the scratch payload address is internal — the loop owns it from
+    /// here); `None` when `sys_evt` is not found/parked, the queue is full,
+    /// or the item does not fit (host retries next step — the completion
+    /// is level, not edge). On `Some` the host must call
+    /// `ready_task_on_list(tcb, ...)` next (same step, same borrow).
+    /// Fixed host scratch base for event payloads (see above): past the end
+    /// of the main DRAM heap (`heap end` from the registered-heap list), so
+    /// it can never be a heap block header, pool free block, or `calloc`
+    /// target. Verified on the STA image: heap end `0x3fced710`, run
+    /// `0x3fced710 len 0x858` (2136 B — plenty for a handful of ≤48 B
+    /// posts). Successive posts advance a bump cursor (no reuse within a
+    /// run). NOTE: the old base (`0x3fcb29d0`) sat INSIDE the pool (a TLSF
+    /// free block) — the first `calloc` after staging overwrote the event
+    /// and poisoned the pool (`CORRUPT HEAP: Bad head`, proven live).
+    pub const WIFI_SCRATCH: u32 = 0x3fce_d710;
+    /// Host event-block pool for arduino-queue posts (see `wifi_ard_post`):
+    /// four 192-byte slots at `WIFI_SCRATCH + 0x10000` (past the pool end,
+    /// never heap — the same fixture-window class as `WIFI_SCRATCH`
+    /// itself). Backed by the dedicated `ard_pool` array (NOT DRAM — see
+    /// its docs), so `heap_caps_free` never claims these blocks; the
+    /// machine intercepts their free as a no-op leak-by-design (see
+    /// `wifi_ard_free` + the `run_fast_core` hook).
+    pub const WIFI_ARD_POOL: u32 = 0x3fce_d710 + 0x10000;
+    /// Ard pool slot stride (188-byte event + 4-byte alignment pad).
+    const WIFI_ARD_SLOT: u32 = 192;
+    /// Number of host event slots (one queued host event at a time in every
+    /// fixture flow; 4 is headroom).
+    const WIFI_ARD_SLOTS: u32 = 4;
+
+    /// Host-pool free interception (called by the machine when firmware
+    /// enters `heap_caps_free`): true when `ptr` is a host event slot, in
+    /// which case the caller must SKIP the call (the block is host-owned
+    /// pool memory, not heap — freeing it would corrupt the heap walk;
+    /// leaking 188 B/run is the documented fixture cost, same class as the
+    /// IDF-side scratch payloads the loop never frees).
+    pub fn wifi_ard_free(&mut self, ptr: u32) -> bool {
+        (0..Self::WIFI_ARD_SLOTS).any(|s| Self::WIFI_ARD_POOL + s * Self::WIFI_ARD_SLOT == ptr)
+    }
+
+    pub fn wifi_post_event_with_data(
+        &mut self,
+        base_var: u32,
+        id: u32,
+        payload: &[u8],
+    ) -> Option<u32> {
+        use xtensa_core::Bus as _Bus;
+        // Bump-allocate from the fixed scratch (4-aligned, never reused).
+        const SCRATCH_SIZE: u32 = 0x858;
+        let sys_probe = self.find_task_by_name(b"sys_evt\0")?;
+        let ev_c_probe = self.read32(sys_probe + 40);
+        if ev_c_probe == 0 {
+            return None;
+        }
+        let queue_probe = ev_c_probe.wrapping_sub(36);
+        if self.read32(queue_probe + 64) != 16 {
+            return None;
+        }
+        // Waiter gating (same reason as `wifi_post_event` above — never
+        // post into an unparked queue or retries wedge it at 32/32).
+        if !self.queue_recv_waiting(queue_probe) {
+            return None;
+        }
+        // Cursor from mw is stale-on-retry: derive the slot from the
+        // scratch occupancy instead — scan DRAM words at each 64B slot for
+        // a nonzero first word (all our payloads start with a nonzero
+        // ssid byte / netif pointer; posts never zero their slot).
+        let mut slot = 0u32;
+        while slot + 64 <= SCRATCH_SIZE {
+            if self.read32(Self::WIFI_SCRATCH + slot) == 0 {
+                break;
+            }
+            slot += 64;
+        }
+        if slot + payload.len() as u32 > SCRATCH_SIZE {
+            return None;
+        }
+        let buf = Self::WIFI_SCRATCH + slot;
+        for (k, b) in payload.iter().enumerate() {
+            self.write8(buf + k as u32, *b as u32);
+        }
         let sys = self.find_task_by_name(b"sys_evt\0")?;
         let ev_c = self.read32(sys + 40);
         if ev_c == 0 {
             return None;
         }
         let queue = ev_c.wrapping_sub(36);
-        // Sanity: itemsize must be 16 (esp_event_post_instance_t with
-        // POST_FROM_ISR flags) and the queue must have room.
-        if self.read32(queue + 64) != 16 {
-            return None;
-        }
-        let base = self.read32(wifi_event_var);
+        let base = self.read32(base_var);
         let mut item = [0u8; 16];
+        // ESP_EVENT_POST_FROM_ISR=y: bool allocated=0 (inline value, NOT
+        // heap — the loop passes `&post.data.val` as data_ptr and frees
+        // nothing), bool set=1, then base, id, data-as-u32-val (= the
+        // carved heap pointer, read inline by every handler).
+        item[0] = 0;
+        item[1] = 1;
         item[4..8].copy_from_slice(&base.to_le_bytes());
-        item[8..12].copy_from_slice(&SCAN_DONE_ID.to_le_bytes());
+        item[8..12].copy_from_slice(&id.to_le_bytes());
+        item[12..16].copy_from_slice(&buf.to_le_bytes());
         if !self.queue_post_raw(queue, &item) {
             return None;
         }
@@ -1579,7 +2171,14 @@ impl Soc {
 
     /// Ready a task (host-side `prvAddTaskToReadyList` minimal form for the
     /// scan completion): append the state item to the tail of the ready
-    /// list for the task's priority, bump the count, track top priority.
+    /// list for the task's priority, bump the count, track top priority —
+    /// then cross-core-yield any core currently running a LOWER-priority
+    /// task, so the switch happens on the next instruction boundary
+    /// instead of whenever the tick ISR next decides (proven live: without
+    /// the yield, a readied prio-20 sys_evt sat on the ready list for 3M+
+    /// steps while core1 idled — the tick ISR never re-evaluated because
+    /// nothing pended a yield; FreeRTOS posts from task context call
+    /// `taskYIELD_IF_USING_PREEMPTION` for exactly this reason).
     /// SRAM addresses for the ready lists live in ROM-data/high-DRAM; the
     /// list base + top-priority cell are passed in (discovered live by the
     /// host).
@@ -1601,6 +2200,25 @@ impl Soc {
         self.write32(list, n);
         if prio > self.read32(top_prio) {
             self.write32(top_prio, prio);
+        }
+        // Cross-core yield: the readied task must PREEMPT whatever runs
+        // now, or it sits until the tick ISR happens to re-evaluate (which
+        // it won't — nothing pends a yield). The machine cannot see the
+        // firmware's current-TCB cells, so the SoC asserts the yield here:
+        // for each core whose `pxCurrentTCBs[core]` ( image layout cell)
+        // holds a LOWER-priority task, raise FROM_CPU_INTR0/1 (sources
+        // 79/80 = FreeRTOS yields; the ISR writes 0 to deassert, TRM
+        // SYSTEM_CPU_INT_FROM_CPU_*).
+        if let Some(pxcur) = self.wifi_pxcur {
+            for core in 0..2 {
+                let cur = self.read32(pxcur + core as u32 * 4);
+                if cur != 0 && cur != owner {
+                    let cur_prio = self.read32(cur + 44);
+                    if prio > cur_prio {
+                        self.cpu_int_from_cpu[core] |= 1;
+                    }
+                }
+            }
         }
     }
 
@@ -2187,6 +2805,12 @@ impl Soc {
     /// window (0x40378000-0x403DFFFF alias of data 0x3FC88000-0x3FCEFFFF,
     /// offset 0x6F0000 — memory.ld.in I_D_SRAM_OFFSET).
     fn ram8(&self, addr: u32) -> u8 {
+        // Host event-block pool (NOT DRAM — outside every heap's bounds by
+        // design; the range check must come first so pool addresses never
+        // hit the sram indexing below, which would panic out-of-bounds).
+        if in_range!(addr, Self::WIFI_ARD_POOL, 768) {
+            return self.ard_pool[(addr - Self::WIFI_ARD_POOL) as usize];
+        }
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE) {
             self.sram[(addr - DRAM_BASE) as usize]
         } else if in_range!(addr, IRAM_BASE, SRAM0_SIZE) {
@@ -2267,6 +2891,11 @@ impl Soc {
     }
 
     fn ram_write8(&mut self, addr: u32, val: u8) {
+        // Host event-block pool (see `ram8`).
+        if in_range!(addr, Self::WIFI_ARD_POOL, 768) {
+            self.ard_pool[(addr - Self::WIFI_ARD_POOL) as usize] = val;
+            return;
+        }
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE) {
             if addr == 0x3FCEF750 || addr == 0x3FCEF748 {
                 return;
@@ -3672,6 +4301,10 @@ fn store_dispatch(is_write: bool, off: u32, value: u32, store: &mut RegStore) ->
 }
 
 impl Soc {
+    /// Host WiFi fixture frontends (scan completion, STA connect, event
+    /// injection) live in the main `impl Soc` block above/below this line,
+    /// next to `find_task_by_name`, `queue_post_raw`, and
+    /// `queue_unblock_receiver`, which they build on.
     /// True if any device requested a hard reset (e.g. a WDT stage action of
     /// reset-CPU/system). The machine consumes this each step to reboot.
     pub fn consume_reset(&mut self) -> bool {
@@ -4426,6 +5059,11 @@ impl Bus for Soc {
     #[inline(always)]
     fn read8(&mut self, addr: u32) -> u32 {
         let addr = ioblock_remap(addr);
+        // Host event-block pool (NOT DRAM — outside every heap's bounds by
+        // design, so `heap_caps_free` skips these blocks; see `ard_pool`).
+        if in_range!(addr, Self::WIFI_ARD_POOL, 768) {
+            return self.ard_pool[(addr - Self::WIFI_ARD_POOL) as usize] as u32;
+        }
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE)
             || in_range!(addr, IRAM_BASE, IRAM_WINDOW_SIZE)
         {
@@ -4500,7 +5138,8 @@ impl Bus for Soc {
                 ]
             });
         }
-        // Slow path: unaligned or non-SRAM — fall back to byte-by-byte.
+        // Slow path: unaligned or non-SRAM — fall back to byte-by-byte
+        // (ram8 already routes the host pool, so no separate check needed).
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE)
             || in_range!(addr, IRAM_BASE, IRAM_WINDOW_SIZE)
         {
@@ -4566,6 +5205,11 @@ impl Bus for Soc {
 
     fn write8(&mut self, addr: u32, val: u32) {
         let addr = ioblock_remap(addr);
+        // Host event-block pool (see `read8`).
+        if in_range!(addr, Self::WIFI_ARD_POOL, 768) {
+            self.ard_pool[(addr - Self::WIFI_ARD_POOL) as usize] = val as u8;
+            return;
+        }
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE)
             || in_range!(addr, IRAM_BASE, IRAM_WINDOW_SIZE)
         {

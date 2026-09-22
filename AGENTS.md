@@ -4361,3 +4361,23 @@ full enumeration REQ0..REQ6 — is covered),
       observers, 39 suites green (574 tests), clippy `-D warnings`
       clean, fmt clean, wasm32 clean, battery usb quartet green,
       Playwright E2E ALL PASS (incl. gallery 38 options).
+  - 2026-09-22: **WiFi STA connect phase validated (scan → STA)**. New
+    `tools/sketches/esp32s3_wifi_sta` (begin → waitForConnectResult →
+    status/IP/SSID/RSSI → disconnect → after-disconnect → DONE) driven by
+    `WIFI_STA_CONN=1` + `WIFI_SCAN_APS` (first entry = association):
+    `WIFI STA status 3` / `IP 192.168.4.2` / `SSID EmuNet` / `RSSI -50` /
+    `after-disconnect 6` / `DONE` (battery entry `wifi_sta`, 150M STEPS).
+    Model work (`soc.rs` + `machine.rs` + `run_flash.rs`, all objdump/live-
+    verified): CONNECTED IDF post → firmware's own `_onStaEvent` →
+    `postEvent` translation (no host arduino post — races wedge the
+    queue); GOT_IP on BOTH buses back-to-back (no consume-gate — sys_evt
+    drains+unparks otherwise); arduino 115 carries the full 20-byte
+    `ip_event_got_ip_t` (flat layout panics the sized-delete);
+    WL_CONNECTED gates on the arduino half (IDF `_ip_event_cb` dormant);
+    insider hooks in `run_fast_core` serve `esp_netif_get_ip_info` /
+    `esp_wifi_sta_get_ap_info` / `esp_wifi_disconnect` from staged fixture
+    data with fake-RETW returns via caller a8 (pc+3 lands mid-callee);
+    disconnect leg posts id 5 + arduino 113 (ASSOC_LEAVE, no reconnect);
+    host events live in a dedicated `ard_pool` (machine intercepts their
+    free as a no-op leak). Battery 108/0/0. Next: SoftAP / remaining WiFi
+    protocols, then gateway backhaul.
