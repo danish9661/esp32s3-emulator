@@ -156,8 +156,11 @@ CASES=(
 "dedic_gpio||DEDIC hi pad=1;DEDIC GPIO PASS|"
 "ee_dsp||EE DSP DOT OK;EE DSP VADDS OK;EE DSP CMUL OK;EE DSP LDF128 OK;EE DSP SRS OK;EE DSP FUSED OK;EE DSP DONE|"
 "virtual_demo|NODE:tools/virtual_demo_harness.mjs|VIRTUAL DEMO HARNESS PASS|"
+"wifi_scan_inwasm|NODE:tools/wifi_harness.mjs|WIFI SCAN HARNESS PASS||esp32s3_wifi_scan/esp32s3_wifi_scan.merged.bin"
+"wifi_sta_inwasm|NODE:tools/wifi_harness.mjs|WIFI STA HARNESS PASS||esp32s3_wifi_sta/esp32s3_wifi_sta.merged.bin"
 "camcap|NODE:tools/camcap_harness.mjs|CAMCAP HARNESS PASS|"
 "gdb|NODE:tools/gdb_harness.mjs|GDB HARNESS PASS||esp32s3_hello/esp32s3_hello.merged.bin"
+"micropython|NODE:tools/micropython_harness.mjs|MICROPYTHON HARNESS PASS|"
 )
 
 pass=0; fail=0; skipped=0
@@ -202,6 +205,20 @@ for c in "${CASES[@]}"; do
       fi
       cp "$dir/build/esp32s3_$name.ino.merged.bin" "$dir/esp32s3_$name.merged.bin"
       bin="$dir/esp32s3_$name.merged.bin"
+    fi
+    # Micropython resolves its own external image (download-once cache in
+    # tools/.micropython/); no sketch bin exists, so skip bin resolution
+    # and pass no argv (the harness downloads when missing).
+    if [[ "$name" == "micropython" ]]; then
+      if ! command -v node >/dev/null 2>&1; then echo "FAIL $name (node missing)"; fail=$((fail+1)); continue; fi
+      log=$(timeout 600 node "$ROOT/${envstr#NODE:}" 2>&1 | tr -d '\0')
+      ok=1; why=""
+      for m in ${markers//;/ }; do
+        echo "$log" | grep -aqF "$m" || { ok=0; why="missing [$m]"; }
+      done
+      echo "$log" | grep -aq "HARNESS FAIL" && { ok=0; why="harness reported FAIL"; }
+      if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); fi
+      continue
     fi
     if [[ ! -f "$bin" ]]; then echo "FAIL $name (no binary $bin)"; fail=$((fail+1)); continue; fi
     if ! command -v node >/dev/null 2>&1; then echo "FAIL $name (node missing)"; fail=$((fail+1)); continue; fi

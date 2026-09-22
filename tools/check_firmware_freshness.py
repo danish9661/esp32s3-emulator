@@ -115,8 +115,16 @@ def battery_cases():
     return re.findall(r'^"([^"|]+)\|', txt, re.M)
 
 
+# Cases with no committed sketch bin (external image, resolved by the
+# harness itself): exempt from the freshness check, like the ota/secure
+# generated artifacts are special-cased in bin_for_case.
+BINLESS_CASES = {"micropython"}  # stock .bin downloads to tools/.micropython/
+
+
 # --- 1. freshness ---
 for name in battery_cases():
+    if name in BINLESS_CASES:
+        continue
     binpath, srcdirs = bin_for_case(name)
     if not os.path.exists(binpath):
         note(f"FAIL missing bin for battery case {name}: {os.path.relpath(binpath, ROOT)}")
@@ -132,10 +140,11 @@ for name in battery_cases():
             )
 
 # --- 2. gallery coverage ---
-# Gallery policy (documented 2026-09-14): the gallery is a curated subset,
-# not 1:1 with the battery. 37/37 entries are the in-wasm-validatable set
-# (touch joined via the in-browser TOUCH_INJECT fixture; flashenc reuses
-# the hello bin with a `key` field; serial input row + MIPS meter);
+# Gallery policy (documented 2026-09-14, extended 2026-09-22): the gallery
+# is a curated subset, not 1:1 with the battery. 57 entries are the
+# in-wasm-validatable set (touch joined via the in-browser TOUCH_INJECT
+# fixture; flashenc reuses the hello bin with a `key` field; Wi-Fi
+# scan/station joined via in-wasm fixtures; serial input row + MIPS meter);
 # everything else is intentionally gallery-absent (needs host env/fixtures
 # the browser cannot provide, is a build variant sharing one source dir, or
 # was never promoted). Warn-only: a missing gallery entry is NEVER a FAIL.
@@ -157,7 +166,7 @@ covered = set()
 for e in man:
     covered.add(e["file"])
 # Gallery-coverage section is informational: the gallery is a curated
-# subset (37 entries), not 1:1 with the 106 battery cases. Report the
+# subset (57 entries), not 1:1 with the 110 battery cases. Report the
 # counts and stop — per-case "no gallery entry" lines would just restate
 # policy as noise.
 print(f"gallery entries: {len(mfiles)}, battery cases: {len(battery_cases())} (gallery is a curated subset; absence is policy, not rot)")

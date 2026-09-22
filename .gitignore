@@ -27,3 +27,7 @@ tools/sketches/esp32s3_secure_boot/app_signed.bin
 # Go gateway build output (rebuilt by tools/gateway/start-gateway.sh)
 tools/gateway/openhw-gw
 tools/gateway/openhw-gw.exe
+
+# MicroPython validation artifacts (download-once caches, rebuilt by harnesses)
+tools/.micropython/
+tools/.micropython_pkg/

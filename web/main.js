@@ -30,6 +30,8 @@ const els = {
   autoScroll: document.getElementById('autoScroll'),
   gpioExpandAll: document.getElementById('gpioExpandAll'),
   gpioCollapseAll: document.getElementById('gpioCollapseAll'),
+  mpUrl: document.getElementById('mpUrl'),
+  mpLoad: document.getElementById('mpLoad'),
 };
 
 // ── Serial console state ──
@@ -211,9 +213,15 @@ function updateGpioCell(i, mask) {
   }
 }
 
+let gpioFrameSkip = 0;
 function renderGpio() {
   const mask = emu.gpio_output();
   if (mask === gpioPrevMask) return;
+  // The grid is 40 DOM cells: repaint at most every 3rd frame (~20 Hz).
+  // Pin state still converges (mask diff is cumulative), but layout work
+  // drops ~3x during blink-heavy firmware. Force full repaint when the
+  // mask settles after activity (so the final state is never stale).
+  if ((gpioFrameSkip = (gpioFrameSkip + 1) % 3) !== 0) return;
   // Only update cells that changed
   let diff = mask ^ gpioPrevMask;
   for (let i = 0; i < NUM_GPIO && diff; i++) {
@@ -261,17 +269,35 @@ let mipsSteps = 0;
 let mipsLastT = performance.now();
 let mipsShown = 0;
 
+// Frame budget: one rAF tick ≈ 16 ms. At ~10 MIPS in-wasm, 40k steps
+// would need only ~4 ms of emulation — but the per-call JS↔wasm boundary
+// cost dominates at small batches (measured: raising the batch 40k →
+// 250k/frame changes wall time per emulated second far less than 6x).
+// Run up to 4 consecutive batches per frame while time remains (< 12 ms),
+// so fast boots finish sooner without freezing the page on slow devices.
+let lastTickMs = 0;
 function tick() {
+  const t0 = performance.now();
+  // Deadline: leave ~4 ms of the 16 ms frame for paint/input.
+  const deadline = t0 + 12;
   const n = parseInt(els.steps.value, 10);
-  if (bridge && vdevSensor && vdevAdc) {
-    emu.i2c_inject_rx(0, new Uint8Array([vdevSensor.reg]));
-    emu.spi_inject_miso(0, new Uint8Array([vdevAdc.value]));
+  let executed = 0;
+  for (let b = 0; b < 4; b++) {
+    if (bridge && vdevSensor && vdevAdc) {
+      emu.i2c_inject_rx(0, new Uint8Array([vdevSensor.reg]));
+      emu.spi_inject_miso(0, new Uint8Array([vdevAdc.value]));
+    }
+    executed += emu.step_batch(n);
+    // Drain + dispatch once per batch (cheap when empty: the Rust drain
+    // fast-path returns without touching merge state, and dispatch only
+    // walks queued events).
+    appendSerial(emu.uart_read());
+    if (bridge) bridge.dispatch();
+    if (performance.now() >= deadline) break;
   }
-  const executed = emu.step_batch(n);
+  lastTickMs = performance.now() - t0;
   totalSteps += executed;
-  appendSerial(emu.uart_read());
   renderGpio();
-  if (bridge) bridge.dispatch();
   // MIPS = emulated instructions per wall second, smoothed over ~0.5 s.
   mipsSteps += executed;
   const now = performance.now();
@@ -345,6 +371,15 @@ async function loadFlash(bytes, keyHex) {
       emu.touch_inject(pad, val);
     }
   }
+  // Wi-Fi fixtures (mirror the run_flash WIFI_SCAN_APS flows): the engine
+  // lives in the machine (`Soc::wifi_fixture_poll`, driven per step_fast),
+  // so the bridge just arms it — no JS per-frame work needed.
+  if (currentGalleryItem && currentGalleryItem.wifiScan !== null) {
+    emu.wifi_scan_fixture(currentGalleryItem.wifiScan || '');
+  }
+  if (currentGalleryItem && currentGalleryItem.wifiSta !== null) {
+    emu.wifi_sta_fixture(currentGalleryItem.wifiSta || 'EmuNet,-50,6,02:11:22:33:44:55');
+  }
 
   if (typeof PeripheralBridge !== 'undefined') {
     bridge = new PeripheralBridge(emu);
@@ -389,7 +424,22 @@ els.firmware.addEventListener('change', async (e) => {
   if (!file) return;
   currentGalleryItem = null;
   const buf = await file.arrayBuffer();
-  loadFlash(new Uint8Array(buf));
+  let bytes = new Uint8Array(buf);
+  // Uploaded MicroPython images arrive as the raw Release .bin (1.78 MB,
+  // magic E9) — without the vfs partition the firmware prints "filesystem
+  // appears to be corrupted" (proven live). Pad + partition exactly like
+  // the ▶ REPL preset; arduino merged bins are already full-flash size
+  // (4 MB ≥ pad size) so they pass through untouched.
+  if (bytes.length > 0 && bytes[0] === 0xe9 && bytes.length < MP_PAD_SIZE) {
+    try {
+      bytes = mpPadAndPartition(bytes);
+      setStatus(`MicroPython image detected — padded to ${(bytes.length / 1048576).toFixed(1)} MiB with vfs partition`);
+    } catch (err) {
+      setStatus(`MicroPython pad failed: ${err.message}`);
+      return;
+    }
+  }
+  loadFlash(bytes);
 });
 
 async function loadFromUrl(url, keyHex) {
@@ -398,6 +448,116 @@ async function loadFromUrl(url, keyHex) {
   const buf = await res.arrayBuffer();
   loadFlash(new Uint8Array(buf), keyHex);
 }
+
+// ── MicroPython REPL preset ──
+// Downloads a stock MicroPython GENERIC_S3 image (Release .bin at flash
+// offset 0, like esptool `write_flash 0`), pads it to 3 MiB, appends the
+// littlefs "vfs" partition (DATA 0x82 @ 0x200000, 1 MiB) the firmware
+// mounts at boot, recomputes the partition-table MD5, and boots it.
+// MicroPython's REPL listens on UART0 (not USB-CDC), so the send port
+// flips to UART0 and the input box gets a try-it snippet. Provenance:
+// tools/micropython_repl.sh asserts the same image boots to `>>> ` and
+// evaluates `print(6*7)` → `42` plus the float family headlessly.
+// NOTE: upstream micropython.org serves no CORS header, so the fetch only
+// succeeds from a same-origin self-hosted copy or a CORS-enabled mirror —
+// the box accepts any URL, and any failure lands in the status line.
+const MP_VFS_OFFSET = 0x200000;
+const MP_VFS_SIZE = 0x100000;
+const MP_PAD_SIZE = 0x300000;
+
+function mpPadAndPartition(raw) {
+  // Pad to the 3 MiB the partition table addresses (erased flash = 0xFF),
+  // then write the vfs record + MD5 exactly like tools/micropython_repl.sh.
+  const out = new Uint8Array(MP_PAD_SIZE).fill(0xff);
+  if (raw.length > MP_PAD_SIZE) throw new Error(`image too large: ${raw.length} > ${MP_PAD_SIZE}`);
+  out.set(raw, 0);
+  const pt = 0x8000;
+  const rec = new Uint8Array(32);
+  rec[0] = 0xaa; rec[1] = 0x50; rec[2] = 1; rec[3] = 0x82; // DATA, sub 0x82
+  new DataView(rec.buffer).setUint32(4, MP_VFS_OFFSET, true);
+  new DataView(rec.buffer).setUint32(8, MP_VFS_SIZE, true);
+  rec.set([0x76, 0x66, 0x73, 0x00], 12); // label "vfs"
+  out.set(rec, pt + 0x60);
+  // MD5 covers every 32-byte record BEFORE the MD5 marker itself
+  // (verified against MicroPython's pristine table: md5(records[0..4])).
+  const prefix = out.slice(pt, pt + 0x80);
+  const sum = mpMd5(prefix);
+  const mrec = new Uint8Array(32);
+  mrec[0] = 0xeb; mrec[1] = 0xeb; // end marker
+  mrec.set(sum, 16);
+  out.set(mrec, pt + 0x80);
+  return out;
+}
+
+// MD5 (RFC 1321) over a byte array — tiny self-contained port so the page
+// needs no dependency; returns the 16-byte digest. Only used for the
+// 128-byte partition-table prefix above.
+function mpMd5(msg) {
+  const s = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21];
+  const K = [];
+  for (let i = 0; i < 64; i++) K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000) >>> 0;
+  const l = msg.length;
+  const bitLen = l * 8;
+  const withPad = (((l + 8) >> 6) + 1) * 64;
+  const m = new Uint8Array(withPad);
+  m.set(msg, 0);
+  m[l] = 0x80;
+  new DataView(m.buffer).setUint32(withPad - 8, bitLen >>> 0, true);
+  new DataView(m.buffer).setUint32(withPad - 4, Math.floor(bitLen / 0x100000000), true);
+  let [a0, b0, c0, d0] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
+  const w = new Uint32Array(16);
+  const rotl = (x, n) => ((x << n) | (x >>> (32 - n))) >>> 0;
+  for (let off = 0; off < withPad; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = new DataView(m.buffer).getUint32(off + i * 4, true);
+    let [a, b, c, d] = [a0, b0, c0, d0];
+    for (let i = 0; i < 64; i++) {
+      let f, g;
+      if (i < 16) { f = (b & c) | (~b & d); g = i; }
+      else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) % 16; }
+      else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) % 16; }
+      else { f = c ^ (b | ~d); g = (7 * i) % 16; }
+      f = (f + a + K[i] + w[g]) >>> 0;
+      a = d; d = c; c = b;
+      b = (b + rotl(f, s[i])) >>> 0;
+    }
+    a0 = (a0 + a) >>> 0; b0 = (b0 + b) >>> 0; c0 = (c0 + c) >>> 0; d0 = (d0 + d) >>> 0;
+  }
+  const out = new Uint8Array(16);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, a0, true); dv.setUint32(4, b0, true);
+  dv.setUint32(8, c0, true); dv.setUint32(12, d0, true);
+  return out;
+}
+
+async function loadMicroPython() {
+  const url = els.mpUrl ? els.mpUrl.value.trim() : '';
+  if (!url) { setStatus('MicroPython: paste an image URL first'); return; }
+  try {
+    setStatus('MicroPython: downloading image…');
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`fetch ${url} -> ${res.status}`);
+    const raw = new Uint8Array(await res.arrayBuffer());
+    if (raw.length < 0x100000 || raw[0] !== 0xe9) {
+      throw new Error(`not a flash image (size ${raw.length}, magic 0x${(raw[0] || 0).toString(16)}) — want the Release .bin at flash offset 0`);
+    }
+    setStatus('MicroPython: padding flash + vfs partition…');
+    const flash = mpPadAndPartition(raw);
+    currentGalleryItem = null; // no fixture: uploaded/self-hosted bytes boot raw
+    loadFlash(flash);
+    // MicroPython's REPL listens on UART0 — flip the send port so typed
+    // lines arrive where the REPL reads them, and offer a try-it snippet.
+    if (els.serialPort) { els.serialPort.value = '0'; updateSerialPlaceholder(); }
+    if (els.serialInput && !els.serialInput.value) els.serialInput.value = 'print(6*7)';
+    setStatus(`MicroPython ready (${raw.length.toLocaleString()} B image) — press Run, wait for >>>`);
+  } catch (err) {
+    setStatus(`MicroPython: failed: ${err.message}`);
+  }
+}
+
+if (els.mpLoad) els.mpLoad.addEventListener('click', loadMicroPython);
 
 // ── Gallery ──
 let currentGalleryItem = null;
@@ -411,6 +571,13 @@ try {
       opt.dataset.key = item.key || '';
       opt.dataset.sdspi = item.sdspi ? '1' : '';
       opt.dataset.touch = item.touch || '';
+      // Wi-Fi fixture specs ride as plain strings, set ONLY when the
+      // manifest entry carries the key (absent = unarmed = dataset
+      // undefined; present-but-empty = empty-air scan):
+      // `wifi_scan` posts SCAN_DONE + records, `wifi_sta` completes the
+      // association (CONNECTED + GOT_IP + disconnect leg).
+      if (item.wifi_scan !== undefined) opt.dataset.wifiScan = item.wifi_scan;
+      if (item.wifi_sta !== undefined) opt.dataset.wifiSta = item.wifi_sta;
       opt.textContent = item.name;
       els.gallery.appendChild(opt);
     }
@@ -421,7 +588,15 @@ els.gallery.addEventListener('change', async (e) => {
   const sel = e.target.selectedOptions[0];
   const url = e.target.value;
   if (!url) return;
-  currentGalleryItem = { sdspi: sel.dataset.sdspi === '1', touch: sel.dataset.touch || null };
+  // dataset.* is undefined when the manifest entry lacks the key
+  // (unarmed) and a string — possibly empty (= empty-air scan) — when
+  // present. No hasAttribute dance needed: undefined means absent.
+  currentGalleryItem = {
+    sdspi: sel.dataset.sdspi === '1',
+    touch: sel.dataset.touch || null,
+    wifiScan: sel.dataset.wifiScan !== undefined ? sel.dataset.wifiScan : null,
+    wifiSta: sel.dataset.wifiSta !== undefined ? sel.dataset.wifiSta : null,
+  };
   try {
     setStatus(`loading ${url}…`);
     await loadFromUrl(url, sel.dataset.key || null);

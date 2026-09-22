@@ -31,7 +31,7 @@ steps on every handover.
 - HEAD: `312d903` "feat: WiFi RF bring-up part 1 (PHY spins fixed, scan task
   still parked)" (2026-09-17). Plus `1a6cdb0` vendoring `tools/gateway`
   (Go SLIRP/NAT + multiplayer gateway, port **5050**, for WiFi backhaul).
-- P5/P6 done per AGENTS.md: battery **106/0/0**, gallery **37 entries**,
+- P5/P6 done per AGENTS.md: battery **111/0/0** (incl. MicroPython REPL), gallery **57 images**,
   Playwright E2E ALL PASS. WiFi/BLE were historically OUT OF SCOPE —
   **WiFi bring-up is now the active workstream** (this file tracks it).
 

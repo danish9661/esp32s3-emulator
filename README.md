@@ -19,20 +19,23 @@ peripherals) with no server-side emulation.
   and a broad set of peripherals.
 - **P5 (peripheral validation) complete**: every SoC peripheral is
   validated end-to-end by booting **real arduino-cli firmware** and asserting
-  both serial output and internal emulator state. Battery: **106/0/0**
-  (106 pass, 0 fail, 0 skipped) across 37 gallery entries + driver/poke
+  both serial output and internal emulator state. Battery: **111/0/0**
+  (111 pass, 0 fail, 0 skipped) across 58 gallery entries (57 images) + driver/poke
   sketches, plus Playwright browser E2E ALL PASS.
 - **P6 (browser frontend) complete**: Serial console + serial input row
-  (USB-CDC/UART0/1/2 + Send), GPIO LED grid, firmware gallery (37 entries:
+  (USB-CDC/UART0/1/2 + Send), GPIO LED grid, firmware gallery (58 entries:
   every major peripheral + SDSPI with in-browser card attach, emmc_driver,
-  usb_device; flashenc reuses the hello bin with a `key` field), MIPS meter,
-  Playwright E2E (hello boot, serial echo, UART1 round-trip, SDSPI mount).
-- **Remaining known gaps**: WiFi/BLE only. The Arduino `Wire` (I2C) empty-bus
-  scan reporting "other" is verified silicon-true behavior (esp-idf NG-driver
-  maps the NACK path's `ESP_ERR_INVALID_STATE` to 4), not a model gap — see
-  `AGENTS.md`. Xtensa `ee.*` DSP/TIE: 218/218 execute; unmapped patterns trap
-  loud (correct). Touch validated.
-- **Out of scope**: WiFi/BLE.
+  usb_device, Wi-Fi scan/station via in-wasm fixtures; flashenc reuses the
+  hello bin with a `key` field), MIPS meter,
+  Playwright E2E (hello boot, serial echo, UART1 round-trip, SDSPI mount,
+  touch read, Wi-Fi scan).
+- **Remaining known gaps**: Wi-Fi beyond scan/station-connect, BLE. The
+  Arduino `Wire` (I2C) empty-bus scan reporting "other" is verified
+  silicon-true behavior (esp-idf NG-driver maps the NACK path's
+  `ESP_ERR_INVALID_STATE` to 4), not a model gap — see `AGENTS.md`. Xtensa
+  `ee.*` DSP/TIE: 218/218 execute; unmapped patterns trap loud (correct).
+  Touch validated.
+- **Out of scope**: Wi-Fi SoftAP/ESP-NOW, BLE.
 
 ## Quickstart
 
@@ -82,8 +85,9 @@ The page has:
 - **Serial input row** — port selector (USB-CDC/UART0/1/2) + text box + Send;
   Enter sends with trailing newline for `readStringUntil`/REPL readers
 - **40-pin GPIO LED grid** — real-time pin state visualization
-- **Examples dropdown** — 37 bundled firmware sketches (fetches + loads),
-  incl. touch (in-browser `TOUCH_INJECT` fixture) and SDSPI (in-browser
+- **Examples dropdown** — 57 bundled firmware sketches (fetches + loads),
+  incl. touch (in-browser `TOUCH_INJECT` fixture), Wi-Fi scan/station
+  (in-wasm `wifi_scan`/`wifi_sta` fixtures) and SDSPI (in-browser
   card attach); flashenc reuses the hello bin with a `key` field
 - **File input** — load your own `.merged.bin`
 - **Run / Stop / Reset** — step-level control

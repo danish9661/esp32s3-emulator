@@ -215,6 +215,24 @@ impl Esp32S3 {
         }
         let (r0, n0) = self.run_fast_core(0, llen);
         let (r1, n1) = self.run_fast_core(1, flen);
+        // Self-contained Wi-Fi fixture engine (browser/bridge path): drive
+        // one step with post-step pcs (same sampling point run_flash uses
+        // after its `step_fast`). No-op while no fixture is armed. Handles
+        // the records-check a10 = ESP_OK force itself (the Soc cannot see
+        // CPU regs): when the engine staged records this poll, force the
+        // trapping core's return value.
+        let pc0 = self.cpu[0].pc;
+        let pc1 = self.cpu[1].pc;
+        let records_pc = self.soc.wifi_fixture_records_pc();
+        let staged_before = self.soc.wifi_fixture_records_staged();
+        self.soc.wifi_fixture_poll(pc0, pc1);
+        if self.soc.wifi_fixture_records_staged() && !staged_before {
+            for c in 0..2 {
+                if (c == 0 && pc0 == records_pc) || (c == 1 && pc1 == records_pc) {
+                    self.cpu[c].set_reg(10, 0); // a10 = ESP_OK
+                }
+            }
+        }
         if self.soc.rom_boot_mode()
             && !(self.cpu[0].pc >= rom_stub::ROM_BASE && self.cpu[0].pc < rom_stub::ROM_END)
         {

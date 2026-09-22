@@ -88,26 +88,28 @@ Core design:
         validated via direct poke). Xtensa LX7 ISA audit passed (218/218
         `ee.*` DSP/TIE executing, incl. `ee_srs_accx`; unmapped patterns
         trap loud, correct). OTA boot-slot selection implemented; ROM
-        coverage sufficient (5+ real sketches boot). Battery 106/0/0,
-        gallery 37 entries, Playwright E2E ALL PASS.
+        coverage sufficient (5+ real sketches boot). Battery 110/0/0,
+        gallery 58 entries (57 images), Playwright E2E ALL PASS.
 - [x] **P6 — Frontend polish**: serial console UI, GPIO/LED visualization,
-      example firmware gallery (37 entries: every major peripheral + SDSPI
+      example firmware gallery (58 entries: every major peripheral + SDSPI
       with in-browser card attach, emmc_driver, usb_device, touch with
-      in-browser TOUCH_INJECT fixture; flashenc reuses
+      in-browser TOUCH_INJECT fixture, Wi-Fi scan/station with in-wasm
+      fixtures; flashenc reuses
       the hello bin with a `key` field; serial input row + MIPS meter).
 - [ ] WiFi/BLE: OUT OF SCOPE for now (months of work; not required for the
       core milestone).
 
-Scope updates (2026-09-14): P5/P6 done — battery 106/0/0 (0 skipped),
-gallery 37/37 in-wasm-validatable entries, Playwright E2E ALL PASS
-(hello boot, MIPS, serial echo, UART1 round-trip, SDSPI mount). Earlier
+Scope updates (2026-09-22): P5/P6 done — battery 111/0/0 (0 skipped),
+gallery 57 in-wasm-validatable entries, Playwright E2E ALL PASS
+(hello boot, MIPS, serial echo, UART1 round-trip, SDSPI mount, touch read,
+Wi-Fi scan). Earlier
 scoping notes below are HISTORICAL (superseded where they conflict):
 Touch validated after all (see status log);
 `ee.*` now 218/218 executing (incl. `ee_srs_accx`); eMMC simulated card,
 flash-encryption pipeline, USB-OTG host enumeration, IDF-driver eMMC mount
 (`emmc_driver`), USB-OTG device-stack boot (`usb_device`), and the
 secure-boot signed pipeline (`secure_boot`) all landed (see status log).
-Still out: WiFi/BLE, USB-OTG device-mode enumeration against an external
+Still out: Wi-Fi SoftAP/ESP-NOW/BLE, USB-OTG device-mode enumeration against an external
 host (no offline harness possible; every validatable path — host enum of
 the simulated device, EP0/EP1 loopback, TinyUSB HID boot + in-model-host
 full enumeration REQ0..REQ6 — is covered),
@@ -4381,3 +4383,32 @@ full enumeration REQ0..REQ6 — is covered),
     host events live in a dedicated `ard_pool` (machine intercepts their
     free as a no-op leak). Battery 108/0/0. Next: SoftAP / remaining WiFi
     protocols, then gateway backhaul.
+  - 2026-09-22: **MicroPython REPL validated + in-browser preset (P6)**.
+    User: "add micropython demo and test if that is fully working or not,
+    and implement it". Answer: FULLY WORKING, zero model changes needed.
+    Fresh stock v1.29.0 GENERIC_S3 image (1.78MB, magic E9, downloaded
+    from micropython.org — dated URL from `/download/ESP32_GENERIC_S3/`,
+    old date-guess 404s) boots via `tools/micropython_repl.sh` to
+    `>>> `, evaluates `print(6*7)`→`42`, floats `0.5`/`0.33333334`/`0.3`,
+    plus `sys.platform`=`esp32`, listcomp, `2**40` bignum — all through
+    windowed-ABI spills, the LX7 FPU, UART0 RX. The vfs-partition recipe
+    is load-bearing (without it: "filesystem appears to be corrupted" —
+    proven live on the bare image). New `tools/micropython_harness.mjs`
+    (NODE battery entry `micropython`, download-once cache in gitignored
+    `tools/.micropython/`, per-byte UART0 injection — a single burst
+    overruns the FIFO while the REPL idles, proven live) →
+    `MICROPYTHON HARNESS PASS`. New bench **MicroPython preset**
+    (`web/index.html` URL box + ▶ REPL, `web/main.js` download + JS
+    MD5 + pad/partition, file-upload auto-detects E9 images, UART0 flip
+    + `print(6*7)` snippet): same-origin self-hosted copy boots in-wasm
+    to `>>> ` + `42` (Playwright Test 7 ALL PASS; upstream serves no CORS
+    header so cross-origin fetch fails loud in the status line —
+    documented in Docs). Cautionary tales: (1) the preset row first
+    rendered UNDER the run-group rail (grid overlap swallowed clicks —
+    Playwright "intercepts pointer events"; fixed with wrap + block
+    layout); (2) 1280px-vs-1600px viewports disagree on overlap — probe
+    at the default viewport. Docs: About REPL paragraph, Docs
+    MicroPython section, odc MicroPython row. Battery 111 (micropython
+    exempt from the freshness guard: BINLESS_CASES, no committed bin).
+    Proofs: harness PASS, Playwright 19/19 ALL PASS, shard 0/4 28/0/0,
+    clippy `-D warnings` clean, fmt clean.

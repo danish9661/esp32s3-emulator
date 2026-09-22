@@ -158,6 +158,53 @@ fn ioblock_remap(addr: u32) -> u32 {
 // esp_image_header_t magic byte (esp_image_format.h: ESP_IMAGE_HEADER_MAGIC).
 const ESP_IMAGE_MAGIC: u8 = 0xE9;
 
+/// Per-image linked addresses for the Wi-Fi fixture engine (see
+/// `Soc::wifi_fixture_layout`). Every address is a LINKED address, stable
+/// for the pinned esp32 core but DIFFERENT per sketch (the STA sketch links
+/// the pool/RAM elsewhere) — ground truth = `nm` on each sketch ELF.
+#[derive(Clone, Copy)]
+struct WifiImageLayout {
+    scan_start: u32,
+    connect: u32,
+    wifi_event_var: u32,
+    ip_event_var: u32,
+    count_cell: u32,
+    scan_count: u32,
+    scan_result: u32,
+    records_check: u32,
+    ready_lists: u32,
+    top_prio: u32,
+    reg_heaps: u32,
+    pxcur: u32,
+    sta_network_if: u32,
+}
+
+/// Fixture-engine state machine (one per armed run; see `WifiFixture`
+/// below for field docs).
+#[derive(Clone, Copy, Default)]
+struct WifiFixtureState {
+    scan_armed: bool,
+    scan_done: bool,
+    records_done: bool,
+    sta_armed: bool,
+    sta_done: bool,
+    sta_stage: u8,
+    sta_ip_done: bool,
+    disc_armed: bool,
+    disc_done: bool,
+}
+
+/// An armed Wi-Fi fixture run: parsed AP list + fixed LAN + engine state.
+/// Staging order mirrors run_flash exactly (count cell → SCAN_DONE post →
+/// records write; CONNECTED post → GOT_IP posts → disconnect posts), so
+/// firmware observes identical bytes.
+#[derive(Clone)]
+struct WifiFixture {
+    aps: alloc::vec::Vec<crate::wifi::ScanFixtureAp>,
+    ip: [u8; 4],
+    st: WifiFixtureState,
+}
+
 /// SENS2 PLL-lock status model (TRM SENS2 SAR_PLL_FORCE_CTRL @ 0x6000E040).
 ///
 /// rtc_clk (rtc_clk.c) powers the CPU PLL by writing the force/power bits of
@@ -340,6 +387,11 @@ pub struct Soc {
     /// NRX @ 0x6001CC00). TEMP WIFI BRING-UP scaffold: plain stores +
     /// proven RF-cal done-bits (see wifi.rs).
     wifi: Wifi,
+    /// Which firmware image the Wi-Fi fixture engine serves (scan vs STA
+    /// sketch link the pool/RAM differently; the layout table lives in
+    /// `wifi_fixture_layout`). Set once via `wifi_fixture_image` before
+    /// arming; defaults to scan.
+    wifi_image_sta: bool,
     /// Image-specific addresses discovered live by the host (WiFi fixture
     /// support): the `registered_heaps` SLIST head, the `pxCurrentTCBs`
     /// (current-TCB-per-core) array, the `_ZL15_sta_network_if` STA-instance
@@ -378,6 +430,11 @@ pub struct Soc {
     /// Latch set by the machine when the `esp_wifi_disconnect` hook fires;
     /// consumed by the run_flash disconnect leg (one-shot arm).
     wifi_disc_fired: bool,
+    /// Self-contained Wi-Fi fixture engine (browser/bridge path — mirrors
+    /// the run_flash host blocks; see `wifi_fixture_*` below). `None` =
+    /// no fixture armed (firmware runs unmodified, like silicon with no
+    /// AP in range).
+    wifi_fixture: Option<WifiFixture>,
     /// I2S audio controllers (I2S0 @ 0x6000F000, I2S1 @ 0x6002D000).
     /// Functional model: TX/RX FIFO + serial shift-out onto GPIO-matrix
     /// signals (BCK/WS/SD).
@@ -550,6 +607,7 @@ impl Soc {
             usb_otg: UsbOtg::new(),
             usb_wrap: RegStore::new(0x1000),
             wifi: Wifi::new(),
+            wifi_image_sta: false,
             wifi_reg_heaps: None,
             wifi_pxcur: None,
             wifi_network: None,
@@ -562,6 +620,7 @@ impl Soc {
             wifi_ip_info: None,
             wifi_ap_reads: 0,
             wifi_disc_fired: false,
+            wifi_fixture: None,
             lcd_cam: LcdCam::new(),
             appcpu_ctrl_a: 0,
             sys_clk_en0: 0xF9C1_E06F,
@@ -1777,6 +1836,306 @@ impl Soc {
     /// hook skip).
     pub fn wifi_notify_disconnect(&mut self) {
         self.wifi_disc_fired = true;
+    }
+
+    // ── Self-contained Wi-Fi fixture engine (browser/bridge path) ──
+    // Mirrors the run_flash host blocks line-for-line (same Soc calls, same
+    // order, same payloads), but driven from machine state instead of env
+    // vars + uart_buf markers, so the wasm bridge (no env, no stdout) can
+    // serve the identical fixtures. run_flash keeps its own copy (it needs
+    // per-step println diagnostics); behavior parity is pinned by the
+    // shared Soc primitives both paths call.
+    //
+    /// Layout table shared by the fixture engine (selected by
+    /// `wifi_image_sta`, programmed once via `wifi_fixture_image`).
+    fn wifi_fixture_layout(&self) -> WifiImageLayout {
+        if self.wifi_image_sta {
+            // wifi-sta image layout (nm on the wifi-sta ELF).
+            WifiImageLayout {
+                scan_start: 0x4206_3b78,
+                connect: 0x4203_c7c4,
+                wifi_event_var: 0x3c0b_42bc,
+                ip_event_var: 0x3c0b_3bb8,
+                count_cell: 0x3fc9_f926,
+                scan_count: 0x3fc9_aee4,
+                scan_result: 0x3fc9_aee0,
+                records_check: 0x4200_3f9c,
+                ready_lists: 0x3fc9_b8dc,
+                top_prio: 0x3fc9_b84c,
+                reg_heaps: 0x3fc9_b794,
+                pxcur: 0x3fc9_bad0,
+                sta_network_if: 0x3fc9_ae6c,
+            }
+        } else {
+            // wifi-scan image layout (nm on the wifi-scan ELF).
+            WifiImageLayout {
+                scan_start: 0x4206_3b90,
+                connect: 0x4203_c84c,
+                wifi_event_var: 0x3c0b_4264,
+                ip_event_var: 0x3c0b_3b60,
+                count_cell: 0x3fc9_f93e,
+                scan_count: 0x3fc9_aef4,
+                scan_result: 0x3fc9_aef0,
+                records_check: 0x4200_3ee0,
+                ready_lists: 0x3fc9_b8f4,
+                top_prio: 0x3fc9_b864,
+                reg_heaps: 0x3fc9_b7ac,
+                pxcur: 0x3fc9_b7e0,
+                sta_network_if: 0x3fc9_ae7c,
+            }
+        }
+    }
+    /// Re-apply the active layout addresses after a boot/reset (which
+    /// rebuilds heap-adjacent state). Called by the fixture arm wrappers
+    /// so main.js load-then-arm order always wins over boot-time wipes.
+    pub fn wifi_fixture_layout_reapply(&mut self) {
+        let l = self.wifi_fixture_layout();
+        self.wifi_reg_heaps = Some(l.reg_heaps);
+        self.wifi_pxcur = Some(l.pxcur);
+        self.wifi_network = Some(l.sta_network_if);
+        self.wifi_event_var = Some(l.wifi_event_var);
+        self.wifi_ip_event_var = Some(l.ip_event_var);
+    }
+
+    /// Select the STA vs scan image for the fixture engine (must precede
+    /// arming; programs the layout addresses like run_flash does at boot).
+    pub fn wifi_fixture_image(&mut self, is_sta: bool) {
+        self.wifi_image_sta = is_sta;
+        let l = self.wifi_fixture_layout();
+        // Program the layout addresses (same five cells run_flash sets).
+        self.wifi_reg_heaps = Some(l.reg_heaps);
+        self.wifi_pxcur = Some(l.pxcur);
+        self.wifi_network = Some(l.sta_network_if);
+        self.wifi_event_var = Some(l.wifi_event_var);
+        self.wifi_ip_event_var = Some(l.ip_event_var);
+    }
+
+    /// Arm the scan fixture: `aps_spec` is `WIFI_SCAN_APS`
+    /// (`ssid,rssi,chan,bssid[;...]`, empty = empty air). Idempotent
+    /// pre-boot setup (no stepping yet — the engine fires on firmware pcs
+    /// like the run_flash blocks do).
+    pub fn wifi_fixture_scan(&mut self, aps_spec: &str) {
+        let aps = crate::wifi::parse_scan_fixtures(aps_spec);
+        self.wifi_fixture = Some(WifiFixture {
+            aps,
+            ip: [192, 168, 4, 2],
+            st: WifiFixtureState::default(),
+        });
+    }
+
+    /// Arm the STA-connect fixture (same AP list drives the association;
+    /// fixed LAN 192.168.4.2/24 gw .1, like run_flash).
+    pub fn wifi_fixture_sta(&mut self, aps_spec: &str) {
+        let mut aps = crate::wifi::parse_scan_fixtures(aps_spec);
+        if aps.is_empty() {
+            aps = crate::wifi::parse_scan_fixtures("EmuNet,-50,6,02:11:22:33:44:55");
+        }
+        self.wifi_fixture = Some(WifiFixture {
+            aps,
+            ip: [192, 168, 4, 2],
+            st: WifiFixtureState::default(),
+        });
+    }
+
+    /// Records-check pc of the active layout (0 while no fixture armed):
+    /// lets the machine force the trapping core's a10 = ESP_OK when the
+    /// records leg stages (the Soc cannot see CPU regs itself).
+    pub fn wifi_fixture_records_pc(&self) -> u32 {
+        if self.wifi_fixture.is_none() {
+            return 0;
+        }
+        self.wifi_fixture_layout().records_check
+    }
+
+    /// True once the records leg staged (machine edge-detects the
+    /// transition to force a10 on the trapping core).
+    pub fn wifi_fixture_records_staged(&self) -> bool {
+        self.wifi_fixture
+            .as_ref()
+            .is_some_and(|f| f.st.records_done)
+    }
+
+    /// Drive one engine step (call once per macro-step from the machine,
+    /// with both cores' pcs sampled post-step like run_flash does after
+    /// `step_fast`). Runs the armed scan and/or STA completion legs.
+    /// No-op while no fixture is armed.
+    pub fn wifi_fixture_poll(&mut self, pc0: u32, pc1: u32) {
+        use xtensa_core::Bus as _Bus;
+        // Snapshot the layout + AP data first (borrow-split: the legs below
+        // need `&mut self` for queue/heap calls, so nothing here may hold
+        // the fixture borrow across them).
+        let Some(fx) = self.wifi_fixture.clone() else {
+            return;
+        };
+        let l = self.wifi_fixture_layout();
+        let mut st = fx.st;
+        let aps = fx.aps.clone();
+        let ip = fx.ip;
+        let mut dirty = false;
+
+        // — Scan leg: arm the dwell at `esp_wifi_scan_start`; on elapse,
+        // stage the count cell + post the REAL SCAN_DONE esp_event. —
+        if !st.scan_done {
+            if !st.scan_armed && (pc0 == l.scan_start || pc1 == l.scan_start) {
+                self.wifi_scan_begin();
+                st.scan_armed = true;
+                dirty = true;
+            }
+            if st.scan_armed && self.wifi_scan_tick_complete() {
+                if !aps.is_empty() {
+                    self.write16(l.count_cell, aps.len().min(8) as u32);
+                }
+                if let Some(tcb) = self.wifi_scan_post_event(l.wifi_event_var) {
+                    self.ready_task_on_list(tcb, l.ready_lists, l.top_prio);
+                }
+                st.scan_done = true;
+                dirty = true;
+            }
+        }
+        // — Scan records leg: at the records-return check the calloc'd
+        // buffer is final — write fixture records + force ESP_OK + count. —
+        if st.scan_done && !st.records_done && !aps.is_empty() {
+            for c in [pc0, pc1] {
+                if c == l.records_check {
+                    let buf = self.read32(l.scan_result);
+                    if buf != 0 {
+                        let n = aps.len().min(8);
+                        for (k, ap) in aps.iter().take(n).enumerate() {
+                            self.wifi_scan_record_ap(buf, k, ap);
+                        }
+                        self.write16(l.count_cell, n as u32);
+                        self.write16(l.scan_count, n as u32);
+                        st.records_done = true;
+                        dirty = true;
+                        break;
+                    }
+                }
+            }
+            // NOTE: run_flash also forces a10 = ESP_OK on the trapping core
+            // via `cpu.set_reg`; the machine wrapper below does that (the
+            // Soc cannot see CPU regs itself).
+        }
+        // — STA stage 1: arm the dwell at `esp_wifi_connect`; on elapse,
+        // post STA_CONNECTED (IDF bus; the firmware translates it to the
+        // arduino bus itself — a host arduino post races it, proven live).
+        // NOTE: run_flash posts stage 1 on the SAME poll that arms (its
+        // dwell check is `tick_complete() || wifi_sta_armed`, i.e. the
+        // just-armed dwell counts as elapsed) — do the same here via the
+        // `just_armed` flag, since a fresh `wifi_scan_begin` can never read
+        // back complete in the same poll.
+        if !st.sta_done {
+            let mut just_armed = false;
+            if !st.sta_armed && (pc0 == l.connect || pc1 == l.connect) {
+                self.wifi_scan_begin();
+                st.sta_armed = true;
+                just_armed = true;
+                dirty = true;
+            }
+            if st.sta_armed && st.sta_stage == 0 && (just_armed || self.wifi_scan_tick_complete()) {
+                let ap = aps.first().copied().unwrap_or(
+                    crate::wifi::parse_scan_fixture("EmuNet,-50,6,02:11:22:33:44:55")
+                        .expect("default fixture parses"),
+                );
+                let mut payload = [0u8; 48];
+                let n = (ap.ssid_len as usize).min(32);
+                payload[..n].copy_from_slice(&ap.ssid[..n]);
+                payload[32] = ap.ssid_len;
+                payload[33..39].copy_from_slice(&ap.bssid);
+                payload[39] = ap.chan;
+                payload[40..44].copy_from_slice(&3u32.to_le_bytes());
+                payload[44..46].copy_from_slice(&1u16.to_le_bytes());
+                if let Some(tcb) = self.wifi_post_event_with_data(l.wifi_event_var, 4, &payload) {
+                    self.ready_task_on_list(tcb, l.ready_lists, l.top_prio);
+                    st.sta_stage = 1;
+                    st.sta_done = true;
+                    dirty = true;
+                }
+            }
+        }
+        // — STA stage 2 (GOT_IP, both buses back-to-back, no consume-gate;
+        // see run_flash notes): IDF half is handler-veracity; the arduino
+        // 115 half (full 20-byte `ip_event_got_ip_t` at the info head) is
+        // what drives WL_CONNECTED. Decoupled: done latches on the arduino
+        // half; a failed IDF half retries best-effort.
+        if st.sta_stage == 1 && !st.sta_ip_done {
+            let netif = self.wifi_sta_netif();
+            if netif != 0 {
+                let mask = [255u8, 255, 255, 0];
+                let gw = [192u8, 168, 4, 1];
+                let mut payload = [0u8; 20];
+                payload[0..4].copy_from_slice(&netif.to_le_bytes());
+                payload[4..8].copy_from_slice(&u32::from_le_bytes(ip).to_le_bytes());
+                payload[8..12].copy_from_slice(&u32::from_le_bytes(mask).to_le_bytes());
+                payload[12..16].copy_from_slice(&u32::from_le_bytes(gw).to_le_bytes());
+                payload[16] = 1;
+                let mut info = [0u8; 44];
+                info[0..20].copy_from_slice(&payload);
+                let idf_ok = match self.wifi_post_event_with_data(l.ip_event_var, 0, &payload) {
+                    Some(tcb) => {
+                        self.ready_task_on_list(tcb, l.ready_lists, l.top_prio);
+                        true
+                    }
+                    None => false,
+                };
+                let ard_ok = self.wifi_ard_post(115, &info, l.ready_lists, l.top_prio);
+                if ard_ok {
+                    let ap = aps.first().copied().unwrap_or(
+                        crate::wifi::parse_scan_fixture("EmuNet,-50,6,02:11:22:33:44:55")
+                            .expect("default fixture parses"),
+                    );
+                    self.wifi_stage_sta_data(&ap, ip);
+                    st.sta_ip_done = true;
+                    dirty = true;
+                }
+                let _ = idf_ok;
+            }
+        }
+        // — Disconnect leg arming is latch-driven (machine notifies on the
+        // `esp_wifi_disconnect` hook skip); the engine only posts. Gate on
+        // GOT_IP done + both ap reads consumed (post-RSSI position) +
+        // arduino idle (the two arduino events must not race).
+        if st.sta_ip_done && !st.disc_done {
+            if self.wifi_hook_rssi_done() && self.wifi_take_disconnect() {
+                st.disc_armed = true;
+                dirty = true;
+            } else {
+                let _ = self.wifi_take_disconnect();
+            }
+            // NOTE: pre-leg latch fires (setup-time disconnect) are drained
+            // above so they can't arm the leg late — same as run_flash.
+            if st.disc_armed && self.wifi_ard_idle() {
+                let ap = aps.first().copied().unwrap_or(
+                    crate::wifi::parse_scan_fixture("EmuNet,-50,6,02:11:22:33:44:55")
+                        .expect("default fixture parses"),
+                );
+                let n = (ap.ssid_len as usize).min(32);
+                let mut full = [0u8; 48];
+                full[..n].copy_from_slice(&ap.ssid[..n]);
+                full[32] = ap.ssid_len;
+                full[33..39].copy_from_slice(&ap.bssid);
+                full[39] = 8; // WIFI_REASON_ASSOC_LEAVE (voluntary)
+                let didf_ok = match self.wifi_post_event_with_data(l.wifi_event_var, 5, &full) {
+                    Some(tcb) => {
+                        self.ready_task_on_list(tcb, l.ready_lists, l.top_prio);
+                        true
+                    }
+                    None => false,
+                };
+                let mut dinfo = [0u8; 44];
+                dinfo[..n].copy_from_slice(&ap.ssid[..n]);
+                dinfo[32] = ap.ssid_len;
+                dinfo[33..39].copy_from_slice(&ap.bssid);
+                dinfo[39] = 8;
+                let dard_ok = self.wifi_ard_post(113, &dinfo, l.ready_lists, l.top_prio);
+                if didf_ok && dard_ok {
+                    st.disc_done = true;
+                    dirty = true;
+                }
+            }
+        }
+        if dirty && let Some(slot) = self.wifi_fixture.as_mut() {
+            slot.st = st;
+        }
     }
 
     /// Poll the scan-dwell completion (host frontend — `true` exactly once

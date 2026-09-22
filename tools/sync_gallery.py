@@ -52,11 +52,26 @@ def note(msg):
         missing.append(msg)
 
 
+def gallery_file_map():
+    """Manifest gallery file -> battery-case sketch dir. Most gallery files
+    are `esp32s3_<case>.merged.bin` for battery case `<case>`; the map below
+    covers the exceptions (variants sharing one source dir, `.ino.` build
+    outputs kept where the freshness guard expects them, flashenc reusing
+    the hello image). Single source of truth for CI/Pages sync."""
+    m = {
+        "esp32s3_psram_opi.merged.bin": "esp32s3_psram",
+        "esp32s3_twai_driver.merged.bin": "esp32s3_twai_driver",
+    }
+    return m
+
+
 def find_present(gfile):
     """Resolve an already-built bin: exact top-level copy anywhere under
     tools/sketches first (covers variants like psram_opi whose dir
     esp32s3_psram differs from the file base esp32s3_psram_opi), then any
-    build/ output, mirroring run_battery.sh fallback order."""
+    build/ output, mirroring run_battery.sh fallback order. Build-output
+    `.ino.merged.bin` files are accepted as-is (arduino-cli names them that
+    way; only the web/firmware copy uses the short gallery name)."""
     # Exact filename match anywhere (top-level copies + build outputs).
     cands = sorted(glob.glob(os.path.join(SK, "*", gfile)))
     if cands:
@@ -65,12 +80,27 @@ def find_present(gfile):
     if cands:
         return cands[0]
     base = gfile[: -len(".merged.bin")]
+    # Same dir, either naming (short committed copy or .ino. build output).
+    for cand in (
+        os.path.join(SK, base, gfile),
+        os.path.join(SK, base, base + ".ino.merged.bin"),
+    ):
+        if os.path.exists(cand):
+            return cand
     cands = sorted(glob.glob(os.path.join(SK, base, "build", "*.merged.bin")))
     if cands:
+        # Prefer the sketch's own .ino.merged.bin over stale siblings.
+        for c in cands:
+            if os.path.basename(c) == base + ".ino.merged.bin":
+                return c
         return cands[0]
     cands = sorted(glob.glob(os.path.join(SK, "*", "build", gfile)))
     if cands:
         return cands[0]
+    # Last resort: the sketch dir's build output under its .ino. name.
+    ino = os.path.join(SK, base, "build", base + ".ino.merged.bin")
+    if os.path.exists(ino):
+        return ino
     return None
 
 

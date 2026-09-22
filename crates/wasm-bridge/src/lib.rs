@@ -233,4 +233,30 @@ impl Emulator {
     pub fn cam_inject_frame(&mut self, bytes: &[u8]) {
         self.inner.soc.cam_inject_frame(bytes);
     }
+
+    /// Arm the Wi-Fi scan fixture (`WIFI_SCAN_APS` =
+    /// `ssid,rssi,chan,bssid[;...]`, empty = empty air) for the wifi-scan
+    /// image. Mirrors run_flash `WIFI_SCAN_FIXTURE=1`: the engine posts the
+    /// REAL SCAN_DONE esp_event + writes fixture records into the calloc'd
+    /// buffer, so `scanNetworks()` returns them unmodified. Call BEFORE
+    /// load (the layout addresses are programmed into the Soc, and
+    /// `boot_from_flash` → `Soc::new` inside `reset()` would wipe them —
+    /// arming order is load-then-arm in main.js, so re-apply here).
+    pub fn wifi_scan_fixture(&mut self, aps: &str) {
+        self.inner.soc.wifi_fixture_image(false);
+        self.inner.soc.wifi_fixture_scan(aps);
+        self.inner.soc.wifi_fixture_layout_reapply();
+    }
+
+    /// Arm the Wi-Fi station-connect fixture (same AP list drives the
+    /// association; fixed LAN 192.168.4.2/24 gw .1) for the wifi-sta image.
+    /// Mirrors run_flash `WIFI_STA_CONN=1`: CONNECTED + GOT_IP posts plus
+    /// the insider hooks serve `localIP()`/`SSID()`/`RSSI()` and the
+    /// disconnect leg, so `waitForConnectResult` returns WL_CONNECTED.
+    /// Call after load, before Run.
+    pub fn wifi_sta_fixture(&mut self, aps: &str) {
+        self.inner.soc.wifi_fixture_image(true);
+        self.inner.soc.wifi_fixture_sta(aps);
+        self.inner.soc.wifi_fixture_layout_reapply();
+    }
 }

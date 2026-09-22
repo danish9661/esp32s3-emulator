@@ -12,6 +12,10 @@ Serves web/ over HTTP, loads index.html in Chromium, and asserts:
   6. touch gallery entry reads the injected pad counter in-wasm
      ('TOUCH PASS' — proves the `"touch": "3:1877"` manifest flag wires
      TOUCH_INJECT through the new `touch_inject` bridge call)
+  7. MicroPython REPL preset boots a self-hosted stock image in-wasm
+     (`>>> ` banner + `print(6*7)` -> `42` over UART0 — proves the URL
+     box + vfs-partition pad + UART0 flip; needs tools/.micropython/
+     cached by tools/micropython_harness.mjs)
 
 Fails loudly on any page error. Exits 0 on PASS, 1 on FAIL.
 """
@@ -170,6 +174,51 @@ try:
         except Exception:
             tail = page.eval_on_selector("#console", "el => el.textContent.slice(-800)")
             check("touch-inwasm-read", False, f"(tail={tail!r})")
+
+        # --- Test 7: MicroPython REPL preset (same-origin self-hosted image) ---
+        # (proves the URL box + vfs-partition pad + UART0 flip: download a
+        # stock MicroPython .bin, pad to 3 MiB with the littlefs vfs record
+        # + MD5 exactly like tools/micropython_repl.sh, boot to `>>> `,
+        # then evaluate `print(6*7)` -> `42` over UART0)
+        import shutil
+        mp_src = ROOT / "tools" / ".micropython" / "ESP32_GENERIC_S3-20260824-v1.29.0.bin"
+        if not mp_src.exists():
+            check("micropython-image-present", False, "(run node tools/micropython_harness.mjs once to cache tools/.micropython/)")
+        else:
+            shutil.copyfile(mp_src, WEB / "mp_test.bin")
+            try:
+                page.click("#stop")
+                page.fill("#mpUrl", f"http://127.0.0.1:{PORT}/mp_test.bin")
+                page.click("#mpLoad")
+                page.wait_for_function(
+                    "() => document.getElementById('status').textContent.includes('MicroPython ready')",
+                    timeout=60000,
+                )
+                check("micropython-preset-load", True)
+                check("micropython-uart0-flip", page.eval_on_selector("#serialPort", "el => el.value") == "0")
+                page.click("#run")
+                try:
+                    page.wait_for_function(
+                        "() => document.getElementById('console').textContent.includes('>>> ')",
+                        timeout=600000,
+                    )
+                    check("micropython-repl-banner", True)
+                except Exception:
+                    tail = page.eval_on_selector("#console", "el => el.textContent.slice(-400)")
+                    check("micropython-repl-banner", False, f"(tail={tail!r})")
+                page.fill("#serialInput", "print(6*7)")
+                page.click("#serialSend")
+                try:
+                    page.wait_for_function(
+                        "() => document.getElementById('console').textContent.includes('42')",
+                        timeout=120000,
+                    )
+                    check("micropython-eval-42", True)
+                except Exception:
+                    tail = page.eval_on_selector("#console", "el => el.textContent.slice(-400)")
+                    check("micropython-eval-42", False, f"(tail={tail!r})")
+            finally:
+                (WEB / "mp_test.bin").unlink(missing_ok=True)
 
         real_errors = [e for e in errors if "favicon" not in e.lower()]
         check("no-page-errors-final", len(real_errors) == 0, f"({real_errors[:3]!r})" if real_errors else "")
