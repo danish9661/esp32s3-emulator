@@ -3,41 +3,70 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ESP32-S3 Emulator</title>
+  <meta name="description" content="S3 Lab — a from-scratch ESP32-S3 emulator in Rust, running real firmware entirely in the browser via WebAssembly." />
+  <link rel="icon" href="data:," />
+  <title>S3 Lab — ESP32-S3 Emulator Bench</title>
   <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
-  <header>
-    <h1>ESP32-S3 Emulator <small>(Rust &rarr; WASM, in-browser)</small></h1>
+  <header class="mast">
+    <a class="brand" href="./index.html" aria-label="S3 Lab home">
+      <svg class="chip" viewBox="0 0 48 48" aria-hidden="true">
+        <rect x="12" y="12" width="24" height="24" rx="2" />
+        <rect x="19" y="19" width="10" height="10" rx="1" class="die" />
+        <g class="pins">
+          <path d="M16 4v8M24 4v8M32 4v8M16 36v8M24 36v8M32 36v8M4 16h8M4 24h8M4 32h8M36 16h8M36 24h8M36 32h8" />
+        </g>
+      </svg>
+      <span class="brand-text">S3 Lab <small>ESP32-S3 emulator · Rust &rarr; WASM</small></span>
+    </a>
+    <nav class="mast-nav" aria-label="Site">
+      <a href="./index.html" class="active" aria-current="page">Bench</a>
+      <a href="./about.html">About</a>
+      <a href="./docs.html">Docs</a>
+      <a href="./odc.html">Coverage</a>
+    </nav>
+    <span class="battery-pill" title="End-to-end firmware validation battery">battery 108/0/0</span>
   </header>
 
-  <section class="controls">
-    <label class="file">
-      Firmware (merged.bin):
-      <input type="file" id="firmware" accept=".bin" />
-    </label>
-    <label class="gallery">
-      Examples:
-      <select id="gallery"><option value="">— select —</option></select>
-    </label>
-    <button id="run" disabled>▶ Run</button>
-    <button id="stop" disabled>⏸ Stop</button>
-    <button id="reset" disabled>↻ Reset</button>
-    <label class="steps">
-      Steps/frame:
-      <input type="range" id="steps" min="1000" max="500000" step="1000" value="40000" />
-      <span id="stepsVal">40000</span>
-    </label>
-    <span id="status" class="status"></span>
-    <span id="mips" class="mips" title="Emulated instructions per second"></span>
+  <section class="setup" aria-label="Firmware setup">
+    <div class="setup-group load-group">
+      <span class="rail-caption">Firmware</span>
+      <label class="file">
+        Load merged.bin
+        <input type="file" id="firmware" accept=".bin" />
+      </label>
+      <label class="gallery">
+        Gallery
+        <select id="gallery"><option value="">— select —</option></select>
+      </label>
+    </div>
+    <div class="setup-group run-group">
+      <span class="rail-caption">Control</span>
+      <div class="run-row">
+        <button id="run" disabled>▶ Run</button>
+        <button id="stop" disabled>⏸ Stop</button>
+        <button id="reset" disabled>↻ Reset</button>
+      </div>
+      <label class="steps">
+        Steps/frame
+        <input type="range" id="steps" min="1000" max="500000" step="1000" value="40000" />
+        <span id="stepsVal">40000</span>
+      </label>
+    </div>
+    <div class="setup-group meter-group">
+      <span class="rail-caption">Readout</span>
+      <span id="status" class="status">wasm loading…</span>
+      <span id="mips" class="mips" title="Emulated instructions per second"></span>
+    </div>
   </section>
 
-  <main>
-    <section class="console-wrap">
+  <main class="bench">
+    <section class="scope" aria-label="Serial console">
       <div class="console-toolbar">
         <h2>Serial console</h2>
         <div class="console-actions">
-          <input type="text" id="searchInput" class="search-input" placeholder="Search..." />
+          <input type="text" id="searchInput" class="search-input" placeholder="Search…" />
           <button id="searchBtn" class="tb-btn" title="Find next (Enter)">🔍</button>
           <button id="searchPrevBtn" class="tb-btn" title="Find previous">⬆</button>
           <span id="searchStatus" class="search-status"></span>
@@ -49,7 +78,7 @@
           </label>
         </div>
       </div>
-      <pre id="console" class="console"></pre>
+      <pre id="console" class="console" aria-live="polite"></pre>
       <div class="serial-input-row">
         <label class="serial-port" title="Which port receives your keystrokes — must match the port your firmware reads (e.g. uart_echo reads UART1, hello/Serial reads USB-CDC)">
           Send to:
@@ -66,21 +95,29 @@
     </section>
 
     <aside class="sidebar">
-      <section class="gpio-wrap">
-        <h2>GPIO outputs</h2>
-        <div class="gpio-controls">
-          <button id="gpioExpandAll" class="tb-btn sm">Expand</button>
-          <button id="gpioCollapseAll" class="tb-btn sm">Collapse</button>
+      <section class="gpio-wrap" aria-label="GPIO pin header">
+        <div class="gpio-head">
+          <h2>Pin header <small>GPIO0–39 · live levels</small></h2>
+          <div class="gpio-controls">
+            <button id="gpioExpandAll" class="tb-btn sm">Expand</button>
+            <button id="gpioCollapseAll" class="tb-btn sm">Collapse</button>
+          </div>
         </div>
         <div id="gpio" class="gpio-grid"></div>
+        <p class="hint">Click a pin to flip its display between output and input view.</p>
       </section>
 
-      <section class="vdev-wrap">
+      <section class="vdev-wrap" aria-label="Virtual devices">
         <h2>Virtual devices</h2>
         <pre id="vdev" class="vdev"></pre>
       </section>
     </aside>
   </main>
+
+  <footer class="foot">
+    <span>S3 Lab — from-scratch ESP32-S3 emulation, no server side.</span>
+    <span class="foot-links"><a href="./about.html">About</a> · <a href="./docs.html">Docs</a> · <a href="./odc.html">Coverage</a></span>
+  </footer>
 
   <script type="module" src="./main.js"></script>
 </body>

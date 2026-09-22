@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="S3 Lab on-device coverage — every ESP32-S3 feature, what the emulator models, and what is left out." />
+  <link rel="icon" href="data:," />
+  <title>Coverage — S3 Lab</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header class="mast">
+    <a class="brand" href="./index.html" aria-label="S3 Lab home">
+      <svg class="chip" viewBox="0 0 48 48" aria-hidden="true">
+        <rect x="12" y="12" width="24" height="24" rx="2" />
+        <rect x="19" y="19" width="10" height="10" rx="1" class="die" />
+        <g class="pins">
+          <path d="M16 4v8M24 4v8M32 4v8M16 36v8M24 36v8M32 36v8M4 16h8M4 24h8M4 32h8M36 16h8M36 24h8M36 32h8" />
+        </g>
+      </svg>
+      <span class="brand-text">S3 Lab <small>ESP32-S3 emulator · Rust &rarr; WASM</small></span>
+    </a>
+    <nav class="mast-nav" aria-label="Site">
+      <a href="./index.html">Bench</a>
+      <a href="./about.html">About</a>
+      <a href="./docs.html">Docs</a>
+      <a href="./odc.html" class="active" aria-current="page">Coverage</a>
+    </nav>
+    <span class="battery-pill" title="End-to-end firmware validation battery">battery 108/0/0</span>
+  </header>
+
+  <main class="prose">
+    <h1>On-device coverage</h1>
+    <p class="lede">Every ESP32-S3 feature the project tracks, what the
+    emulator models, and what is deliberately left out. “Validated” means a
+    real arduino-cli sketch boots in the emulator and its serial output plus
+    internal state are asserted by the battery.</p>
+
+    <h2>CPU</h2>
+    <div class="matrix-wrap">
+      <table class="matrix">
+        <thead><tr><th>Feature</th><th>Status</th><th>Remark</th></tr></thead>
+        <tbody>
+          <tr><td>LX7 base ISA</td><td><span class="badge yes">Validated</span></td><td class="remark">ALU, loads/stores, branches, CALL0/J loops, windowed registers, exceptions, interrupts.</td></tr>
+          <tr><td>ee.* DSP/TIE</td><td><span class="badge yes">Validated</span></td><td class="remark">218/218 execute incl. ee_srs_accx; unmapped patterns trap loud (correct).</td></tr>
+          <tr><td>Single-precision FPU</td><td><span class="badge yes">Validated</span></td><td class="remark">Full libgcc __divsf3 / sqrtf sequences bit-exact vs host f32.</td></tr>
+          <tr><td>Dual core + cross-core IRQ</td><td><span class="badge yes">Validated</span></td><td class="remark">PRID strapping, serialized stepping, cross-core yields; FreeRTOS SMP boots.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>Connectivity</h2>
+    <div class="matrix-wrap">
+      <table class="matrix">
+        <thead><tr><th>Feature</th><th>Status</th><th>Remark</th></tr></thead>
+        <tbody>
+          <tr><td>Wi-Fi scan</td><td><span class="badge yes">Validated</span></td><td class="remark">Host-completed scan at the firmware boundary; SSID/RSSI/chan/BSSID asserted.</td></tr>
+          <tr><td>Wi-Fi station connect</td><td><span class="badge yes">Validated</span></td><td class="remark">Association + GOT_IP + status/IP/SSID/RSSI prints + disconnect leg.</td></tr>
+          <tr><td>Wi-Fi SoftAP / ESP-NOW</td><td><span class="badge no">Out of scope</span></td><td class="remark">No RF front end; nothing could validate over-the-air behavior.</td></tr>
+          <tr><td>Bluetooth / BLE</td><td><span class="badge no">Out of scope</span></td><td class="remark">Radio + controller stack; months of work, not required for the milestone.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>Serial and bus I/O</h2>
+    <div class="matrix-wrap">
+      <table class="matrix">
+        <thead><tr><th>Feature</th><th>Status</th><th>Remark</th></tr></thead>
+        <tbody>
+          <tr><td>UART0/1/2 + USB-Serial-JTAG</td><td><span class="badge yes">Validated</span></td><td class="remark">TX/RX FIFOs, interrupts, RS485 echo, HW flow control, RX timeout; console merged in UI.</td></tr>
+          <tr><td>SPI master (GPSPI2/3)</td><td><span class="badge yes">Validated</span></td><td class="remark">USR polling path, GDMA master DMA, slave + slave-DMA, quad hook, SDSPI mount.</td></tr>
+          <tr><td>I2C master/slave</td><td><span class="badge yes">Validated</span></td><td class="remark">Full FSM + NACK model; Wire driver verified silicon-true (empty bus reports “other”).</td></tr>
+          <tr><td>I2S audio</td><td><span class="badge yes">Validated</span></td><td class="remark">TX/RX FIFOs, BCK clock gen, TDM, PDM, GDMA path, loopback; esp-idf driver path green.</td></tr>
+          <tr><td>TWAI / CAN</td><td><span class="badge yes">Validated</span></td><td class="remark">PeliCAN registers, self-test loopback, RX inject; esp-idf driver path green.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>Timers, PWM, capture</h2>
+    <div class="matrix-wrap">
+      <table class="matrix">
+        <thead><tr><th>Feature</th><th>Status</th><th>Remark</th></tr></thead>
+        <tbody>
+          <tr><td>TIMG + WDT + RTC WDT</td><td><span class="badge yes">Validated</span></td><td class="remark">64-bit timers, alarm interrupts, MWDT stages incl. chip-reset reboot.</td></tr>
+          <tr><td>SYSTIMER</td><td><span class="badge yes">Validated</span></td><td class="remark">Unit counters + OP snapshot handshake; backs millis/micros/delay.</td></tr>
+          <tr><td>MCPWM (groups 0/1)</td><td><span class="badge yes">Validated</span></td><td class="remark">Timers/operators/generators, capture, fault/trip, dead-time, carrier, sync chains.</td></tr>
+          <tr><td>LEDC PWM + fade</td><td><span class="badge yes">Validated</span></td><td class="remark">Fractional divider, duty resolution, fade engine with DONE interrupt.</td></tr>
+          <tr><td>RMT TX/RX</td><td><span class="badge yes">Validated</span></td><td class="remark">Item RAM, carrier modulation, RX capture + demodulation, loopback.</td></tr>
+          <tr><td>PCNT pulse counter</td><td><span class="badge yes">Validated</span></td><td class="remark">Edge counting, gating, threshold interrupts via GPIO-matrix routing.</td></tr>
+          <tr><td>Sigma-Delta</td><td><span class="badge yes">Validated</span></td><td class="remark">PDM duty output on matrix signals 93–100.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>Analog, touch, sensors</h2>
+    <div class="matrix-wrap">
+      <table class="matrix">
+        <thead><tr><th>Feature</th><th>Status</th><th>Remark</th></tr></thead>
+        <tbody>
+          <tr><td>SAR ADC (oneshot + digital)</td><td><span class="badge yes">Validated</span></td><td class="remark">Attenuation scaling, injected voltages exact; GDMA-IN path.</td></tr>
+          <tr><td>Temperature sensor</td><td><span class="badge yes">Validated</span></td><td class="remark">TSENS DAC codes with the driver-fitted curve; TEMP_C fixture.</td></tr>
+          <tr><td>Touch controller</td><td><span class="badge yes">Validated</span></td><td class="remark">Oneshot, approach counters, denoise, sleep latch; in-browser fixture.</td></tr>
+          <tr><td>BOD brown-out</td><td><span class="badge yes">Validated</span></td><td class="remark">Interrupt + chip-reset paths, BOD_INJECT fixture.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>Crypto and security</h2>
+    <div class="matrix-wrap">
+      <table class="matrix">
+        <thead><tr><th>Feature</th><th>Status</th><th>Remark</th></tr></thead>
+        <tbody>
+          <tr><td>SHA-1/224/256/384/512</td><td><span class="badge yes">Validated</span></td><td class="remark">GDMA-fed engine; known-answer digests via mbedTLS.</td></tr>
+          <tr><td>AES-ECB/CBC/XTS (+GCM via HW)</td><td><span class="badge yes">Validated</span></td><td class="remark">FIPS vectors + chaining via the real mbedTLS driver.</td></tr>
+          <tr><td>RSA / HMAC / DS / ECDSA</td><td><span class="badge yes">Validated</span></td><td class="remark">Mod-exp, key-block HMAC, signature verify, P-256 sign/verify.</td></tr>
+          <tr><td>eFuse + burn</td><td><span class="badge yes">Validated</span></td><td class="remark">Factory MAC, field blobs, block burn with write-disable.</td></tr>
+          <tr><td>Flash encryption (XTS)</td><td><span class="badge yes">Validated</span></td><td class="remark">Whole-image XTS pipeline; hello boots fully encrypted.</td></tr>
+          <tr><td>Secure boot v2</td><td><span class="badge partial">Gallery-absent</span></td><td class="remark">Signed pipeline + fail-closed gate validated; needs a SECURE_BOOT_EN burn the browser cannot provide, so no gallery entry.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>Storage and USB</h2>
+    <div class="matrix-wrap">
+      <table class="matrix">
+        <thead><tr><th>Feature</th><th>Status</th><th>Remark</th></tr></thead>
+        <tbody>
+          <tr><td>SDMMC + FAT + eMMC</td><td><span class="badge yes">Validated</span></td><td class="remark">Simulated card, IDMAC, RPMB, full FAT mount; IDF-driver mount green.</td></tr>
+          <tr><td>SDSPI (SD over SPI)</td><td><span class="badge yes">Validated</span></td><td class="remark">Full FAT mount over GPSPI2; in-browser card attach.</td></tr>
+          <tr><td>USB-Serial-JTAG</td><td><span class="badge yes">Validated</span></td><td class="remark">Every sketch console flows through it.</td></tr>
+          <tr><td>USB-OTG host + device</td><td><span class="badge yes">Validated</span></td><td class="remark">Host enumeration of the simulated device; EP0/EP1 loopback; TinyUSB HID boot + full 7-transfer enum.</td></tr>
+          <tr><td>USB device vs external host</td><td><span class="badge no">Out of scope</span></td><td class="remark">Needs a USB-host counterparty; no offline harness possible.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>Memory, power, misc</h2>
+    <div class="matrix-wrap">
+      <table class="matrix">
+        <thead><th>Feature</th><th>Status</th><th>Remark</th></tr></thead>
+        <tbody>
+          <tr><td>PSRAM + cache MMU</td><td><span class="badge yes">Validated</span></td><td class="remark">QSPI/OPI init, up to 16 MB mapped, malloc pattern tests.</td></tr>
+          <tr><td>Deep / light sleep</td><td><span class="badge yes">Validated</span></td><td class="remark">Timer/EXT0/EXT1/ULP/touch/GPIO/UART wakeups, resume + reboot paths.</td></tr>
+          <tr><td>ULP-RISC-V</td><td><span class="badge yes">Validated</span></td><td class="remark">rv32imc core runs from RTC slow memory, halts on ebreak.</td></tr>
+          <tr><td>GPIO / RTC_IO / dedicated GPIO</td><td><span class="badge yes">Validated</span></td><td class="remark">Matrix routing, interrupts, hold across sleep, TIE latch bundles.</td></tr>
+          <tr><td>GDMA / LCD_CAM / UHCI</td><td><span class="badge yes">Validated</span></td><td class="remark">Descriptor walks, camera capture, UART-DMA bridge, SLIP framing.</td></tr>
+          <tr><td>OTA updates</td><td><span class="badge yes">Validated</span></td><td class="remark">Boot-slot selection + end-to-end reflash into ota_1.</td></tr>
+          <tr><td>RNG</td><td><span class="badge yes">Validated</span></td><td class="remark">Seeded stream; RNG_SEED varies it across runs.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </main>
+
+  <footer class="foot">
+    <span>S3 Lab — from-scratch ESP32-S3 emulation, no server side.</span>
+    <span class="foot-links"><a href="./index.html">Bench</a> · <a href="./about.html">About</a> · <a href="./docs.html">Docs</a></span>
+  </footer>
+</body>
+</html>

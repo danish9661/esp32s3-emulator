@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="S3 Lab docs — run the bench, load firmware, use fixtures, validate end to end." />
+  <link rel="icon" href="data:," />
+  <title>Docs — S3 Lab</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header class="mast">
+    <a class="brand" href="./index.html" aria-label="S3 Lab home">
+      <svg class="chip" viewBox="0 0 48 48" aria-hidden="true">
+        <rect x="12" y="12" width="24" height="24" rx="2" />
+        <rect x="19" y="19" width="10" height="10" rx="1" class="die" />
+        <g class="pins">
+          <path d="M16 4v8M24 4v8M32 4v8M16 36v8M24 36v8M32 36v8M4 16h8M4 24h8M4 32h8M36 16h8M36 24h8M36 32h8" />
+        </g>
+      </svg>
+      <span class="brand-text">S3 Lab <small>ESP32-S3 emulator · Rust &rarr; WASM</small></span>
+    </a>
+    <nav class="mast-nav" aria-label="Site">
+      <a href="./index.html">Bench</a>
+      <a href="./about.html">About</a>
+      <a href="./docs.html" class="active" aria-current="page">Docs</a>
+      <a href="./odc.html">Coverage</a>
+    </nav>
+    <span class="battery-pill" title="End-to-end firmware validation battery">battery 108/0/0</span>
+  </header>
+
+  <main class="prose">
+    <h1>Bench manual</h1>
+    <p class="lede">Everything on the bench page, and how the same runs are
+    reproduced headlessly for validation.</p>
+
+    <div class="toc">
+      <a href="#run">Run firmware</a>
+      <a href="#serial">Serial in and out</a>
+      <a href="#gpio">Pin header</a>
+      <a href="#fixtures">Fixtures</a>
+      <a href="#validate">Validate</a>
+    </div>
+
+    <h2 id="run">Run firmware</h2>
+    <p>Pick a gallery example or load your own <code>.merged.bin</code>
+    (arduino-cli produces one per sketch). Press <strong>Run</strong> — the
+    emulator steps both cores, and output appears in the console as the
+    firmware prints. <strong>Stop</strong> halts stepping;
+    <strong>Reset</strong> reloads the same image from its first boot
+    instruction. The steps-per-frame slider trades emulation speed against
+    page responsiveness; the MIPS readout shows smoothed emulated
+    instructions per wall second.</p>
+
+    <h2 id="serial">Serial in and out</h2>
+    <p>The console merges USB-CDC (<code>Serial</code>) and UART output.
+    Search, copy, and clear act on the scrollback buffer, which holds the
+    last 5000 lines. To send keystrokes, choose the port your firmware
+    reads — USB-CDC for <code>Serial</code> sketches, UART1 for the echo
+    example — type, and press Enter. Lines are sent with a trailing newline
+    unless you hold Shift, matching what <code>readStringUntil</code> and
+    REPL readers wait for. Long pastes are chunked under the 128-byte
+    hardware FIFO depth, the way silicon drops overrun bytes.</p>
+
+    <h2 id="gpio">Pin header</h2>
+    <p>The header shows live levels for GPIO0–39. Amber means driven high,
+    dim means low, blue marks pins switched to input view. Click any pin to
+    flip its display between output and input. The levels come from the same
+    GPIO matrix the firmware drives, including peripheral-routed signals
+    such as PWM, RMT, and I2S — so a blinking LED sketch visibly blinks
+    here.</p>
+
+    <h2 id="fixtures">Fixtures</h2>
+    <p>Some gallery entries need a stand-in for hardware that cannot exist
+    in a browser tab. The manifest declares them and the bench applies them
+    before boot — the same values the headless harness feeds through
+    environment variables:</p>
+    <pre>TOUCH_INJECT=3:1877        touch pad 3 reads counter 1877
+ADC_INJECT_MV=825           ADC1_CH3 (GPIO4) reads 825 mV
+TEMP_C=25                   internal temperature sensor reads 25 °C
+WIFI_SCAN_APS=...           fixture access points for the scan sketch
+WIFI_STA_CONN=1             complete the station association
+SPI_SDSPI=1                 attach the virtual SD card over SPI
+FLASHENC_KEY=...            boot the image through XTS flash encryption</pre>
+    <p>Nothing about the firmware changes — fixtures only answer the reads
+    real hardware would answer.</p>
+
+    <h2 id="validate">Validate</h2>
+    <p>The battery replays all 108 cases headlessly: build (or reuse) each
+    merged image, boot it through <code>run_flash</code> or the Node bridge,
+    and assert serial markers plus internal state. Run a slice locally with
+    <code>./tools/run_battery.sh wifi_scan wifi_sta</code>, or the whole
+    suite with <code>./tools/run_battery.sh</code>. The freshness guard
+    (<code>tools/check_firmware_freshness.py</code>) keeps committed bins in
+    sync with their sketch sources, and <code>tools/webui_playwright.py</code>
+    drives the real page in Chromium — boot, MIPS, echo, UART round-trip,
+    SD mount, touch read — failing loudly on any page error.</p>
+  </main>
+
+  <footer class="foot">
+    <span>S3 Lab — from-scratch ESP32-S3 emulation, no server side.</span>
+    <span class="foot-links"><a href="./index.html">Bench</a> · <a href="./about.html">About</a> · <a href="./odc.html">Coverage</a></span>
+  </footer>
+</body>
+</html>

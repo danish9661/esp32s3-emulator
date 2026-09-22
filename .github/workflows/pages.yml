@@ -1,0 +1,89 @@
+name: Deploy to GitHub Pages
+
+# Publishes web/ (index.html + JS + wasm bundle + gallery firmware) as a
+# project site at https://<user>.github.io/<repo>/.
+#
+# Why the build steps exist (both outputs are gitignored, never committed):
+# - web/pkg/ (wasm-pack output) is gitignored and rots silently; the deploy
+#   rebuilds it from current Rust sources every time.
+# - web/firmware/*.merged.bin are gitignored local copies (only
+#   manifest.json is tracked); tools/sync_gallery.py --build repopulates
+#   them from tools/sketches (committed bins where present, arduino-cli
+#   compile where missing).
+#
+# All frontend URLs are relative (./pkg/..., ./firmware/...), so the site
+# works both at the repo subpath and locally via `python3 -m http.server`.
+#
+# First-time repo setup (one click, not in this file): Settings → Pages →
+# Source: "GitHub Actions".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "crates/**"
+      - "tools/sketches/**"
+      - "tools/sync_gallery.py"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build site (wasm + gallery firmware)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install wasm-pack
+        run: |
+          curl -sSf https://raw.githubusercontent.com/drager/wasm-pack/master/installer/init.sh | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build wasm bundle into web/pkg
+        # NOTE: --out-dir resolves relative to the CRATE dir, so from the
+        # workspace root it must be ../../web/pkg (a bare web/pkg would land
+        # inside crates/wasm-bridge/web/pkg).
+        run: wasm-pack build crates/wasm-bridge --target web --out-dir ../../web/pkg
+        timeout-minutes: 30
+      - name: Install arduino-cli
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+      - name: Install ESP32 core
+        run: |
+          arduino-cli config init --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json || true
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@3.3.10
+      - name: Sync gallery firmware bins
+        # Copies committed bins; compiles missing sketches (psram_opi
+        # variant fqbn, ota two-pass script, twai_driver build-output).
+        run: python3 tools/sync_gallery.py --build
+        timeout-minutes: 120
+      - name: Verify gallery complete
+        run: python3 tools/sync_gallery.py --check
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
