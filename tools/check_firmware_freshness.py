@@ -98,6 +98,15 @@ def bin_for_case(name):
         return (b, [f"{SK}/esp32s3_twai_driver"])
     if name == "gdb":
         return (f"{SK}/esp32s3_hello/esp32s3_hello.merged.bin", [f"{SK}/esp32s3_hello"])
+    if name in ("wifi_scan_inwasm", "wifi_sta_inwasm"):
+        # NODE harness entries reuse the base sketch image via the 4th-field
+        # binrel (see run_battery.sh): wifi_scan_inwasm -> the wifi_scan
+        # image, wifi_sta_inwasm -> the wifi_sta image. Resolve to the base
+        # case so the guard checks the real committed bin, not a
+        # nonexistent esp32s3_<name> dir (which would false-FAIL "missing
+        # bin" forever).
+        base = name.removesuffix("_inwasm")
+        return bin_for_case(base)
     d = f"{SK}/esp32s3_{name}"
     for cand in (f"{d}/esp32s3_{name}.merged.bin", f"{d}/esp32s3_{name}.ino.merged.bin"):
         if os.path.exists(cand):
@@ -118,7 +127,10 @@ def battery_cases():
 # Cases with no committed sketch bin (external image, resolved by the
 # harness itself): exempt from the freshness check, like the ota/secure
 # generated artifacts are special-cased in bin_for_case.
-BINLESS_CASES = {"micropython"}  # stock .bin downloads to tools/.micropython/
+# micropython: the stock .bin is committed at tools/firmware/ (bundled —
+# no download), but there are no sketch sources to compare mtimes against,
+# so it stays exempt; the harness asserts the image boots instead.
+BINLESS_CASES = {"micropython"}
 
 
 # --- 1. freshness ---
@@ -159,9 +171,20 @@ for e in man:
     p = os.path.join(WEB_FW, e["file"])
     if not os.path.exists(p):
         note(f"FAIL gallery manifest entry missing bin: {e['file']}")
-webbins = {f for f in os.listdir(WEB_FW) if f.endswith(".merged.bin")}
-for f in sorted(webbins - set(mfiles)):
+webbins = {f for f in os.listdir(WEB_FW) if f.endswith((".merged.bin", ".bin"))}
+# The MicroPython stock image is a firmware payload, not a gallery entry
+# (it boots via the ▶ REPL preset, not the gallery dropdown) — never an
+# orphan.
+MP_BUNDLED = {"ESP32_GENERIC_S3-20260824-v1.29.0.bin"}
+for f in sorted(webbins - set(mfiles) - MP_BUNDLED):
     note(f"WARN web/firmware orphan bin (no manifest entry): {f}")
+# The bundled MicroPython image must exist (the ▶ REPL preset fetches it
+# same-origin; no download fallback offline).
+for f in sorted(MP_BUNDLED):
+    if not os.path.exists(os.path.join(WEB_FW, f)):
+        note(f"FAIL bundled MicroPython image missing: web/firmware/{f}")
+    if not os.path.exists(os.path.join(ROOT, "tools", "firmware", f)):
+        note(f"FAIL bundled MicroPython image missing: tools/firmware/{f}")
 covered = set()
 for e in man:
     covered.add(e["file"])

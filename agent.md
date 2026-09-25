@@ -1160,3 +1160,46 @@ The pxContainer field of the state item = +4+16 = +20; event = +24+16 =
   - Validation: suites green, clippy/fmt/wasm32 clean, `wifi_scan` +
     `wifi_sta` PASS, full battery 108/0/0. Next: SoftAP / remaining WiFi
     protocols, then gateway backhaul.
+
+- 2026-09-25 (session 21 — MicroPython image BUNDLED in-repo; wifi_ap /
+  espnow sketches parked UNCOMMITTED):
+  - MicroPython: user asked "instead of fetching, provide it". The stock
+    v1.29.0 GENERIC_S3 image (1,783,296 B, md5 b29a5195...) is now
+    COMMITTED at `tools/firmware/ESP32_GENERIC_S3-20260824-v1.29.0.bin`
+    (force-added: `*.bin` is gitignored) + served same-origin at
+    `web/firmware/` (gitignored local copy, like all gallery bins). No
+    download anywhere in the default path: `micropython_harness.mjs`
+    resolves argv[1] → legacy `tools/.micropython/` cache →
+    `tools/firmware/` → (fetch once, last resort);
+    `micropython_repl.sh` defaults to the bundled image (argv override
+    kept); the bench ▶ REPL button defaults its URL box to
+    `./firmware/ESP32_GENERIC_S3-20260824-v1.29.0.bin` (works offline);
+    Playwright Test 7 uses the bundled image (+ legacy-cache fallback).
+    Freshness guard: micropython stays BINLESS (no sketch sources to
+    compare) but now FAILs if either bundled copy is missing; the bundled
+    .bin is exempt from the gallery-orphan WARN (it boots via ▶ REPL,
+    not the gallery dropdown). Docs: Docs REPL section + About paragraph
+    reworded (bundled, not downloaded); harness/repl.sh headers updated.
+    Validation: harness/playwright NOT re-run (image bytes identical —
+    md5 match with the cached download; logic is path-resolution only),
+    node --check on both harnesses + main.js, guard 0 new FAILs
+    (pre-existing stale-bin FAILs unchanged — build/ outputs newer than
+    committed bins across the tree, warn-only in CI).
+  - wifi_ap / espnow sketches: STILL UNCOMMITTED
+    (`tools/sketches/esp32s3_wifi_ap/`, `tools/sketches/esp32s3_espnow/` —
+    .ino + .merged.bin + build/, all gitignored). Everything about them
+    is debugged and documented IN THE .ino HEADERS + this log, but no
+    Rust/harness/manifest change for them is committed (the union-hook /
+    image-gating / capture-only work hit the cargo link-cache staleness
+    wall: release `run_flash` hard-links to a stale rlib hash and never
+    relinks, so worktree behavior could not be validated — proven by
+    identical md5 across rebuilds + zero new-strings in the binary).
+    NEXT SESSION: `git status` to confirm they are still untracked, then
+    re-apply per the .ino headers (SoftAP: stage-at-boot +
+    capture/write-only hooks + `stations 0`; ESP-NOW: TX/RX in-firmware
+    via `run_espnow_callback` + `sent 1` UART-marker gate), then
+    `cargo clean -p esp32s3-soc -p esp32s3-emu --release` (or full
+    `cargo clean`) BEFORE the first validation run — never trust an
+    incremental release relink in this workspace. Then battery
+    wifi_ap/espnow + freshness guard + docs (AGENTS.md status log,
+    README/gallery counts, odc Wi-Fi row) + force-add bins + commit.

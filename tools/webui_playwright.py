@@ -12,10 +12,10 @@ Serves web/ over HTTP, loads index.html in Chromium, and asserts:
   6. touch gallery entry reads the injected pad counter in-wasm
      ('TOUCH PASS' — proves the `"touch": "3:1877"` manifest flag wires
      TOUCH_INJECT through the new `touch_inject` bridge call)
-  7. MicroPython REPL preset boots a self-hosted stock image in-wasm
-     (`>>> ` banner + `print(6*7)` -> `42` over UART0 — proves the URL
-     box + vfs-partition pad + UART0 flip; needs tools/.micropython/
-     cached by tools/micropython_harness.mjs)
+  7. MicroPython REPL preset boots the bundled stock image in-wasm
+     (`>>> ` banner + `print(6*7)` -> `42` over UART0 — proves the ▶ REPL
+     button + vfs-partition pad + UART0 flip; image committed at
+     tools/firmware/, served same-origin)
 
 Fails loudly on any page error. Exits 0 on PASS, 1 on FAIL.
 """
@@ -175,15 +175,19 @@ try:
             tail = page.eval_on_selector("#console", "el => el.textContent.slice(-800)")
             check("touch-inwasm-read", False, f"(tail={tail!r})")
 
-        # --- Test 7: MicroPython REPL preset (same-origin self-hosted image) ---
-        # (proves the URL box + vfs-partition pad + UART0 flip: download a
-        # stock MicroPython .bin, pad to 3 MiB with the littlefs vfs record
-        # + MD5 exactly like tools/micropython_repl.sh, boot to `>>> `,
-        # then evaluate `print(6*7)` -> `42` over UART0)
+        # --- Test 7: MicroPython REPL preset (bundled same-origin image) ---
+        # (proves the ▶ REPL button + vfs-partition pad + UART0 flip: load
+        # the committed tools/firmware/ stock MicroPython .bin, pad to 3
+        # MiB with the littlefs vfs record + MD5 exactly like
+        # tools/micropython_repl.sh, boot to `>>> `, then evaluate
+        # `print(6*7)` -> `42` over UART0)
         import shutil
-        mp_src = ROOT / "tools" / ".micropython" / "ESP32_GENERIC_S3-20260824-v1.29.0.bin"
+        mp_src = ROOT / "tools" / "firmware" / "ESP32_GENERIC_S3-20260824-v1.29.0.bin"
         if not mp_src.exists():
-            check("micropython-image-present", False, "(run node tools/micropython_harness.mjs once to cache tools/.micropython/)")
+            # legacy cache dir (pre-bundle harness downloads)
+            mp_src = ROOT / "tools" / ".micropython" / "ESP32_GENERIC_S3-20260824-v1.29.0.bin"
+        if not mp_src.exists():
+            check("micropython-image-present", False, "(missing tools/firmware/ESP32_GENERIC_S3-20260824-v1.29.0.bin)")
         else:
             shutil.copyfile(mp_src, WEB / "mp_test.bin")
             try:

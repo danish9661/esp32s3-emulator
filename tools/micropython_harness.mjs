@@ -7,10 +7,9 @@
 // "vfs" DATA 0x82 @ 0x200000 + partition-table MD5, mirroring
 // tools/micropython_repl.sh).
 //
-// The image is an external ~1.8MB download (NOT committed — like the ota
-// generated header: it cannot be rebuilt from sources in-tree). The
-// harness downloads it once into tools/.micropython/ (or accepts a path
-// as argv[1], e.g. a manually downloaded .bin) and asserts:
+// The image is the committed stock MicroPython GENERIC_S3 release in
+// tools/firmware/ (no download — fully offline; a legacy tools/.micropython/
+// cache or an explicit argv[1] path still wins when present) and asserts:
 //   * `>>> ` REPL banner (first boot formats littlefs: "Performing
 //     initial setup")
 //   * `print(6*7)` -> `42` over UART0_INJECT-at->>> (MicroPython's REPL
@@ -35,6 +34,7 @@ const wasmFile = join(pkgDir, 'wasm_bridge_bg.wasm');
 const MP_URL = 'https://micropython.org/resources/firmware/ESP32_GENERIC_S3-20260824-v1.29.0.bin';
 const mpDir = join(root, 'tools', '.micropython');
 const mpBin = join(mpDir, 'ESP32_GENERIC_S3-20260824-v1.29.0.bin');
+const mpBundled = join(root, 'tools', 'firmware', 'ESP32_GENERIC_S3-20260824-v1.29.0.bin');
 
 function crateNewerThan(file) {
   if (!existsSync(file)) return true;
@@ -56,16 +56,22 @@ if (crateNewerThan(wasmFile)) {
   });
 }
 
-// Resolve the stock image: explicit argv path wins, else the cached
-// download, else fetch it once (fails loudly offline — no silent skip).
+// Resolve the stock image: explicit argv path wins, else the legacy
+// tools/.micropython/ cache, else the committed tools/firmware/ image,
+// else fetch it once into the legacy cache dir (fails loudly offline —
+// no silent skip).
 let imgPath = process.argv[2];
 if (!imgPath) {
-  if (!existsSync(mpBin)) {
+  if (existsSync(mpBin)) {
+    imgPath = mpBin;
+  } else if (existsSync(mpBundled)) {
+    imgPath = mpBundled;
+  } else {
     console.error('[micropython] downloading stock image (once)...');
     mkdirSync(mpDir, { recursive: true });
     execSync(`curl -sSL -o ${JSON.stringify(mpBin)} ${MP_URL}`, { stdio: 'inherit' });
+    imgPath = mpBin;
   }
-  imgPath = mpBin;
 }
 const raw = new Uint8Array(readFileSync(imgPath));
 if (raw.length < 0x100000 || raw[0] !== 0xe9) {

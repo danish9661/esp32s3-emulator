@@ -450,17 +450,19 @@ async function loadFromUrl(url, keyHex) {
 }
 
 // ── MicroPython REPL preset ──
-// Downloads a stock MicroPython GENERIC_S3 image (Release .bin at flash
+// Boots a stock MicroPython GENERIC_S3 image (Release .bin at flash
 // offset 0, like esptool `write_flash 0`), pads it to 3 MiB, appends the
 // littlefs "vfs" partition (DATA 0x82 @ 0x200000, 1 MiB) the firmware
 // mounts at boot, recomputes the partition-table MD5, and boots it.
+// The default URL is the same-origin tools/firmware/ copy committed in
+// the repo (no download — works offline); any other URL may be pasted.
 // MicroPython's REPL listens on UART0 (not USB-CDC), so the send port
 // flips to UART0 and the input box gets a try-it snippet. Provenance:
 // tools/micropython_repl.sh asserts the same image boots to `>>> ` and
 // evaluates `print(6*7)` → `42` plus the float family headlessly.
-// NOTE: upstream micropython.org serves no CORS header, so the fetch only
-// succeeds from a same-origin self-hosted copy or a CORS-enabled mirror —
-// the box accepts any URL, and any failure lands in the status line.
+// NOTE: upstream micropython.org serves no CORS header, so fetching from
+// there fails — self-host the file or use the bundled default; any
+// failure lands in the status line.
 const MP_VFS_OFFSET = 0x200000;
 const MP_VFS_SIZE = 0x100000;
 const MP_PAD_SIZE = 0x300000;

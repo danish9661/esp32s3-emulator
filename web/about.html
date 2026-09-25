@@ -84,9 +84,10 @@
     (v1.29.0 GENERIC_S3, unmodified) boots to its <code>&gt;&gt;&gt;</code>
     REPL and runs Python — arithmetic, floats, lists — through the
     windowed-ABI spill path, the LX7 FPU, and UART0 RX. The bench page has a
-    <strong>MicroPython</strong> preset that downloads the image, appends the
-    littlefs partition it expects, and boots it; set the serial port to
-    UART0 and type Python. Headless proof:
+    <strong>MicroPython</strong> preset that boots the bundled
+    <code>tools/firmware/</code> image, appends the littlefs partition it
+    expects, and boots it; set the serial port to UART0 and type Python.
+    Headless proof:
     <code>node tools/micropython_harness.mjs</code>
     (<code>MICROPYTHON HARNESS PASS</code>).</p>
 

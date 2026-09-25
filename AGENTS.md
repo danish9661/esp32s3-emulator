@@ -4412,3 +4412,19 @@ full enumeration REQ0..REQ6 — is covered),
     exempt from the freshness guard: BINLESS_CASES, no committed bin).
     Proofs: harness PASS, Playwright 19/19 ALL PASS, shard 0/4 28/0/0,
     clippy `-D warnings` clean, fmt clean.
+  - 2026-09-25: **MicroPython image bundled in-repo (no fetch)**. The stock
+    v1.29.0 GENERIC_S3 release (1,783,296 B) is committed at
+    `tools/firmware/ESP32_GENERIC_S3-20260824-v1.29.0.bin` (force-added —
+    `*.bin` is gitignored) and served same-origin from `web/firmware/`
+    (gitignored local copy). `tools/micropython_harness.mjs` resolves
+    argv[1] → legacy `tools/.micropython/` cache → `tools/firmware/` →
+    fetch-once (last resort); `tools/micropython_repl.sh` defaults to the
+    bundled image; the bench ▶ REPL URL box defaults to the bundled
+    same-origin path (works offline); Playwright Test 7 uses the bundled
+    image. Freshness guard asserts both bundled copies exist (micropython
+    stays BINLESS — no sketch sources — but missing copies FAIL; the
+    bundled .bin is orphan-WARN-exempt since it boots via ▶ REPL, not the
+    gallery). Validation: 575/0 tests, clippy `-D warnings` clean, fmt
+    clean, wasm32 clean, wifi_scan/wifi_sta (+inwasm) green, harness JS
+    `node --check` clean. Image bytes md5-identical to the cached
+    download, so no behavioral re-validation needed.

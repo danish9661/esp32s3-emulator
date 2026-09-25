@@ -59,18 +59,19 @@
     <h2 id="micropython">MicroPython REPL</h2>
     <p>The <strong>MicroPython</strong> preset in the firmware rail boots the
     stock v1.29.0 GENERIC_S3 interpreter to an interactive
-    <code>&gt;&gt;&gt;</code> prompt — no build needed. Paste an image URL
-    (default: the upstream release <code>.bin</code>) and press
-    <strong>▶ REPL</strong>: the page downloads it, pads flash to 3 MiB,
-    appends the littlefs <code>vfs</code> partition the firmware mounts
-    (same recipe as <code>tools/micropython_repl.sh</code>), and loads it.
-    Press <strong>Run</strong> and wait for <code>&gt;&gt;&gt;</code> (tens
+    <code>&gt;&gt;&gt;</code> prompt — no build needed. Press
+    <strong>▶ REPL</strong>: the page loads the bundled
+    <code>tools/firmware/ESP32_GENERIC_S3-20260824-v1.29.0.bin</code>
+    (same-origin, works offline), pads flash to 3 MiB, appends the
+    littlefs <code>vfs</code> partition the firmware mounts (same recipe
+    as <code>tools/micropython_repl.sh</code>), and loads it. Press
+    <strong>Run</strong> and wait for <code>&gt;&gt;&gt;</code> (tens
     of seconds: the interpreter is a ~35M-instruction boot). The preset
     flips the serial port to <strong>UART0</strong> — the REPL listens
     there, not on USB-CDC — and offers <code>print(6*7)</code> as a first
-    line; type any Python and press Enter. The same URL box boots a local
-    copy: serve the <code>.bin</code> beside the page (same-origin fetch)
-    or pick the file through <strong>Load merged.bin</strong>. Upstream
+    line; type any Python and press Enter. The URL box accepts any other
+    image (a local copy served beside the page, or
+    <strong>Load merged.bin</strong>). Upstream
     <code>micropython.org</code> serves no CORS header, so a cross-origin
     fetch fails in the status line — self-host the file in that case.</p>
 

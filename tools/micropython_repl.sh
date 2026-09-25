@@ -1,8 +1,12 @@
 #!/bin/bash
-# MicroPython REPL validation recipe (manual — NOT a battery entry: the image
-# is an external ~1.8MB download, and the boot needs ~300M steps).
+# MicroPython REPL validation recipe (manual — NOT a battery entry: the boot
+# needs ~300M steps).
 #
-#   tools/micropython_repl.sh /path/to/ESP32_GENERIC_S3-<date>-v1.29.0.bin
+#   tools/micropython_repl.sh [/path/to/ESP32_GENERIC_S3-<date>-v1.29.0.bin]
+#
+# Default image is the in-repo tools/firmware/ESP32_GENERIC_S3-*-v1.29.0.bin
+# (committed stock MicroPython GENERIC_S3 release — no download needed).
+# Pass an explicit path to validate a different MicroPython build instead.
 #
 # What it does:
 #   1. Appends a littlefs "vfs" partition (DATA sub 0x82 @ 0x200000, 1MB) to a
@@ -19,8 +23,13 @@
 # binary class that once exposed the write16 qstr clobber and the AR-MOVF
 # hang. Re-run after touching cpu/exec/window/UART/PSRAM/cache code.
 set -u
-IMG="${1:?usage: micropython_repl.sh <ESP32_GENERIC_S3-...-v1.29.0.bin>}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+if [ $# -ge 1 ]; then
+  IMG="$1"
+else
+  IMG="$(ls "$ROOT"/tools/firmware/ESP32_GENERIC_S3-*-v1.29.0.bin 2>/dev/null | head -1)"
+  [ -n "$IMG" ] || { echo "MP REPL FAIL: no in-repo image in tools/firmware/ and none passed"; exit 1; }
+fi
 RUN="$ROOT/target/release/examples/run_flash"
 WORK="$(mktemp -d /tmp/mp_repl.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
