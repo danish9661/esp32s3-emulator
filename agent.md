@@ -1203,3 +1203,18 @@ The pxContainer field of the state item = +4+16 = +20; event = +24+16 =
     incremental release relink in this workspace. Then battery
     wifi_ap/espnow + freshness guard + docs (AGENTS.md status log,
     README/gallery counts, odc Wi-Fi row) + force-add bins + commit.
+
+- 2026-09-25 (session 22 — wifi_ap/espnow .ino COMMITTED as unvalidated
+  scaffolds):
+  - Committed ONLY the two sketch sources
+    (`esp32s3_wifi_ap.ino`, `esp32s3_espnow.ino`); headers reworded to say
+    NOT-yet-validated / no fixture support (they previously claimed a
+    `wifi_ap` battery entry + WIFI_AP_FIXTURE=1 / WIFI_ESPNOW_LOOPBACK=1
+    envs that do not exist in run_flash). Both sketches compile clean
+    under arduino-cli 1.5.1 / esp32 core 3.3.10. Their build dirs +
+    .merged.bin stay gitignored (NOT force-added — nothing can validate
+    them yet). No Rust/harness/manifest/battery change committed.
+    NEXT (fixture work, still open): SoftAP stage-at-boot +
+    capture/write-only hooks + `stations 0`; ESP-NOW TX/RX in-firmware
+    via windowed-ABI callback + UART `sent 1` gate; battery entries +
+    bins + docs then commit.
