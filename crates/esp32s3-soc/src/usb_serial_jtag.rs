@@ -98,6 +98,13 @@ impl UsbSerialJtag {
         core::mem::take(&mut self.tx_out)
     }
 
+    /// Peek at the queued TX bytes WITHOUT draining (fixture-engine
+    /// UART-marker legs — see `Soc::console_snapshot`; the real host
+    /// drain still owns consumption).
+    pub fn peek_tx(&self) -> &[u8] {
+        &self.tx_out
+    }
+
     /// Periodic tick — models the USB host polling the device (IN tokens).
     /// On real hardware the `serial_in_empty_int` is level-triggered:
     /// asserted whenever the TX FIFO is empty and the device is

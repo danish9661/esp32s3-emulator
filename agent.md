@@ -1218,3 +1218,29 @@ The pxContainer field of the state item = +4+16 = +20; event = +24+16 =
     capture/write-only hooks + `stations 0`; ESP-NOW TX/RX in-firmware
     via windowed-ABI callback + UART `sent 1` gate; battery entries +
     bins + docs then commit.
+
+- 2026-09-26 (session 23 — SoftAP + ESP-NOW VALIDATED, battery 115/0/0):
+  - SoftAP: boot-time `wifi_stage_ap_data` (248B config + 192.168.4.1/24
+    LAN) + write-only get_config mirror + capture-only set_config (NEVER
+    skip — fake-RETW smashed the canary twice, proven live) + sta_list
+    num=0 (S3 `sta[15]@0+num-last` layout); per-image hook tables (AP
+    addrs nm-verified; AP links every hook elsewhere). `stations 0`
+    with AND without the env (hooks are write-only side effects). 60M
+    STEPS. Sketch asserts boot+IP+stations, never SSID (closed store).
+  - ESP-NOW: host-as-virtual-second-node; `run_espnow_callback`
+    (CALL8-frame synthesis, wb+2, `set_windowbase` added) runs the TX
+    wrapper with a real 28B `wifi_tx_info_t` → `onSent(true)`, then
+    direct vtable slot-2 `onReceive` (bypasses the closed memcmp gate:
+    wrapper left got_rx=0, direct sets got_rx=1/rx0=A5). `sent 1` UART
+    marker gate (earlier firing stack-smashes in `add()`'s canary
+    frame). `peek_tx` console snapshot (peek, never drain). Reset
+    preservation for all fixture runtime. 60M STEPS.
+  - Battery +4 (wifi_ap/espnow + inwasm NODE) → 115/0/0; gallery 60
+    (59 images); Playwright Tests 8+9 ALL PASS; web/pkg rebuilt.
+  - L3–L7 assessed, correctly scoped OUT: gateway exists (DHCP/DNS/ARP/
+    IPv6-RA/UDP-forward, port 5050) but no emulator-side Ethernet
+    bridge feeds it frames (no linkoutput/netif path; closed lwIP has
+    no live netif state). No test-worker-* suites exist in-tree; none
+    of DHCP→LAN/ICMP/UDP/DNS/HTTP/MQTT/CoAP/servers/IPv6/pcap is
+    validatable offline. README + odc document the "Live IP backhaul"
+    row. BLE stays out per directive.

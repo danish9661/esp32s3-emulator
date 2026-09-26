@@ -100,10 +100,13 @@ fn main() {
     m.boot_from_flash(boot_ref);
 
     // WiFi fixture layout: program the image-specific addresses into the
-    // SoC once, before any fixture call (scan vs STA sketch link the pool
-    // and RAM differently; the SoC holds no image addresses itself).
+    // SoC once, before any fixture call (scan vs STA vs AP vs ESP-NOW
+    // sketch link the pool and RAM differently; the SoC holds no image
+    // addresses itself).
     {
-        let layout = if bin_name_contains_wifi_sta {
+        let layout = if path.contains("wifi_ap") {
+            &AP_LAYOUT
+        } else if bin_name_contains_wifi_sta {
             &STA_LAYOUT
         } else {
             &SCAN_LAYOUT
@@ -355,8 +358,31 @@ fn main() {
         pxcur: 0x3fc9_bad0,
         sta_network_if: 0x3fc9_ae6c,
     };
+    // wifi-ap image layout (nm on the wifi-ap ELF; sta_network_if =
+    // `_ZL14_ap_network_if` bss static; esp_wifi_start = 0x420638c4).
+    const AP_LAYOUT: WifiLayout = WifiLayout {
+        scan_start: 0x4206_3b78,
+        connect: 0x4203_c7c4,
+        wifi_event_var: 0x3c0b_42b0,
+        ip_event_var: 0x3c0b_3bac,
+        count_cell: 0x3fc9_f926,
+        scan_count: 0x3fc9_aee4,
+        scan_result: 0x3fc9_aee0,
+        records_check: 0x4200_3f9c,
+        ready_lists: 0x3fc9_b8dc,
+        top_prio: 0x3fc9_b84c,
+        reg_heaps: 0x3fc9_b794,
+        pxcur: 0x3fc9_bad0,
+        sta_network_if: 0x3fc9_ae64,
+    };
     let wifi_scan_fixture = env::var("WIFI_SCAN_FIXTURE").is_ok();
     let wifi_sta_conn = env::var("WIFI_STA_CONN").is_ok();
+    let wifi_ap_fixture = env::var("WIFI_AP_FIXTURE").is_ok();
+    let mut wifi_ap_armed = false;
+    let mut wifi_ap_done = false;
+    let wifi_espnow_loopback = env::var("WIFI_ESPNOW_LOOPBACK").is_ok();
+    let mut wifi_espnow_tx_done = false;
+    let mut wifi_espnow_rx_done = false;
 
     let wifi_scan_aps: Vec<esp32s3_soc::wifi::ScanFixtureAp> = env::var("WIFI_SCAN_APS")
         .ok()
@@ -1175,6 +1201,145 @@ fn main() {
                 wifi_sta_disc_done = true;
             } else if !wifi_sta_disc_done {
                 println!("[host] WiFi STA DISCONNECT post pending (idf={didf_ok} ard={dard_ok})");
+            }
+        }
+        // WiFi SoftAP fixture (wifi-ap sketch, WIFI_AP_FIXTURE=1): the
+        // firmware posts the IDF AP_START itself (`_ap_event_cb` fires at
+        // the `esp_wifi_start` return path — proven live: id=12/data=0 at
+        // step ~23M with NO host post); the host only (a) stages the AP
+        // fixture data (config + 192.168.4.1/24 LAN) the hooks serve back,
+        // and (b) posts the arduino ARDUINO_EVENT_WIFI_AP_START (130)
+        // — NO wait, see below. The real chains (`_onApEvent` →
+        // setStatusBits(STARTED) → `postEvent` → arduino_events →
+        // `_onApArduinoEvent`) then run unmodified and `softAP()`'s
+        // `waitStatusBits(STARTED)` returns true.
+        //
+        // NO HOST IDF POST: the firmware's own id=12 post already drives
+        // the full chain (proven: set(bits=12) via `_onApEvent` at step
+        // ~22.98M, begin-resume ret=1). A duplicate host id=12 post would
+        // double-start the netif (second `netif_add` on the same netif
+        // aborts in "netif already added" — proven live). NO HOST ARD
+        // POST either: the IDF chain's own `Network.postEvent` allocates
+        // a heap-valid event; a host ard post points into `ard_pool` and
+        // aborts in `heap_caps_free` when consumed (proven live).
+        // WLAN event IDs from `esp_wifi_types_generic.h`: AP_START=12.
+        if wifi_ap_fixture && !wifi_ap_done {
+            // NOTE: the stage pc is checked on CORE 0 ONLY. Core 1 runs
+            // `esp_wifi_start` itself at boot (step ~5.5M, proven live:
+            // pc1==esp_wifi_start while core1 still owns the wifi task);
+            // staging there would arm mid-bring-up and the very next
+            // step_fast block on core1 vectors through the kernel
+            // `_UserExceptionVector` into the ROM hole (UNIMPLEMENTED
+            // trap, proven live). Core 0 reaches the same pc later, once
+            // the wifi task migrated and the bring-up is settled.
+            if !wifi_ap_armed && m.cpu[0].pc == 0x4206_3840 {
+                // SSID/passphrase/channel from the fixture (defaults match
+                // the sketch): the staged config is what `softAPSSID()`
+                // reads back via `esp_wifi_get_config`.
+                let (ssid, pass, chan) = ("EmuAP", "password", 6);
+                m.soc
+                    .wifi_stage_ap_data(ssid.as_bytes(), pass.as_bytes(), chan);
+                wifi_ap_armed = true;
+                println!("[host] WiFi AP fixture staged (firmware posts AP_START itself)");
+            }
+            // Completion: the sketch prints DONE when its own chain ran
+            // (softAP 1 + IP + SSID + stations + clients). The host only
+            // staged the data; the DONE marker arriving latches the leg
+            // (level, not edge — the marker stays in uart_buf).
+            if wifi_ap_armed
+                && uart_buf
+                    .windows(b"WIFI AP DONE".len())
+                    .any(|w| w == b"WIFI AP DONE")
+            {
+                println!("[host] WiFi AP DONE observed");
+                wifi_ap_done = true;
+            }
+        }
+        // WiFi ESP-NOW loopback (espnow sketch, WIFI_ESPNOW_LOOPBACK=1):
+        // the host is the virtual second node. The closed `libespnow.a`
+        // send path delivers TX-complete/RX frames by DIRECT C calls
+        // (no FreeRTOS queue to post to — proven live: zero DRAM
+        // transitions across `esp_now_send`, firmware parks in
+        // `delay()`), so the host invokes the registered wrappers IN
+        // FIRMWARE via `run_espnow_callback` (windowed-ABI call frame
+        // synthesis — see machine.rs):
+        // - TX leg: once the sketch's `handler.send()` returned ESP_OK
+        //   (the closed send runs fully in-emulator and returns 0 —
+        //   proven live at the caller resume), invoke the registered
+        //   TX wrapper (closed .bss cell) with the peer mac → dispatches
+        //   to the peer's `onSent(true)` → `sent_ok = true`.
+        // - RX leg: after TX, invoke the registered RX wrapper with a
+        //   2-byte frame from the peer mac → dispatches to the peer's
+        //   `onReceive` → `got_rx = true`, `rx_byte0 = 0xA5`.
+        // Level, not edge: each leg runs once (latched). The sketch's
+        // own `delay(50)` poll loop observes the flags and prints.
+        if wifi_espnow_loopback && (!wifi_espnow_tx_done || !wifi_espnow_rx_done) {
+            // Closed cb cells live in closed .bss (espnow image, nm-proof
+            // is impossible — discovered live: RX @0x3fc9dd20, TX
+            // @0x3fc9dd24 hold the Arduino wrapper entries once
+            // `ESP_NOW.begin()` registers them; the peer object sits at
+            // the Arduino `_esp_now_peers[0]` cell).
+            //
+            // TIMING RULE (proven live — stack-smash otherwise): the TX
+            // leg fires ONLY after the sketch's `handler.send()` RETURNED
+            // (the `WIFI ESPNOW sent 1` marker). At the cells-live moment
+            // the sketch is still INSIDE `ESP_NOW_Peer::add()` (core1 pc
+            // in add(), the stack-canary frame live); invoking the TX
+            // wrapper then runs a nested call on the same core while
+            // add()'s canary slot is live, and add()'s epilogue check
+            // (`__stack_chk_fail` at +0x55) fires ~2k steps later. The
+            // `sent 1` marker proves `esp_now_send` returned ESP_OK *and*
+            // the sketch left add() (markers print between the calls).
+            const ESPNOW_RX_CELL: u32 = 0x3fc9_dd20;
+            const ESPNOW_TX_CELL: u32 = 0x3fc9_dd24;
+            const ESPNOW_PEERS: u32 = 0x3fc9_aeac;
+            const ESPNOW_PEER_OBJ: u32 = 0x3fc9_ae60;
+            let espnow_send_done = uart_buf
+                .windows(b"WIFI ESPNOW sent 1".len())
+                .any(|w| w == b"WIFI ESPNOW sent 1");
+            if !wifi_espnow_tx_done && !espnow_send_done {
+                continue;
+            }
+            if !wifi_espnow_tx_done {
+                let txcb = m.soc.read32(ESPNOW_TX_CELL);
+                let peer = m.soc.read32(ESPNOW_PEERS);
+                if txcb != 0 && peer != 0 {
+                    // Peer mac from the Arduino peer object (+4/+8, the
+                    // mac bytes — proven live: 02:11:22:33:44:55).
+                    let m0 = m.soc.read32(ESPNOW_PEER_OBJ + 4);
+                    let m1 = m.soc.read32(ESPNOW_PEER_OBJ + 8);
+                    let mut mac = [0u8; 6];
+                    mac[..4].copy_from_slice(&m0.to_le_bytes());
+                    mac[4..].copy_from_slice(&m1.to_le_bytes()[..2]);
+                    m.soc.wifi_espnow_invoke_tx_cb(txcb, &mac);
+                    // Run on core 1 (parks in IDLE — always safe).
+                    if m.run_espnow_callback(1) {
+                        println!("[host] WiFi ESP-NOW TX-cb invoked (sent_ok)");
+                        wifi_espnow_tx_done = true;
+                    }
+                }
+            } else if !wifi_espnow_rx_done {
+                let rxcb = m.soc.read32(ESPNOW_RX_CELL);
+                // Direct vtable dispatch (slot 2 = onReceive): the closed
+                // wrapper's memcmp peer gate would need a known-peer mac;
+                // the vtable call carries (this, data, len, bcast) with no
+                // gate (proven live: wrapper path leaves got_rx=0, direct
+                // path sets got_rx=1/rx0=0xA5).
+                let recv = m.soc.wifi_espnow_peer_slot(ESPNOW_PEER_OBJ, 2);
+                if rxcb != 0 && recv != 0 {
+                    let peer = [0x02u8, 0x11, 0x22, 0x33, 0x44, 0x55];
+                    m.soc.wifi_espnow_invoke_rx_cb(
+                        recv,
+                        &peer,
+                        &[0xA5, 0x5A],
+                        true,
+                        ESPNOW_PEER_OBJ,
+                    );
+                    if m.run_espnow_callback(1) {
+                        println!("[host] WiFi ESP-NOW RX-cb invoked (got_rx)");
+                        wifi_espnow_rx_done = true;
+                    }
+                }
             }
         }
         // WiFi STA insider hooks live in `run_fast_core` (machine.rs —

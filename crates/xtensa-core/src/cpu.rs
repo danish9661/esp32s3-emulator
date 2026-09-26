@@ -358,6 +358,15 @@ impl Cpu {
         self.sregs[SR_WINDOW_BASE as usize] & 0xf
     }
 
+    /// Direct WINDOWBASE write (host-callback frontend — same field CALL8
+    /// / ENTRY / RETW / WSR_WINDOWBASE write; QEMU `win_helper.c` parity).
+    /// Needed to synthesize a call frame around a firmware callback the
+    /// host invokes (see `Esp32S3::run_espnow_callback`).
+    #[inline]
+    pub fn set_windowbase(&mut self, wb: u32) {
+        self.sregs[SR_WINDOW_BASE as usize] = wb & 0xf;
+    }
+
     /// Logical register aN (ISA RM: aN = phys[(WINDOW_BASE*4 + N) & 63]).
     #[inline]
     pub fn reg(&self, n: u32) -> u32 {

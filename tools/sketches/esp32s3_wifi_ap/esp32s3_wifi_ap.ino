@@ -1,13 +1,11 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
-// SoftAP validation sketch (NOT yet validated — no battery entry and no
-// emulator fixture support committed). The emulator has no RF, so this
-// sketch will need a host-side fixture once SoftAP support lands: the
-// firmware posts WIFI_EVENT_AP_START itself and the full Arduino chain
-// (`_onApEvent` → STARTED bits → `softAP()` returns true) should then run
-// unmodified. NOTE: `softAPSSID()` reads back the closed driver's default
-// AP config ("ESP_..." fallback), so the sketch asserts boot + IP +
-// station count, not the SSID.
+// SoftAP validation sketch (battery entry `wifi_ap`, fixture
+// `WIFI_AP_FIXTURE=1`). The emulator has no RF: the host stages the AP
+// fixture data (config + 192.168.4.1/24 LAN) at boot, the firmware posts
+// WIFI_EVENT_AP_START itself, and the full Arduino chain (`_onApEvent` →
+// STARTED bits → `softAP()` returns true) runs unmodified. Asserts
+// `softAP 1` + IP + `stations 0` + IDF `clients 0` → `WIFI AP DONE`.
 void setup() {
   Serial.begin(115200);
   delay(200);

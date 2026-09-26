@@ -259,4 +259,30 @@ impl Emulator {
         self.inner.soc.wifi_fixture_sta(aps);
         self.inner.soc.wifi_fixture_layout_reapply();
     }
+
+    /// Arm the SoftAP fixture (SSID/passphrase/channel) for the wifi-ap
+    /// image. Mirrors run_flash `WIFI_AP_FIXTURE=1`: the firmware posts
+    /// AP_START itself; the engine stages the AP config (served back by
+    /// the get/set-config hooks) + the fixed 192.168.4.1/24 LAN (served
+    /// by the shared ip-info hook). Call after load, before Run.
+    pub fn wifi_ap_fixture(&mut self, ssid: &str, passphrase: &str, channel: u32) {
+        self.inner.soc.wifi_fixture_image_ap();
+        self.inner
+            .soc
+            .wifi_fixture_ap(ssid, passphrase, channel as u8);
+        self.inner.soc.wifi_fixture_layout_reapply();
+    }
+
+    /// Arm the ESP-NOW loopback fixture (virtual second node) for the
+    /// espnow image. Mirrors run_flash `WIFI_ESPNOW_LOOPBACK=1`: once the
+    /// sketch's `send()` returned (`sent 1` UART marker — the engine
+    /// peeks the host console stream, same bytes run_flash greps), the
+    /// engine invokes the registered TX wrapper in-firmware (`sent_ok`),
+    /// then the peer `onReceive` directly (`got_rx`, `rx_byte0 = 0xA5`).
+    /// Call after load, before Run.
+    pub fn wifi_espnow_fixture(&mut self) {
+        self.inner.soc.wifi_fixture_image_espnow();
+        self.inner.soc.wifi_fixture_espnow();
+        self.inner.soc.wifi_fixture_layout_reapply();
+    }
 }

@@ -225,13 +225,24 @@ impl Esp32S3 {
         let pc1 = self.cpu[1].pc;
         let records_pc = self.soc.wifi_fixture_records_pc();
         let staged_before = self.soc.wifi_fixture_records_staged();
-        self.soc.wifi_fixture_poll(pc0, pc1);
+        // The engine's ESP-NOW legs need the UART `sent 1` marker, which
+        // lives in host-side console state the SoC cannot see: pass a
+        // cheap snapshot (the merged UART0+USB stream, same bytes
+        // run_flash greps). Snapshot BEFORE the drain below so the poll
+        // sees the same bytes the host just observed.
+        let uart_snap = self.soc.console_snapshot();
+        self.soc.wifi_fixture_poll(pc0, pc1, &uart_snap);
         if self.soc.wifi_fixture_records_staged() && !staged_before {
             for c in 0..2 {
                 if (c == 0 && pc0 == records_pc) || (c == 1 && pc1 == records_pc) {
                     self.cpu[c].set_reg(10, 0); // a10 = ESP_OK
                 }
             }
+        }
+        // Run any ESP-NOW callback the poll staged, in-firmware on core 1
+        // (parks in IDLE — always safe; same core run_flash uses).
+        while self.soc.wifi_espnow_call_pending() {
+            self.run_espnow_callback(1);
         }
         if self.soc.rom_boot_mode()
             && !(self.cpu[0].pc >= rom_stub::ROM_BASE && self.cpu[0].pc < rom_stub::ROM_END)
@@ -286,14 +297,18 @@ impl Esp32S3 {
                 n += 1;
                 continue;
             }
-            // WiFi STA insider hooks (fixture support — the closed
-            // lwIP/net80211 stack has no live state): serve
-            // `esp_netif_get_ip_info` (0x4202e77c), `esp_wifi_sta_get_ap_
-            // info` (0x42064118), and `esp_wifi_disconnect` (0x4203c7d0)
-            // from staged fixture data. Caller args are windowed (callee
-            // a2/a3 = caller a10/a11): read BEFORE `step_one` while wb
-            // still names the caller. Hooks fire only while staged;
-            // unstaged they let the call run (fails soft like silicon).
+            // WiFi insider hooks (fixture support — the closed
+            // lwIP/net80211 stack has no live state). Hook TABLE (all
+            // CALLEE entries; caller args are windowed — callee a2/a3 =
+            // caller a10/a11 — read BEFORE `step_one` while wb still
+            // names the caller; hooks fire only while staged, else the
+            // call runs and fails soft like silicon):
+            // - `esp_netif_get_ip_info` → staged fixture LAN
+            // - `esp_wifi_sta_get_ap_info` → staged AP record
+            // - `esp_wifi_get_config` (ifx==1) → staged AP config
+            // - `esp_wifi_set_config` (ifx==1) → capture AP config
+            // - `esp_wifi_ap_get_sta_list` → staged station count (0)
+            // - `esp_wifi_disconnect` → ESP_OK + disconnect latch
             // (Single-step `step` never reaches here — run_flash drives
             // `step_fast` exclusively; the `step` hook above covers only
             // the host-pool free for probe use.)
@@ -306,7 +321,15 @@ impl Esp32S3 {
             // a8 read BEFORE stepping (wb still names the caller), and stage
             // the ESP_OK return in caller a10 (= future callee a2, which the
             // caller reads as its return value).
-            if pc0 == 0x4202_e77c {
+            //
+            // IMAGE CAVEAT: the linked addresses DIFFER per sketch (nm on
+            // each sketch ELF — STA/scan/AP/ESP-NOW link the closed libs
+            // elsewhere). The table below is the UNION over the four WiFi
+            // sketches; at most one entry matches per image (addresses are
+            // unique per image — no cross-image aliasing possible since a
+            // run boots exactly one image).
+            if pc0 == 0x4202_e77c || pc0 == 0x4202_e798 || pc0 == 0x4202_e804 || pc0 == 0x4202_ea30
+            {
                 let out = self.cpu[core].reg(11);
                 let ra = self.cpu[core].reg(8);
                 if self.soc.wifi_hook_get_ip_info(out) {
@@ -315,7 +338,11 @@ impl Esp32S3 {
                     n += 1;
                     continue;
                 }
-            } else if pc0 == 0x4206_4118 {
+            } else if pc0 == 0x4206_4118
+                || pc0 == 0x4206_4130
+                || pc0 == 0x4206_4134
+                || pc0 == 0x4206_a22c
+            {
                 let out = self.cpu[core].reg(10);
                 let ra = self.cpu[core].reg(8);
                 if self.soc.wifi_hook_get_ap_info(out) {
@@ -324,7 +351,56 @@ impl Esp32S3 {
                     n += 1;
                     continue;
                 }
-            } else if pc0 == 0x4203_c7d0 && self.soc.wifi_hook_disconnect() {
+            } else if pc0 == 0x4206_3ec0
+                || pc0 == 0x4206_3ed8
+                || pc0 == 0x4206_3edc
+                || pc0 == 0x4206_9f2c
+            {
+                // NOTE: get_config is a WRITE-ONLY side effect like
+                // set_config (no fake-RETW skip): the closed driver's own
+                // store update + canary live in the caller's frame, and
+                // skipping corrupts it. The staged bytes now mirror the
+                // caller's buffer, so the caller's own return path
+                // observes them unmodified.
+                let ifx = self.cpu[core].reg(10);
+                let out = self.cpu[core].reg(11);
+                self.soc.wifi_hook_ap_get_config(ifx, out);
+            } else if pc0 == 0x4206_3e58
+                || pc0 == 0x4206_3e70
+                || pc0 == 0x4206_3e74
+                || pc0 == 0x4206_9ec4
+            {
+                // NOTE: set_config is DELIBERATELY never skipped (no
+                // fake-RETW): the hook only CAPTURES the firmware's own
+                // config into the staged store and lets the call run. A
+                // skip here would bypass the closed driver's own store
+                // update (the canary lives in the caller's frame, which
+                // the skip's window surgery corrupts). Capture is
+                // read-only w.r.t. CPU state.
+                let ifx = self.cpu[core].reg(10);
+                let src = self.cpu[core].reg(11);
+                self.soc.wifi_hook_ap_set_config(ifx, src);
+            } else if pc0 == 0x4206_3f04
+                || pc0 == 0x4206_3f1c
+                || pc0 == 0x4206_3f20
+                || pc0 == 0x4206_9f70
+            {
+                let out = self.cpu[core].reg(10);
+                let ra = self.cpu[core].reg(8);
+                if self.soc.wifi_hook_ap_sta_list(out) {
+                    self.cpu[core].set_reg(10, 0);
+                    self.cpu[core].pc = (pc0 & 0xc000_0000) | (ra & 0x3fff_ffff);
+                    n += 1;
+                    continue;
+                }
+            } else if (pc0 == 0x4203_c7d0
+                || pc0 == 0x4203_c858
+                || pc0 == 0x4203_c7e0
+                || pc0 == 0x4203_c7ec
+                || pc0 == 0x4203_ca78
+                || pc0 == 0x4203_ca84)
+                && self.soc.wifi_hook_disconnect()
+            {
                 let ra = self.cpu[core].reg(8);
                 self.cpu[core].set_reg(10, 0);
                 self.cpu[core].pc = (pc0 & 0xc000_0000) | (ra & 0x3fff_ffff);
@@ -356,6 +432,87 @@ impl Esp32S3 {
         (StepResult::Ok, n)
     }
 
+    /// Run one staged ESP-NOW callback invocation IN FIRMWARE on `core`
+    /// (host frontend — the machine owns the CPUs, the SoC only stages;
+    /// see `Soc::wifi_espnow_take_call`). Saves the core's full windowed
+    /// state, calls the closed driver's registered wrapper with the
+    /// windowed-ABI args staged in the scratch window, runs it to `retw`,
+    /// then restores everything except the callback's own memory writes
+    /// (the sketch-visible `sent_ok`/`got_rx` flags + peer dispatch).
+    ///
+    /// Window discipline (ISA RM Ch.4, verified against exec.rs CALL8):
+    /// the caller (host) synthesizes a call8 frame — rotate wb by 2 (the
+    /// ENTRY will rotate back on return), stash the return pc in the
+    /// caller's a8 slot (callee-a0 alias), stage args in caller
+    /// a10/a11/a12 (callee-a2/a3/a4 aliases), jump to the entry. The
+    /// callback's ENTRY rotates wb back; its `retw` rotates forward to
+    /// the host frame and lands at the stashed return pc, where the host
+    /// detects completion and restores the saved state.
+    pub fn run_espnow_callback(&mut self, core: usize) -> bool {
+        let Some((entry, a2, a3)) = self.soc.wifi_espnow_take_call() else {
+            return false;
+        };
+        let a4 = self.soc.wifi_espnow_take_a4();
+        let cpu = &mut self.cpu[core];
+        let saved_pc = cpu.pc;
+        let saved_wb = cpu.windowbase();
+        let saved_a0 = cpu.reg(0);
+        let saved_a1 = cpu.reg(1);
+        let saved_a6 = cpu.reg(6);
+        let saved_a7 = cpu.reg(7);
+        let saved_a8 = cpu.reg(8);
+        let saved_a10 = cpu.reg(10);
+        let saved_a11 = cpu.reg(11);
+        let saved_a12 = cpu.reg(12);
+        let saved_a13 = cpu.reg(13);
+        // Synthesize the call8 frame: wb+2 (ENTRY rotates back), return
+        // address 0x4000_0000 (unmapped ROM hole — never executed, only
+        // compared), args staged. a6/a7 also saved: the wrapper's
+        // vtable dispatch (`l32i a8,[a6,8]` + `callx8`) runs in the
+        // CURRENT window, so a live a6 would route the call through a
+        // garbage vtable (proven live: handler ENTRY saw a3=2/a4=0).
+        let wb = (saved_wb + 2) & 0xf;
+        cpu.set_windowbase(wb);
+        cpu.pc = entry;
+        cpu.set_reg(8, 0x4000_0000);
+        cpu.set_reg(10, a2);
+        cpu.set_reg(11, a3);
+        // Direct-vtable `onReceive` is a 4-arg method
+        // (this, data, len, bcast): len + bcast ride in a4/a5 from the
+        // staged frame; wrapper calls ignore a4/a5 (a2/a3 suffice).
+        if let Some((len, bcast)) = a4 {
+            cpu.set_reg(12, len);
+            cpu.set_reg(13, bcast);
+        } else {
+            cpu.set_reg(12, 0);
+        }
+        // Run until the callback returns to the host return pc (bounded:
+        // the wrapper is a few dozen instructions; a stuck callback
+        // restores and reports false rather than hanging the harness).
+        for _ in 0..10_000 {
+            self.cpu[core].step_one(&mut self.soc);
+            if self.cpu[core].pc == 0x4000_0000 {
+                break;
+            }
+        }
+        let ok = self.cpu[core].pc == 0x4000_0000;
+        let cpu = &mut self.cpu[core];
+        cpu.pc = saved_pc;
+        cpu.set_reg(0, saved_a0);
+        cpu.set_reg(1, saved_a1);
+        cpu.set_reg(6, saved_a6);
+        cpu.set_reg(7, saved_a7);
+        cpu.set_reg(8, saved_a8);
+        cpu.set_reg(10, saved_a10);
+        cpu.set_reg(11, saved_a11);
+        cpu.set_reg(12, saved_a12);
+        cpu.set_reg(13, saved_a13);
+        // Apply the restored wb immediately (no step boundary before the
+        // harness resumes — a stale wb would misname every reg).
+        cpu.set_windowbase(saved_wb);
+        ok
+    }
+
     /// Re-run the boot sequence from the last loaded flash image.  Used when a
     /// peripheral (WDT) triggers a system reset.
     pub fn reset(&mut self) {
@@ -375,10 +532,22 @@ impl Esp32S3 {
         // RTC domain (slow/fast memory, ULP + touch state) survives CPU
         // resets on silicon — only a power-down loses it.
         let rtc = self.soc.snapshot_rtc();
+        // Wi-Fi fixture DRAM-live state (staged records/IP/config, read
+        // counters, disconnect latch, staged ESP-NOW calls, engine latch
+        // bits) survives CPU/system resets like DRAM does — without it a
+        // mid-run WDT reset wipes the STA association / ESP-NOW legs and
+        // the post-reboot firmware hangs re-waiting (proven live:
+        // wifi_sta lost GOT_IP/DONE across an interrupt-WDT reset).
+        let wifi_fixture = self.soc.snapshot_wifi_fixture_runtime();
+        let wifi_image = self.soc.wifi_image;
+        let wifi_layout = self.soc.wifi_layout_cells();
         self.soc = Soc::new();
         self.soc.restore_efuse(efuse);
         self.soc.restore_psram(psram);
         self.soc.restore_rtc(rtc);
+        self.soc.restore_wifi_fixture_runtime(wifi_fixture);
+        self.soc.wifi_image = wifi_image;
+        self.soc.wifi_layout_restore(wifi_layout);
         self.asleep = false;
         self.boot_denied = false;
         self.boot_deny_reason = None;

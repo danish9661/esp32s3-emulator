@@ -233,6 +233,13 @@ impl Uart {
         core::mem::take(&mut self.tx_out)
     }
 
+    /// Peek at the queued TX bytes WITHOUT draining (fixture-engine
+    /// UART-marker legs — see `Soc::console_snapshot`; the real host
+    /// drain still owns consumption).
+    pub fn peek_tx(&self) -> &[u8] {
+        &self.tx_out
+    }
+
     /// Bytes queued (debug probe). Inline: hot console-drain fast path.
     #[inline]
     pub fn tx_len(&self) -> usize {

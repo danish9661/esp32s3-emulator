@@ -235,5 +235,19 @@
     "name": "wifi_sta — station connect + GOT_IP",
     "file": "esp32s3_wifi_sta.merged.bin",
     "wifi_sta": "EmuNet,-50,6,02:11:22:33:44:55"
+  },
+  {
+    "name": "wifi_ap — SoftAP + station list (fixture)",
+    "file": "esp32s3_wifi_ap.merged.bin",
+    "wifi_ap": {
+      "ssid": "EmuAP",
+      "passphrase": "password",
+      "channel": 6
+    }
+  },
+  {
+    "name": "espnow — ESP-NOW loopback (virtual peer)",
+    "file": "esp32s3_espnow.merged.bin",
+    "espnow": true
   }
 ]

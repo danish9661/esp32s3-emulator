@@ -16,6 +16,12 @@ Serves web/ over HTTP, loads index.html in Chromium, and asserts:
      (`>>> ` banner + `print(6*7)` -> `42` over UART0 — proves the ▶ REPL
      button + vfs-partition pad + UART0 flip; image committed at
      tools/firmware/, served same-origin)
+  8. wifi_ap gallery entry boots in-wasm to 'WIFI AP DONE' (proves the
+     `"wifi_ap"` manifest object wires the SoftAP fixture through the new
+     `wifi_ap_fixture` bridge call)
+  9. espnow gallery entry boots in-wasm to 'WIFI ESPNOW DONE' (proves the
+     `"espnow": true` manifest flag wires the virtual-peer loopback
+     through the new `wifi_espnow_fixture` bridge call)
 
 Fails loudly on any page error. Exits 0 on PASS, 1 on FAIL.
 """
@@ -174,6 +180,46 @@ try:
         except Exception:
             tail = page.eval_on_selector("#console", "el => el.textContent.slice(-800)")
             check("touch-inwasm-read", False, f"(tail={tail!r})")
+
+        # --- Test 8: wifi_ap gallery entry boots in-wasm to WIFI AP DONE ---
+        # (proves the `"wifi_ap"` manifest object wires the SoftAP fixture
+        # through the new `wifi_ap_fixture` bridge call)
+        page.click("#stop")
+        page.select_option("#gallery", value="./firmware/esp32s3_wifi_ap.merged.bin")
+        page.wait_for_function(
+            "() => !document.getElementById('run').disabled",
+            timeout=120000,
+        )
+        page.click("#run")
+        try:
+            page.wait_for_function(
+                "() => document.getElementById('console').textContent.includes('WIFI AP DONE')",
+                timeout=240000,
+            )
+            check("wifi-ap-inwasm-done", True)
+        except Exception:
+            tail = page.eval_on_selector("#console", "el => el.textContent.slice(-800)")
+            check("wifi-ap-inwasm-done", False, f"(tail={tail!r})")
+
+        # --- Test 9: espnow gallery entry boots in-wasm to WIFI ESPNOW DONE ---
+        # (proves the `"espnow": true` manifest flag wires the virtual-peer
+        # loopback through the new `wifi_espnow_fixture` bridge call)
+        page.click("#stop")
+        page.select_option("#gallery", value="./firmware/esp32s3_espnow.merged.bin")
+        page.wait_for_function(
+            "() => !document.getElementById('run').disabled",
+            timeout=120000,
+        )
+        page.click("#run")
+        try:
+            page.wait_for_function(
+                "() => document.getElementById('console').textContent.includes('WIFI ESPNOW DONE')",
+                timeout=240000,
+            )
+            check("espnow-inwasm-done", True)
+        except Exception:
+            tail = page.eval_on_selector("#console", "el => el.textContent.slice(-800)")
+            check("espnow-inwasm-done", False, f"(tail={tail!r})")
 
         # --- Test 7: MicroPython REPL preset (bundled same-origin image) ---
         # (proves the ▶ REPL button + vfs-partition pad + UART0 flip: load

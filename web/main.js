@@ -380,6 +380,18 @@ async function loadFlash(bytes, keyHex) {
   if (currentGalleryItem && currentGalleryItem.wifiSta !== null) {
     emu.wifi_sta_fixture(currentGalleryItem.wifiSta || 'EmuNet,-50,6,02:11:22:33:44:55');
   }
+  // SoftAP fixture (mirrors run_flash WIFI_AP_FIXTURE=1): the firmware
+  // posts AP_START itself; the engine stages the AP config + fixed LAN.
+  if (currentGalleryItem && currentGalleryItem.wifiAp !== null) {
+    const ap = currentGalleryItem.wifiAp || {};
+    emu.wifi_ap_fixture(ap.ssid || 'EmuAP', ap.passphrase || 'password', ap.channel || 6);
+  }
+  // ESP-NOW loopback (mirrors run_flash WIFI_ESPNOW_LOOPBACK=1): the
+  // engine invokes the TX/RX wrappers in-firmware once `send()` returned
+  // (UART `sent 1` marker, peeked from the host console stream).
+  if (currentGalleryItem && currentGalleryItem.espnow === true) {
+    emu.wifi_espnow_fixture();
+  }
 
   if (typeof PeripheralBridge !== 'undefined') {
     bridge = new PeripheralBridge(emu);
@@ -577,9 +589,14 @@ try {
       // manifest entry carries the key (absent = unarmed = dataset
       // undefined; present-but-empty = empty-air scan):
       // `wifi_scan` posts SCAN_DONE + records, `wifi_sta` completes the
-      // association (CONNECTED + GOT_IP + disconnect leg).
+      // association (CONNECTED + GOT_IP + disconnect leg), `wifi_ap` is a
+      // JSON object {ssid, passphrase, channel} (firmware posts AP_START
+      // itself; the engine stages config + LAN), `espnow` is a boolean
+      // (virtual second node; engine invokes TX/RX in-firmware).
       if (item.wifi_scan !== undefined) opt.dataset.wifiScan = item.wifi_scan;
       if (item.wifi_sta !== undefined) opt.dataset.wifiSta = item.wifi_sta;
+      if (item.wifi_ap !== undefined) opt.dataset.wifiAp = JSON.stringify(item.wifi_ap);
+      if (item.espnow === true) opt.dataset.espnow = '1';
       opt.textContent = item.name;
       els.gallery.appendChild(opt);
     }
@@ -593,11 +610,19 @@ els.gallery.addEventListener('change', async (e) => {
   // dataset.* is undefined when the manifest entry lacks the key
   // (unarmed) and a string — possibly empty (= empty-air scan) — when
   // present. No hasAttribute dance needed: undefined means absent.
+  let wifiAp = null;
+  try {
+    wifiAp = sel.dataset.wifiAp !== undefined ? JSON.parse(sel.dataset.wifiAp) : null;
+  } catch (_) {
+    wifiAp = null;
+  }
   currentGalleryItem = {
     sdspi: sel.dataset.sdspi === '1',
     touch: sel.dataset.touch || null,
     wifiScan: sel.dataset.wifiScan !== undefined ? sel.dataset.wifiScan : null,
     wifiSta: sel.dataset.wifiSta !== undefined ? sel.dataset.wifiSta : null,
+    wifiAp,
+    espnow: sel.dataset.espnow === '1',
   };
   try {
     setStatus(`loading ${url}…`);

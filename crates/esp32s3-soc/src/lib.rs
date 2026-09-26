@@ -53,4 +53,4 @@ pub mod usb_otg;
 pub mod usb_serial_jtag;
 pub mod wifi;
 
-pub use soc::Soc;
+pub use soc::{Soc, WifiImage};

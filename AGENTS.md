@@ -4428,3 +4428,59 @@ full enumeration REQ0..REQ6 — is covered),
     clean, wasm32 clean, wifi_scan/wifi_sta (+inwasm) green, harness JS
     `node --check` clean. Image bytes md5-identical to the cached
     download, so no behavioral re-validation needed.
+  - 2026-09-26: **WiFi SoftAP + ESP-NOW validated end-to-end (P5)**.
+    Battery +4 (`wifi_ap`, `espnow` run_flash + `wifi_ap_inwasm`,
+    `espnow_inwasm` NODE harnesses) → **115/0/0**; gallery 60 entries
+    (59 images); Playwright E2E ALL PASS (Tests 8+9: `WIFI AP DONE`,
+    `WIFI ESPNOW DONE` in-wasm).
+    - **SoftAP** (`tools/sketches/esp32s3_wifi_ap`): `softAP()` init +
+      STARTED bits + `softAPIP()` 192.168.4.1 + station count 0 + IDF
+      `esp_wifi_ap_get_sta_list` 0 → `WIFI AP DONE` (60M STEPS, works
+      with AND without the fixture env — hooks are write-only side
+      effects that only fire when the firmware calls them). Model work
+      (`soc.rs` + `machine.rs` + `run_flash.rs`, all nm/live-verified):
+      boot-time `wifi_stage_ap_data` (248B `wifi_ap_config_t` from
+      SSID/pass/channel + fixed 192.168.4.1/24 LAN); pc-intercept hooks
+      for `esp_wifi_get_config` (write-only mirror into caller buf),
+      `esp_wifi_set_config` (capture-only, NEVER skipped — a fake-RETW
+      skip smashed the stack canary at `__stack_chk_fail`, proven live
+      twice), `esp_wifi_ap_get_sta_list` (num=0, S3 layout
+      sta[15]@0+num-last verified in `esp_wifi_types_native.h`);
+      per-image hook tables (AP addrs verified by nm on the AP ELF —
+      the AP image links every hook elsewhere vs STA/scan/ESP-NOW).
+      Sketch lesson: `softAPSSID()` reads the closed driver's OWN store
+      (not the staged mirror), so the sketch asserts boot + IP +
+      station count, never SSID.
+    - **ESP-NOW** (`tools/sketches/esp32s3_espnow`): `begin` + `add` +
+      `send` → TXCB (`sent_ok`) + RXCB (`got_rx`, `rx0=A5`) → `DONE`
+      (60M STEPS). Model work: host-as-virtual-second-node — once the
+      sketch's `send()` returned (`sent 1` UART marker; firing earlier
+      stack-smashes inside `add()`'s live canary frame, proven live),
+      the host invokes the registered wrappers IN FIRMWARE via
+      `run_espnow_callback` (windowed-ABI CALL8-frame synthesis: wb+2,
+      ra in caller-a8, args in caller-a10/a11/a12, ENTRY rotates back,
+      `retw` lands at the stashed pc; `set_windowbase` added to
+      `xtensa-core` for it): TX wrapper (`_esp_now_tx_cb` with a real
+      28B `wifi_tx_info_t`) → peer `onSent(true)`; RX via direct vtable
+      slot-2 `onReceive` (this/data/len/bcast — bypasses the closed
+      wrapper's memcmp peer gate, proven live: wrapper left got_rx=0).
+      Console `peek_tx` (UART + USB-CDC) added for the marker snapshot
+      (peek, never drain — the 2026-09-03 drain-batching corruption
+      class). WDT/system-reset preservation for all fixture runtime
+      (records/IP/config/reads/latches/staged calls/engine state +
+      image + layout cells).
+    - Gallery: `esp32s3_wifi_ap` (with `wifi_ap` SSID/pass/channel
+      object) + `esp32s3_espnow` (with `espnow: true`) appended to
+      `manifest.json`; `main.js` arms `wifi_ap_fixture` /
+      `wifi_espnow_fixture`; `wifi_harness.mjs` covers all four modes
+      (`scan|sta|ap|espnow` + bin-path detection); `web/pkg` rebuilt.
+    - Still out (correctly scoped, assessed 2026-09-26): live L3–L7 IP
+      backhaul — the Go SLIRP/NAT gateway (`tools/gateway/`, DHCP/DNS/
+      ARP/IPv6-RA/UDP-forward done, port 5050) has no emulator-side
+      Ethernet bridge feeding it frames (no `linkoutput`/`netif` path
+      exists in soc.rs; the closed lwIP stack has no live netif state —
+      `esp_netif_get_ip_info` is hook-served). So DHCP→real-LAN,
+      ICMP/UDP/DNS/HTTP/MQTT/CoAP client+server, IPv6, pcap, and any
+      `test-worker-*` suites are unvalidatable offline: no counterparty
+      exists in-tree. Documented in README + odc (new "Live IP
+      backhaul" row). BLE stays out per directive.

@@ -158,10 +158,22 @@ fn ioblock_remap(addr: u32) -> u32 {
 // esp_image_header_t magic byte (esp_image_format.h: ESP_IMAGE_HEADER_MAGIC).
 const ESP_IMAGE_MAGIC: u8 = 0xE9;
 
+/// Which firmware image the Wi-Fi fixture engine serves. Layout tables
+/// are per-image (every address is a LINKED address, stable for the
+/// pinned esp32 core but DIFFERENT per sketch — ground truth = `nm` on
+/// each sketch ELF); the engine arms one image per run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum WifiImage {
+    Scan,
+    Sta,
+    Ap,
+    EspNow,
+}
+
 /// Per-image linked addresses for the Wi-Fi fixture engine (see
-/// `Soc::wifi_fixture_layout`). Every address is a LINKED address, stable
-/// for the pinned esp32 core but DIFFERENT per sketch (the STA sketch links
-/// the pool/RAM elsewhere) — ground truth = `nm` on each sketch ELF.
+/// `Soc::wifi_fixture_layout`). AP/ESP-NOW images share the scan/STA
+/// address *shape* (unused legs stay inert: their trigger pcs never match
+/// that image's code), so only the fields their legs touch must be exact.
 #[derive(Clone, Copy)]
 struct WifiImageLayout {
     scan_start: u32,
@@ -177,6 +189,8 @@ struct WifiImageLayout {
     reg_heaps: u32,
     pxcur: u32,
     sta_network_if: u32,
+    /// `esp_wifi_start` entry (AP stage pc + ESP-NOW bring-up marker).
+    esp_wifi_start: u32,
 }
 
 /// Fixture-engine state machine (one per armed run; see `WifiFixture`
@@ -192,17 +206,59 @@ struct WifiFixtureState {
     sta_ip_done: bool,
     disc_armed: bool,
     disc_done: bool,
+    ap_armed: bool,
+    ap_done: bool,
+    espnow_tx_done: bool,
+    espnow_rx_done: bool,
+    espnow_send_seen: bool,
+}
+
+/// Five layout/address cells (`wifi_layout_set` /
+/// `wifi_fixture_layout_reapply` targets) carried across resets.
+/// Pure addresses, valid for the whole run once programmed.
+pub type WifiLayoutCells = (
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+);
+
+/// DRAM-live Wi-Fi fixture runtime state preserved across WDT/system
+/// resets (see `Soc::snapshot_wifi_fixture_runtime`). Plain data only —
+/// no heap pointers — so it survives the `Soc::new()` rebuild in
+/// `Esp32S3::reset` by value.
+#[derive(Clone, Copy, Default)]
+pub struct WifiFixtureRuntime {
+    ap_record: Option<[u8; 92]>,
+    ip_info: Option<[u8; 12]>,
+    ap_reads: u32,
+    ap_config: Option<[u8; 248]>,
+    ap_stations: u32,
+    disc_fired: bool,
+    espnow_a4: Option<(u32, u32)>,
+    espnow_call: Option<(u32, u32, u32)>,
+    fixture_st: Option<WifiFixtureState>,
 }
 
 /// An armed Wi-Fi fixture run: parsed AP list + fixed LAN + engine state.
 /// Staging order mirrors run_flash exactly (count cell → SCAN_DONE post →
-/// records write; CONNECTED post → GOT_IP posts → disconnect posts), so
-/// firmware observes identical bytes.
+/// records write; CONNECTED post → GOT_IP posts → disconnect posts; AP
+/// stage; ESP-NOW TX/RX callback invocations), so firmware observes
+/// identical bytes.
 #[derive(Clone)]
 struct WifiFixture {
     aps: alloc::vec::Vec<crate::wifi::ScanFixtureAp>,
     ip: [u8; 4],
     st: WifiFixtureState,
+    /// SoftAP fixture config (SSID/passphrase/channel, defaults match the
+    /// wifi-ap sketch). Staged at arm time; served back by the
+    /// get/set-config hooks (see `wifi_stage_ap_data`).
+    ap_ssid: [u8; 32],
+    ap_ssid_len: u8,
+    ap_pass: [u8; 64],
+    ap_pass_len: u8,
+    ap_chan: u8,
 }
 
 /// SENS2 PLL-lock status model (TRM SENS2 SAR_PLL_FORCE_CTRL @ 0x6000E040).
@@ -387,11 +443,15 @@ pub struct Soc {
     /// NRX @ 0x6001CC00). TEMP WIFI BRING-UP scaffold: plain stores +
     /// proven RF-cal done-bits (see wifi.rs).
     wifi: Wifi,
-    /// Which firmware image the Wi-Fi fixture engine serves (scan vs STA
-    /// sketch link the pool/RAM differently; the layout table lives in
-    /// `wifi_fixture_layout`). Set once via `wifi_fixture_image` before
-    /// arming; defaults to scan.
-    wifi_image_sta: bool,
+    /// Which firmware image the Wi-Fi fixture engine serves. Layout
+    /// tables are per-image (scan/STA/AP/ESP-NOW sketches link the
+    /// pool/RAM differently; the table lives in `wifi_fixture_layout`).
+    /// Set once via `wifi_fixture_image` (scan/STA) /
+    /// `wifi_fixture_image_ap` / `wifi_fixture_image_espnow` before
+    /// arming; defaults to scan. `pub` so `Esp32S3::reset` can preserve
+    /// it across WDT/system resets (a fresh `Soc::new()` defaults to
+    /// scan, which would misroute every post-reboot engine leg).
+    pub wifi_image: WifiImage,
     /// Image-specific addresses discovered live by the host (WiFi fixture
     /// support): the `registered_heaps` SLIST head, the `pxCurrentTCBs`
     /// (current-TCB-per-core) array, the `_ZL15_sta_network_if` STA-instance
@@ -404,12 +464,14 @@ pub struct Soc {
     /// here).
     ///
     /// Cached by the host after first discovery (the arduino_events queue
-    /// and waiter are stable once `Network.initEvents` runs).
-    wifi_reg_heaps: Option<u32>,
-    wifi_pxcur: Option<u32>,
-    wifi_network: Option<u32>,
-    wifi_event_var: Option<u32>,
-    wifi_ip_event_var: Option<u32>,
+    /// and waiter are stable once `Network.initEvents` runs). `pub` so
+    /// `Esp32S3::reset` can preserve them across WDT/system resets (they
+    /// are pure addresses — valid for the whole run once programmed).
+    pub wifi_reg_heaps: Option<u32>,
+    pub wifi_pxcur: Option<u32>,
+    pub wifi_network: Option<u32>,
+    pub wifi_event_var: Option<u32>,
+    pub wifi_ip_event_var: Option<u32>,
     wifi_ard_queue: Option<u32>,
     #[allow(dead_code)]
     wifi_ard_waiter: Option<u32>,
@@ -425,11 +487,26 @@ pub struct Soc {
     wifi_ap_record: Option<[u8; 92]>,
     wifi_ip_info: Option<[u8; 12]>,
     /// Served ap-record reads (SSID + RSSI = 2): the disconnect-leg arm
-    /// gate (see `wifi_hook_rssi_done`).
+    /// gate (see `wifi_hook_rssi_done`). Survives WDT/system resets like
+    /// the staged record itself (see `wifi_reset_fixture_runtime`).
     wifi_ap_reads: u32,
+    /// Staged SoftAP fixture data (programmed by the host when it posts
+    /// AP_START): the AP `wifi_config_t` (248B union image) + station
+    /// count served by `esp_wifi_ap_get_sta_list` (0 — no RF clients).
+    /// `None` until staged.
+    wifi_ap_config: Option<[u8; 248]>,
+    wifi_ap_stations: u32,
     /// Latch set by the machine when the `esp_wifi_disconnect` hook fires;
     /// consumed by the run_flash disconnect leg (one-shot arm).
     wifi_disc_fired: bool,
+    /// Staged a4/a5 for a direct-vtable ESP-NOW call (`Some((len,
+    /// bcast))` — the machine stages only a2/a3 positionally; the
+    /// `onReceive` 4-arg form needs len + bcast in a4/a5 — see
+    /// `run_espnow_callback`).
+    wifi_espnow_a4: Option<(u32, u32)>,
+    /// Staged ESP-NOW callback invocation for the machine
+    /// (`Some((entry, a2, a3))` — see `wifi_espnow_take_call`).
+    wifi_espnow_call: Option<(u32, u32, u32)>,
     /// Self-contained Wi-Fi fixture engine (browser/bridge path — mirrors
     /// the run_flash host blocks; see `wifi_fixture_*` below). `None` =
     /// no fixture armed (firmware runs unmodified, like silicon with no
@@ -607,7 +684,7 @@ impl Soc {
             usb_otg: UsbOtg::new(),
             usb_wrap: RegStore::new(0x1000),
             wifi: Wifi::new(),
-            wifi_image_sta: false,
+            wifi_image: WifiImage::Scan,
             wifi_reg_heaps: None,
             wifi_pxcur: None,
             wifi_network: None,
@@ -619,7 +696,11 @@ impl Soc {
             wifi_ap_record: None,
             wifi_ip_info: None,
             wifi_ap_reads: 0,
+            wifi_ap_config: None,
+            wifi_ap_stations: 0,
             wifi_disc_fired: false,
+            wifi_espnow_call: None,
+            wifi_espnow_a4: None,
             wifi_fixture: None,
             lcd_cam: LcdCam::new(),
             appcpu_ctrl_a: 0,
@@ -1838,6 +1919,93 @@ impl Soc {
         self.wifi_disc_fired = true;
     }
 
+    /// Stage the SoftAP fixture data the pc-intercept hooks serve back
+    /// (`wifi_hook_ap_get_config` / `wifi_hook_ap_sta_list` below + the
+    /// shared `wifi_hook_get_ip_info`): the AP `wifi_config_t` (from the
+    /// fixture SSID/passphrase/channel) + the fixed AP LAN
+    /// (192.168.4.1/24, gw 192.168.4.1 — the IDF SoftAP default subnet,
+    /// matching what the sketch's `softAPIP()` printed unmodified).
+    /// Single source of truth — the sketch's `softAPSSID()` /
+    /// `softAPgetStationNum()` / `softAPIP()` then agree by construction.
+    pub fn wifi_stage_ap_data(&mut self, ssid: &[u8], passphrase: &[u8], channel: u8) {
+        // `wifi_config_t` is a 248B union; the AP arm (`wifi_ap_config_t`,
+        // `esp_wifi_types.h`): ssid[32]@0, password[64]@32, ssid_len@96,
+        // channel@97, authmode@98, ssid_hidden@99, max_connection@100,
+        // beacon_interval u16@102 (+ pairwise/group ciphers, FTM, ...).
+        let mut cfg = [0u8; 248];
+        let n = ssid.len().min(32);
+        cfg[..n].copy_from_slice(&ssid[..n]);
+        let m = passphrase.len().min(64);
+        cfg[32..32 + m].copy_from_slice(&passphrase[..m]);
+        cfg[96] = n as u8;
+        cfg[97] = channel;
+        // authmode: WPA2_PSK (3) when a passphrase is set, OPEN (0) else —
+        // matches the Arduino `softAP(ssid, passphrase, ...)` mapping.
+        cfg[98] = if m > 0 { 3 } else { 0 };
+        cfg[100] = 4; // max_connection (Arduino default)
+        cfg[102..104].copy_from_slice(&100u16.to_le_bytes()); // beacon_interval
+        self.wifi_ap_config = Some(cfg);
+        let mut info = [0u8; 12];
+        info[0..4].copy_from_slice(&[192, 168, 4, 1]);
+        info[4..8].copy_from_slice(&[255, 255, 255, 0]);
+        info[8..12].copy_from_slice(&[192, 168, 4, 1]);
+        self.wifi_ip_info = Some(info);
+        self.wifi_ap_stations = 0;
+    }
+
+    /// pc-intercept hook for `esp_wifi_get_config` on the AP interface:
+    /// serve the staged AP `wifi_config_t` (248B) into the caller's
+    /// buffer. Fires only for `WIFI_IF_AP` (ifx==1); STA reads pass
+    /// through (fail soft like silicon with no config). Returns false
+    /// while unstaged (caller lets the call run).
+    pub fn wifi_hook_ap_get_config(&mut self, ifx: u32, out: u32) -> bool {
+        use xtensa_core::Bus as _Bus;
+        if ifx != 1 {
+            return false;
+        }
+        let Some(cfg) = self.wifi_ap_config else {
+            return false;
+        };
+        for (k, b) in cfg.iter().enumerate() {
+            self.write8(out + k as u32, *b as u32);
+        }
+        true
+    }
+
+    /// pc-intercept hook for `esp_wifi_set_config` on the AP interface:
+    /// capture the firmware's own AP config (248B) into the staged store
+    /// so later `esp_wifi_get_config` reads agree with what the sketch
+    /// programmed (the closed driver keeps its own copy on silicon; here
+    /// the host store IS that copy). Fires only for `WIFI_IF_AP`.
+    /// Always reports staged (caller then skips the call with ESP_OK).
+    pub fn wifi_hook_ap_set_config(&mut self, ifx: u32, src: u32) -> bool {
+        use xtensa_core::Bus as _Bus;
+        if ifx != 1 {
+            return false;
+        }
+        let mut cfg = [0u8; 248];
+        for (k, b) in cfg.iter_mut().enumerate() {
+            *b = self.read8(src + k as u32) as u8;
+        }
+        self.wifi_ap_config = Some(cfg);
+        true
+    }
+
+    /// pc-intercept hook for `esp_wifi_ap_get_sta_list`: serve the
+    /// staged station count (0 — no RF stations can associate; the host
+    /// is the only counterparty and it never associates as an AP
+    /// client). `wifi_sta_list_t` = num u32@0 + sta[14]@4; write num=0.
+    /// Reports staged (caller skips with ESP_OK) once AP data is staged;
+    /// false while unstaged (caller lets the call run).
+    pub fn wifi_hook_ap_sta_list(&mut self, out: u32) -> bool {
+        use xtensa_core::Bus as _Bus;
+        if self.wifi_ap_config.is_none() {
+            return false;
+        }
+        self.write32(out, self.wifi_ap_stations);
+        true
+    }
+
     // ── Self-contained Wi-Fi fixture engine (browser/bridge path) ──
     // Mirrors the run_flash host blocks line-for-line (same Soc calls, same
     // order, same payloads), but driven from machine state instead of env
@@ -1847,41 +2015,90 @@ impl Soc {
     // shared Soc primitives both paths call.
     //
     /// Layout table shared by the fixture engine (selected by
-    /// `wifi_image_sta`, programmed once via `wifi_fixture_image`).
+    /// `wifi_image`, programmed once via `wifi_fixture_image*`).
+    /// Ground truth = `nm` on each sketch ELF (verified 2026-09-23).
     fn wifi_fixture_layout(&self) -> WifiImageLayout {
-        if self.wifi_image_sta {
-            // wifi-sta image layout (nm on the wifi-sta ELF).
-            WifiImageLayout {
-                scan_start: 0x4206_3b78,
-                connect: 0x4203_c7c4,
-                wifi_event_var: 0x3c0b_42bc,
-                ip_event_var: 0x3c0b_3bb8,
-                count_cell: 0x3fc9_f926,
-                scan_count: 0x3fc9_aee4,
-                scan_result: 0x3fc9_aee0,
-                records_check: 0x4200_3f9c,
-                ready_lists: 0x3fc9_b8dc,
-                top_prio: 0x3fc9_b84c,
-                reg_heaps: 0x3fc9_b794,
-                pxcur: 0x3fc9_bad0,
-                sta_network_if: 0x3fc9_ae6c,
+        match self.wifi_image {
+            WifiImage::Sta => {
+                // wifi-sta image layout (nm on the wifi-sta ELF).
+                WifiImageLayout {
+                    scan_start: 0x4206_3b78,
+                    connect: 0x4203_c7c4,
+                    wifi_event_var: 0x3c0b_42bc,
+                    ip_event_var: 0x3c0b_3bb8,
+                    count_cell: 0x3fc9_f926,
+                    scan_count: 0x3fc9_aee4,
+                    scan_result: 0x3fc9_aee0,
+                    records_check: 0x4200_3f9c,
+                    ready_lists: 0x3fc9_b8dc,
+                    top_prio: 0x3fc9_b84c,
+                    reg_heaps: 0x3fc9_b794,
+                    pxcur: 0x3fc9_bad0,
+                    sta_network_if: 0x3fc9_ae6c,
+                    esp_wifi_start: 0x4206_3824,
+                }
             }
-        } else {
-            // wifi-scan image layout (nm on the wifi-scan ELF).
-            WifiImageLayout {
-                scan_start: 0x4206_3b90,
-                connect: 0x4203_c84c,
-                wifi_event_var: 0x3c0b_4264,
-                ip_event_var: 0x3c0b_3b60,
-                count_cell: 0x3fc9_f93e,
-                scan_count: 0x3fc9_aef4,
-                scan_result: 0x3fc9_aef0,
-                records_check: 0x4200_3ee0,
-                ready_lists: 0x3fc9_b8f4,
-                top_prio: 0x3fc9_b864,
-                reg_heaps: 0x3fc9_b7ac,
-                pxcur: 0x3fc9_b7e0,
-                sta_network_if: 0x3fc9_ae7c,
+            WifiImage::Ap => {
+                // wifi-ap image layout (nm on the wifi-ap ELF; verified
+                // 2026-09-23: ready_lists/top_prio/reg_heaps/pxcur match
+                // the STA shape; WIFI_EVENT/IP_EVENT + ap netif differ).
+                WifiImageLayout {
+                    scan_start: 0x4206_3b94,
+                    connect: 0x4203_c7e0,
+                    wifi_event_var: 0x3c0b_42a4,
+                    ip_event_var: 0x3c0b_3ba0,
+                    count_cell: 0x3fc9_f926,
+                    scan_count: 0x3fc9_aee4,
+                    scan_result: 0x3fc9_aee0,
+                    records_check: 0x4200_3f9c,
+                    ready_lists: 0x3fc9_b8dc,
+                    top_prio: 0x3fc9_b84c,
+                    reg_heaps: 0x3fc9_b794,
+                    pxcur: 0x3fc9_bad0,
+                    sta_network_if: 0x3fc9_ae64,
+                    esp_wifi_start: 0x4206_3840,
+                }
+            }
+            WifiImage::EspNow => {
+                // espnow image layout (nm on the espnow ELF; verified
+                // 2026-09-23). Only the ready/heap/cpu cells + event vars
+                // matter (ESP-NOW legs never post IDF events; the TX/RX
+                // wrappers run in-firmware via `run_espnow_callback`).
+                WifiImageLayout {
+                    scan_start: 0x4206_9be4,
+                    connect: 0x4203_ca78,
+                    wifi_event_var: 0x3c0b_4990,
+                    ip_event_var: 0x3c0b_428c,
+                    count_cell: 0x3fc9_f926,
+                    scan_count: 0x3fc9_aee4,
+                    scan_result: 0x3fc9_aee0,
+                    records_check: 0x4200_3f9c,
+                    ready_lists: 0x3fc9_b984,
+                    top_prio: 0x3fc9_b8f4,
+                    reg_heaps: 0x3fc9_b83c,
+                    pxcur: 0x3fc9_bb78,
+                    sta_network_if: 0x3fc9_af14,
+                    esp_wifi_start: 0x4206_9890,
+                }
+            }
+            WifiImage::Scan => {
+                // wifi-scan image layout (nm on the wifi-scan ELF).
+                WifiImageLayout {
+                    scan_start: 0x4206_3b90,
+                    connect: 0x4203_c84c,
+                    wifi_event_var: 0x3c0b_4264,
+                    ip_event_var: 0x3c0b_3b60,
+                    count_cell: 0x3fc9_f93e,
+                    scan_count: 0x3fc9_aef4,
+                    scan_result: 0x3fc9_aef0,
+                    records_check: 0x4200_3ee0,
+                    ready_lists: 0x3fc9_b8f4,
+                    top_prio: 0x3fc9_b864,
+                    reg_heaps: 0x3fc9_b7ac,
+                    pxcur: 0x3fc9_b7e0,
+                    sta_network_if: 0x3fc9_ae7c,
+                    esp_wifi_start: 0x4206_383c,
+                }
             }
         }
     }
@@ -1897,12 +2114,35 @@ impl Soc {
         self.wifi_ip_event_var = Some(l.ip_event_var);
     }
 
-    /// Select the STA vs scan image for the fixture engine (must precede
-    /// arming; programs the layout addresses like run_flash does at boot).
+    /// Select the image for the fixture engine (must precede arming;
+    /// programs the layout addresses like run_flash does at boot).
+    /// `is_sta` keeps the old scan/STA bridge API working; prefer the
+    /// named `wifi_fixture_image_*` constructors for new images.
     pub fn wifi_fixture_image(&mut self, is_sta: bool) {
-        self.wifi_image_sta = is_sta;
+        self.wifi_image = if is_sta {
+            WifiImage::Sta
+        } else {
+            WifiImage::Scan
+        };
+        self.wifi_fixture_layout_program();
+    }
+
+    /// Select the SoftAP image (nm on the wifi-ap ELF).
+    pub fn wifi_fixture_image_ap(&mut self) {
+        self.wifi_image = WifiImage::Ap;
+        self.wifi_fixture_layout_program();
+    }
+
+    /// Select the ESP-NOW image (nm on the espnow ELF).
+    pub fn wifi_fixture_image_espnow(&mut self) {
+        self.wifi_image = WifiImage::EspNow;
+        self.wifi_fixture_layout_program();
+    }
+
+    /// Program the active layout addresses (same five cells run_flash
+    /// sets via `wifi_layout_set`).
+    fn wifi_fixture_layout_program(&mut self) {
         let l = self.wifi_fixture_layout();
-        // Program the layout addresses (same five cells run_flash sets).
         self.wifi_reg_heaps = Some(l.reg_heaps);
         self.wifi_pxcur = Some(l.pxcur);
         self.wifi_network = Some(l.sta_network_if);
@@ -1920,6 +2160,11 @@ impl Soc {
             aps,
             ip: [192, 168, 4, 2],
             st: WifiFixtureState::default(),
+            ap_ssid: [0; 32],
+            ap_ssid_len: 0,
+            ap_pass: [0; 64],
+            ap_pass_len: 0,
+            ap_chan: 6,
         });
     }
 
@@ -1934,6 +2179,52 @@ impl Soc {
             aps,
             ip: [192, 168, 4, 2],
             st: WifiFixtureState::default(),
+            ap_ssid: [0; 32],
+            ap_ssid_len: 0,
+            ap_pass: [0; 64],
+            ap_pass_len: 0,
+            ap_chan: 6,
+        });
+    }
+
+    /// Arm the SoftAP fixture (SSID/passphrase/channel; defaults match
+    /// the wifi-ap sketch). The firmware posts AP_START itself; the
+    /// engine only stages the AP fixture data (config + 192.168.4.1/24
+    /// LAN) the get/set-config + sta-list + ip-info hooks serve back
+    /// (see run_flash WIFI_AP_FIXTURE notes).
+    pub fn wifi_fixture_ap(&mut self, ssid: &str, passphrase: &str, channel: u8) {
+        let sn = ssid.len().min(32);
+        let mut ssid_b = [0u8; 32];
+        ssid_b[..sn].copy_from_slice(&ssid.as_bytes()[..sn]);
+        let pn = passphrase.len().min(64);
+        let mut pass_b = [0u8; 64];
+        pass_b[..pn].copy_from_slice(&passphrase.as_bytes()[..pn]);
+        self.wifi_fixture = Some(WifiFixture {
+            aps: crate::wifi::parse_scan_fixtures(""),
+            ip: [192, 168, 4, 1],
+            st: WifiFixtureState::default(),
+            ap_ssid: ssid_b,
+            ap_ssid_len: sn as u8,
+            ap_pass: pass_b,
+            ap_pass_len: pn as u8,
+            ap_chan: channel,
+        });
+    }
+
+    /// Arm the ESP-NOW loopback fixture (virtual second node). The engine
+    /// invokes the registered TX/RX wrappers in-firmware once the
+    /// sketch's `send()` returned (gated on the `sent 1` UART marker by
+    /// the host — see run_flash WIFI_ESPNOW_LOOPBACK notes).
+    pub fn wifi_fixture_espnow(&mut self) {
+        self.wifi_fixture = Some(WifiFixture {
+            aps: crate::wifi::parse_scan_fixtures(""),
+            ip: [192, 168, 4, 2],
+            st: WifiFixtureState::default(),
+            ap_ssid: [0; 32],
+            ap_ssid_len: 0,
+            ap_pass: [0; 64],
+            ap_pass_len: 0,
+            ap_chan: 6,
         });
     }
 
@@ -1957,9 +2248,14 @@ impl Soc {
 
     /// Drive one engine step (call once per macro-step from the machine,
     /// with both cores' pcs sampled post-step like run_flash does after
-    /// `step_fast`). Runs the armed scan and/or STA completion legs.
+    /// `step_fast`). Runs the armed scan / STA / AP / ESP-NOW legs.
     /// No-op while no fixture is armed.
-    pub fn wifi_fixture_poll(&mut self, pc0: u32, pc1: u32) {
+    ///
+    /// UART-marker legs (ESP-NOW TX timing) CANNOT run here: the SoC owns
+    /// no console state, so UART matching stays a host-side helper (see
+    /// `wifi_console_seen`). The host passes the match result in —
+    /// same bytes run_flash greps, so both paths observe identical data.
+    pub fn wifi_fixture_poll(&mut self, pc0: u32, pc1: u32, uart: &[u8]) {
         use xtensa_core::Bus as _Bus;
         // Snapshot the layout + AP data first (borrow-split: the legs below
         // need `&mut self` for queue/heap calls, so nothing here may hold
@@ -1972,6 +2268,61 @@ impl Soc {
         let aps = fx.aps.clone();
         let ip = fx.ip;
         let mut dirty = false;
+
+        // — SoftAP leg: stage the AP fixture data once, at `esp_wifi_start`
+        // on CORE 0 only (run_flash WIFI_AP_FIXTURE notes: core 1 runs the
+        // same pc mid-bring-up; staging there vectors the next block into
+        // the ROM hole). The firmware posts AP_START itself; the hooks
+        // serve the staged config/IP/sta-list back. —
+        if !st.ap_done && !st.ap_armed && pc0 == l.esp_wifi_start {
+            self.wifi_stage_ap_data(
+                &fx.ap_ssid[..fx.ap_ssid_len as usize],
+                &fx.ap_pass[..fx.ap_pass_len as usize],
+                fx.ap_chan,
+            );
+            st.ap_armed = true;
+            st.ap_done = true;
+            dirty = true;
+        }
+        // — ESP-NOW legs: invoke the registered wrappers in-firmware via
+        // the staged-call handoff (`run_espnow_callback` runs them; the
+        // SoC only stages — it cannot run firmware itself). —
+        if !st.espnow_tx_done {
+            // TIMING RULE (run_flash WIFI_ESPNOW_LOOPBACK notes): fire only
+            // after the sketch's `send()` RETURNED (`sent 1` marker — the
+            // cells-live moment is still inside `add()` with its canary
+            // frame live; invoking then stack-smashes at the epilogue).
+            let send_done = uart
+                .windows(b"WIFI ESPNOW sent 1".len())
+                .any(|w| w == b"WIFI ESPNOW sent 1");
+            if send_done && !st.espnow_send_seen {
+                st.espnow_send_seen = true;
+                dirty = true;
+            }
+            if st.espnow_send_seen {
+                let txcb = self.read32(0x3fc9_dd20 + 4);
+                let peer = self.read32(0x3fc9_aeac);
+                if txcb != 0 && peer != 0 {
+                    let m0 = self.read32(0x3fc9_ae60 + 4);
+                    let m1 = self.read32(0x3fc9_ae60 + 8);
+                    let mut mac = [0u8; 6];
+                    mac[..4].copy_from_slice(&m0.to_le_bytes());
+                    mac[4..].copy_from_slice(&m1.to_le_bytes()[..2]);
+                    self.wifi_espnow_invoke_tx_cb(txcb, &mac);
+                    st.espnow_tx_done = true;
+                    dirty = true;
+                }
+            }
+        } else if !st.espnow_rx_done {
+            let rxcb = self.read32(0x3fc9_dd20);
+            let recv = self.wifi_espnow_peer_slot(0x3fc9_ae60, 2);
+            if rxcb != 0 && recv != 0 {
+                let peer = [0x02u8, 0x11, 0x22, 0x33, 0x44, 0x55];
+                self.wifi_espnow_invoke_rx_cb(recv, &peer, &[0xA5, 0x5A], true, 0x3fc9_ae60);
+                st.espnow_rx_done = true;
+                dirty = true;
+            }
+        }
 
         // — Scan leg: arm the dwell at `esp_wifi_scan_start`; on elapse,
         // stage the count cell + post the REAL SCAN_DONE esp_event. —
@@ -2345,6 +2696,191 @@ impl Soc {
     pub fn wifi_scan_post_event(&mut self, wifi_event_var: u32) -> Option<u32> {
         const SCAN_DONE_ID: u32 = 1;
         self.wifi_post_event(wifi_event_var, SCAN_DONE_ID)
+    }
+
+    /// Post a data-less IDF event (host frontend — shared by completions
+    /// whose handlers free/inspect the event data, e.g. WIFI_EVENT_AP_START
+    /// whose handler `heap_caps_free`s it: a scratch payload would abort
+    /// in `heap_caps_free` ("free() target pointer is outside heap areas",
+    /// proven live). Same 16-byte post item as `wifi_post_event` with any
+    /// event id.
+    pub fn wifi_scan_post_event_generic(&mut self, base_var: u32, id: u32) -> Option<u32> {
+        self.wifi_post_event(base_var, id)
+    }
+
+    /// Direct firmware-callback invocation (host frontend — ESP-NOW
+    /// fixture path): run the closed driver's registered TX/RX callbacks
+    /// IN FIRMWARE by saving the machine's CPU state, pointing a core at
+    /// the callback entry with the windowed-ABI args staged, running until
+    /// the callback returns, then restoring.
+    ///
+    /// Why this instead of posting an event: the closed `libespnow.a`
+    /// drivers deliver TX-complete/RX frames by DIRECT C calls (the
+    /// Arduino `_esp_now_tx_cb`/`_esp_now_rx_cb` wrappers run in the WiFi
+    /// task context, not through any FreeRTOS queue the host can post
+    /// to — proven live: zero DRAM transitions across the send, the
+    /// firmware parks in `delay()` with no event pending). The host
+    /// therefore BECOMES the virtual second node: it stages the callback
+    /// arguments in the SoC scratch window and runs the wrapper, which
+    /// dispatches to the sketch peer's `onSent`/`onReceive` unmodified.
+    /// `WIFI_SCRATCH` (fixed host window past heap end) holds the args;
+    /// the call runs on core 1 while core 0 keeps idling (serialized
+    /// stepping keeps the scheduler state coherent — the callback runs
+    /// to `retw` before the next tick, so no ISR can interleave).
+    /// (Scratch-layout note: args live at +0x900 past the IDF allocator
+    /// window — see `wifi_espnow_invoke_rx_cb`.)
+    pub fn wifi_espnow_invoke_tx_cb(&mut self, tx_cb: u32, peer_mac: &[u8; 6]) {
+        use xtensa_core::Bus as _Bus;
+        // `wifi_tx_info_t` (28B, `esp_wifi_types_generic.h`): des_addr@0,
+        // src_addr@4, ifidx@8, data@12, data_len@16, rate@20, tx_status@24.
+        let base = Self::WIFI_SCRATCH + 0x900;
+        for (k, b) in peer_mac.iter().enumerate() {
+            self.write8(base + k as u32, *b as u32);
+        }
+        let mut info = [0u8; 28];
+        info[0..4].copy_from_slice(&base.to_le_bytes());
+        info[4..8].copy_from_slice(&base.to_le_bytes());
+        info[8..12].copy_from_slice(&0u32.to_le_bytes());
+        info[12..16].copy_from_slice(&0u32.to_le_bytes());
+        info[16] = 0;
+        info[20..24].copy_from_slice(&0u32.to_le_bytes());
+        info[24..28].copy_from_slice(&0u32.to_le_bytes()); // WIFI_SEND_SUCCESS
+        let arg = Self::WIFI_SCRATCH + 0x940;
+        for (k, b) in info.iter().enumerate() {
+            self.write8(arg + k as u32, *b as u32);
+        }
+        // Stash the invocation for the machine (it owns the CPUs): the
+        // SoC cannot run firmware itself — see `wifi_espnow_take_call`.
+        self.wifi_espnow_call = Some((tx_cb, arg, 0));
+    }
+
+    /// Stage an ESP-NOW RX callback invocation (host frontend — see
+    /// `wifi_espnow_invoke_tx_cb`): EITHER the closed wrapper
+    /// (`_esp_now_rx_cb`: args (info_ptr, data_ptr, len) with
+    /// `esp_now_recv_info_t` (12B: src@0/des@4/rx_ctrl@8) + data bytes)
+    /// OR a sketch peer vtable slot looked up via
+    /// `wifi_espnow_peer_slot` (slot 2 = `onReceive`: args
+    /// (this, data_ptr, len, bcast)). Selected by `direct`: false =
+    /// wrapper (goes through the memcmp peer gate — needs a KNOWN peer
+    /// mac or BROADCAST des), true = direct vtable dispatch (no gate —
+    /// use for unknown-peer or unit flows).
+    ///
+    /// SCRATCH-LAYOUT NOTE (proven live): the IDF scratch allocator
+    /// (`wifi_post_event_with_data`) bump-allocates 64B slots from
+    /// `WIFI_SCRATCH` and treats "first word nonzero = occupied" — its
+    /// cursor is the FIRST zero word. Payloads staged here must therefore
+    /// live PAST the allocator's 0x858 window (MAC bytes at +0x480 alias
+    /// slot 18 and get mistaken for occupancy, starving later posts).
+    /// ESP-NOW args use +0x900..+0xA00 (past 0x858, inside the verified
+    /// 2136B free run, clear of the 0x10000 ard-pool page).
+    pub fn wifi_espnow_invoke_rx_cb(
+        &mut self,
+        rx_cb: u32,
+        src_mac: &[u8; 6],
+        data: &[u8],
+        direct: bool,
+        this: u32,
+    ) {
+        use xtensa_core::Bus as _Bus;
+        let base = Self::WIFI_SCRATCH + 0x900;
+        for (k, b) in src_mac.iter().enumerate() {
+            self.write8(base + k as u32, *b as u32);
+        }
+        let des = Self::WIFI_SCRATCH + 0x908;
+        for (k, b) in src_mac.iter().enumerate() {
+            self.write8(des + k as u32, *b as u32);
+        }
+        let databuf = Self::WIFI_SCRATCH + 0x910;
+        for (k, b) in data.iter().enumerate() {
+            self.write8(databuf + k as u32, *b as u32);
+        }
+        let n = data.len().min(250) as u32;
+        if direct {
+            // Direct vtable dispatch: stage (this, data_ptr, len) as the
+            // call's a2/a3/a4 — the machine passes a2/a3 positionally and
+            // a4 is read from the staged frame (see `run_espnow_callback`).
+            let arg = Self::WIFI_SCRATCH + 0x980;
+            self.write32(arg, this);
+            self.write32(arg + 4, databuf);
+            self.write32(arg + 8, n);
+            self.write32(arg + 12, 0); // bcast = unicast
+            self.wifi_espnow_call = Some((rx_cb, this, databuf));
+            self.wifi_espnow_a4 = Some((n, 0));
+        } else {
+            let arg = Self::WIFI_SCRATCH + 0x980;
+            self.write32(arg, base);
+            self.write32(arg + 4, des);
+            self.write32(arg + 8, 0); // rx_ctrl NULL (wrapper only reads addrs)
+            self.write32(arg + 12, databuf);
+            self.write32(arg + 16, n);
+            self.wifi_espnow_call = Some((rx_cb, arg, n));
+            self.wifi_espnow_a4 = None;
+        }
+    }
+
+    /// Take a staged ESP-NOW callback invocation for the machine
+    /// (`Some((entry, a2, a3))` = callback entry pc, first arg, second
+    /// arg; the RX length rides in the staged frame — see machine).
+    pub fn wifi_espnow_take_call(&mut self) -> Option<(u32, u32, u32)> {
+        self.wifi_espnow_call.take()
+    }
+
+    /// True while an ESP-NOW callback invocation is staged and waiting
+    /// for the machine to run it in-firmware (see `run_espnow_callback`).
+    /// Lets `step_fast` drain staged calls without taking them itself.
+    pub fn wifi_espnow_call_pending(&self) -> bool {
+        self.wifi_espnow_call.is_some()
+    }
+
+    /// Host-side console snapshot for the fixture engine's UART-marker
+    /// legs (ESP-NOW TX timing): the merged UART0 + USB-CDC TX bytes
+    /// queued since the last host drain — the same bytes run_flash
+    /// greps for markers. `no_std`-safe (`alloc::vec::Vec`).
+    ///
+    /// PEEK, not drain: the real host drain (`take_uart_tx` /
+    /// `take_usb_serial_tx`, with its ROM-doubling dedup + merge order)
+    /// still owns consumption. Draining here would steal bytes from the
+    /// host stream (proven class: the 2026-09-03 console-drain batching
+    /// corruption) — the poll only needs to SEE the marker, so it clones
+    /// the queued bytes and leaves the FIFOs intact for the host drain.
+    pub fn console_snapshot(&mut self) -> alloc::vec::Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(self.uarts[0].peek_tx());
+        out.extend_from_slice(self.usb.peek_tx());
+        out
+    }
+
+    /// Take the staged a4/a5 for a direct-vtable call (`Some((len,
+    /// bcast))` — see `wifi_espnow_invoke_rx_cb`).
+    pub fn wifi_espnow_take_a4(&mut self) -> Option<(u32, u32)> {
+        self.wifi_espnow_a4.take()
+    }
+
+    /// Stage a direct-vtable `onSent(bool)` invocation (host frontend —
+    /// ESP-NOW fixture path): the call's args are (this, success) in
+    /// a2/a3; no scratch needed (the bool rides positionally).
+    pub fn wifi_espnow_invoke_tx_direct(&mut self, sent_entry: u32, this: u32, success: bool) {
+        self.wifi_espnow_call = Some((sent_entry, this, success as u32));
+        self.wifi_espnow_a4 = None;
+    }
+
+    /// Look up a sketch peer's vtable dispatch slot (host frontend —
+    /// ESP-NOW fixture path): the Arduino `ESP_NOW_Peer` object starts
+    /// with a vptr; slot 2 = `onReceive`, slot 3 = `onSent` (proven live
+    /// on the espnow image: vtab = [?, 0x42002c58, 0x42002c28 onReceive,
+    /// 0x42002c44 onSent]). Returns 0 while the object is not yet
+    /// constructed (host retries — level, not edge).
+    pub fn wifi_espnow_peer_slot(&mut self, peer_obj: u32, slot: u32) -> u32 {
+        use xtensa_core::Bus as _Bus;
+        let vptr = self.read32(peer_obj);
+        if !(0x3C00_0000..0x4240_0000).contains(&vptr) {
+            return 0;
+        }
+        let target = self.read32(vptr + slot * 4);
+        if !(0x4000_0000..0x4240_0000).contains(&target) {
+            return 0;
+        }
+        target
     }
 
     /// Post a scratch-payload event item into the default esp_event loop
@@ -5099,6 +5635,75 @@ impl Soc {
         self.rtc_fast = s.fast;
         self.ulp = s.ulp;
         self.touch = s.touch;
+    }
+
+    /// Snapshot of the Wi-Fi fixture RUNTIME state across a WDT/system
+    /// reset. On silicon the AP record + netif + driver config live in
+    /// DRAM, which a CPU/system reset does not wipe — only the engine's
+    /// one-shot latches must re-fire, which they do naturally as the
+    /// firmware re-enters the trigger pcs post-reboot. Covers the STA
+    /// disconnect-leg gate (`wifi_ap_reads`), the disconnect latch, the
+    /// staged ESP-NOW call + a4 frame, and the engine's own state
+    /// machine (scan/STA/AP legs latch done so they don't double-post
+    /// after the reboot; the ESP-NOW legs re-run from the UART marker,
+    /// which persists in the host console stream).
+    pub fn snapshot_wifi_fixture_runtime(&self) -> WifiFixtureRuntime {
+        WifiFixtureRuntime {
+            ap_record: self.wifi_ap_record,
+            ip_info: self.wifi_ip_info,
+            ap_reads: self.wifi_ap_reads,
+            ap_config: self.wifi_ap_config,
+            ap_stations: self.wifi_ap_stations,
+            disc_fired: self.wifi_disc_fired,
+            espnow_a4: self.wifi_espnow_a4,
+            espnow_call: self.wifi_espnow_call,
+            fixture_st: self.wifi_fixture.clone().map(|f| f.st),
+        }
+    }
+
+    /// Snapshot the five layout/address cells (`wifi_layout_set` /
+    /// `wifi_fixture_layout_reapply` targets) for reset preservation —
+    /// pure addresses, valid for the whole run once programmed.
+    pub fn wifi_layout_cells(&self) -> WifiLayoutCells {
+        (
+            self.wifi_reg_heaps,
+            self.wifi_pxcur,
+            self.wifi_network,
+            self.wifi_event_var,
+            self.wifi_ip_event_var,
+        )
+    }
+
+    /// Restore the five layout/address cells (see `wifi_layout_cells`).
+    pub fn wifi_layout_restore(&mut self, s: WifiLayoutCells) {
+        (
+            self.wifi_reg_heaps,
+            self.wifi_pxcur,
+            self.wifi_network,
+            self.wifi_event_var,
+            self.wifi_ip_event_var,
+        ) = s;
+    }
+
+    /// Restore the Wi-Fi fixture runtime state after a WDT/system reset
+    /// (see `snapshot_wifi_fixture_runtime`). The layout cells
+    /// (`wifi_reg_heaps`/`wifi_pxcur`/`wifi_network`/`wifi_event_var`/
+    /// `wifi_ip_event_var`) are restored separately via
+    /// `wifi_layout_restore` (they are reprogrammed by the host on a
+    /// clean boot, but no host runs at reset time); only genuinely
+    /// DRAM-live state is kept here.
+    pub fn restore_wifi_fixture_runtime(&mut self, s: WifiFixtureRuntime) {
+        self.wifi_ap_record = s.ap_record;
+        self.wifi_ip_info = s.ip_info;
+        self.wifi_ap_reads = s.ap_reads;
+        self.wifi_ap_config = s.ap_config;
+        self.wifi_ap_stations = s.ap_stations;
+        self.wifi_disc_fired = s.disc_fired;
+        self.wifi_espnow_a4 = s.espnow_a4;
+        self.wifi_espnow_call = s.espnow_call;
+        if let (Some(slot), Some(st)) = (self.wifi_fixture.as_mut(), s.fixture_st) {
+            slot.st = st;
+        }
     }
 
     /// Debug accessor for the AES interrupt raw&enabled state (validation harness).

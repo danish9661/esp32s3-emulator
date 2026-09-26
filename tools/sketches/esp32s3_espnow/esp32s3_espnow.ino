@@ -1,12 +1,12 @@
 #include <Arduino.h>
 #include "ESP32_NOW.h"
 #include "WiFi.h"
-// ESP-NOW validation sketch (Arduino ESP_NOW peer API; NOT yet validated
-// — no battery entry and no emulator support committed). The emulator has
-// no RF, so this sketch will need the host to act as a virtual second
-// node once ESP-NOW support lands: firmware-to-host sends completing
-// with ESP_NOW_SEND_SUCCESS, and a host-to-firmware frame staged so the
-// recv callback fires with the exact bytes.
+// ESP-NOW validation sketch (Arduino ESP_NOW peer API; battery entry
+// `espnow`, fixture `WIFI_ESPNOW_LOOPBACK=1`). The emulator has no RF,
+// so the host acts as a virtual second node: firmware-to-host sends
+// complete via an in-firmware TX-callback invocation (peer `onSent`
+// → `sent_ok`), and a 2-byte frame from the peer MAC is delivered via
+// the peer's `onReceive` directly (`got_rx`, `rx_byte0 = 0xA5`).
 #define ESPNOW_WIFI_CHANNEL 6
 static volatile bool sent_ok = false;
 static volatile bool got_rx = false;
