@@ -13,10 +13,13 @@
 //           "WIFI STA SSID EmuNet", "WIFI STA after-disconnect 6",
 //           "WIFI STA DONE"
 //   * ap:   "WIFI AP softAP 1", "WIFI AP IP 192.168.4.1",
+//           "WIFI AP MAC 62:55:44:33:22:11" (factory-MAC-derived AP MAC),
 //           "WIFI AP stations 0", "WIFI AP clients 0", "WIFI AP DONE"
 //   * espnow: "WIFI ESPNOW init 1", "WIFI ESPNOW addpeer 1",
 //           "WIFI ESPNOW sent 1", "WIFI ESPNOW sendcb 1",
-//           "WIFI ESPNOW rxcb 1", "WIFI ESPNOW rx0 A5", "WIFI ESPNOW DONE"
+//           "WIFI ESPNOW rxcb 1", "WIFI ESPNOW rx0 68",
+//           "WIFI ESPNOW rxlen 5", "WIFI ESPNOW rxsum 14",
+//           "WIFI ESPNOW DONE" (full "hello" A→B→A exchange)
 //
 // Usage: node tools/wifi_harness.mjs [scan|sta|ap|espnow]
 // (battery passes the sketch bin as argv[2]; the mode follows the bin
@@ -74,13 +77,13 @@ const MODES = {
     bin: 'tools/sketches/esp32s3_wifi_ap/esp32s3_wifi_ap.merged.bin',
     budget: 60_000_000,
     arm: (emu) => emu.wifi_ap_fixture('EmuAP', 'password', 6),
-    wants: ['WIFI AP softAP 1', 'WIFI AP IP 192.168.4.1', 'WIFI AP stations 0', 'WIFI AP clients 0', 'WIFI AP DONE'],
+    wants: ['WIFI AP softAP 1', 'WIFI AP IP 192.168.4.1', 'WIFI AP MAC 62:55:44:33:22:11', 'WIFI AP stations 0', 'WIFI AP clients 0', 'WIFI AP DONE'],
   },
   espnow: {
     bin: 'tools/sketches/esp32s3_espnow/esp32s3_espnow.merged.bin',
     budget: 60_000_000,
     arm: (emu) => emu.wifi_espnow_fixture(),
-    wants: ['WIFI ESPNOW init 1', 'WIFI ESPNOW addpeer 1', 'WIFI ESPNOW sent 1', 'WIFI ESPNOW sendcb 1', 'WIFI ESPNOW rxcb 1', 'WIFI ESPNOW rx0 A5', 'WIFI ESPNOW DONE'],
+    wants: ['WIFI ESPNOW init 1', 'WIFI ESPNOW addpeer 1', 'WIFI ESPNOW sent 1', 'WIFI ESPNOW sendcb 1', 'WIFI ESPNOW rxcb 1', 'WIFI ESPNOW rx0 68', 'WIFI ESPNOW rxlen 5', 'WIFI ESPNOW rxsum 14', 'WIFI ESPNOW DONE'],
   },
 };
 

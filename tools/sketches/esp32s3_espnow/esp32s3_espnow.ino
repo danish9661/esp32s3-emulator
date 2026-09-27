@@ -5,12 +5,16 @@
 // `espnow`, fixture `WIFI_ESPNOW_LOOPBACK=1`). The emulator has no RF,
 // so the host acts as a virtual second node: firmware-to-host sends
 // complete via an in-firmware TX-callback invocation (peer `onSent`
-// → `sent_ok`), and a 2-byte frame from the peer MAC is delivered via
-// the peer's `onReceive` directly (`got_rx`, `rx_byte0 = 0xA5`).
+// → `sent_ok`), and a 5-byte "hello" frame (68656c6c6f) from the peer
+// MAC is delivered via the peer's `onReceive` directly (`got_rx`,
+// `rx_byte0` + `rx_len`/`rx_sum` verify the full A→B payload, not just
+// byte 0).
 #define ESPNOW_WIFI_CHANNEL 6
 static volatile bool sent_ok = false;
 static volatile bool got_rx = false;
 static uint8_t rx_byte0 = 0;
+static volatile uint8_t rx_len = 0;
+static volatile uint8_t rx_sum = 0;
 class EspNowHandler : public ESP_NOW_Peer {
 public:
   EspNowHandler(const uint8_t *mac, uint8_t channel, wifi_interface_t iface, const uint8_t *lmk)
@@ -23,6 +27,12 @@ public:
   void onReceive(const uint8_t *data, size_t len, bool broadcast) override {
     (void)broadcast;
     if (len >= 1) { rx_byte0 = data[0]; got_rx = true; }
+    if (len <= 32) {
+      rx_len = (uint8_t)len;
+      uint8_t s = 0;
+      for (size_t i = 0; i < len; i++) { s += data[i]; }
+      rx_sum = s;
+    }
   }
   void onSent(bool success) override { sent_ok = success; }
 };
@@ -40,7 +50,10 @@ void setup() {
   Serial.println(ok ? 1 : 0);
   Serial.print("WIFI ESPNOW addpeer ");
   Serial.println(ok ? 1 : 0);
-  uint8_t tx[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+  // A→B payload: ASCII "hello" (68656c6c6f). The host second node
+  // delivers the same 5 bytes back (B→A echo), so rx0/rxlen/rxsum
+  // prove the full exchange both directions.
+  uint8_t tx[5] = {0x68, 0x65, 0x6C, 0x6C, 0x6F};
   bool s = handler.peerSend(tx, sizeof(tx));
   Serial.print("WIFI ESPNOW sent ");
   Serial.println(s ? 1 : 0);
@@ -53,6 +66,10 @@ void setup() {
   if (got_rx) {
     Serial.print("WIFI ESPNOW rx0 ");
     Serial.println(rx_byte0, HEX);
+    Serial.print("WIFI ESPNOW rxlen ");
+    Serial.println(rx_len, DEC);
+    Serial.print("WIFI ESPNOW rxsum ");
+    Serial.println(rx_sum, HEX);
   }
   Serial.println("WIFI ESPNOW DONE");
 }

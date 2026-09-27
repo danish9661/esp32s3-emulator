@@ -408,6 +408,35 @@ impl Esp32S3 {
                 n += 1;
                 continue;
             }
+            // Ethernet TX capture (live-IP backhaul tap): the linked
+            // `esp_netif_transmit(esp_netif, data, len)` callee is lwIP's
+            // single egress point (DHCP/ARP/IP/ICMP/UDP/TCP all leave
+            // here). Pcs are nm on each sketch ELF (STA 0x4202e4d8 / AP
+            // 0x4202e594 / scan 0x4202e560 / ESP-NOW 0x4202e7f8 — same
+            // per-image-union discipline as the hook table above). The
+            // call RUNS unmodified (capture is read-only w.r.t. CPU
+            // state — same class as the set_config capture hook); the
+            // frame bytes land in `pending_net_tx` + an EVT_NET_FRAME
+            // event for the host (gateway bridge + pcap) to drain.
+            // Caller args are windowed (callee a3/a4 = caller a11/a12),
+            // read BEFORE `step_one` while wb still names the caller.
+            // PROVENANCE NOTE (2026-09-27, single-step + post-step
+            // histograms over 150M insns on the STA image): the current
+            // fixture sketches NEVER call this — the closed DHCP/client
+            // stack has no live netif state (no DHCP/client task runs;
+            // `esp_netif_get_ip_info` is hook-served), so no frame is
+            // ever captured on today's images. The tap is therefore
+            // wired but IDLE: it fires if/when a future test-worker-net
+            // sketch drives the real stack, and stays silent otherwise.
+            // (An earlier pcap trial captured 1600B of zeros/garbage —
+            // that was the hook reading caller regs at a pc the
+            // firmware never reaches as a call, now understood.)
+            if pc0 == 0x4202_e4d8 || pc0 == 0x4202_e594 || pc0 == 0x4202_e560 || pc0 == 0x4202_e7f8
+            {
+                let data = self.cpu[core].reg(11);
+                let len = self.cpu[core].reg(12);
+                self.soc.net_capture_tx(data, len);
+            }
             let r = self.cpu[core].step_one(&mut self.soc);
             // `step_one` records the fetched length even on exception paths,
             // so no re-fetch is needed to verify fall-through advance.

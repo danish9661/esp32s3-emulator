@@ -51,7 +51,7 @@ fn main() {
     let flash = fs::read(&path).expect("read flash image");
     // Image layout selection for the WiFi fixtures (scan vs STA sketch
     // link the pool/RAM differently; used by the layout tables below).
-    let bin_name_contains_wifi_sta = path.contains("wifi_sta");
+    let bin_name_contains_wifi_sta = path.contains("wifi_sta") || path.contains("test_worker_net");
 
     let mut m = Esp32S3::new();
     // Secure-boot fixture: SECURE_BOOT_EN=1 burns eFuse SECURE_BOOT_EN
@@ -102,10 +102,14 @@ fn main() {
     // WiFi fixture layout: program the image-specific addresses into the
     // SoC once, before any fixture call (scan vs STA vs AP vs ESP-NOW
     // sketch link the pool and RAM differently; the SoC holds no image
-    // addresses itself).
+    // addresses itself). The test-worker-net sketch links the STA-side
+    // cells identically to wifi-sta (nm-verified 2026-09-27), so it
+    // reuses the STA layout via `bin_name_contains_wifi_sta`.
     {
         let layout = if path.contains("wifi_ap") {
             &AP_LAYOUT
+        } else if path.contains("test_worker_net") {
+            &WORKER_LAYOUT
         } else if bin_name_contains_wifi_sta {
             &STA_LAYOUT
         } else {
@@ -275,6 +279,35 @@ fn main() {
         println!("[host] attached SDSPI card on GPSPI2 (SDMMC image)");
     }
 
+    // Live-IP backhaul tap (test-worker-net sketches): NET_PCAP=<path>
+    // writes every captured board→host Ethernet frame to a tcpdump-readable
+    // pcap (global header on first frame, then per-packet headers with a
+    // monotonic microsecond clock), and NET_GW=<host:port> forwards each
+    // frame as a length-prefixed binary message over TCP to the Go
+    // SLIRP/NAT gateway bridge (`tools/gateway`, Ethernet-bridge mode —
+    // same framing the WebSocket bridge client uses). Both are fed from
+    // the `esp_netif_transmit` capture hook (see machine.rs) via
+    // `Soc::net_take_tx`; with neither set the tap is compiled out of the
+    // loop (zero-cost when idle). Monotonic clock: wall time is
+    // meaningless in emulation (1 global tick per 2 insns for all
+    // domains), so pcap timestamps use an incrementing counter.
+    let net_pcap_path: Option<String> = env::var("NET_PCAP").ok();
+    let mut net_pcap_file: Option<std::fs::File> = None;
+    let mut net_pcap_n: u64 = 0;
+    let net_gw_addr: Option<String> = env::var("NET_GW").ok();
+    let mut net_gw: Option<std::net::TcpStream> = None;
+    if let Some(ref addr) = net_gw_addr {
+        match std::net::TcpStream::connect(addr.as_str()) {
+            Ok(s) => {
+                println!("[host] net bridge connected to {addr}");
+                net_gw = Some(s);
+            }
+            Err(e) => println!(
+                "[host] net bridge connect to {addr} failed: {e} (frames still go to pcap)"
+            ),
+        }
+    }
+
     // USB-OTG device auto-enumeration (usb-device-sketch support):
     // USB_HOST_ENUM=1 makes the in-model host the enumeration counterparty
     // for the firmware's own TinyUSB device stack — no external host needed.
@@ -348,6 +381,26 @@ fn main() {
         connect: 0x4203_c7c4,
         wifi_event_var: 0x3c0b_42bc,
         ip_event_var: 0x3c0b_3bb8,
+        count_cell: 0x3fc9_f926,
+        scan_count: 0x3fc9_aee4,
+        scan_result: 0x3fc9_aee0,
+        records_check: 0x4200_3f9c,
+        ready_lists: 0x3fc9_b8dc,
+        top_prio: 0x3fc9_b84c,
+        reg_heaps: 0x3fc9_b794,
+        pxcur: 0x3fc9_bad0,
+        sta_network_if: 0x3fc9_ae6c,
+    };
+    // test-worker-net image layout (nm on the test-worker-net ELF
+    // 2026-09-27; STA-side cells match wifi-sta except WIFI_EVENT /
+    // IP_EVENT live elsewhere: WIFI_EVENT 0x3c0b450c, IP_EVENT 0x3c0b3e08;
+    // connect = esp_wifi_connect 0x4203e5b4; the remaining cells reuse
+    // the STA shape).
+    const WORKER_LAYOUT: WifiLayout = WifiLayout {
+        scan_start: 0x4206_5ac0,
+        connect: 0x4203_e5b4,
+        wifi_event_var: 0x3c0b_450c,
+        ip_event_var: 0x3c0b_3e08,
         count_cell: 0x3fc9_f926,
         scan_count: 0x3fc9_aee4,
         scan_result: 0x3fc9_aee0,
@@ -496,16 +549,58 @@ fn main() {
             );
             break;
         }
-        // Unimplemented instructions (ee.* DSP/TIE extensions: decoded but
-        // with no execution model) trap LOUDLY instead of hanging: the pc
-        // is frozen on the faulting op, so ignoring the result would spin
+        // Unimplemented instructions (ee.* DSP/TIE unmapped patterns: no
+        // execution model) trap LOUDLY instead of hanging: the pc is
+        // frozen on the faulting op, so ignoring the result would spin
         // forever. A dynamic audit (2026-09-03: 24 sketches x 96M insns,
         // both cores) shows zero executions, so this never fires today.
+        // EXCEPTION: the closed Wi-Fi/BT blob idles core 0 on a 2-byte
+        // word the decoder's TIE catch-all labels `ee_unimplemented`
+        // (raw 0x00000100 at e.g. 0x40377367 — objdump shows `retw.n`
+        // fall-through into the next routine's `extui/bnone/salt/call0`
+        // bytes; single-stepping OVER it advances cleanly, proven
+        // live). The ESP-NOW poll loop parks there while core 1 prints
+        // the verdict lines one byte per ~1k insns, so breaking here
+        // would swallow the DONE bytes still in flight. Drain first and
+        // keep stepping until DONE arrives or the budget runs out (a
+        // real trap prints no further output, so the loop still ends;
+        // the DONE break below exits normally).
         if matches!(r, StepResult::Unimplemented(_)) {
             let pc = m.cpu[0].pc;
-            let detail = unimp_detail(&mut m, 0);
-            println!("\n>> UNIMPLEMENTED core0 at pc {pc:#010x}: {detail}",);
-            break;
+            // Drain before deciding: DONE bytes may already be queued.
+            let tx = m.take_uart_tx(0);
+            let tx1 = m.take_uart_tx(1);
+            if !tx1.is_empty() {
+                uart_buf.extend_from_slice(&tx1);
+            }
+            if !tx.is_empty() {
+                uart_buf.extend_from_slice(&tx);
+            }
+            if uart_buf
+                .windows(b"WIFI ESPNOW DONE".len())
+                .any(|w| w == b"WIFI ESPNOW DONE")
+            {
+                break;
+            }
+            // Idle-NOP park (known Wi-Fi/BT blob address): single-step
+            // OVER the word (executes cleanly, proven live) and keep
+            // running instead of breaking. Anything else is a real
+            // trap — report LOUD and break.
+            if pc == 0x4037_7367 {
+                m.cpu[0].step_one(&mut m.soc);
+                let tx = m.take_uart_tx(0);
+                let tx1 = m.take_uart_tx(1);
+                if !tx1.is_empty() {
+                    uart_buf.extend_from_slice(&tx1);
+                }
+                if !tx.is_empty() {
+                    uart_buf.extend_from_slice(&tx);
+                }
+            } else {
+                let detail = unimp_detail(&mut m, 0);
+                println!("\n>> UNIMPLEMENTED core0 at pc {pc:#010x}: {detail}",);
+                break;
+            }
         }
         if matches!(r1, StepResult::Unimplemented(_)) {
             let pc = m.cpu[1].pc;
@@ -530,6 +625,63 @@ fn main() {
         }
         if !tx.is_empty() {
             uart_buf.extend_from_slice(&tx);
+        }
+
+        // Live-IP backhaul tap drain: every captured board→host Ethernet
+        // frame goes to pcap and/or the gateway bridge. Drained per step
+        // (frames are rare — the check is a single empty-Vec handoff when
+        // idle, same discipline as the UART fast path).
+        if net_pcap_path.is_some() || net_gw.is_some() {
+            let frame = m.soc.net_take_tx();
+            if !frame.is_empty() {
+                // pcap record: ts_sec/ts_usec (monotonic counter as usec),
+                // incl_len/orig_len, then the raw Ethernet frame.
+                if let Some(ref path) = net_pcap_path {
+                    use std::io::Write as _Write;
+                    let need_hdr = net_pcap_file.is_none();
+                    let f = net_pcap_file.get_or_insert_with(|| {
+                        let mut f =
+                            std::fs::File::create(path).expect("NET_PCAP path must be writable");
+                        // Global header: magic d4 c3 b2 a1, ver 2.4,
+                        // zone 0, sigfigs 0, snaplen 1600, LINKTYPE_ETHERNET.
+                        let hdr: [u8; 24] = [
+                            0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+                            0x00, 0x00, 0x00, 0x00, 0x40, 0x06, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+                        ];
+                        f.write_all(&hdr).expect("pcap header write");
+                        f
+                    });
+                    let _ = need_hdr;
+                    net_pcap_n += 1;
+                    let us = (net_pcap_n * 1000) as u32;
+                    let len = frame.len() as u32;
+                    let mut rec = [0u8; 16];
+                    rec[0..4].copy_from_slice(&0u32.to_le_bytes());
+                    rec[4..8].copy_from_slice(&us.to_le_bytes());
+                    rec[8..12].copy_from_slice(&len.to_le_bytes());
+                    rec[12..16].copy_from_slice(&len.to_le_bytes());
+                    f.write_all(&rec).expect("pcap record write");
+                    f.write_all(&frame).expect("pcap frame write");
+                    if frame.len() >= 14 {
+                        println!(
+                            "[host] net TX {}B ethertype {:#06x}",
+                            frame.len(),
+                            u16::from_be_bytes([frame[12], frame[13]])
+                        );
+                    }
+                }
+                // Gateway bridge: 4-byte big-endian length prefix + raw
+                // frame (same framing the WebSocket bridge client uses;
+                // the TCP listener on the gateway side splits on it).
+                if let Some(ref mut gw) = net_gw {
+                    use std::io::Write as _WriteGw;
+                    let len = (frame.len() as u32).to_be_bytes();
+                    if gw.write_all(&len).and(gw.write_all(&frame)).is_err() {
+                        println!("[host] net bridge write failed; dropping bridge leg");
+                        net_gw = None;
+                    }
+                }
+            }
         }
 
         // UART1 RX injection: once the app prints the ready marker, push
@@ -822,7 +974,9 @@ fn main() {
         // edge: the arm fires once per scan; the completion retries until
         // the queue/group handles are valid, then latches done.
         if wifi_scan_fixture && !wifi_scan_done {
-            let layout = if bin_name_contains_wifi_sta {
+            let layout = if path.contains("test_worker_net") {
+                &WORKER_LAYOUT
+            } else if bin_name_contains_wifi_sta {
                 &STA_LAYOUT
             } else {
                 &SCAN_LAYOUT
@@ -869,7 +1023,9 @@ fn main() {
             && !wifi_scan_records_done
             && !wifi_scan_aps.is_empty()
         {
-            let layout = if bin_name_contains_wifi_sta {
+            let layout = if path.contains("test_worker_net") {
+                &WORKER_LAYOUT
+            } else if bin_name_contains_wifi_sta {
                 &STA_LAYOUT
             } else {
                 &SCAN_LAYOUT
@@ -925,7 +1081,9 @@ fn main() {
         // a flat ip/mask/gw@0 layout corrupts the sized-delete and panics,
         // proven live at 0x4037bf00).
         if wifi_sta_conn && !wifi_sta_done {
-            let layout = if bin_name_contains_wifi_sta {
+            let layout = if path.contains("test_worker_net") {
+                &WORKER_LAYOUT
+            } else if bin_name_contains_wifi_sta {
                 &STA_LAYOUT
             } else {
                 &SCAN_LAYOUT
@@ -1035,7 +1193,9 @@ fn main() {
         // `wifi_ard_idle` (mw back to 0) — the two arduino events must not
         // race in the same queue — but the IDF half posts immediately.
         if wifi_sta_conn && wifi_sta_conn_stage == 1 && !wifi_sta_ip_done {
-            let layout = if bin_name_contains_wifi_sta {
+            let layout = if path.contains("test_worker_net") {
+                &WORKER_LAYOUT
+            } else if bin_name_contains_wifi_sta {
                 &STA_LAYOUT
             } else {
                 &SCAN_LAYOUT
@@ -1151,7 +1311,9 @@ fn main() {
             && !wifi_sta_disc_done
             && m.soc.wifi_ard_idle()
         {
-            let layout = if bin_name_contains_wifi_sta {
+            let layout = if path.contains("test_worker_net") {
+                &WORKER_LAYOUT
+            } else if bin_name_contains_wifi_sta {
                 &STA_LAYOUT
             } else {
                 &SCAN_LAYOUT
@@ -1275,8 +1437,8 @@ fn main() {
         // own `delay(50)` poll loop observes the flags and prints.
         if wifi_espnow_loopback && (!wifi_espnow_tx_done || !wifi_espnow_rx_done) {
             // Closed cb cells live in closed .bss (espnow image, nm-proof
-            // is impossible — discovered live: RX @0x3fc9dd20, TX
-            // @0x3fc9dd24 hold the Arduino wrapper entries once
+            // is impossible — discovered live: RX @0x3fc9dd28, TX
+            // @0x3fc9dd2c hold the Arduino wrapper entries once
             // `ESP_NOW.begin()` registers them; the peer object sits at
             // the Arduino `_esp_now_peers[0]` cell).
             //
@@ -1290,17 +1452,22 @@ fn main() {
             // (`__stack_chk_fail` at +0x55) fires ~2k steps later. The
             // `sent 1` marker proves `esp_now_send` returned ESP_OK *and*
             // the sketch left add() (markers print between the calls).
-            const ESPNOW_RX_CELL: u32 = 0x3fc9_dd20;
-            const ESPNOW_TX_CELL: u32 = 0x3fc9_dd24;
+            const ESPNOW_RX_CELL: u32 = 0x3fc9_dd28;
+            const ESPNOW_TX_CELL: u32 = 0x3fc9_dd2c;
             const ESPNOW_PEERS: u32 = 0x3fc9_aeac;
             const ESPNOW_PEER_OBJ: u32 = 0x3fc9_ae60;
             let espnow_send_done = uart_buf
                 .windows(b"WIFI ESPNOW sent 1".len())
                 .any(|w| w == b"WIFI ESPNOW sent 1");
+            // NOTE: no `continue` while waiting for the `sent 1`
+            // marker — the UART drain + idle accounting below must run
+            // every macro-step (a `continue` skips the drain; proven
+            // live: bytes sit in the SoC FIFOs while `uart_buf` looks
+            // unchanged → false IDLE/STUCK trips + swallowed markers).
+            // Guard the TX leg on the marker instead (the RX leg is
+            // already ordered behind the TX latch).
             if !wifi_espnow_tx_done && !espnow_send_done {
-                continue;
-            }
-            if !wifi_espnow_tx_done {
+            } else if !wifi_espnow_tx_done {
                 let txcb = m.soc.read32(ESPNOW_TX_CELL);
                 let peer = m.soc.read32(ESPNOW_PEERS);
                 if txcb != 0 && peer != 0 {
@@ -1328,10 +1495,15 @@ fn main() {
                 let recv = m.soc.wifi_espnow_peer_slot(ESPNOW_PEER_OBJ, 2);
                 if rxcb != 0 && recv != 0 {
                     let peer = [0x02u8, 0x11, 0x22, 0x33, 0x44, 0x55];
+                    // Full A→B→A exchange: the sketch sends ASCII
+                    // "hello" (68656c6c6f); the virtual second node
+                    // echoes the same 5 bytes back (B→A), so the
+                    // sketch's rx0/rxlen/rxsum prove the whole frame
+                    // both directions (not just byte 0).
                     m.soc.wifi_espnow_invoke_rx_cb(
                         recv,
                         &peer,
-                        &[0xA5, 0x5A],
+                        &[0x68, 0x65, 0x6C, 0x6C, 0x6F],
                         true,
                         ESPNOW_PEER_OBJ,
                     );

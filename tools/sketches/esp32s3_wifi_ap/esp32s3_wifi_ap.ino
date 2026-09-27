@@ -17,6 +17,8 @@ void setup() {
   if (ok) {
     Serial.print("WIFI AP IP ");
     Serial.println(WiFi.softAPIP());
+    Serial.print("WIFI AP MAC ");
+    Serial.println(WiFi.softAPmacAddress());
     Serial.print("WIFI AP stations ");
     Serial.println(WiFi.softAPgetStationNum());
     wifi_sta_list_t clients;

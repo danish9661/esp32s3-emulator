@@ -72,6 +72,13 @@ use crate::wifi::Wifi;
 /// * `EVT_I2C_WRITE` (3): `a` = channel, `b` = data byte.
 /// * `EVT_I2C_READ` (4): `a` = channel, `b` = data byte (value the MCU read).
 /// * `EVT_I2C_STOP` (5): `a` = channel.
+/// * `EVT_NET_FRAME` (6): `a` = direction (0 = board→host TX, 1 = host→board
+///   RX loopback), `b` = frame byte count; the bytes themselves are
+///   retrieved via [`Soc::net_take_tx`]. Emitted by the `esp_netif_transmit`
+///   capture hook (see `Soc::net_capture_tx`); the host feeds the bytes to
+///   the Go SLIRP/NAT gateway over its WebSocket Ethernet bridge
+///   (`tools/gateway`, `ws://127.0.0.1:5050/api/network-gateway`) and writes
+///   them to a tcpdump-readable pcap (see `run_flash` NET_PCAP/NET_GW).
 #[derive(Clone, Copy, Debug)]
 pub struct EmuEvent {
     pub kind: u8,
@@ -85,6 +92,7 @@ pub const EVT_I2C_START: u8 = 2;
 pub const EVT_I2C_WRITE: u8 = 3;
 pub const EVT_I2C_READ: u8 = 4;
 pub const EVT_I2C_STOP: u8 = 5;
+pub const EVT_NET_FRAME: u8 = 6;
 
 /// RTC-retained state (slow/fast memory + ULP core) snapshotted before a
 /// deep-sleep reboot and restored after (silicon retention behavior).
@@ -599,6 +607,11 @@ pub struct Soc {
     /// Most recent SPI MOSI byte stream per channel, retrieved by the host
     /// when it sees an `EVT_SPI_XFER` event.
     pending_spi_tx: [Vec<u8>; 2],
+    /// Most recent captured Ethernet TX frame (board→host), retrieved by
+    /// the host when it sees an `EVT_NET_FRAME` event (see
+    /// `net_capture_tx` / `net_take_tx`). Grows only while frames are
+    /// captured; drained per event like the SPI path.
+    pending_net_tx: Vec<u8>,
 
     /// Block-boundary cache for block-at-a-time execution (machine
     /// `step_fast`): per core, `fast_tag[c][i]` is the block-start pc
@@ -716,6 +729,7 @@ impl Soc {
             events: Vec::new(),
             last_gpio_out: 0,
             pending_spi_tx: [Vec::new(), Vec::new()],
+            pending_net_tx: Vec::new(),
             fast_tag: [
                 Box::new([FAST_TAG_INVALID; FAST_CACHE_SIZE]),
                 Box::new([FAST_TAG_INVALID; FAST_CACHE_SIZE]),
@@ -2300,7 +2314,7 @@ impl Soc {
                 dirty = true;
             }
             if st.espnow_send_seen {
-                let txcb = self.read32(0x3fc9_dd20 + 4);
+                let txcb = self.read32(0x3fc9_dd2c);
                 let peer = self.read32(0x3fc9_aeac);
                 if txcb != 0 && peer != 0 {
                     let m0 = self.read32(0x3fc9_ae60 + 4);
@@ -2314,11 +2328,20 @@ impl Soc {
                 }
             }
         } else if !st.espnow_rx_done {
-            let rxcb = self.read32(0x3fc9_dd20);
+            let rxcb = self.read32(0x3fc9_dd28);
             let recv = self.wifi_espnow_peer_slot(0x3fc9_ae60, 2);
             if rxcb != 0 && recv != 0 {
                 let peer = [0x02u8, 0x11, 0x22, 0x33, 0x44, 0x55];
-                self.wifi_espnow_invoke_rx_cb(recv, &peer, &[0xA5, 0x5A], true, 0x3fc9_ae60);
+                // Full A→B→A exchange (mirrors run_flash): the sketch
+                // sends ASCII "hello" (68656c6c6f); the virtual second
+                // node echoes the same 5 bytes back.
+                self.wifi_espnow_invoke_rx_cb(
+                    recv,
+                    &peer,
+                    &[0x68, 0x65, 0x6C, 0x6C, 0x6F],
+                    true,
+                    0x3fc9_ae60,
+                );
                 st.espnow_rx_done = true;
                 dirty = true;
             }
@@ -3198,6 +3221,40 @@ impl Soc {
     /// [`Soc::spi_inject_miso`].
     pub fn spi_take_tx(&mut self, chan: usize) -> Vec<u8> {
         core::mem::take(&mut self.pending_spi_tx[chan])
+    }
+
+    /// Capture one board→host Ethernet frame at the `esp_netif_transmit`
+    /// entry hook (called by the machine when firmware enters the linked
+    /// `esp_netif_transmit(esp_netif, data, len)` callee — the single lwIP
+    /// egress point for DHCP/ARP/IP/ICMP/UDP/TCP). `data`/`len` are the
+    /// caller's buffer pointer + byte count (callee a3/a4 = caller
+    /// a11/a12, read BEFORE `step_one` while wb still names the caller).
+    /// Copies `len` bytes (capped at 1600, the 1500-MTU + headroom class)
+    /// into `pending_net_tx` and queues an `EVT_NET_FRAME` event; the host
+    /// drains the bytes via [`Soc::net_take_tx`] and feeds them to the Go
+    /// gateway bridge + pcap. No-op on a short/empty read (never panics on
+    /// firmware pointers — a bad pointer just captures whatever the bus
+    /// returns, like the UART FIFO path).
+    pub fn net_capture_tx(&mut self, data: u32, len: u32) {
+        use xtensa_core::Bus as _Bus;
+        let n = (len as usize).min(1600);
+        let mut frame = alloc::vec::Vec::with_capacity(n);
+        for k in 0..n {
+            frame.push(self.read8(data + k as u32) as u8);
+        }
+        self.pending_net_tx = frame;
+        self.events.push(EmuEvent {
+            kind: EVT_NET_FRAME,
+            a: 0, // 0 = board→host TX
+            b: n as u32,
+        });
+    }
+
+    /// Retrieve the most recent captured board→host Ethernet frame and
+    /// clear it. Call this when an `EVT_NET_FRAME` event arrives, then
+    /// forward the bytes to the gateway bridge / pcap writer.
+    pub fn net_take_tx(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.pending_net_tx)
     }
 
     /// Inject MISO bytes for the next SPI transfer on `chan`

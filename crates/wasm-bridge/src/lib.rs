@@ -187,6 +187,15 @@ impl Emulator {
         self.inner.soc.spi_take_tx(chan as usize)
     }
 
+    /// Take the most recent captured board→host Ethernet frame (bytes)
+    /// and clear it. Call this when an `EVT_NET_FRAME` (kind 6) event
+    /// arrives, then forward the bytes to the gateway bridge WebSocket
+    /// (`ws://127.0.0.1:5050/api/network-gateway`, binary message =
+    /// raw Ethernet frame) — the browser-side live-IP backhaul path.
+    pub fn net_take_tx(&mut self) -> Vec<u8> {
+        self.inner.soc.net_take_tx()
+    }
+
     /// Inject RX bytes for the next I2C master-read on `chan`
     /// (0=I2CEXT0, 1=I2CEXT1). Each byte is returned to the MCU on a READ; an
     /// empty supply reads back 0xFF (no device).

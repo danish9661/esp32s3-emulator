@@ -14,6 +14,7 @@
 //   bridge.gpio.onChange((pin, level) => { /* LED matrix, button, ... */ });
 //   bridge.spi.onTransfer((chan, tx) => { return rxBytes; });   // inject MISO
 //   bridge.i2c.onRead((chan) => 0x57);                            // inject RX byte
+//   bridge.net.onFrame((frame) => gatewaySocket.send(frame));    // live-IP backhaul
 //   // inside the animation loop, right after emu.step(n):
 //   bridge.dispatch();
 
@@ -24,6 +25,7 @@ export const EVT = {
   I2C_WRITE: 3,
   I2C_READ: 4,
   I2C_STOP: 5,
+  NET_FRAME: 6,
 };
 
 export class PeripheralBridge {
@@ -32,6 +34,7 @@ export class PeripheralBridge {
     this.gpio = new GpioPeripheral();
     this.spi = new SpiPeripheral();
     this.i2c = new I2cPeripheral();
+    this.net = new NetPeripheral();
   }
 
   // Drain the emulator's event queue and dispatch each event to the matching
@@ -69,6 +72,14 @@ export class PeripheralBridge {
         case EVT.I2C_STOP:
           this.i2c._emitStop(e.a);
           break;
+        case EVT.NET_FRAME: {
+          // A captured board→host Ethernet frame is available via
+          // net_take_tx; virtual network devices forward its bytes (e.g.
+          // to the Go gateway WebSocket as a binary message = raw frame).
+          const frame = this.emu.net_take_tx();
+          this.net._emit(frame);
+          break;
+        }
       }
     }
   }
@@ -91,6 +102,13 @@ class SpiPeripheral {
     for (const cb of this._cbs) rx = cb(chan, tx);
     return rx;
   }
+}
+
+class NetPeripheral {
+  constructor() { this._cbs = []; }
+  // cb(frame: Uint8Array) — one captured board→host Ethernet frame.
+  onFrame(cb) { this._cbs.push(cb); }
+  _emit(frame) { for (const cb of this._cbs) cb(frame); }
 }
 
 class I2cPeripheral {

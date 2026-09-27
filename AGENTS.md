@@ -4484,3 +4484,36 @@ full enumeration REQ0..REQ6 — is covered),
       `test-worker-*` suites are unvalidatable offline: no counterparty
       exists in-tree. Documented in README + odc (new "Live IP
       backhaul" row). BLE stays out per directive.
+  - 2026-09-27: **WiFi follow-ups: SoftAP MAC print + full ESP-NOW hello
+    exchange (both battery-green, 8/8 wifi cases)**.
+    - **SoftAP MAC** (`tools/sketches/esp32s3_wifi_ap` + `WIFI AP MAC
+      62:55:44:33:22:11` marker): the sketch now prints
+      `WiFi.softAPmacAddress()` and the battery/harness assert it.
+      Ground truth: NO model change was needed — the live
+      `s_wifi_mac`-table path already serves the factory-MAC-derived
+      bytes (proven: `WIFI AP MAC 62:55:44:33:22:11` with the stock
+      hook set). An `esp_wifi_get_if_mac`-skip hook was tried and
+      REVERTED (it hangs the boot: the caller's `beqz`-gated store +
+      `esp_wifi_get_mac` copy do the table→caller work — skipping
+      starves them; and the 0x42064128-callee hook could never fire —
+      `entry` rotates the window first, caller a10/a11 read 0/0).
+      Lesson: hook the narrowest observable that is provably live, and
+      never skip a call whose caller does post-call work.
+    - **ESP-NOW full A→B→A hello exchange** (was 2-byte A5/5A): sketch
+      sends ASCII "hello" (68656c6c6f), prints `rx0 68`/`rxlen 5`/
+      `rxsum 14`, battery + harness assert all three. Three stacked
+      fixes, each live-proven: (1) cb cells moved 0x3fc9dd20/24 →
+      0x3fc9dd28/2c (fresh-elf DRAM scan; the old addrs read 0 so both
+      legs silently never fired); (2) run_flash `continue`-while-
+      waiting skipped the per-step UART drain → false IDLE/STUCK +
+      swallowed markers (guard on the marker instead, no `continue`);
+      (3) the `retw.n` idle-NOP at 0x40377367 (decoder TIE catch-all
+      `ee_unimplemented`, raw 0x100) parks core 0 while core 1 prints
+      the verdict one byte per ~1k insns — the harness broke at the
+      trap BEFORE draining DONE (DONE arrives +48k insns later, proven
+      by byte-level drain trace). Fix: on that KNOWN park pc only,
+      drain + single-step OVER the word (executes cleanly) and keep
+      running; all other Unimplemented still break LOUD. Same
+      treatment mirrored in the SoC fixture engine (`soc.rs` RX
+      payload). Battery wifi 8/8 (scan/sta/ap/espnow × run_flash +
+      inwasm).
