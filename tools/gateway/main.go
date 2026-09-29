@@ -28,6 +28,22 @@ var upgrader = websocket.Upgrader{
 type Client struct {
 	Conn       *websocket.Conn
 	WriteMutex sync.Mutex
+	// TCP ingest leg (run_flash NET_GW): when non-nil the client speaks
+	// length-prefixed frames over a raw TCP connection instead of a
+	// WebSocket. Replies use `sendFrame`, which picks the transport.
+	TCP        net.Conn
+}
+
+// sendFrame delivers one gateway→board frame to a client on whatever
+// transport it speaks (WS binary message vs TCP length-prefix). All
+// hub→client reply paths must use this — never `Conn.WriteMessage`
+// directly — so TCP-ingest peers get their DHCP/ARP/IPv6/gVisor
+// replies back.
+func sendFrame(client *Client, frame []byte) error {
+	if client.TCP != nil {
+		return sendToTCPClientRaw(client, frame)
+	}
+	return client.Conn.WriteMessage(websocket.BinaryMessage, frame)
 }
 
 type Room struct {
@@ -201,6 +217,17 @@ func main() {
 	// Periodic IPv6 Router Advertisements (see handleIPv6.go).
 	go startPeriodicRA()
 
+	// Native TCP ingest for the emulator's NET_GW leg (run_flash
+	// NET_GW=<host:port>): length-prefixed raw Ethernet frames (4-byte
+	// big-endian length + frame bytes — same framing the WS bridge client
+	// uses, minus the WebSocket envelope). Each connection joins the
+	// default room as a headless client: frames flow into the gVisor
+	// stack + DHCP/ARP/IPv6 handlers exactly like WS frames, and
+	// gateway→board replies are sent back length-prefixed on the same
+	// TCP connection. Port is ws-port + 1 (5051) so one gateway serves
+	// both transports.
+	go startTCPIngest("127.0.0.1:5051")
+
 	http.HandleFunc("/api/ble-gateway", handleBLEGateway)
 	http.HandleFunc("/api/thread-gateway", handleThreadGateway)
 
@@ -259,11 +286,236 @@ func gvisorToClientsLoop(room *Room) {
 
 		for _, client := range targets {
 			client.WriteMutex.Lock()
-			err = client.Conn.WriteMessage(websocket.BinaryMessage, buf)
+			err = sendFrame(client, buf)
 			client.WriteMutex.Unlock()
 			if err != nil {
 				fmt.Printf("[Room %s] Client Write Error: %v\n", room.SessionId, err)
 			}
+		}
+	}
+}
+
+// startTCPIngest serves the native TCP ingest leg for headless emulator
+// runs (run_flash NET_GW=<host:port>, framing = 4-byte big-endian length
+// + raw Ethernet frame). Each accepted connection joins the default
+// (global-VN) room as a headless client sharing the hub loop with the
+// WebSocket clients: board→gateway frames reuse handleTCPFrame (the same
+// DHCP/ARP/UDP-forward/IPv6/gVisor pipeline handleClient runs), and
+// gateway→board replies (DHCP offers, ARP replies, gVisor returns) are
+// written back length-prefixed on the same TCP connection.
+func startTCPIngest(addr string) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Printf("[TCP Ingest] Listen %s failed: %v (NET_GW leg disabled)\n", addr, err)
+		return
+	}
+	fmt.Printf("[TCP Ingest] Listening on %s (length-prefixed raw Ethernet)\n", addr)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			fmt.Printf("[TCP Ingest] Accept error: %v\n", err)
+			continue
+		}
+		go handleTCPConn(conn)
+	}
+}
+
+func defaultRoom() *Room {
+	roomsMutex.Lock()
+	defer roomsMutex.Unlock()
+	room, exists := rooms["tcp-ingest"]
+	if exists {
+		return room
+	}
+	if globalVN == nil {
+		config := types.Configuration{
+			Debug:             false,
+			MTU:               1500,
+			Subnet:            "192.168.4.0/24",
+			GatewayIP:         "192.168.4.1",
+			GatewayMacAddress: "5a:94:ef:e4:0c:dd",
+		}
+		vn, err := virtualnetwork.New(&config)
+		if err != nil {
+			fmt.Printf("[TCP Ingest] virtual network create failed: %v\n", err)
+			return nil
+		}
+		globalVN = vn
+	}
+	pipe1, pipe2, err := connLoopback()
+	if err != nil {
+		fmt.Printf("[TCP Ingest] pipe create failed: %v\n", err)
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	room = &Room{
+		SessionId: "tcp-ingest",
+		VN:        globalVN,
+		Clients:   make(map[*Client]bool),
+		PipeToVN:  pipe2,
+		Ctx:       ctx,
+		Cancel:    cancel,
+		NextIP:    2,
+		MacToIP:   make(map[string]net.IP),
+	}
+	rooms["tcp-ingest"] = room
+	go globalVN.AcceptQemu(ctx, pipe1)
+	go gvisorToClientsLoop(room)
+	fmt.Printf("[TCP Ingest] Created virtual network room: tcp-ingest\n")
+	return room
+}
+
+func handleTCPConn(conn net.Conn) {
+	room := defaultRoom()
+	if room == nil {
+		conn.Close()
+		return
+	}
+	client := &Client{TCP: conn}
+	room.Lock()
+	room.Clients[client] = true
+	room.Unlock()
+	fmt.Printf("[TCP Ingest] Client connected: %s\n", conn.RemoteAddr())
+	defer func() {
+		conn.Close()
+		room.Lock()
+		delete(room.Clients, client)
+		room.Unlock()
+		fmt.Printf("[TCP Ingest] Client disconnected: %s\n", conn.RemoteAddr())
+	}()
+	for {
+		var length uint32
+		if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
+			if err != io.EOF {
+				fmt.Printf("[TCP Ingest] Read error (size): %v\n", err)
+			}
+			return
+		}
+		if length == 0 || length > 1600 {
+			fmt.Printf("[TCP Ingest] Bad frame length %d, dropping connection\n", length)
+			return
+		}
+		msg := make([]byte, length)
+		if _, err := io.ReadFull(conn, msg); err != nil {
+			fmt.Printf("[TCP Ingest] Read error (data): %v\n", err)
+			return
+		}
+		handleTCPFrame(client, room, msg)
+	}
+}
+
+// sendToTCPClient writes one gateway→board frame back over the TCP leg
+// (length-prefixed, same framing as ingest). Prefer `sendFrame`.
+func sendToTCPClient(client *Client, frame []byte) {
+	client.WriteMutex.Lock()
+	defer client.WriteMutex.Unlock()
+	if err := sendToTCPClientRaw(client, frame); err != nil {
+		fmt.Printf("[TCP Ingest] Write error: %v\n", err)
+	}
+}
+
+// sendToTCPClientRaw is the lock-free TCP write used under an already-held
+// WriteMutex (see sendFrame callers that hold the lock).
+func sendToTCPClientRaw(client *Client, frame []byte) error {
+	if err := binary.Write(client.TCP, binary.BigEndian, uint32(len(frame))); err != nil {
+		return err
+	}
+	_, err := client.TCP.Write(frame)
+	return err
+}
+
+// handleTCPFrame runs one board→gateway frame through the hub pipeline:
+// DHCP intercept, gateway-ARP fast reply, ICMPv4 echo, UDP-forward relay,
+// IPv6 services, then gVisor feed + room broadcast (TCP peers get
+// length-prefixed frames; WS peers get binary messages). Mirrors the
+// binary-message arm of handleClient; keep the two in sync.
+func handleTCPFrame(client *Client, room *Room, msg []byte) {
+	if len(msg) >= 14 {
+		dst := msg[0:6]
+		src := msg[6:12]
+		ethType := binary.BigEndian.Uint16(msg[12:14])
+		fmt.Printf("[%s] [ESP32 -> Hub] >> Eth Frame (dst=%x, src=%x, type=0x%04x, len=%d)\n", time.Now().Format("15:04:05.000"), dst, src, ethType, len(msg))
+	}
+	packet := gopacket.NewPacket(msg, layers.LayerTypeEthernet, gopacket.Default)
+	if arpLayer := packet.Layer(layers.LayerTypeARP); arpLayer != nil {
+		arp, _ := arpLayer.(*layers.ARP)
+		if arp.Operation == layers.ARPRequest &&
+			(arp.DstProtAddress[0] == 192 && arp.DstProtAddress[1] == 168 &&
+				arp.DstProtAddress[2] == 4 && arp.DstProtAddress[3] == 1) {
+			sendTCPARPReply(client, arp)
+			return
+		}
+		// Proxy-ARP for any OTHER 192.168.4.0/24 target (e.g. 8.8.8.8 is
+		// off-LAN, but so is every internet IP the board ARPs for first):
+		// answer with the gateway MAC so the board sends the IP packet to
+		// us and gVisor NAT can do its job. Without this the board's ARP
+		// goes unanswered (gVisor only ARPs for its own IP) and the IP
+		// packet is never transmitted (proven live 2026-09-29 with DNS).
+		if arp.Operation == layers.ARPRequest && len(arp.DstProtAddress) == 4 {
+			sendProxyARPReply(client, arp)
+			return
+		}
+	}
+	// ICMPv4 echo (board → gateway): answer gateway-destined echo requests
+	// here (gVisor also answers, but the direct reply is deterministic and
+	// keeps the worker battery assertion off wall-clock NAT timing).
+	if snoopICMPv4(msg, client, room) {
+		return
+	}
+	if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
+		udp, _ := udpLayer.(*layers.UDP)
+		if udp.DstPort == 67 {
+			handleTCPDHCP(msg, packet, client, room)
+			return // DO NOT forward to gVisor or other clients!
+		}
+	}
+	if divertTCPUDPForward(packet, room) {
+		return
+	}
+	if snoopTCPIPv6(msg, client, room) {
+		return
+	}
+	isEspNow := len(msg) > 4 && msg[0] == 0xE5 && msg[1] == 0x50 && msg[2] == 0x4E && msg[3] == 0x57
+	if !isEspNow {
+		room.Lock()
+		pipe := room.PipeToVN
+		room.Unlock()
+		if pipe != nil {
+			var werr error
+			vnPipeMu.Lock()
+			werr = binary.Write(pipe, binary.BigEndian, uint32(len(msg)))
+			if werr == nil {
+				_, werr = pipe.Write(msg)
+			}
+			vnPipeMu.Unlock()
+			if werr != nil {
+				fmt.Printf("[Room %s] Pipe Write Error: %v\n", room.SessionId, werr)
+				return
+			}
+		}
+	}
+	room.Lock()
+	targets := make([]*Client, 0, len(room.Clients))
+	for otherClient := range room.Clients {
+		if otherClient != client {
+			targets = append(targets, otherClient)
+		}
+	}
+	room.Unlock()
+	for _, otherClient := range targets {
+		otherClient.WriteMutex.Lock()
+		var werr error
+		if otherClient.TCP != nil {
+			werr = binary.Write(otherClient.TCP, binary.BigEndian, uint32(len(msg)))
+			if werr == nil {
+				_, werr = otherClient.TCP.Write(msg)
+			}
+		} else {
+			werr = otherClient.Conn.WriteMessage(websocket.BinaryMessage, msg)
+		}
+		otherClient.WriteMutex.Unlock()
+		if werr != nil {
+			fmt.Printf("[Room %s] Client Write Error: %v\n", room.SessionId, werr)
 		}
 	}
 }
@@ -354,6 +606,12 @@ func handleClient(client *Client, room *Room) {
 					sendARPReply(client, arp)
 					continue
 				}
+				// Proxy-ARP for any other target (same as the TCP leg):
+				// without it off-LAN DNS/UDP never leaves the board.
+				if arp.Operation == layers.ARPRequest && len(arp.DstProtAddress) == 4 {
+					sendProxyARPReply(client, arp)
+					continue
+				}
 			}
 			if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
 				udp, _ := udpLayer.(*layers.UDP)
@@ -408,8 +666,11 @@ func handleClient(client *Client, room *Room) {
 
 			for _, otherClient := range targets {
 				otherClient.WriteMutex.Lock()
-				otherClient.Conn.WriteMessage(websocket.BinaryMessage, msg)
+				werr := sendFrame(otherClient, msg)
 				otherClient.WriteMutex.Unlock()
+				if werr != nil {
+					fmt.Printf("[Room %s] Client Write Error: %v\n", room.SessionId, werr)
+				}
 			}
 
 			if err != nil {

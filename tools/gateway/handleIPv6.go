@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/google/gopacket"
 )
 
 // ---- IPv6 gateway support (board <-> gateway only) ----------------------
@@ -127,11 +127,27 @@ func sendIPv6(client *Client, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, next
 		binary.BigEndian.PutUint16(frame[60:62], ck)
 	}
 	client.WriteMutex.Lock()
-	werr := client.Conn.WriteMessage(websocket.BinaryMessage, frame)
+	werr := sendFrame(client, frame)
 	client.WriteMutex.Unlock()
 	if werr != nil {
 		fmt.Printf("[IPv6] send to %s failed: %v\n", dstIP.String(), werr)
 	}
+}
+
+// snoopTCPIPv6 is the TCP-ingest twin of snoopIPv6 (same RS/RA, NS/NA,
+// echo, UDP-echo services — sendIPv6 now routes via sendFrame, so the
+// shared implementation already reaches TCP-leg clients). Kept as an
+// explicit entry point so handleTCPFrame reads symmetric with
+// handleClient.
+func snoopTCPIPv6(msg []byte, client *Client, room *Room) bool {
+	return snoopIPv6(msg, client, room)
+}
+
+// divertTCPUDPForward is the TCP-ingest twin of divertUDPForward (same
+// relay map — replies addressed to 192.168.4.1:<alloc> are relayed to
+// the host UDP client regardless of which transport delivered them).
+func divertTCPUDPForward(packet gopacket.Packet, room *Room) bool {
+	return divertUDPForward(packet, room)
 }
 
 func v6Addr(b []byte) net.IP {

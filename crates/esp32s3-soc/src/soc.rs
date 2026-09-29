@@ -176,6 +176,9 @@ pub enum WifiImage {
     Sta,
     Ap,
     EspNow,
+    /// Live-IP backhaul worker (test-worker-net sketch): STA-side cells,
+    /// own linked pcs (see `wifi_fixture_layout` Worker arm).
+    Worker,
 }
 
 /// Per-image linked addresses for the Wi-Fi fixture engine (see
@@ -612,6 +615,24 @@ pub struct Soc {
     /// `net_capture_tx` / `net_take_tx`). Grows only while frames are
     /// captured; drained per event like the SPI path.
     pending_net_tx: Vec<u8>,
+    /// Host→board Ethernet frames staged for injection (gateway→board
+    /// replies: ARP/DHCP/IPv6/gVisor returns read off the NET_GW TCP leg).
+    /// FIFO: `net_inject_rx` pushes, the machine's `esp_netif_receive`
+    /// entry hook pops one frame per call. Bounded (8 frames) so a chatty
+    /// gateway can't grow memory; excess drops with a counter (see
+    /// `net_rx_dropped`).
+    pending_net_rx: Vec<alloc::vec::Vec<u8>>,
+    /// Count of dropped host→board frames (RX FIFO full). Host-visible
+    /// for the NET_RX_DROPPED battery assertion.
+    net_rx_dropped: u32,
+    /// Scratch address of the last RX-injected frame buffer (host-side
+    /// allocation inside `WIFI_SCRATCH`, past the event-payload bump
+    /// cursor — see `net_inject_rx`). Lets tests assert the hook staged
+    /// the right bytes without re-reading firmware memory.
+    net_rx_last_buf: u32,
+    /// Length of the last RX-injected frame (bytes staged at
+    /// `net_rx_last_buf`).
+    net_rx_last_len: u32,
 
     /// Block-boundary cache for block-at-a-time execution (machine
     /// `step_fast`): per core, `fast_tag[c][i]` is the block-start pc
@@ -730,6 +751,10 @@ impl Soc {
             last_gpio_out: 0,
             pending_spi_tx: [Vec::new(), Vec::new()],
             pending_net_tx: Vec::new(),
+            pending_net_rx: Vec::new(),
+            net_rx_dropped: 0,
+            net_rx_last_buf: 0,
+            net_rx_last_len: 0,
             fast_tag: [
                 Box::new([FAST_TAG_INVALID; FAST_CACHE_SIZE]),
                 Box::new([FAST_TAG_INVALID; FAST_CACHE_SIZE]),
@@ -1877,6 +1902,11 @@ impl Soc {
     /// and reports whether it fired (caller then skips the call).
     /// Returns false while unstaged (caller lets the call run — it fails
     /// soft like silicon with no lease, `localIP()` → 0.0.0.0).
+    /// True while the fixture IP info is staged (probe observability).
+    pub fn wifi_ip_info_staged(&self) -> bool {
+        self.wifi_ip_info.is_some()
+    }
+
     pub fn wifi_hook_get_ip_info(&mut self, out: u32) -> bool {
         use xtensa_core::Bus as _Bus;
         let Some(info) = self.wifi_ip_info else {
@@ -2008,15 +2038,21 @@ impl Soc {
     /// pc-intercept hook for `esp_wifi_ap_get_sta_list`: serve the
     /// staged station count (0 — no RF stations can associate; the host
     /// is the only counterparty and it never associates as an AP
-    /// client). `wifi_sta_list_t` = num u32@0 + sta[14]@4; write num=0.
-    /// Reports staged (caller skips with ESP_OK) once AP data is staged;
-    /// false while unstaged (caller lets the call run).
+    /// client). S3 `wifi_sta_list_t` (`esp_wifi_types_native.h`) =
+    /// sta[15]@0 (each `wifi_sta_info_t` 12B: mac[6]+rssi+pad+flags, so
+    /// 180B) + num@180 — NOT num@0 (that layout is the `wifi_sta_mac_ip_
+    /// list_t` twin). Write num=0 at out+180 (and zero the sta array for
+    /// determinism). Reports staged (caller skips with ESP_OK) once AP
+    /// data is staged; false while unstaged (caller lets the call run).
     pub fn wifi_hook_ap_sta_list(&mut self, out: u32) -> bool {
         use xtensa_core::Bus as _Bus;
         if self.wifi_ap_config.is_none() {
             return false;
         }
-        self.write32(out, self.wifi_ap_stations);
+        for k in 0..184u32 {
+            self.write8(out + k, 0);
+        }
+        self.write32(out + 180, self.wifi_ap_stations);
         true
     }
 
@@ -2056,6 +2092,9 @@ impl Soc {
                 // wifi-ap image layout (nm on the wifi-ap ELF; verified
                 // 2026-09-23: ready_lists/top_prio/reg_heaps/pxcur match
                 // the STA shape; WIFI_EVENT/IP_EVENT + ap netif differ).
+                // `esp_wifi_start` re-verified 2026-09-28 (0x42063870;
+                // the old 0x42063840 never fires on this image, so the AP
+                // leg never staged and `stations` read an unstaged count).
                 WifiImageLayout {
                     scan_start: 0x4206_3b94,
                     connect: 0x4203_c7e0,
@@ -2070,7 +2109,7 @@ impl Soc {
                     reg_heaps: 0x3fc9_b794,
                     pxcur: 0x3fc9_bad0,
                     sta_network_if: 0x3fc9_ae64,
-                    esp_wifi_start: 0x4206_3840,
+                    esp_wifi_start: 0x4206_3870,
                 }
             }
             WifiImage::EspNow => {
@@ -2114,6 +2153,31 @@ impl Soc {
                     esp_wifi_start: 0x4206_383c,
                 }
             }
+            WifiImage::Worker => {
+                // test-worker-net image layout (nm on the test-worker-net
+                // ELF, re-verified after the keep-alive relink: scan_start
+                // 0x42063c3c, connect 0x4203c8f8, event vars 0x3c0b4304 /
+                // 0x3c0b3c00; the TX/RX tap pcs live in the machine.rs
+                // wifi_image gate, not in this table. The worker sketch
+                // never scans, so records_check is an unused placeholder
+                // (scan leg never arms on this image).
+                WifiImageLayout {
+                    scan_start: 0x4206_3c3c,
+                    connect: 0x4203_c8f8,
+                    wifi_event_var: 0x3c0b_4304,
+                    ip_event_var: 0x3c0b_3c00,
+                    count_cell: 0x3fc9_f926,
+                    scan_count: 0x3fc9_aee4,
+                    scan_result: 0x3fc9_aee0,
+                    records_check: 0x4200_3f9c,
+                    ready_lists: 0x3fc9_b8dc,
+                    top_prio: 0x3fc9_b84c,
+                    reg_heaps: 0x3fc9_b794,
+                    pxcur: 0x3fc9_bad0,
+                    sta_network_if: 0x3fc9_ae6c,
+                    esp_wifi_start: 0x4206_3824,
+                }
+            }
         }
     }
     /// Re-apply the active layout addresses after a boot/reset (which
@@ -2150,6 +2214,12 @@ impl Soc {
     /// Select the ESP-NOW image (nm on the espnow ELF).
     pub fn wifi_fixture_image_espnow(&mut self) {
         self.wifi_image = WifiImage::EspNow;
+        self.wifi_fixture_layout_program();
+    }
+
+    /// Select the live-IP worker image (nm on the test-worker-net ELF).
+    pub fn wifi_fixture_image_worker(&mut self) {
+        self.wifi_image = WifiImage::Worker;
         self.wifi_fixture_layout_program();
     }
 
@@ -2286,8 +2356,10 @@ impl Soc {
         // — SoftAP leg: stage the AP fixture data once, at `esp_wifi_start`
         // on CORE 0 only (run_flash WIFI_AP_FIXTURE notes: core 1 runs the
         // same pc mid-bring-up; staging there vectors the next block into
-        // the ROM hole). The firmware posts AP_START itself; the hooks
-        // serve the staged config/IP/sta-list back. —
+        // the ROM hole — proven live 2026-09-28: either-core arming stack-
+        // smashes the AP image in `stationCount`). The firmware posts
+        // AP_START itself; the hooks serve the staged config/IP/sta-list
+        // back. —
         if !st.ap_done && !st.ap_armed && pc0 == l.esp_wifi_start {
             self.wifi_stage_ap_data(
                 &fx.ap_ssid[..fx.ap_ssid_len as usize],
@@ -2970,6 +3042,113 @@ impl Soc {
         (0..Self::WIFI_ARD_SLOTS).any(|s| Self::WIFI_ARD_POOL + s * Self::WIFI_ARD_SLOT == ptr)
     }
 
+    /// Per-image `callx8 _ZdlPvj` (operator delete) CALL-SITE pcs the
+    /// host-pool free hook watches (see `wifi_ard_free` + machine.rs).
+    /// Ground truth = disassembly of each image's `_checkForEvent`
+    /// (`delete event` at the loop tail via `l32r a8, _ZdlPvj; callx8`):
+    /// the call op's own pc differs per image because the Arduino
+    /// `NetworkEvents` code links elsewhere — a single shared pc would
+    /// miss frees on relinked images. nm + objdump per image (worker
+    /// re-verified 2026-09-28 after the static-IP relink: `callx8` at
+    /// 0x4200431d, `_ZdlPvj` at 0x42079cfc). Match by `wifi_image`,
+    /// same discipline as the TX-tap gate. NOTE: like the hook tables
+    /// above, ONLY true call-site entries may appear here — a stale pc
+    /// that lands mid-function on a relinked image would skip a real
+    /// call with garbage regs.
+    pub fn wifi_delete_call_site(&self) -> u32 {
+        match self.wifi_image {
+            WifiImage::Sta => 0x4200_41f1,
+            WifiImage::Scan => 0x4200_426d,
+            WifiImage::Ap => 0x4200_42ad,
+            WifiImage::EspNow => 0x4200_450d,
+            WifiImage::Worker => 0x4200_433d,
+        }
+    }
+
+    /// Per-image `esp_netif_get_ip_info` TRUE entry (nm-verified per
+    /// image; the machine.rs get_ip_info arm fires iff pc == this).
+    /// Same true-entry-only rule as `wifi_delete_call_site` (a stale
+    /// union pc lands mid-function on relinked images — proven live on
+    /// worker: STA/scan/AP/espnow entries all sit inside
+    /// `esp_netif_update_default_netif_lwip` / `esp_netif_dhcps_option_api`
+    /// / `esp_netif_get_mac` there).
+    pub fn wifi_hook_get_ip_info_pc(&self) -> u32 {
+        match self.wifi_image {
+            WifiImage::Sta => 0x4202_e77c,
+            WifiImage::Scan => 0x4202_e804,
+            WifiImage::Ap => 0x4202_e838,
+            WifiImage::EspNow => 0x4202_ea9c,
+            WifiImage::Worker => 0x4202_e8b0,
+        }
+    }
+
+    /// Per-image `esp_wifi_sta_get_ap_info` TRUE entry (same rule).
+    pub fn wifi_hook_get_ap_info_pc(&self) -> u32 {
+        match self.wifi_image {
+            WifiImage::Sta => 0x4206_4118,
+            WifiImage::Scan => 0x4206_4130,
+            WifiImage::Ap => 0x4206_4164,
+            WifiImage::EspNow => 0x4206_a298,
+            WifiImage::Worker => 0x4206_41dc,
+        }
+    }
+
+    /// Per-image `esp_wifi_get_config` TRUE entry (same rule;
+    /// capture-only arm).
+    pub fn wifi_hook_get_config_pc(&self) -> u32 {
+        match self.wifi_image {
+            WifiImage::Sta => 0x4206_3ec0,
+            WifiImage::Scan => 0x4206_3ed8,
+            WifiImage::Ap => 0x4206_3f0c,
+            WifiImage::EspNow => 0x4206_9f98,
+            WifiImage::Worker => 0x4206_3f84,
+        }
+    }
+
+    /// Per-image `esp_wifi_set_config` TRUE entry (same rule;
+    /// capture-only arm).
+    pub fn wifi_hook_set_config_pc(&self) -> u32 {
+        match self.wifi_image {
+            WifiImage::Sta => 0x4206_3e58,
+            WifiImage::Scan => 0x4206_3e70,
+            WifiImage::Ap => 0x4206_3ea4,
+            WifiImage::EspNow => 0x4206_9f30,
+            WifiImage::Worker => 0x4206_3f1c,
+        }
+    }
+
+    /// Per-image `esp_wifi_ap_get_sta_list` TRUE entry (same rule).
+    /// NOTE: the legacy union ALSO contained scan 0x42063f20 (which on
+    /// the AP image is `esp_wifi_get_config+0x14`, mid-function) and
+    /// ESP-NOW 0x42069f70 (`sta_recv_assoc+0x314`, mid-function) — both
+    /// removed 2026-09-28 (proven live: AP in-wasm harness read
+    /// `stations 102` = the hook fired mid-`get_config` with garbage
+    /// regs and wrote num=0 to the wrong out pointer... actually it
+    /// WROTE num=0 correctly but to `get_config`'s caller buffer; the
+    /// real `stations` print then read an unstaged count. Either way the
+    /// union members were not true entries on the AP image). Only true
+    /// entries remain.
+    pub fn wifi_hook_ap_sta_list_pc(&self) -> u32 {
+        match self.wifi_image {
+            WifiImage::Sta => 0x4206_3f04,
+            WifiImage::Scan => 0x4206_3f1c,
+            WifiImage::Ap => 0x4206_3f50,
+            WifiImage::EspNow => 0x4206_9fdc,
+            WifiImage::Worker => 0x4206_3fc8,
+        }
+    }
+
+    /// Per-image `esp_wifi_disconnect` TRUE entry (same rule).
+    pub fn wifi_hook_disconnect_pc(&self) -> u32 {
+        match self.wifi_image {
+            WifiImage::Sta => 0x4203_c7d0,
+            WifiImage::Scan => 0x4203_c858,
+            WifiImage::Ap => 0x4203_c88c,
+            WifiImage::EspNow => 0x4203_caf0,
+            WifiImage::Worker => 0x4203_c904,
+        }
+    }
+
     pub fn wifi_post_event_with_data(
         &mut self,
         base_var: u32,
@@ -3255,6 +3434,104 @@ impl Soc {
     /// forward the bytes to the gateway bridge / pcap writer.
     pub fn net_take_tx(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.pending_net_tx)
+    }
+
+    /// Stage one host→board Ethernet frame for injection (gateway→board
+    /// replies: ARP/DHCP/IPv6/gVisor returns read off the NET_GW TCP leg,
+    /// or test bytes pushed by a unit test). FIFO, bounded at 8 frames —
+    /// excess drops increment `net_rx_dropped` (host-visible, so the
+    /// bridge dropping under load is observable, not silent). Empty
+    /// frames are ignored (a zero-length `esp_netif_receive` is a no-op
+    /// on silicon too). Queues an `EVT_NET_FRAME` event with `a` = 1
+    /// (host→board RX) so event-driven hosts (browser bridge) observe
+    /// the reply without polling.
+    pub fn net_inject_rx(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if self.pending_net_rx.len() >= 8 {
+            self.net_rx_dropped += 1;
+            return;
+        }
+        let mut v = alloc::vec::Vec::with_capacity(bytes.len());
+        v.extend_from_slice(bytes);
+        self.pending_net_rx.push(v);
+        self.events.push(EmuEvent {
+            kind: EVT_NET_FRAME,
+            a: 1, // 1 = host→board RX
+            b: bytes.len() as u32,
+        });
+    }
+
+    /// Pop the oldest staged host→board frame (machine frontend — called
+    /// by the `esp_netif_receive` entry hook, which stages the bytes into
+    /// firmware memory itself; see `net_rx_stage`). Returns `None` while
+    /// the FIFO is empty (hook then runs the call unmodified, like
+    /// silicon with no packet waiting — the closed stack drops it).
+    pub fn net_take_rx(&mut self) -> Option<alloc::vec::Vec<u8>> {
+        if self.pending_net_rx.is_empty() {
+            None
+        } else {
+            Some(self.pending_net_rx.remove(0))
+        }
+    }
+
+    /// Stage one popped RX frame into firmware-visible memory for the
+    /// `esp_netif_receive(esp_netif, buffer, len, eb)` entry hook. Copies
+    /// `frame` into the host scratch window (`WIFI_SCRATCH` past the
+    /// event-payload bump cursor — never heap, never the TLSF pool, so
+    /// the closed stack's `pbuf_alloc`/`free` path can't trip over it),
+    /// records the buffer address + length in `net_rx_last_buf` /
+    /// `net_rx_last_len` (unit-test observability), and queues an
+    /// `EVT_NET_FRAME` RX event. Returns the scratch address the hook
+    /// must point the firmware buffer at (via caller a11) — or 0 when
+    /// `frame` is empty (caller keeps its own buffer, silicon-identical
+    /// no-injection path).
+    pub fn net_rx_stage(&mut self, frame: &[u8]) -> u32 {
+        use xtensa_core::Bus as _Bus;
+        if frame.is_empty() {
+            return 0;
+        }
+        // Bump cursor past the event-payload region (0x858) + the ESP-NOW
+        // arg window (0x900..0xA00): RX buffers live at +0xC00, one slot
+        // per injection, 1600B each, 4 slots rotating (6.4 KB — inside
+        // the verified 2136B+ free run past heap end; the scratch base
+        // itself is past the DRAM heap so no heap block ever aliases).
+        const RX_BASE: u32 = Soc::WIFI_SCRATCH + 0xC00;
+        const RX_SLOT: u32 = 1600;
+        const RX_SLOTS: u32 = 4;
+        // Rotate by drop counter + queue depth so back-to-back frames
+        // never alias while a previous buffer is still firmware-live.
+        let slot = (self.net_rx_dropped + self.net_rx_last_len) % RX_SLOTS;
+        let buf = RX_BASE + slot * RX_SLOT;
+        let n = frame.len().min(1600) as u32;
+        for (k, b) in frame.iter().take(n as usize).enumerate() {
+            self.write8(buf + k as u32, *b as u32);
+        }
+        self.net_rx_last_buf = buf;
+        self.net_rx_last_len = n;
+        self.events.push(EmuEvent {
+            kind: EVT_NET_FRAME,
+            a: 1, // 1 = host→board RX
+            b: n,
+        });
+        buf
+    }
+
+    /// Dropped-RX counter (host frontend for the NET_RX_DROPPED battery
+    /// assertion): frames lost while the RX FIFO was full.
+    pub fn net_rx_dropped(&self) -> u32 {
+        self.net_rx_dropped
+    }
+
+    /// Last RX-staged buffer address (unit-test observability).
+    pub fn net_rx_last_buf(&self) -> u32 {
+        self.net_rx_last_buf
+    }
+
+    /// Last RX-staged length (unit-test observability).
+    pub fn net_rx_last_len(&self) -> u32 {
+        self.net_rx_last_len
     }
 
     /// Inject MISO bytes for the next SPI transfer on `chan`

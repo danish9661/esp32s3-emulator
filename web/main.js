@@ -21,6 +21,11 @@ const els = {
   serialPort: document.getElementById('serialPort'),
   gpio: document.getElementById('gpio'),
   vdev: document.getElementById('vdev'),
+  gwUrl: document.getElementById('gwUrl'),
+  gwConnect: document.getElementById('gwConnect'),
+  gwDisconnect: document.getElementById('gwDisconnect'),
+  gwStatus: document.getElementById('gwStatus'),
+  netlog: document.getElementById('netlog'),
   searchInput: document.getElementById('searchInput'),
   searchBtn: document.getElementById('searchBtn'),
   searchPrevBtn: document.getElementById('searchPrevBtn'),
@@ -242,6 +247,97 @@ els.gpioCollapseAll.addEventListener('click', () => {
   for (let i = 0; i < NUM_GPIO; i++) gpioCells[i].className = 'gpio-cell out-lo';
 });
 
+// ── Live-IP gateway bridge (browser → Go gateway → board) ──
+// board→host: `bridge.net.onFrame` (EVT_NET_FRAME + `net_take_tx`) sends
+// each captured Ethernet frame as one WebSocket binary message (raw
+// frame, same framing the run_flash NET_GW TCP leg uses minus its
+// 4-byte length prefix). host→board: the gateway's binary replies feed
+// `net_inject_rx`; the machine's `esp_netif_receive` entry hook pops one
+// per call into the firmware's own buffer (same path the NET_GW leg
+// exercises headlessly). Default URL targets a locally-run gateway
+// (`go run .` in tools/gateway, ws://127.0.0.1:5050/api/network-gateway);
+// without it the panel stays disconnected and TX frames are only logged.
+let gwSocket = null;
+let netLineCount = 0;
+let netTxCount = 0;
+let netRxCount = 0;
+function netStatus(msg) {
+  if (els.gwStatus) els.gwStatus.textContent = msg;
+}
+function appendNet(text) {
+  if (!els.netlog) return;
+  const line = document.createElement('div');
+  line.className = 'net-line';
+  line.textContent = text;
+  els.netlog.appendChild(line);
+  if (++netLineCount > 200) els.netlog.removeChild(els.netlog.firstChild);
+  els.netlog.scrollTop = els.netlog.scrollHeight;
+}
+function netCounters() {
+  netStatus(`gateway: ${gwSocket && gwSocket.readyState === 1 ? 'connected' : 'disconnected'} — TX ${netTxCount} frames, RX ${netRxCount} frames`);
+}
+function gwConnect() {
+  if (!emu || !bridge) { netStatus('gateway: load firmware first'); return; }
+  if (gwSocket && gwSocket.readyState === 1) { netStatus('gateway: already connected'); return; }
+  const url = (els.gwUrl && els.gwUrl.value.trim()) || 'ws://127.0.0.1:5050/api/network-gateway?sessionId=browser';
+  let ws;
+  try {
+    ws = new WebSocket(url);
+  } catch (err) {
+    netStatus(`gateway: connect failed (${err.message})`);
+    return;
+  }
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    netStatus(`gateway: connected — ${url}`);
+    appendNet(`connected ${url}`);
+    netCounters();
+  };
+  ws.onmessage = (ev) => {
+    // Gateway→board reply: one binary message = one raw Ethernet frame.
+    if (!(ev.data instanceof ArrayBuffer)) return;
+    const bytes = new Uint8Array(ev.data);
+    if (!bytes.length || bytes.length > 1600) return;
+    emu.net_inject_rx(bytes);
+    netRxCount++;
+    const type = bytes.length >= 14 ? bytes[12].toString(16).padStart(2, '0') + bytes[13].toString(16).padStart(2, '0') : '??';
+    appendNet(`RX ${bytes.length}B ethertype 0x${type}`);
+    netCounters();
+  };
+  ws.onclose = () => {
+    appendNet('disconnected');
+    netStatus('gateway: disconnected — TX frames stay local (pcap only via run_flash)');
+    gwSocket = null;
+  };
+  ws.onerror = () => {
+    netStatus('gateway: error — is the Go gateway running? (go run . in tools/gateway)');
+  };
+  // (Re)arm the TX leg on every (re)connect so no capture is missed even
+  // if the socket opens after frames already flowed: onFrame callbacks
+  // accumulate on the bridge, so guard against double-arming.
+  if (!gwConnect._armed) {
+    bridge.net.onFrame((frame) => {
+      if (!frame || !frame.length) return;
+      netTxCount++;
+      const type = frame.length >= 14 ? frame[12].toString(16).padStart(2, '0') + frame[13].toString(16).padStart(2, '0') : '??';
+      appendNet(`TX ${frame.length}B ethertype 0x${type}`);
+      netCounters();
+      if (gwSocket && gwSocket.readyState === 1) {
+        try { gwSocket.send(frame); } catch (_) { /* drop, keep stepping */ }
+      }
+    });
+    gwConnect._armed = true;
+  }
+  gwSocket = ws;
+  netStatus(`gateway: connecting — ${url}`);
+}
+function gwDisconnect() {
+  if (gwSocket) { try { gwSocket.close(); } catch (_) { /* closed */ } gwSocket = null; }
+  netStatus('gateway: disconnected — TX frames stay local (pcap only via run_flash)');
+}
+if (els.gwConnect) els.gwConnect.addEventListener('click', gwConnect);
+if (els.gwDisconnect) els.gwDisconnect.addEventListener('click', gwDisconnect);
+
 // ── Virtual devices ──
 let vdevLineCount = 0;
 function appendVdev(text) {
@@ -392,9 +488,25 @@ async function loadFlash(bytes, keyHex) {
   if (currentGalleryItem && currentGalleryItem.espnow === true) {
     emu.wifi_espnow_fixture();
   }
+  // Live-IP worker (mirrors run_flash WIFI_STA_CONN=1 on the worker
+  // image): same AP list + fixed LAN as wifi-sta, own linked pcs under
+  // `WifiImage::Worker`. The TX tap fires on the worker's real
+  // `esp_netif_transmit` calls; forward captured frames via
+  // `bridge.net.onFrame` (gateway WebSocket, see emu_api.js).
+  if (currentGalleryItem && currentGalleryItem.wifiWorker !== null) {
+    emu.wifi_worker_fixture(currentGalleryItem.wifiWorker || 'EmuNet,-50,6,02:11:22:33:44:55');
+  }
 
   if (typeof PeripheralBridge !== 'undefined') {
     bridge = new PeripheralBridge(emu);
+    // A fresh bridge means fresh onFrame subscribers: allow the gateway
+    // TX leg to re-arm on next connect (see gwConnect).
+    gwConnect._armed = false;
+    if (gwSocket) { try { gwSocket.close(); } catch (_) { /* closed */ } gwSocket = null; }
+    netTxCount = 0; netRxCount = 0;
+    netStatus('gateway: disconnected — TX frames stay local (pcap only via run_flash)');
+    if (els.netlog) els.netlog.textContent = '';
+    netLineCount = 0;
     vdevSensor = new VirtualI2CSensor(0x42);
     vdevAdc = new VirtualSpiAdc(0xaa);
     vdevSensor.onActivity = (t) => appendVdev(t);
@@ -454,11 +566,23 @@ els.firmware.addEventListener('change', async (e) => {
   loadFlash(bytes);
 });
 
-async function loadFromUrl(url, keyHex) {
+async function loadFromUrl(url, keyHex, micropython) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`fetch ${url} -> ${res.status}`);
   const buf = await res.arrayBuffer();
-  loadFlash(new Uint8Array(buf), keyHex);
+  let bytes = new Uint8Array(buf);
+  // Gallery MicroPython entries (`"micropython": true`) fetch the raw
+  // Release .bin (magic E9, not a merged flash image) — pad + partition
+  // exactly like the ▶ REPL preset / file-upload path below, else the
+  // firmware prints "filesystem appears to be corrupted" (proven live).
+  if (micropython === true) {
+    if (bytes.length === 0 || bytes[0] !== 0xe9) {
+      throw new Error(`not a MicroPython image (magic 0x${(bytes[0] || 0).toString(16)})`);
+    }
+    bytes = mpPadAndPartition(bytes);
+    setStatus(`MicroPython image detected — padded to ${(bytes.length / 1048576).toFixed(1)} MiB with vfs partition`);
+  }
+  loadFlash(new Uint8Array(bytes), keyHex);
 }
 
 // ── MicroPython REPL preset ──
@@ -597,6 +721,11 @@ try {
       if (item.wifi_sta !== undefined) opt.dataset.wifiSta = item.wifi_sta;
       if (item.wifi_ap !== undefined) opt.dataset.wifiAp = JSON.stringify(item.wifi_ap);
       if (item.espnow === true) opt.dataset.espnow = '1';
+      if (item.wifi_worker !== undefined) opt.dataset.wifiWorker = item.wifi_worker;
+      // Gallery MicroPython entries (`"micropython": true`) fetch the raw
+      // Release .bin — flagged so the select handler pads + partitions
+      // before load (same transform the ▶ REPL preset applies).
+      if (item.micropython === true) opt.dataset.micropython = '1';
       opt.textContent = item.name;
       els.gallery.appendChild(opt);
     }
@@ -623,10 +752,18 @@ els.gallery.addEventListener('change', async (e) => {
     wifiSta: sel.dataset.wifiSta !== undefined ? sel.dataset.wifiSta : null,
     wifiAp,
     espnow: sel.dataset.espnow === '1',
+    wifiWorker: sel.dataset.wifiWorker !== undefined ? sel.dataset.wifiWorker : null,
+    micropython: sel.dataset.micropython === '1',
   };
   try {
     setStatus(`loading ${url}…`);
-    await loadFromUrl(url, sel.dataset.key || null);
+    await loadFromUrl(url, sel.dataset.key || null, currentGalleryItem.micropython);
+    // MicroPython's REPL listens on UART0 (not USB-CDC) — same flip the
+    // ▶ REPL preset applies, so typed lines arrive where the REPL reads.
+    if (currentGalleryItem.micropython === true) {
+      if (els.serialPort) { els.serialPort.value = '0'; updateSerialPlaceholder(); }
+      if (els.serialInput && !els.serialInput.value) els.serialInput.value = 'print(6*7)';
+    }
   } catch (err) {
     setStatus(`failed: ${err.message}`);
   }

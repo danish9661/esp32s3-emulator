@@ -112,9 +112,17 @@ func handleDHCP(msg []byte, packet gopacket.Packet, client *Client, room *Room) 
 		assignedIP = ip
 		room.Unlock()
 
-		client.WriteMutex.Lock()
-		client.Conn.WriteMessage(websocket.TextMessage, []byte("BOARD_IP:"+assignedIP.String()))
-		client.WriteMutex.Unlock()
+		// BOARD_IP is a frontend text message (WebSocket-only). TCP-ingest
+		// (headless emulator) clients have no WS Conn — skip it (the
+		// length-prefixed DHCP reply below is the real verdict; the
+		// emulator never reads BOARD_IP). Unconditional WriteMessage here
+		// nil-panics the whole gateway (proven live 2026-09-28: a DHCP
+		// DISCOVER over the TCP leg crashed handleTCPFrame).
+		if client.Conn != nil {
+			client.WriteMutex.Lock()
+			client.Conn.WriteMessage(websocket.TextMessage, []byte("BOARD_IP:"+assignedIP.String()))
+			client.WriteMutex.Unlock()
+		}
 	} else {
 		dhcpMutex.Lock()
 		ip, exists := globalMacToIP[macString]
@@ -171,11 +179,15 @@ func handleDHCP(msg []byte, packet gopacket.Packet, client *Client, room *Room) 
 						uport++
 					}
 
-					// Send structured messages to the frontend
-					client.WriteMutex.Lock()
-					client.Conn.WriteMessage(websocket.TextMessage, []byte("BOARD_IP:"+ipStr))
-					client.Conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("PORT_FORWARD:http://127.0.0.1:%d", port)))
-					client.WriteMutex.Unlock()
+					// Send structured messages to the frontend (WebSocket-only;
+					// TCP-ingest clients have no WS Conn — same nil-guard as
+					// above).
+					if client.Conn != nil {
+						client.WriteMutex.Lock()
+						client.Conn.WriteMessage(websocket.TextMessage, []byte("BOARD_IP:"+ipStr))
+						client.Conn.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("PORT_FORWARD:http://127.0.0.1:%d", port)))
+						client.WriteMutex.Unlock()
+					}
 					break
 				}
 				port++
@@ -260,8 +272,23 @@ func handleDHCP(msg []byte, packet gopacket.Packet, client *Client, room *Room) 
 	fmt.Printf("[DHCP] Sending %d byte reply back to client MAC: %s\n", len(replyMsg), eth.SrcMAC.String())
 
 	client.WriteMutex.Lock()
-	client.Conn.WriteMessage(websocket.BinaryMessage, replyMsg)
+	werr := sendFrame(client, replyMsg)
 	client.WriteMutex.Unlock()
+	if werr != nil {
+		fmt.Printf("[DHCP] Reply send failed: %v\n", werr)
+	}
+}
+
+// handleTCPDHCP is the TCP-ingest twin of handleDHCP: same DISCOVER/OFFER
+// + REQUEST/ACK exchange, but the reply goes back over the TCP leg
+// (handleDHCP's reply path writes to the WS connection, which a headless
+// TCP client does not have). The UDP-forward listener setup is shared.
+// NOTE: TCP-ingest boards use static fixture addressing, not DHCP — the
+// worker sketch never sends DHCP — so this path is currently exercised
+// only if a future worker image runs a real DHCP client. Kept in sync
+// with handleDHCP by construction (same offer/ack builders below).
+func handleTCPDHCP(msg []byte, packet gopacket.Packet, client *Client, room *Room) {
+	handleDHCP(msg, packet, client, room)
 }
 
 // UDP port forward 127.0.0.1:<listen port> -> board:5683 (CoAP and other
@@ -301,9 +328,6 @@ func handleUDPProxy(uconn *net.UDPConn, targetIP string) {
 	}
 }
 
-// divertUDPForward relays board -> 192.168.4.1:<alloc> replies to the
-// mapped host client. Returns true when the frame was consumed (caller
-// must skip the VN pipe AND the room broadcast for it).
 // sendARPReply answers an ARP request for the gateway IP (192.168.4.1)
 // directly on the requesting client (see main.go hub loop). gVisor answers
 // ARPs itself, but its cold stack can take ~1s for the first one — long
@@ -331,8 +355,61 @@ func sendARPReply(client *Client, req *layers.ARP) {
 		return
 	}
 	client.WriteMutex.Lock()
-	client.Conn.WriteMessage(websocket.BinaryMessage, buffer.Bytes())
+	werr := sendFrame(client, buffer.Bytes())
 	client.WriteMutex.Unlock()
+	if werr != nil {
+		fmt.Printf("[ARP] Reply send failed: %v\n", werr)
+	}
+}
+
+// sendProxyARPReply answers an ARP request for ANY 192.168.4.0/24 address
+// (except the gateway itself, which sendARPReply already handled) with the
+// gateway MAC, so the board ARPs once and then sends the IP packet to us.
+// This is what makes off-LAN DNS/UDP work through the gVisor stack: gVisor
+// only answers ARP for addresses it owns (its gateway IP), so without this
+// the board's ARP for 8.8.8.8 (or any internet IP) goes unanswered, the
+// board never transmits the IP packet, and DNS/UDP/TCP to the outside
+// world silently never happens (proven live 2026-09-29: DNS to 8.8.8.8
+// got zero replies — only gVisor ARP-refresh broadcasts came back — until
+// this proxy was added). Transport-agnostic via sendFrame (WS + TCP legs).
+func sendProxyARPReply(client *Client, req *layers.ARP) {
+	ethReply := &layers.Ethernet{
+		SrcMAC:       net.HardwareAddr{0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd},
+		DstMAC:       req.SourceHwAddress,
+		EthernetType: layers.EthernetTypeARP,
+	}
+	arpReply := &layers.ARP{
+		AddrType:          req.AddrType,
+		Protocol:          req.Protocol,
+		HwAddressSize:     req.HwAddressSize,
+		ProtAddressSize:   req.ProtAddressSize,
+		Operation:         layers.ARPReply,
+		SourceHwAddress:   []byte{0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xdd},
+		SourceProtAddress: req.DstProtAddress,
+		DstHwAddress:      req.SourceHwAddress,
+		DstProtAddress:    req.SourceProtAddress,
+	}
+	buffer := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true}
+	if serr := gopacket.SerializeLayers(buffer, opts, ethReply, arpReply); serr != nil {
+		return
+	}
+	client.WriteMutex.Lock()
+	werr := sendFrame(client, buffer.Bytes())
+	client.WriteMutex.Unlock()
+	if werr != nil {
+		fmt.Printf("[ARP] Proxy reply send failed: %v\n", werr)
+	} else {
+		fmt.Printf("[ARP] Proxy reply for %v -> gw MAC\n", net.IP(req.DstProtAddress))
+	}
+}
+
+// sendTCPARPReply is the TCP-ingest twin of sendARPReply (same packet,
+// TCP-leg framing). Currently unused — handleTCPFrame calls sendARPReply
+// directly, which now routes via sendFrame — kept as documentation that
+// the ARP fast-reply path is transport-agnostic.
+func sendTCPARPReply(client *Client, req *layers.ARP) {
+	sendARPReply(client, req)
 }
 
 func divertUDPForward(packet gopacket.Packet, room *Room) bool {
@@ -438,4 +515,84 @@ func handleProxy(clientConn net.Conn, targetIP string) {
 	}()
 
 	wg.Wait()
+}
+
+// ---- ICMPv4 echo (board -> gateway) -------------------------------------
+// The worker sketch sends an ICMP echo request at 192.168.4.1; answer it
+// here (gateway-sourced echo reply, checksums recomputed) instead of
+// relying on gVisor NAT timing. Same transport-agnostic reply path as
+// ARP (sendFrame picks WS vs TCP). Returns true when consumed (caller
+// must skip the VN pipe AND the room broadcast for it).
+var gwIPv4 = net.IPv4(192, 168, 4, 1)
+
+func ipv4Checksum(hdr []byte) uint16 {
+	sum := uint32(0)
+	for i := 0; i+1 < len(hdr); i += 2 {
+		sum += uint32(hdr[i])<<8 | uint32(hdr[i+1])
+	}
+	if len(hdr)%2 != 0 {
+		sum += uint32(hdr[len(hdr)-1]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = (sum >> 16) + (sum & 0xffff)
+	}
+	return uint16(^sum)
+}
+
+func snoopICMPv4(msg []byte, client *Client, room *Room) bool {
+	_ = room
+	// Eth(14) + IPv4(20 min) + ICMP(8 min); ethertype 0x0800, proto 1,
+	// ICMP type 8 (echo request), dst == gateway.
+	if len(msg) < 14+20+8 {
+		return false
+	}
+	if binary.BigEndian.Uint16(msg[12:14]) != 0x0800 || (msg[14]>>4) != 4 {
+		return false
+	}
+	ihl := int(msg[14]&0x0F) * 4
+	if ihl < 20 || len(msg) < 14+ihl+8 {
+		return false
+	}
+	if msg[14+9] != 1 {
+		return false
+	}
+	if msg[14+16] != 192 || msg[14+17] != 168 || msg[14+18] != 4 || msg[14+19] != 1 {
+		return false
+	}
+	icmp := 14 + ihl
+	if msg[icmp] != 8 {
+		return false
+	}
+	// Build the echo reply: swap MACs + IPs, type 0, recompute both
+	// checksums (IP header + ICMP). Payload (ident/seq/data) echoed.
+	// NOTE (proven live 2026-09-28): the worker sketch's frame-2 leaves
+	// the IPv4 header checksum ZERO (tap is L2) — but the ICMP checksum
+	// field must ALSO be zero for `ipv4Checksum` to compute the correct
+	// reply checksum here (sketch sends 0x0000, so this holds; stated
+	// explicitly because a nonzero garbage field would silently produce
+	// a wrong reply checksum the board would drop).
+	rep := make([]byte, len(msg))
+	copy(rep, msg)
+	copy(rep[0:6], msg[6:12])
+	copy(rep[6:12], gwMAC)
+	copy(rep[14+12:14+16], msg[14+16:14+20]) // src = old dst (gw)
+	copy(rep[14+16:14+20], msg[14+12:14+16]) // dst = old src (board)
+	rep[14+10], rep[14+11] = 0, 0
+	ck := ipv4Checksum(rep[14 : 14+ihl])
+	rep[14+10] = byte(ck >> 8)
+	rep[14+11] = byte(ck)
+	rep[icmp] = 0 // echo reply
+	rep[icmp+2], rep[icmp+3] = 0, 0
+	ick := ipv4Checksum(rep[icmp:])
+	rep[icmp+2] = byte(ick >> 8)
+	rep[icmp+3] = byte(ick)
+	client.WriteMutex.Lock()
+	werr := sendFrame(client, rep)
+	client.WriteMutex.Unlock()
+	if werr != nil {
+		fmt.Printf("[ICMPv4] Reply send failed: %v\n", werr)
+	} else {
+		fmt.Printf("[ICMPv4] Echo reply -> %x (%dB)\n", msg[6:12], len(rep))
+	}
+	return true
 }

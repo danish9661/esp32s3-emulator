@@ -103,16 +103,28 @@ fn main() {
     // SoC once, before any fixture call (scan vs STA vs AP vs ESP-NOW
     // sketch link the pool and RAM differently; the SoC holds no image
     // addresses itself). The test-worker-net sketch links the STA-side
-    // cells identically to wifi-sta (nm-verified 2026-09-27), so it
-    // reuses the STA layout via `bin_name_contains_wifi_sta`.
+    // cells identically to wifi-sta except the event vars / scan_start /
+    // connect / transmit pcs (nm on its own ELF — see WORKER_LAYOUT).
+    // `wifi_image` selects the per-image hook tables in BOTH engines
+    // (run_flash layout tables here + the SoC fixture engine + the
+    // machine.rs TX-tap/delete-site gates); the default Scan image is
+    // wrong for non-scan runs (its event vars point at the scan image's
+    // event loop instances — posts would land in dead queues). Every
+    // image therefore selects its engine table here, then programs the
+    // run_flash layout cells (same five cells the engine's own
+    // `wifi_fixture_layout_program` writes — see soc.rs).
     {
         let layout = if path.contains("wifi_ap") {
+            m.soc.wifi_fixture_image_ap();
             &AP_LAYOUT
         } else if path.contains("test_worker_net") {
+            m.soc.wifi_fixture_image_worker();
             &WORKER_LAYOUT
         } else if bin_name_contains_wifi_sta {
+            m.soc.wifi_fixture_image(true);
             &STA_LAYOUT
         } else {
+            m.soc.wifi_fixture_image(false);
             &SCAN_LAYOUT
         };
         m.soc.wifi_layout_set(
@@ -291,16 +303,46 @@ fn main() {
     // loop (zero-cost when idle). Monotonic clock: wall time is
     // meaningless in emulation (1 global tick per 2 insns for all
     // domains), so pcap timestamps use an incrementing counter.
+    // Full-duplex: the same TCP leg carries gateway→board replies back
+    // (length-prefixed, same framing): each reply is staged via
+    // `Soc::net_inject_rx` and delivered at the next `esp_netif_receive`
+    // entry (see machine.rs RX hook). The socket is NONBLOCKING and the
+    // reply drain below runs ONLY on steps where a TX frame was just
+    // forwarded (gateway replies are always causally after a board TX —
+    // ARP/DHCP answers, gVisor returns) plus one poll every 1024 steps
+    // as a backstop for unsolicited frames (IPv6 RAs, UDP-forward
+    // injects). This keeps framing sync without per-step blocking:
+    // nonblocking `read_exact` on a half-arrived header consumes the
+    // partial bytes then fails, so the drain uses single `read` calls
+    // with a small reassembly buffer (never `read_exact` on a
+    // nonblocking socket — proven live: the ARP reply arrived split
+    // across two TCP segments → "reply body short" → leg dropped).
+    // A NET_RX_LOG=1 env additionally logs every injected reply
+    // (ethertype + length) for the NET_RX battery assertion.
     let net_pcap_path: Option<String> = env::var("NET_PCAP").ok();
     let mut net_pcap_file: Option<std::fs::File> = None;
     let mut net_pcap_n: u64 = 0;
     let net_gw_addr: Option<String> = env::var("NET_GW").ok();
     let mut net_gw: Option<std::net::TcpStream> = None;
+    let net_rx_log = env::var("NET_RX_LOG").is_ok();
+    // Reassembly buffer for the nonblocking reply drain (length header
+    // + body may arrive split across steps; never reset except on
+    // fatal framing errors).
+    let mut net_rx_buf: Vec<u8> = Vec::new();
+    // Set when the current step forwarded a TX frame (reply drain arm).
+    let mut net_tx_this_step: bool;
+    // Step counter for the periodic backstop poll (unsolicited frames).
+    let mut net_step_n: u64 = 0;
     if let Some(ref addr) = net_gw_addr {
         match std::net::TcpStream::connect(addr.as_str()) {
             Ok(s) => {
-                println!("[host] net bridge connected to {addr}");
-                net_gw = Some(s);
+                if let Err(e) = s.set_nonblocking(true) {
+                    println!("[host] net bridge nonblocking failed: {e} (reply drain disabled)");
+                    net_gw = None;
+                } else {
+                    println!("[host] net bridge connected to {addr}");
+                    net_gw = Some(s);
+                }
             }
             Err(e) => println!(
                 "[host] net bridge connect to {addr} failed: {e} (frames still go to pcap)"
@@ -391,16 +433,23 @@ fn main() {
         pxcur: 0x3fc9_bad0,
         sta_network_if: 0x3fc9_ae6c,
     };
-    // test-worker-net image layout (nm on the test-worker-net ELF
-    // 2026-09-27; STA-side cells match wifi-sta except WIFI_EVENT /
-    // IP_EVENT live elsewhere: WIFI_EVENT 0x3c0b450c, IP_EVENT 0x3c0b3e08;
-    // connect = esp_wifi_connect 0x4203e5b4; the remaining cells reuse
-    // the STA shape).
+    // test-worker-net image layout (nm on the test-worker-net ELF —
+    // re-verified after the keep-alive relink: WIFI_EVENT 0x3c0b4304,
+    // IP_EVENT 0x3c0b3c00, scan_start 0x42063c3c, connect 0x4203c8f8,
+    // transmit 0x4202e60c / receive 0x4202e670 (machine.rs wifi_image
+    // gate); the remaining cells identical to wifi-sta; the worker sketch
+    // never scans, so records_check is unused (set to the STA value as a
+    // harmless placeholder — the scan leg never arms on this image).
+    // NOTE: the sketch source pins the layout — any .ino edit relinks
+    // the closed libs elsewhere, so EVERY pc/var above must be re-nm'd
+    // after every sketch change (proven live twice: removing one
+    // disconnect() call moved transmit/connect/delete by 0x4c; the
+    // keep-alive loop moved them again + both event vars by 0x10).
     const WORKER_LAYOUT: WifiLayout = WifiLayout {
-        scan_start: 0x4206_5ac0,
-        connect: 0x4203_e5b4,
-        wifi_event_var: 0x3c0b_450c,
-        ip_event_var: 0x3c0b_3e08,
+        scan_start: 0x4206_3c3c,
+        connect: 0x4203_c8f8,
+        wifi_event_var: 0x3c0b_4304,
+        ip_event_var: 0x3c0b_3c00,
         count_cell: 0x3fc9_f926,
         scan_count: 0x3fc9_aee4,
         scan_result: 0x3fc9_aee0,
@@ -412,7 +461,9 @@ fn main() {
         sta_network_if: 0x3fc9_ae6c,
     };
     // wifi-ap image layout (nm on the wifi-ap ELF; sta_network_if =
-    // `_ZL14_ap_network_if` bss static; esp_wifi_start = 0x420638c4).
+    // `_ZL14_ap_network_if` bss static; esp_wifi_start = 0x42063870
+    // (re-verified 2026-09-28; the old 0x42063840/0xc4 never fires,
+    // so the AP leg never staged and `stations` read an unstaged count).
     const AP_LAYOUT: WifiLayout = WifiLayout {
         scan_start: 0x4206_3b78,
         connect: 0x4203_c7c4,
@@ -631,6 +682,7 @@ fn main() {
         // frame goes to pcap and/or the gateway bridge. Drained per step
         // (frames are rare — the check is a single empty-Vec handoff when
         // idle, same discipline as the UART fast path).
+        net_tx_this_step = false;
         if net_pcap_path.is_some() || net_gw.is_some() {
             let frame = m.soc.net_take_tx();
             if !frame.is_empty() {
@@ -679,8 +731,99 @@ fn main() {
                     if gw.write_all(&len).and(gw.write_all(&frame)).is_err() {
                         println!("[host] net bridge write failed; dropping bridge leg");
                         net_gw = None;
+                    } else {
+                        // A forwarded TX almost always has a causally
+                        // linked reply (ARP/DHCP answers, gVisor returns)
+                        // — arm the reply drain below for this step.
+                        net_tx_this_step = true;
                     }
                 }
+            }
+        }
+        // Gateway→board replies (full-duplex leg): nonblocking drain of
+        // length-prefixed frames off the same NET_GW TCP connection,
+        // staged via `Soc::net_inject_rx` for the `esp_netif_receive`
+        // entry hook. Runs ONLY on steps where a TX frame was just
+        // forwarded (replies are causally linked to board TX) plus one
+        // poll every 64 steps as a backstop for in-flight replies whose
+        // TCP segments arrive a few steps after the TX (proven live:
+        // the ICMP echo reply arrives ~1 step after its TX, so a
+        // TX-only drain delivers the ARP reply but misses the ICMP one;
+        // the 64-step backstop catches it — every other step still costs
+        // nothing: no syscall at all) and every 1024 steps for truly
+        // unsolicited frames (IPv6 RAs, UDP-forward injects). Single
+        // `read` calls with a persistent reassembly buffer (never
+        // `read_exact` on a nonblocking socket — it consumes partial
+        // headers then fails).
+        net_step_n += 1;
+        let net_poll_backstop = net_step_n.is_multiple_of(64) || net_step_n.is_multiple_of(1024);
+        if net_gw.is_some() && (net_tx_this_step || net_poll_backstop) {
+            use std::io::Read as _ReadGw;
+            // Up to 4 reply frames per drain so a chatty gateway
+            // can't starve the emulation loop (each frame ≤1600B;
+            // the RX FIFO itself is also bounded at 8). A `drop_leg`
+            // flag carries the drop decision out of the `gw` borrow
+            // (reassigning `net_gw` while borrowed is E0506).
+            let mut drop_leg = false;
+            if let Some(ref mut gw) = net_gw {
+                // Fill the reassembly buffer: one nonblocking read
+                // per iteration (bytes may arrive split across steps
+                // — the buffer persists, framing never resyncs).
+                for _ in 0..4 {
+                    let mut tmp = [0u8; 1600];
+                    match gw.read(&mut tmp) {
+                        Ok(0) => break, // orderly shutdown; next read errors
+                        Ok(n) => net_rx_buf.extend_from_slice(&tmp[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => {
+                            println!("[host] net bridge read failed; dropping bridge leg");
+                            drop_leg = true;
+                            net_rx_buf.clear();
+                            break;
+                        }
+                    }
+                    // Extract complete frames from the buffer.
+                    loop {
+                        if net_rx_buf.len() < 4 {
+                            break;
+                        }
+                        let rlen = u32::from_be_bytes([
+                            net_rx_buf[0],
+                            net_rx_buf[1],
+                            net_rx_buf[2],
+                            net_rx_buf[3],
+                        ]) as usize;
+                        if rlen == 0 || rlen > 1600 {
+                            println!(
+                                "[host] net bridge bad reply length {rlen}; dropping bridge leg"
+                            );
+                            drop_leg = true;
+                            net_rx_buf.clear();
+                            break;
+                        }
+                        if net_rx_buf.len() < 4 + rlen {
+                            break; // body still arriving; keep buffering
+                        }
+                        let rbuf: Vec<u8> = net_rx_buf[4..4 + rlen].to_vec();
+                        net_rx_buf.drain(..4 + rlen);
+                        if net_rx_log && rbuf.len() >= 14 {
+                            println!(
+                                "[host] net RX {}B ethertype {:#06x}",
+                                rbuf.len(),
+                                u16::from_be_bytes([rbuf[12], rbuf[13]])
+                            );
+                        }
+                        m.soc.net_inject_rx(&rbuf);
+                    }
+                    // Only loop for more frames if the buffer already
+                    // holds another complete one (no extra syscalls).
+                    if net_rx_buf.len() < 4 {
+                        break;
+                    }
+                }
+            }
+            if drop_leg {
+                net_gw = None;
             }
         }
 
@@ -1291,10 +1434,19 @@ fn main() {
         // the sketch calls `WiFi.disconnect()` → `esp_wifi_disconnect`).
         // Gate on GOT_IP done AND the RSSI leg consumed (the staged reads
         // prove the sketch reached the post-WL_CONNECTED prints): the
-        // sketch ALSO calls `WiFi.disconnect()` in setup() before `begin()`
-        // (unstaged hook lets it run, but the latch still fires) — only the
-        // post-RSSI disconnect arms the status-change leg.
+        // wifi-sta sketch ALSO calls `WiFi.disconnect()` in setup() before
+        // `begin()` (unstaged hook lets it run, but the latch still fires)
+        // — only the post-RSSI disconnect arms the status-change leg.
+        // The worker image must NOT arm this leg at all (proven live
+        // 2026-09-28: its setup() never disconnects, but the closed
+        // `esp_wifi_connect` path calls `esp_wifi_disconnect` internally
+        // on retry — arming posts DISCONNECTED, the firmware tears the
+        // association down, and the run parks at `esp_wifi_connect`
+        // forever; the worker sketch never calls `WiFi.disconnect()`
+        // itself, so nothing is lost by skipping).
+        let needs_disc_leg = !path.contains("test_worker_net");
         if wifi_sta_conn
+            && needs_disc_leg
             && wifi_sta_ip_done
             && m.soc.wifi_hook_rssi_done()
             && m.soc.wifi_take_disconnect()
@@ -1394,7 +1546,7 @@ fn main() {
             // `_UserExceptionVector` into the ROM hole (UNIMPLEMENTED
             // trap, proven live). Core 0 reaches the same pc later, once
             // the wifi task migrated and the bring-up is settled.
-            if !wifi_ap_armed && m.cpu[0].pc == 0x4206_3840 {
+            if !wifi_ap_armed && m.cpu[0].pc == 0x4206_3870 {
                 // SSID/passphrase/channel from the fixture (defaults match
                 // the sketch): the staged config is what `softAPSSID()`
                 // reads back via `esp_wifi_get_config`.

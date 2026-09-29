@@ -66,6 +66,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
       - name: Install arduino-cli
         run: |
           curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
@@ -79,6 +82,13 @@ jobs:
         run: |
           curl -sSf https://raw.githubusercontent.com/drager/wasm-pack/master/installer/init.sh | sh
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Go gateway framing tests (TCP-ingest wire contract)
+        # The emulator's NET_GW leg speaks length-prefixed raw Ethernet;
+        # these pin the framing both sides implement (split-segment
+        # reassembly is the proven live failure class). `working-directory`
+        # matters: `./...` from the repo root is not the gateway module.
+        run: go test ./...
+        working-directory: tools/gateway
       - name: Browser bundle check (rebuild web/pkg, boot hello in-wasm)
         # web/pkg/ is gitignored and rots silently (Sep 2026: 13h stale);
         # the battery never touches it (NODE harnesses build their own pkg).

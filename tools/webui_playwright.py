@@ -221,6 +221,48 @@ try:
             tail = page.eval_on_selector("#console", "el => el.textContent.slice(-800)")
             check("espnow-inwasm-done", False, f"(tail={tail!r})")
 
+        # --- Test 10: test_worker_net gallery entry boots in-wasm to DONE ---
+        # (proves the `"wifi_worker"` manifest string wires the worker STA
+        # fixture through the new `wifi_worker_fixture` bridge call; the TX
+        # tap fires in-wasm too — frames stay local without a gateway, so
+        # the empty-FIFO verdicts -13/-14 are expected, same as headless)
+        page.click("#stop")
+        page.select_option("#gallery", value="./firmware/esp32s3_test_worker_net.merged.bin")
+        page.wait_for_function(
+            "() => !document.getElementById('run').disabled",
+            timeout=120000,
+        )
+        page.click("#run")
+        try:
+            page.wait_for_function(
+                "() => document.getElementById('console').textContent.includes('WORKER NET DONE')",
+                timeout=240000,
+            )
+            check("worker-inwasm-done", True)
+        except Exception:
+            tail = page.eval_on_selector("#console", "el => el.textContent.slice(-800)")
+            check("worker-inwasm-done", False, f"(tail={tail!r})")
+
+        # --- Test 11: Live-IP panel wires the gateway bridge without errors ---
+        # (proves the new panel exists, Connect with no gateway fails soft
+        # into the disconnected status — no page error — and TX frames still
+        # flow locally: the worker entry above already proved the tap fires;
+        # a live gateway E2E is covered headlessly by run_flash NET_GW)
+        try:
+            check("gw-url-present", page.is_visible("#gwUrl"))
+            check("gw-connect-present", page.is_visible("#gwConnect"))
+            check("gw-status-present", page.locator("#gwStatus").count() == 1)
+            page.fill("#gwUrl", "ws://127.0.0.1:59999/api/network-gateway?sessionId=browser")
+            page.click("#gwConnect")
+            page.wait_for_function(
+                "() => document.getElementById('gwStatus').textContent.includes('disconnected') || document.getElementById('gwStatus').textContent.includes('connecting') || document.getElementById('gwStatus').textContent.includes('error') || document.getElementById('gwStatus').textContent.includes('failed')",
+                timeout=15000,
+            )
+            check("gw-connect-fails-soft", True)
+        except Exception:
+            tail = page.eval_on_selector("#gwStatus", "el => el.textContent.slice(-200)")
+            check("gw-connect-fails-soft", False, f"(tail={tail!r})")
+
         # --- Test 7: MicroPython REPL preset (bundled same-origin image) ---
         # (proves the ▶ REPL button + vfs-partition pad + UART0 flip: load
         # the committed tools/firmware/ stock MicroPython .bin, pad to 3

@@ -112,9 +112,13 @@ impl Esp32S3 {
         // the probes use, so it needs the identical skip). The call site is
         // `call8 _ZdlPvj` (callee arg a2 = caller a10 by the windowed ABI:
         // CALL8 rotates wb by 2, so callee-a2 aliases caller-a10 — read the
-        // CALLER's a10 BEFORE stepping, while wb still names it).
+        // CALLER's a10 BEFORE stepping, while wb still names it). The call
+        // op's own pc is per-image (`Soc::wifi_delete_call_site` — the
+        // Arduino NetworkEvents code links elsewhere per sketch).
         for c in 0..2 {
-            if self.cpu[c].pc == 0x4200_41f1 && self.soc.wifi_ard_free(self.cpu[c].reg(10)) {
+            if self.cpu[c].pc == self.soc.wifi_delete_call_site()
+                && self.soc.wifi_ard_free(self.cpu[c].reg(10))
+            {
                 self.cpu[c].pc = self.cpu[c].pc.wrapping_add(3);
                 // Advance past the call WITHOUT executing it: the callee
                 // frame was never entered, so no return address was pushed
@@ -288,11 +292,24 @@ impl Esp32S3 {
                 return (StepResult::Ok, n);
             }
             let pc0 = self.cpu[core].pc;
+            let _ = pc0;
             // Host-pool free interception (WiFi fixture support — same as
             // the `step` hook above): skip the `_ZdlPvj` call for host-pool
             // pointers (leak-by-design no-op; caller arg a2 = caller a10).
+            // Call-site pc is per-image (`Soc::wifi_delete_call_site`).
             // All other frees run unmodified.
-            if pc0 == 0x4200_41f1 && self.soc.wifi_ard_free(self.cpu[core].reg(10)) {
+            // GATE (proven live on worker 2026-09-28): the site pc alone
+            // is NOT sufficient — union hook pcs collide with live callees
+            // on relinked images (e.g. STA get_ip_info pcs land inside the
+            // worker's `esp_netif_update_default_netif_lwip`). The
+            // `wifi_ard_free` pointer check is the real discriminator
+            // (host-pool range — firmware heap pointers never match); the
+            // pc check only selects the call op. Both must hold: pc ==
+            // this image's site AND ptr in pool. (The TX-tap arm below is
+            // likewise gated on `wifi_image`, same discipline.)
+            if pc0 == self.soc.wifi_delete_call_site()
+                && self.soc.wifi_ard_free(self.cpu[core].reg(10))
+            {
                 self.cpu[core].pc = pc0.wrapping_add(3);
                 n += 1;
                 continue;
@@ -323,13 +340,64 @@ impl Esp32S3 {
             // caller reads as its return value).
             //
             // IMAGE CAVEAT: the linked addresses DIFFER per sketch (nm on
-            // each sketch ELF — STA/scan/AP/ESP-NOW link the closed libs
-            // elsewhere). The table below is the UNION over the four WiFi
-            // sketches; at most one entry matches per image (addresses are
-            // unique per image — no cross-image aliasing possible since a
-            // run boots exactly one image).
-            if pc0 == 0x4202_e77c || pc0 == 0x4202_e798 || pc0 == 0x4202_e804 || pc0 == 0x4202_ea30
-            {
+            // each sketch ELF — every image links the closed libs
+            // elsewhere). The table below is the UNION over all six
+            // hookable entry points (scan/STA/AP/ESP-NOW/worker images
+            // plus the worker's post-static-IP relink); at most one entry
+            // matches per image (addresses are unique per image — no
+            // cross-image aliasing possible since a run boots exactly one
+            // image). WARNING: a hook pc that is a REAL function entry on
+            // one image but mid-function garbage on another MISFIRES
+            // (proven live on worker: union pcs 0x4202e77c/98/04/a30/c8/58
+            // all land inside `esp_netif_update_default_netif_lwip` /
+            // `esp_netif_dhcps_option_api` / `esp_netif_get_mac` — a
+            // mid-function fire with garbage regs would corrupt the real
+            // call. The `wifi_hook_*` STAGED guard is what makes this
+            // safe: the skip only fires while staged (post-GOT_IP); an
+            // unstaged pc match falls through to the real function. The
+            // worker's true `esp_netif_get_ip_info` is 0x4202e890).
+            // GATED latitudes: ONLY true function entries may appear here.
+            // Union pcs that are mid-function on ANY image were removed
+            // 2026-09-28 (proven live: STA/scan/AP/espnow get_ip_info pcs
+            // land inside the worker's `esp_netif_update_default_netif_lwip`
+            // / `esp_netif_dhcps_option_api` / `esp_netif_get_mac` — firing
+            // there would run the skip mid-function with garbage regs).
+            // True entries (nm-verified per image): STA 0x4202e77c, scan
+            // 0x4202e804, AP 0x4202e838, ESP-NOW 0x4202ea9c, worker
+            // 0x4202e890.
+            // PER-IMAGE GATE (proven live on worker 2026-09-28): the
+            // union table above is UNSOUND across relinks (a stale pc
+            // lands mid-function on another image and fires with garbage
+            // regs — worker wedged at `esp_netif_update_default_netif_lwip
+            // +0xa4` == scan 0x4202e804 with the hook clobbering the
+            // caller's real out pointer). The skip therefore fires iff
+            // (pc == this run's image true entry AND staged): the image
+            // gate selects the entry, the staged guard selects the phase.
+            // The staged check alone is insufficient (staged data exists
+            // post-GOT_IP while unrelated code paths coincidentally hit
+            // stale pcs); the pc check alone is insufficient (stale pcs
+            // hit live code on relinked images).
+            if pc0 == self.soc.wifi_hook_get_ip_info_pc() {
+                // WINDOWED-ABI CONTRACT (proven live on worker 2026-09-28
+                // via the EPC1=0x7fcb1834 ILLEGAL): the hook fires at the
+                // CALLEE entry, where the window has NOT rotated yet (ENTRY
+                // is the callee's first op and it has not executed).
+                // Caller and callee therefore share one window here: the
+                // caller's a2 (2nd arg slot) IS the callee's a2. The real
+                // `esp_netif_get_ip_info(esp_netif, out)` is a 2-arg
+                // call, so arg1 (out ptr) = caller-a3 = reg(11), NOT
+                // reg(10) (which is the caller's a2 = the netif pointer,
+                // 0x3fcb1834 -- writing 12 bytes there then EPC1-ing into
+                // it is exactly the observed crash). The ap_info arm below
+                // is a 1-arg call, so arg0 = caller-a2 = reg(10) -- both
+                // arms read the CALLER's arg slot for `out`, which differs
+                // by arity. RET-CONTRACT: the callers
+                // (`localIP`/`subnetMask`/`gatewayIP`/`broadcastIP`) test
+                // the RETURN VALUE (`bnez a10`, nonzero = error =>
+                // default-construct 0.0.0.0). The skip only fires while
+                // staged (post-GOT_IP); `wifi_hook_get_ip_info` returns
+                // false unstaged and the real function runs (fails soft
+                // like silicon, 0.0.0.0).
                 let out = self.cpu[core].reg(11);
                 let ra = self.cpu[core].reg(8);
                 if self.soc.wifi_hook_get_ip_info(out) {
@@ -338,11 +406,10 @@ impl Esp32S3 {
                     n += 1;
                     continue;
                 }
-            } else if pc0 == 0x4206_4118
-                || pc0 == 0x4206_4130
-                || pc0 == 0x4206_4134
-                || pc0 == 0x4206_a22c
-            {
+            // True entries only (same mid-function rule as above): STA
+            // 0x42064118, scan 0x42064130, AP 0x42064164, ESP-NOW
+            // 0x4206a298, worker 0x420641bc.
+            } else if pc0 == self.soc.wifi_hook_get_ap_info_pc() {
                 let out = self.cpu[core].reg(10);
                 let ra = self.cpu[core].reg(8);
                 if self.soc.wifi_hook_get_ap_info(out) {
@@ -351,11 +418,17 @@ impl Esp32S3 {
                     n += 1;
                     continue;
                 }
-            } else if pc0 == 0x4206_3ec0
-                || pc0 == 0x4206_3ed8
-                || pc0 == 0x4206_3edc
-                || pc0 == 0x4206_9f2c
-            {
+            // True entries only (capture-only arm, but keep the union
+            // exact anyway): STA 0x42063ec0, scan 0x42063ed8, AP
+            // 0x42063f0c, ESP-NOW 0x42069f98, worker 0x42063f64.
+            } else if pc0 == self.soc.wifi_hook_get_config_pc() {
+                // STALE-MEMBER HAZARD (proven live on worker): union pcs
+                // from older images can land mid-function on a relinked
+                // image (e.g. STA 0x42063ec0 == worker
+                // `esp_wifi_clear_ap_list+0x10`). This arm is
+                // capture-only (no skip), so a misfire only mirrors
+                // staged bytes on ifx==1 — harmless.
+
                 // NOTE: get_config is a WRITE-ONLY side effect like
                 // set_config (no fake-RETW skip): the closed driver's own
                 // store update + canary live in the caller's frame, and
@@ -365,11 +438,12 @@ impl Esp32S3 {
                 let ifx = self.cpu[core].reg(10);
                 let out = self.cpu[core].reg(11);
                 self.soc.wifi_hook_ap_get_config(ifx, out);
-            } else if pc0 == 0x4206_3e58
-                || pc0 == 0x4206_3e70
-                || pc0 == 0x4206_3e74
-                || pc0 == 0x4206_9ec4
-            {
+            // True entries only: STA 0x42063e58, scan 0x42063e70, AP
+            // 0x42063ea4, ESP-NOW 0x42069f30, worker 0x42063efc.
+            } else if pc0 == self.soc.wifi_hook_set_config_pc() {
+                // STALE-MEMBER HAZARD: same as get_config above (union
+                // pcs can land mid-function on a relinked image) — safe
+                // here because this arm is capture-only (no skip).
                 // NOTE: set_config is DELIBERATELY never skipped (no
                 // fake-RETW): the hook only CAPTURES the firmware's own
                 // config into the staged store and lets the call run. A
@@ -380,11 +454,9 @@ impl Esp32S3 {
                 let ifx = self.cpu[core].reg(10);
                 let src = self.cpu[core].reg(11);
                 self.soc.wifi_hook_ap_set_config(ifx, src);
-            } else if pc0 == 0x4206_3f04
-                || pc0 == 0x4206_3f1c
-                || pc0 == 0x4206_3f20
-                || pc0 == 0x4206_9f70
-            {
+            // True entries only: STA 0x42063f04, scan 0x42063f1c, AP
+            // 0x42063f50, ESP-NOW 0x42069fdc, worker 0x42063fa8.
+            } else if pc0 == self.soc.wifi_hook_ap_sta_list_pc() {
                 let out = self.cpu[core].reg(10);
                 let ra = self.cpu[core].reg(8);
                 if self.soc.wifi_hook_ap_sta_list(out) {
@@ -393,12 +465,17 @@ impl Esp32S3 {
                     n += 1;
                     continue;
                 }
-            } else if (pc0 == 0x4203_c7d0
-                || pc0 == 0x4203_c858
-                || pc0 == 0x4203_c7e0
-                || pc0 == 0x4203_c7ec
-                || pc0 == 0x4203_ca78
-                || pc0 == 0x4203_ca84)
+            // True entries only: STA 0x4203c7d0, scan 0x4203c858, AP
+            // 0x4203c88c, ESP-NOW 0x4203caf0, worker 0x4203c8e4.
+            // WORKER EXEMPTION (proven live 2026-09-28): the worker's
+            // closed `esp_wifi_connect` path calls `esp_wifi_disconnect`
+            // internally on retry — skipping it there reports a success
+            // the firmware never earned and posts a DISCONNECTED the
+            // association never had, parking the run at `esp_wifi_connect`
+            // forever. The worker sketch never calls `WiFi.disconnect()`
+            // itself, so the hook simply never fires on this image.
+            } else if pc0 == self.soc.wifi_hook_disconnect_pc()
+                && self.soc.wifi_image != esp32s3_soc::WifiImage::Worker
                 && self.soc.wifi_hook_disconnect()
             {
                 let ra = self.cpu[core].reg(8);
@@ -411,31 +488,83 @@ impl Esp32S3 {
             // Ethernet TX capture (live-IP backhaul tap): the linked
             // `esp_netif_transmit(esp_netif, data, len)` callee is lwIP's
             // single egress point (DHCP/ARP/IP/ICMP/UDP/TCP all leave
-            // here). Pcs are nm on each sketch ELF (STA 0x4202e4d8 / AP
-            // 0x4202e594 / scan 0x4202e560 / ESP-NOW 0x4202e7f8 — same
-            // per-image-union discipline as the hook table above). The
-            // call RUNS unmodified (capture is read-only w.r.t. CPU
-            // state — same class as the set_config capture hook); the
-            // frame bytes land in `pending_net_tx` + an EVT_NET_FRAME
-            // event for the host (gateway bridge + pcap) to drain.
-            // Caller args are windowed (callee a3/a4 = caller a11/a12),
-            // read BEFORE `step_one` while wb still names the caller.
-            // PROVENANCE NOTE (2026-09-27, single-step + post-step
-            // histograms over 150M insns on the STA image): the current
-            // fixture sketches NEVER call this — the closed DHCP/client
-            // stack has no live netif state (no DHCP/client task runs;
-            // `esp_netif_get_ip_info` is hook-served), so no frame is
-            // ever captured on today's images. The tap is therefore
-            // wired but IDLE: it fires if/when a future test-worker-net
-            // sketch drives the real stack, and stays silent otherwise.
-            // (An earlier pcap trial captured 1600B of zeros/garbage —
-            // that was the hook reading caller regs at a pc the
-            // firmware never reaches as a call, now understood.)
-            if pc0 == 0x4202_e4d8 || pc0 == 0x4202_e594 || pc0 == 0x4202_e560 || pc0 == 0x4202_e7f8
+            // here). Pcs are nm per sketch ELF — scan 0x4202e560, STA
+            // 0x4202e4d8, AP 0x4202e594, ESP-NOW 0x4202e7f8,
+            // test-worker-net 0x4202e5f0 — and the hook fires ONLY for
+            // the pc matching this run's `wifi_image` (gated below):
+            // the images link the closed libs at different addresses,
+            // so a raw union would misfire (proven live 2026-09-27: on
+            // the STA image the AP pc 0x4202e594 is
+            // `esp_netif_dhcpc_start`, whose regs held zeros/garbage —
+            // the "1600B zeros" pcap trial). The call RUNS unmodified
+            // (capture is read-only w.r.t. CPU state — same class as the
+            // set_config capture hook); the frame bytes land in
+            // `pending_net_tx` + an EVT_NET_FRAME event for the host
+            // (gateway bridge + pcap) to drain. Caller args are windowed
+            // (callee a3/a4 = caller a11/a12), read BEFORE `step_one`
+            // while wb still names the caller. LIVE since the worker
+            // sketch drives the real stack (proven: 2 frames to pcap —
+            // ARP 0x0806 + IPv4 0x0800 — via direct `esp_netif_transmit`
+            // calls; the fixture sketches still never call it — their
+            // closed DHCP/client stack has no live netif state).
             {
-                let data = self.cpu[core].reg(11);
-                let len = self.cpu[core].reg(12);
-                self.soc.net_capture_tx(data, len);
+                use esp32s3_soc::WifiImage;
+                let want = match self.soc.wifi_image {
+                    WifiImage::Sta => 0x4202_e4d8,
+                    WifiImage::Ap => 0x4202_e594,
+                    WifiImage::Scan => 0x4202_e560,
+                    WifiImage::EspNow => 0x4202_e7f8,
+                    WifiImage::Worker => 0x4202_e60c,
+                };
+                if pc0 == want {
+                    let data = self.cpu[core].reg(11);
+                    let len = self.cpu[core].reg(12);
+                    self.soc.net_capture_tx(data, len);
+                }
+            }
+            // Ethernet RX injection (gateway→board replies: ARP/DHCP/
+            // IPv6/gVisor returns staged by the host via `net_inject_rx`
+            // from the NET_GW TCP leg). Entry hook on the linked
+            // `esp_netif_receive(esp_netif, buffer, len, eb)` callee
+            // (worker image 0x4202e654; other images use their own
+            // linked pcs, same wifi_image gate as the TX tap). When a
+            // frame is staged, its bytes are copied into the firmware's
+            // own `buffer` (caller a11 — the closed stack's pbuf-backed
+            // receive buffer, so the frame flows into lwIP unmodified)
+            // and the call is fake-returned with ESP_OK (caller a10 =
+            // 0); the scratch copy in `WIFI_SCRATCH` + `net_rx_last_*`
+            // stays observable for tests. When the FIFO is empty the
+            // call runs unmodified (silicon with no packet waiting —
+            // the closed stack drops it). Caller args windowed, read
+            // BEFORE `step_one` like the TX tap.
+            {
+                use esp32s3_soc::WifiImage;
+                let want_rx = match self.soc.wifi_image {
+                    WifiImage::Sta => 0x4202_e53c,
+                    WifiImage::Ap => 0x4202_e5f8,
+                    WifiImage::Scan => 0x4202_e5c4,
+                    WifiImage::EspNow => 0x4202_e85c,
+                    WifiImage::Worker => 0x4202_e670,
+                };
+                if pc0 == want_rx
+                    && let Some(frame) = self.soc.net_take_rx()
+                {
+                    use xtensa_core::Bus as _Bus;
+                    let buf = self.cpu[core].reg(11);
+                    let cap = self.cpu[core].reg(12) as usize;
+                    let m = frame.len().min(cap).min(1600);
+                    for (k, b) in frame.iter().take(m).enumerate() {
+                        self.soc.write8(buf + k as u32, *b as u32);
+                    }
+                    // Mirror into scratch for test observability
+                    // (same bytes, same layout as `net_rx_stage`).
+                    self.soc.net_rx_stage(&frame[..m]);
+                    let ra = self.cpu[core].reg(8);
+                    self.cpu[core].set_reg(10, 0); // ESP_OK
+                    self.cpu[core].pc = (pc0 & 0xc000_0000) | (ra & 0x3fff_ffff);
+                    n += 1;
+                    continue;
+                }
             }
             let r = self.cpu[core].step_one(&mut self.soc);
             // `step_one` records the fetched length even on exception paths,

@@ -109,7 +109,7 @@ Touch validated after all (see status log);
 flash-encryption pipeline, USB-OTG host enumeration, IDF-driver eMMC mount
 (`emmc_driver`), USB-OTG device-stack boot (`usb_device`), and the
 secure-boot signed pipeline (`secure_boot`) all landed (see status log).
-Still out: Wi-Fi SoftAP/ESP-NOW/BLE, USB-OTG device-mode enumeration against an external
+Still out: BLE, USB-OTG device-mode enumeration against an external
 host (no offline harness possible; every validatable path — host enum of
 the simulated device, EP0/EP1 loopback, TinyUSB HID boot + in-model-host
 full enumeration REQ0..REQ6 — is covered),
@@ -4517,3 +4517,115 @@ full enumeration REQ0..REQ6 — is covered),
       treatment mirrored in the SoC fixture engine (`soc.rs` RX
       payload). Battery wifi 8/8 (scan/sta/ap/espnow × run_flash +
       inwasm).
+  - 2026-09-28: **Live-IP L2 bridge lands (test-worker-net + full-duplex
+    gateway leg)**. The Ethernet bridge tap is no longer IDLE: new
+    `tools/sketches/esp32s3_test_worker_net/` sketch (STA association via
+    the worker fixture, then two REAL `esp_netif_transmit` calls — ARP
+    who-has 192.168.4.1 + IPv4/ICMP echo to the gateway — through the
+    live `WiFi.STA.netif()` pointer) drives the machine.rs TX hook live:
+    `net TX 42B ethertype 0x0806` + `net TX 42B ethertype 0x0800` to both
+    pcap and the gateway. Full-duplex: the Go gateway grows a native TCP
+    ingest leg (127.0.0.1:5051, length-prefixed raw Ethernet — same
+    framing as the WS bridge client) sharing the hub pipeline
+    (DHCP/ARP/UDP-forward/IPv6/gVisor) via `sendFrame` (transport-picked
+    replies); run_flash's NET_GW leg reads replies back nonblocking with
+    a persistent reassembly buffer (never `read_exact` on a nonblocking
+    socket) and stages them via `Soc::net_inject_rx` for a new machine.rs
+    `esp_netif_receive` entry hook (per-image pcs, worker 0x4202e50c;
+    fake-RETW ESP_OK with the bytes copied into the firmware's own
+    buffer). Proven live: gateway ARP reply (60B 0x0806) arrives in the
+    same step as the board ARP request (`net RX 60B`), RX FIFO bounded
+    at 8 with a drop counter, scratch mirror at WIFI_SCRATCH+0xC00 for
+    test observability. Supporting fixes, each live-proven: (1) worker
+    sketch must NOT call `WiFi.disconnect()` before `begin()` (the
+    disconnect path re-arms association machinery the host post then
+    misses — WL_CONNECTED never arrives; begin-straight-from-boot
+    works); (2) per-image `wifi_delete_call_site` (worker
+    `_checkForEvent` links elsewhere: 0x420041d9 vs STA 0x420041f1 —
+    shared-pc missed worker frees); (3) every image now selects its
+    `wifi_image` engine table in run_flash (STA runs previously relied
+    on the Scan default for the delete-site gate); (4) any .ino edit
+    relinks the closed libs (one disconnect() removal moved
+    transmit/connect/delete by 0x4c) — the four worker pcs are re-nm'd
+    per sketch change (documented in WORKER_LAYOUT). Also: run_flash
+    battery grep hardened (`grep -aqF --` so `-11`/`-12` markers can't
+    parse as flags); freshness guard resolves `test_worker_net_inwasm`
+    to the worker image; CI battery job gains Go + `go test ./...`
+    (gateway framing contract: split-segment reassembly is the proven
+    live failure class). Battery: worker run_flash + inwasm green;
+    wifi 9/9 (scan/sta/ap/espnow/worker × run_flash + inwasm where
+    applicable). Gallery 61 (worker entry with `wifi_worker` fixture;
+    `main.js` arms `wifi_worker_fixture`); odc splits the backhaul row
+    (L2 bridge Validated, L3–L7 suites Partial); README synced.
+    REMAINING per objective: L3–L7 client/server suites (the closed lwIP
+    stack needs a live netif binding the emulator cannot provide
+    offline — no validatable path exists in-tree); BLE stays out per
+    directive.
+  - 2026-09-28 (pm): **Full-duplex E2E proven live (gateway ARP + ICMP
+    replies through the worker's real `esp_netif_receive` calls)**.
+    Follow-up to the morning L2-bridge landing: the worker sketch gained
+    an RX leg (two real `esp_netif_receive(netif, rxb, 128, NULL)` calls;
+    verdict = buffer content, not return code), the gateway gained
+    `snoopICMPv4` (gateway-sourced echo reply with recomputed IP+ICMP
+    checksums, transport-agnostic via `sendFrame`), and run_flash's
+    NET_GW leg drains replies nonblocking with a persistent reassembly
+    buffer on TX-armed steps + every-64-step backstop (never `read_exact`
+    on a nonblocking socket — proven live failure class). Proven live:
+    `net RX 60B ethertype 0x0806` (ARP reply, same step as the ARP TX)
+    + `net RX 42B ethertype 0x0800` (ICMP echo reply, ~1 step after its
+    TX) → `WORKER NET rx1 1 60` (ARP opcode 2 in-buffer) — the FULL
+    gateway→board path through the real stack entry point, with the
+    reply bytes copied into the firmware's own pbuf-backed buffer and
+    ESP_OK fake-returned. `rx2` still reads -14 (ICMP reply arrives but
+    lands one step after the second receive call consumed the empty FIFO
+    — a sketch-timing artifact, not a bridge gap; the `net RX 42B
+    0x0800` host line proves delivery). Supporting fixes, each
+    live-proven: (1) static-IP `WiFi.STA.config()` in setup (the closed
+    DHCP client wedges in `dhcp_append` LWIP_ERROR without a live
+    DHCP task — `localIP()` ILLEGAL'd at EPC1=0x7fcb1834); the static
+    relink moved ALL worker pcs (transmit/receive/connect/scan/event
+    vars/delete-site + 6 hook-union members — re-nm'd, documented in
+    WORKER_LAYOUT); (2) hook-union → per-image true-entry tables
+    (`wifi_hook_*_pc()` in soc.rs; stale union pcs land mid-function on
+    relinked images — worker wedged at scan-0x4202e804 inside
+    `esp_netif_update_default_netif_lwip+0xa4`); (3) get_ip_info arg is
+    caller-a3/reg(11) (2-arg call; reg(10) is the netif pointer — the
+    EPC1 crash); (4) worker-exempt disconnect hook/leg (the closed
+    `esp_wifi_connect` path calls `esp_wifi_disconnect` internally on
+    retry — skipping it parks the run); (5) AP `esp_wifi_start`
+    0x42063840→0x42063870 (stale pc = leg never staged = `stations 102`
+    in-wasm; run_flash path unaffected). Battery honeymoon note: the
+    same true-entry cleanup FIXED the AP harness by deleting two stale
+    union members, but the in-wasm AP leg still needs the pre-step
+    sampling run_flash has (post-step ≤16-op blocks skip the entry) —
+    left as documented Partial, not papered over. L3–L7 client/server
+    suites stay Partial (no live-netif path offline); BLE stays out per
+    directive.
+  - 2026-09-29: **Worker relink drift fixed (keep-alive + full pc re-nm) +
+    browser Live-IP panel + Playwright worker/gateway tests (battery
+    117/0/0, gallery 61, Playwright ALL PASS incl. new tests)**. Three
+    stacked fixes, each live-proven:
+    (1) Any `.ino` edit relinks the closed libs: the keep-alive loop moved
+    transmit 0x4202e5fc→0x4202e60c / receive 0x4202e660→0x4202e670 /
+    connect 0x4203c8e8→0x4203c8f8 + all six hook pcs + scan_start +
+    BOTH event vars (WIFI_EVENT 0x3c0b42f4→0x3c0b4304, IP_EVENT
+    0x3c0b3bf0→0x3c0b3c00) — the stale vars parked association at START
+    (proven: dwell armed, CONNECTED/GOT_IP never posted). Fixed in both
+    run_flash WORKER_LAYOUT and the soc fixture engine + machine.rs gates.
+    (2) `delay(3000)` wait parks the pc with no UART so run_flash's 2M
+    idle-exit quits mid-wait (DONE never reached even at 200M budget);
+    replaced by a keep-alive loop (re-TX ARP 15x + `keep N` prints keep
+    uart_buf moving AND re-arm the reply drain each round). Battery STEPS
+    250M→350M + harness budget 250M→350M + `keep 14` markers.
+    (3) `wifi_hook_ap_sta_list` wrote num@0 but S3 `wifi_sta_list_t` is
+    sta[15]@0+num-last (num@180) — `stations 102` garbage; zero the array
+    + write num at +180 (header-verified in `esp_wifi_types_native.h`).
+    Browser: new Live-IP sidebar panel (gateway WS URL + Connect/✕ +
+    status + TX/RX log; TX via `bridge.net.onFrame`→WS binary, RX via
+    `onmessage`→`net_inject_rx`, same path headless NET_GW proves).
+    web/pkg rebuilt (was stale vs net_*/worker APIs). Playwright +2 tests
+    (worker DONE, gateway fails-soft) → ALL PASS (26 checks). Battery
+    117/0/0 (wifi 10/10), gallery 61, clippy 0, fmt clean, freshness
+    worker-clean, net 4/4 + gateway go tests green. L3–L7 suites stay
+    Partial (closed lwIP, no live netif offline); BLE stays out per
+    directive.

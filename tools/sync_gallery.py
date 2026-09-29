@@ -29,6 +29,17 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SK = os.path.join(ROOT, "tools", "sketches")
 WEB_FW = os.path.join(ROOT, "web", "firmware")
+# Bundled non-sketch firmware payloads (stock vendor images, not arduino
+# builds): gallery file -> source path. The MicroPython GENERIC_S3 release
+# is committed at tools/firmware/ and boots in the browser via the gallery
+# (padded + vfs-partitioned at load time by web/main.js, same as the
+# file-upload path and the ▶ REPL preset) — it has no sketch dir, so the
+# sketch resolution below could never find it (was: FAIL unresolvable).
+BUNDLED_FW = {
+    "ESP32_GENERIC_S3-20260824-v1.29.0.bin": os.path.join(
+        ROOT, "tools", "firmware", "ESP32_GENERIC_S3-20260824-v1.29.0.bin"
+    ),
+}
 BUILD = "--build" in sys.argv
 CHECK = "--check" in sys.argv
 
@@ -157,9 +168,18 @@ files = list(dict.fromkeys(e["file"] for e in man))
 os.makedirs(WEB_FW, exist_ok=True)
 synced = 0
 for gfile in files:
-    src = find_present(gfile)
-    if src is None and BUILD:
-        src = build_gallery_file(gfile)
+    src = None
+    if gfile in BUNDLED_FW:
+        # Stock vendor image (no sketch, no arduino build): copy the
+        # committed bundle verbatim.
+        if os.path.exists(BUNDLED_FW[gfile]):
+            src = BUNDLED_FW[gfile]
+        elif BUILD:
+            print(f"SKIP build {gfile} (bundled image missing at {BUNDLED_FW[gfile]})")
+    else:
+        src = find_present(gfile)
+        if src is None and BUILD:
+            src = build_gallery_file(gfile)
     if src is None:
         note(f"FAIL gallery file unresolvable: {gfile}")
         continue

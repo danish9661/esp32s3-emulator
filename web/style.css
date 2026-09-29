@@ -333,13 +333,13 @@ button#stop:disabled { background: #333945; color: #9aa1ad; }
 
 /* ── Sidebar ── */
 .sidebar { display: flex; flex-direction: column; gap: 14px; min-height: 0; }
-.gpio-wrap, .vdev-wrap {
+.gpio-wrap, .vdev-wrap, .net-wrap {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 12px 14px;
 }
-.gpio-wrap h2, .vdev-wrap h2 {
+.gpio-wrap h2, .vdev-wrap h2, .net-wrap h2 {
   font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.14em;
@@ -347,7 +347,7 @@ button#stop:disabled { background: #333945; color: #9aa1ad; }
   color: var(--dim);
   margin: 0 0 8px;
 }
-.gpio-wrap h2 small, .gpio-head h2 small { letter-spacing: 0; text-transform: none; font-weight: 400; }
+.gpio-wrap h2 small, .gpio-head h2 small, .net-wrap h2 small { letter-spacing: 0; text-transform: none; font-weight: 400; }
 .gpio-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
 .gpio-head h2 { margin: 0; }
 .gpio-controls { display: flex; gap: 5px; }
@@ -403,7 +403,38 @@ button#stop:disabled { background: #333945; color: #9aa1ad; }
   word-break: break-word;
   margin: 0;
 }
-.vdev-line { line-height: 1.45; }
+.vdev-line, .net-line { line-height: 1.45; }
+/* ── Live-IP bridge panel ── */
+.net-wrap { display: flex; flex-direction: column; gap: 8px; }
+.net-controls { display: flex; gap: 6px; align-items: center; }
+.net-url {
+  flex: 1 1 auto;
+  min-width: 120px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--ink);
+  padding: 6px 8px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+.net-url:focus { border-color: var(--amber); outline: none; }
+.net-status { font-size: 11.5px; color: var(--dim); }
+.netlog {
+  background: var(--crt);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 9px;
+  min-height: 48px;
+  max-height: 150px;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+}
 .gpio-cell[data-tip]:hover::after {
   content: attr(data-tip);
   position: absolute;

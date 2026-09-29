@@ -1,5 +1,21 @@
 # agent.md — Handover / Working Notes (WiFi bring-up)
 
+> SUPERSEDED 2026-09-29: the WiFi bring-up workstream this file tracked is
+> DONE and landed. Sessions 19–24 (scan → STA → SoftAP → ESP-NOW →
+> live-IP L2 bridge) all shipped; see `AGENTS.md` status log (2026-09-22
+> through 2026-09-29 entries) for the authoritative record. Battery is
+> **117/0/0**, gallery **62 entries**, Playwright E2E ALL PASS (26 checks
+> incl. worker boot + gateway panel). What remains is the documented
+> Partial, not open work: L3–L7 client/server suites (closed lwIP needs a
+> live netif binding the emulator cannot provide offline) and BLE (out of
+> scope per directive). Everything below §0 is HISTORICAL (kept for
+> forensics, superseded where it conflicts — notably §2's "no
+> emulator-side Ethernet bridge" and session 23's "no test-worker-*
+> suites": the `esp_netif_transmit` TX tap + `esp_netif_receive` RX
+> injection + `test_worker_net` sketch + Go gateway TCP ingest on
+> 127.0.0.1:5051 + browser Live-IP panel all landed and are proven live).
+> `AGENTS.md` is the authoritative status source; this file is frozen.
+
 Last updated: 2026-09-20 (session 18: SYSTIMER TARGET2 oneshot storm FIXED —
   SCAN COMPLETES `found 0`/`DONE`; uncommitted wifi.rs + soc.rs + systimer.rs
   + tests/systimer.rs).

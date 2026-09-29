@@ -19,26 +19,32 @@ peripherals) with no server-side emulation.
   and a broad set of peripherals.
 - **P5 (peripheral validation) complete**: every SoC peripheral is
   validated end-to-end by booting **real arduino-cli firmware** and asserting
-  both serial output and internal emulator state. Battery: **115/0/0**
-  (115 pass, 0 fail, 0 skipped) across 60 gallery entries (59 images) + driver/poke
+  both serial output and internal emulator state. Battery: **117/0/0**
+  (117 pass, 0 fail, 0 skipped) across 62 gallery entries (60 images + the
+  MicroPython stock image) + driver/poke
   sketches, plus Playwright browser E2E ALL PASS.
 - **P6 (browser frontend) complete**: Serial console + serial input row
-  (USB-CDC/UART0/1/2 + Send), GPIO LED grid, firmware gallery (60 entries:
+  (USB-CDC/UART0/1/2 + Send), GPIO LED grid, firmware gallery (62 entries:
   every major peripheral + SDSPI with in-browser card attach, emmc_driver,
-  usb_device, Wi-Fi scan/station/SoftAP/ESP-NOW via in-wasm fixtures; flashenc reuses the
+  usb_device, Wi-Fi scan/station/SoftAP/ESP-NOW/worker via in-wasm fixtures,
+  MicroPython REPL via the bundled stock image; flashenc reuses the
   hello bin with a `key` field), MIPS meter,
   Playwright E2E (hello boot, serial echo, UART1 round-trip, SDSPI mount,
-  touch read, Wi-Fi scan, SoftAP + ESP-NOW).
-- **Remaining known gaps**: live L3–L7 IP backhaul (DHCP→real LAN, ICMP/UDP/DNS/HTTP/MQTT/CoAP
-  client+server, IPv6) — a Go SLIRP/NAT + multiplayer gateway exists under `tools/gateway/`
-  (port 5050, DHCP/DNS/ARP/IPv6-RA/UDP-forward already implemented) but no emulator-side
-  Ethernet bridge feeds it frames yet (see `AGENTS.md`). The
+  touch read, Wi-Fi scan, SoftAP + ESP-NOW, worker).
+- **Remaining known gaps**: live L3–L7 IP suites (DHCP, DNS, HTTP, MQTT, CoAP
+  client+server, IPv6) — the L2 Ethernet bridge now flows both ways
+  (`test_worker_net`: TX tap → pcap + gateway TCP ingest on 127.0.0.1:5051;
+  RX injection via the `esp_netif_receive` hook; gateway SLIRP/NAT +
+  DHCP/DNS/ARP/IPv6-RA/UDP-forward under `tools/gateway/`), but the closed
+  lwIP stack needs a live netif binding the emulator cannot provide
+  offline, so no L3–L7 client/server flow completes end-to-end yet
+  (see `AGENTS.md`). The
   Arduino `Wire` (I2C) empty-bus scan reporting "other" is verified
   silicon-true behavior (esp-idf NG-driver maps the NACK path's
   `ESP_ERR_INVALID_STATE` to 4), not a model gap — see `AGENTS.md`. Xtensa
   `ee.*` DSP/TIE: 218/218 execute; unmapped patterns trap loud (correct).
   Touch validated.
-- **Out of scope**: live-IP backhaul wiring, BLE.
+- **Out of scope**: BLE.
 
 ## Quickstart
 
@@ -204,7 +210,7 @@ on CALL/RETW, matching QEMU's `win_helper.c` behavior.
 | I2C Wire driver | Silicon-true | Empty-bus scan reports "other" per esp-idf NG-driver mapping (verified behavior, not a gap); peripheral validated via direct poke |
 | ee.* DSP/TIE | 218/218 execute | Unmapped patterns trap loud (correct); only needed for WiFi/FFT firmware |
 | Touch | Validated | Oneshot + threshold ISR path via direct poke (see `AGENTS.md`) |
-| WiFi/BLE | Out of scope | Months of work; not required for core milestone |
+| WiFi/BLE | Partial / Out of scope | WiFi scan/STA/AP/ESP-NOW + live-IP L2 bridge validated; L3–L7 suites pending; BLE out of scope (months of work; not required for core milestone) |
 | I2S TDM/PDM | Modeled | Master/slave clock-gen, TDM, PDM all functional |
 | LCD_CAM 8080/6800 | Partial | FIFO + transfer-done functional; RGB FSM not modeled |
 | ULP rv32imc | Functional | C extension supported; compressed decode working |

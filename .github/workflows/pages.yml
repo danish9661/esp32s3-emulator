@@ -24,6 +24,7 @@ on:
       - "web/**"
       - "crates/**"
       - "tools/sketches/**"
+      - "tools/firmware/**"
       - "tools/sync_gallery.py"
       - ".github/workflows/pages.yml"
   workflow_dispatch:

@@ -196,6 +196,23 @@ impl Emulator {
         self.inner.soc.net_take_tx()
     }
 
+    /// Stage one host→board Ethernet frame for injection (gateway→board
+    /// replies: ARP/DHCP/IPv6/gVisor returns). The machine's
+    /// `esp_netif_receive` entry hook pops one frame per call and copies
+    /// it into the firmware's own receive buffer (see `Soc::net_inject_rx`
+    /// + the machine.rs RX hook). Browser frontend: call this from the
+    /// gateway WebSocket's `onmessage` handler with each binary message.
+    pub fn net_inject_rx(&mut self, bytes: &[u8]) {
+        self.inner.soc.net_inject_rx(bytes);
+    }
+
+    /// Dropped-RX counter (frames lost while the RX FIFO was full —
+    /// see `Soc::net_rx_dropped`). Host-visible so bridge drops under
+    /// load are observable, not silent.
+    pub fn net_rx_dropped(&self) -> u32 {
+        self.inner.soc.net_rx_dropped()
+    }
+
     /// Inject RX bytes for the next I2C master-read on `chan`
     /// (0=I2CEXT0, 1=I2CEXT1). Each byte is returned to the MCU on a READ; an
     /// empty supply reads back 0xFF (no device).
@@ -292,6 +309,16 @@ impl Emulator {
     pub fn wifi_espnow_fixture(&mut self) {
         self.inner.soc.wifi_fixture_image_espnow();
         self.inner.soc.wifi_fixture_espnow();
+        self.inner.soc.wifi_fixture_layout_reapply();
+    }
+
+    /// Arm the STA-connect fixture for the live-IP worker image
+    /// (test-worker-net sketch: same AP list + fixed LAN as wifi-sta, own
+    /// linked pcs under `WifiImage::Worker`). Mirrors run_flash
+    /// `WIFI_STA_CONN=1` on that image. Call after load, before Run.
+    pub fn wifi_worker_fixture(&mut self, aps: &str) {
+        self.inner.soc.wifi_fixture_image_worker();
+        self.inner.soc.wifi_fixture_sta(aps);
         self.inner.soc.wifi_fixture_layout_reapply();
     }
 }

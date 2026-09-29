@@ -98,15 +98,21 @@ def bin_for_case(name):
         return (b, [f"{SK}/esp32s3_twai_driver"])
     if name == "gdb":
         return (f"{SK}/esp32s3_hello/esp32s3_hello.merged.bin", [f"{SK}/esp32s3_hello"])
-    if name in ("wifi_scan_inwasm", "wifi_sta_inwasm", "wifi_ap_inwasm", "espnow_inwasm"):
+    if name in ("wifi_scan_inwasm", "wifi_sta_inwasm", "wifi_ap_inwasm", "espnow_inwasm", "test_worker_net_inwasm"):
         # NODE harness entries reuse the base sketch image via the 4th-field
         # binrel (see run_battery.sh): wifi_scan_inwasm -> the wifi_scan
         # image, wifi_sta_inwasm -> the wifi_sta image, wifi_ap_inwasm ->
-        # the wifi_ap image, espnow_inwasm -> the espnow image. Resolve to
+        # the wifi_ap image, espnow_inwasm -> the espnow image,
+        # test_worker_net_inwasm -> the test_worker_net image. Resolve to
         # the base case so the guard checks the real committed bin, not a
         # nonexistent esp32s3_<name> dir (which would false-FAIL "missing
         # bin" forever).
         base = name.removesuffix("_inwasm")
+        if base == "test_worker_net":
+            return (
+                f"{SK}/esp32s3_test_worker_net/esp32s3_test_worker_net.merged.bin",
+                [f"{SK}/esp32s3_test_worker_net"],
+            )
         return bin_for_case(base)
     d = f"{SK}/esp32s3_{name}"
     for cand in (f"{d}/esp32s3_{name}.merged.bin", f"{d}/esp32s3_{name}.ino.merged.bin"):
@@ -153,11 +159,14 @@ for name in battery_cases():
             )
 
 # --- 2. gallery coverage ---
-# Gallery policy (documented 2026-09-14, extended 2026-09-22/26): the
-# gallery is a curated subset, not 1:1 with the battery. 59 entries are
+# Gallery policy (documented 2026-09-14, extended 2026-09-22/26/29): the
+# gallery is a curated subset, not 1:1 with the battery. 62 entries are
 # the in-wasm-validatable set (touch joined via the in-browser
 # TOUCH_INJECT fixture; flashenc reuses the hello bin with a `key`
-# field; Wi-Fi scan/station/SoftAP/ESP-NOW joined via in-wasm fixtures;
+# field; Wi-Fi scan/station/SoftAP/ESP-NOW/worker joined via in-wasm
+# fixtures; the MicroPython stock image joined as a raw Release .bin with
+# a `"micropython": true` flag — main.js pads + partitions it at load,
+# and tools/sync_gallery.py copies it from tools/firmware/;
 # serial input row + MIPS meter);
 # everything else is intentionally gallery-absent (needs host env/fixtures
 # the browser cannot provide, is a build variant sharing one source dir, or
@@ -191,7 +200,7 @@ covered = set()
 for e in man:
     covered.add(e["file"])
 # Gallery-coverage section is informational: the gallery is a curated
-# subset (59 entries), not 1:1 with the battery cases. Report the
+# subset (62 entries), not 1:1 with the battery cases. Report the
 # counts and stop — per-case "no gallery entry" lines would just restate
 # policy as noise.
 print(f"gallery entries: {len(mfiles)}, battery cases: {len(battery_cases())} (gallery is a curated subset; absence is policy, not rot)")

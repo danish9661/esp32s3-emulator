@@ -119,6 +119,8 @@ CASES=(
 "usb_host||USB HOST PORT OK;USB HOST DESC OK;USB HOST CFG OK;USB HOST STR OK;USB HOST SOF OK;USB HOST ENUM PASS;USB HOST DONE|"
 "wifi_scan|WIFI_SCAN_FIXTURE=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55|WIFI SCAN found 1;WIFI NET 0 EmuNet;WIFI SCAN DONE|60000000"
 "wifi_sta|WIFI_STA_CONN=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55|WIFI STA status 3;WIFI STA IP 192.168.4.2;WIFI STA SSID EmuNet;WIFI STA after-disconnect 6;WIFI STA DONE|150000000"
+"test_worker_net|WIFI_STA_CONN=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55|WORKER NET START;WORKER NET status 3;WORKER NET netif 1;WORKER NET tx1 -11;WORKER NET tx2 -12;WORKER NET keep 14;WORKER NET rx1 1 -13;WORKER NET rx2 1 -14;WORKER NET DONE|350000000"
+"test_worker_net_inwasm|NODE:tools/wifi_harness.mjs|WIFI WORKER NET HARNESS PASS||esp32s3_test_worker_net/esp32s3_test_worker_net.merged.bin"
 "wifi_ap|WIFI_AP_FIXTURE=1|WIFI AP softAP 1;WIFI AP IP 192.168.4.1;WIFI AP MAC 62:55:44:33:22:11;WIFI AP stations 0;WIFI AP clients 0;WIFI AP DONE|60000000"
 "espnow|WIFI_ESPNOW_LOOPBACK=1|WIFI ESPNOW init 1;WIFI ESPNOW addpeer 1;WIFI ESPNOW sent 1;WIFI ESPNOW sendcb 1;WIFI ESPNOW rxcb 1;WIFI ESPNOW rx0 68;WIFI ESPNOW rxlen 5;WIFI ESPNOW rxsum 14;WIFI ESPNOW DONE|60000000"
 "usb_device|USB_HOST_ENUM=1|USB DEVICE STACK UP;USB DEVICE RESET ENUMSPD;USB DEVICE POLL RDV;USB DEVICE ENUM OK;USB DEVICE REQ1 OK;USB DEVICE REQ2 OK;USB DEVICE REQ3 OK;USB DEVICE REQ4 OK;USB DEVICE REQ5 OK;USB DEVICE REQ6 OK;USB DEVICE ENUM FULL OK;USB DEVICE PASS;USB DEVICE DONE|60000000"
@@ -218,7 +220,7 @@ for c in "${CASES[@]}"; do
       log=$(timeout 600 node "$ROOT/${envstr#NODE:}" 2>&1 | tr -d '\0')
       ok=1; why=""
       for m in ${markers//;/ }; do
-        echo "$log" | grep -aqF "$m" || { ok=0; why="missing [$m]"; }
+        echo "$log" | grep -aqF -- "$m" || { ok=0; why="missing [$m]"; }
       done
       echo "$log" | grep -aq "HARNESS FAIL" && { ok=0; why="harness reported FAIL"; }
       if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); fi
@@ -229,7 +231,7 @@ for c in "${CASES[@]}"; do
     log=$(timeout 600 node "$ROOT/${envstr#NODE:}" "$bin" 2>&1 | tr -d '\0')
     ok=1; why=""
     for m in ${markers//;/ }; do
-      echo "$log" | grep -aqF "$m" || { ok=0; why="missing [$m]"; }
+      echo "$log" | grep -aqF -- "$m" || { ok=0; why="missing [$m]"; }
     done
     echo "$log" | grep -aq "HARNESS FAIL" && { ok=0; why="harness reported FAIL"; }
     if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); fi
@@ -280,7 +282,7 @@ for c in "${CASES[@]}"; do
   log=$(STEPS=$steps env $envstr timeout 300 "$EMU" "$bin" 2>&1 | tr -d '\0')
   ok=1; why=""
   for m in ${markers//;/ }; do
-    echo "$log" | grep -aqF "$m" || { ok=0; why="missing [$m]"; }
+    echo "$log" | grep -aqF -- "$m" || { ok=0; why="missing [$m]"; }
   done
   echo "$log" | grep -aq "FAIL" && { ok=0; why="FAIL in output"; }
   if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); fi

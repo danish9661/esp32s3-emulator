@@ -249,5 +249,15 @@
     "name": "espnow — ESP-NOW loopback (virtual peer)",
     "file": "esp32s3_espnow.merged.bin",
     "espnow": true
+  },
+  {
+    "name": "test_worker_net — live-IP backhaul TX tap (fixture)",
+    "file": "esp32s3_test_worker_net.merged.bin",
+    "wifi_worker": "EmuNet,-50,6,02:11:22:33:44:55"
+  },
+  {
+    "name": "micropython — Python REPL (UART0, pads + vfs)",
+    "file": "ESP32_GENERIC_S3-20260824-v1.29.0.bin",
+    "micropython": true
   }
 ]
