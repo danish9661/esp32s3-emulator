@@ -102,21 +102,26 @@ Core design:
 Scope updates (2026-09-22): P5/P6 done — battery 111/0/0 (0 skipped),
 gallery 57 in-wasm-validatable entries, Playwright E2E ALL PASS
 (hello boot, MIPS, serial echo, UART1 round-trip, SDSPI mount, touch read,
-Wi-Fi scan). Earlier
+Wi-Fi scan). Scope updates (2026-09-30): WiFi L3–L7 gateway-local legs
++ BLE landed — battery +4 (`test_worker_l3`, `ble` run_flash entries +
+`test_worker_l3_inwasm` NODE harness; BLE boots to DONE with or without
+the bridge), gallery 64 entries (+`test_worker_l3` with the
+`wifi_worker_l3` fixture, +`ble` with the Bumble bridge panel), Go
+gateway serves DNS/NTP/UDP-echo locally (handleL7.go) + BLE byte-pump
+(/api/ble-gateway), Bumble 0.0.231 pinned by the self-test. Earlier
 scoping notes below are HISTORICAL (superseded where they conflict):
 Touch validated after all (see status log);
 `ee.*` now 218/218 executing (incl. `ee_srs_accx`); eMMC simulated card,
 flash-encryption pipeline, USB-OTG host enumeration, IDF-driver eMMC mount
 (`emmc_driver`), USB-OTG device-stack boot (`usb_device`), and the
 secure-boot signed pipeline (`secure_boot`) all landed (see status log).
-Still out: BLE, USB-OTG device-mode enumeration against an external
+Still out: USB-OTG device-mode enumeration against an external
 host (no offline harness possible; every validatable path — host enum of
 the simulated device, EP0/EP1 loopback, TinyUSB HID boot + in-model-host
 full enumeration REQ0..REQ6 — is covered),
 `ee.*` unmapped patterns (loud trap, correct). Gallery-excluded by policy
 (needs a host fixture the browser cannot provide): `secure_boot`
 (SECURE_BOOT_EN burn).
-
 ## Validation strategy
 
 1. **Unit tests** in each crate (instruction-level, known-answer tests).
@@ -4629,3 +4634,37 @@ full enumeration REQ0..REQ6 — is covered),
     worker-clean, net 4/4 + gateway go tests green. L3–L7 suites stay
     Partial (closed lwIP, no live netif offline); BLE stays out per
     directive.
+  - 2026-09-30: **WiFi L3–L7 gateway-local legs + BLE land (battery +4,
+    gallery 64)**. Two workstreams, both live-proven:
+    (1) Gateway-local L3–L7 (`tools/gateway/handleL7.go` + `l7_test.go`):
+    the Go gateway answers board→gateway DNS (static A table:
+    example.com/test.mosquitto.org/gateway names), NTP (fixed 2026-01-01
+    epoch), and UDP-echo on the CoAP port synchronously — same snoop
+    placement as the IPv6 hub services (before the gVisor feed; TCP
+    HTTP/MQTT falls through to gVisor NAT by design, proven live with
+    host egress EGRESS_TCP80_OK/EGRESS_MQTT_OK). New
+    `esp32s3_test_worker_l3` sketch speaks REAL lwIP client frames
+    through the live `esp_netif_transmit` tap (own WorkerL3 linked pcs in
+    soc.rs + machine.rs + run_flash WORKER_L3_LAYOUT) and checks reply
+    BYTES via real `esp_netif_receive` calls → `WORKER L3 DONE` with
+    NET_GW up (dns 34/ntp 123), graceful `DONE` without it.
+    (2) BLE via Google Bumble (`tools/ble_bridge.py`, Bumble 0.0.231):
+    emulator VHCI tap (BT page 0x60011000 + modem-EM alias 0x60031000
+    with seeded EM base + `bltz` busy-bit overlays, BT_LPCK DIV reset
+    defaults, RWBLE source 8 with BB-RMW split ownership) captures
+    firmware HCI at the `esp_vhci_host_send_packet` entry and forwards
+    length-prefixed over `BLE_GW` to the Bumble virtual controller
+    (Battery 0x180F + echo GATT app); Go `/api/ble-gateway` byte-pumps
+    it to the browser BLE panel (bridge.ble.onPacket ↔
+    `bt_hci_inject_rx`). KEY FINDING (proven live after 30+ probes): the
+    REAL ROM (0x4002dd10/0x4002ded8) implements a controller loopback —
+    it synthesizes Command Completes into 0x3fcacfd6 itself and calls
+    `host_rcv_pkt` with its OWN buffer — so the sketch boots to
+    `BLE DONE` with AND without the bridge; all host-side firmware
+    synthesis (sem give, ack deliver, pool top-up) was proven harmful
+    (stale-CC opcode mismatch rc=12, foreign-buffer assert 0x42014482)
+    and reverted to a capture-only tap (helpers parked with
+    #[allow(dead_code)]). Battery +4 (`test_worker_l3`,
+    `test_worker_l3_inwasm` NODE harness, `ble`), gallery 64 (+L3 with
+    `wifi_worker_l3` fixture, +BLE with bridge panel), clippy 0, fmt
+    clean, go tests green, freshness guard clean.

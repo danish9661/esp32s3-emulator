@@ -213,6 +213,30 @@ impl Emulator {
         self.inner.soc.net_rx_dropped()
     }
 
+    /// Take the most recent captured firmware→controller HCI packet
+    /// (bytes) and clear it. Call this when an `EVT_BLE_HCI` (kind 7)
+    /// event arrives, then forward the bytes length-prefixed to the
+    /// Bumble BLE bridge (`tools/ble_bridge.py --emu-port`, raw TCP =
+    /// 4-byte BE length + HCI packet) — the browser-side BLE path.
+    pub fn bt_hci_take_tx(&mut self) -> Vec<u8> {
+        self.inner.soc.bt_hci_take_tx()
+    }
+
+    /// Stage one controller→firmware HCI packet for injection (Bumble
+    /// bridge replies: Command Complete/Status events, ACL data, LE
+    /// advertising reports). The firmware VHCI-recv path pops one packet
+    /// per poll. Browser frontend: call this from the bridge TCP socket's
+    /// `onmessage` handler with each length-prefixed packet.
+    pub fn bt_hci_inject_rx(&mut self, bytes: &[u8]) {
+        self.inner.soc.bt_hci_inject_rx(bytes);
+    }
+
+    /// Dropped BLE-RX counter (packets lost while the RX FIFO was full —
+    /// see `Soc::bt_hci_rx_dropped`).
+    pub fn bt_hci_rx_dropped(&self) -> u32 {
+        self.inner.soc.bt_hci_rx_dropped()
+    }
+
     /// Inject RX bytes for the next I2C master-read on `chan`
     /// (0=I2CEXT0, 1=I2CEXT1). Each byte is returned to the MCU on a READ; an
     /// empty supply reads back 0xFF (no device).
@@ -318,6 +342,16 @@ impl Emulator {
     /// `WIFI_STA_CONN=1` on that image. Call after load, before Run.
     pub fn wifi_worker_fixture(&mut self, aps: &str) {
         self.inner.soc.wifi_fixture_image_worker();
+        self.inner.soc.wifi_fixture_sta(aps);
+        self.inner.soc.wifi_fixture_layout_reapply();
+    }
+
+    /// Arm the STA-connect fixture for the L3 worker image
+    /// (test-worker-l3 sketch: same AP list + fixed LAN as wifi-sta, own
+    /// linked pcs under `WifiImage::WorkerL3`). Mirrors run_flash
+    /// `WIFI_STA_CONN=1` on that image. Call after load, before Run.
+    pub fn wifi_worker_l3_fixture(&mut self, aps: &str) {
+        self.inner.soc.wifi_fixture_image_worker_l3();
         self.inner.soc.wifi_fixture_sta(aps);
         self.inner.soc.wifi_fixture_layout_reapply();
     }

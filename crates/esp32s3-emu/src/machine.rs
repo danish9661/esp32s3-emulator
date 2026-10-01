@@ -476,6 +476,7 @@ impl Esp32S3 {
             // itself, so the hook simply never fires on this image.
             } else if pc0 == self.soc.wifi_hook_disconnect_pc()
                 && self.soc.wifi_image != esp32s3_soc::WifiImage::Worker
+                && self.soc.wifi_image != esp32s3_soc::WifiImage::WorkerL3
                 && self.soc.wifi_hook_disconnect()
             {
                 let ra = self.cpu[core].reg(8);
@@ -515,6 +516,7 @@ impl Esp32S3 {
                     WifiImage::Scan => 0x4202_e560,
                     WifiImage::EspNow => 0x4202_e7f8,
                     WifiImage::Worker => 0x4202_e60c,
+                    WifiImage::WorkerL3 => 0x4202_e6e8,
                 };
                 if pc0 == want {
                     let data = self.cpu[core].reg(11);
@@ -545,6 +547,7 @@ impl Esp32S3 {
                     WifiImage::Scan => 0x4202_e5c4,
                     WifiImage::EspNow => 0x4202_e85c,
                     WifiImage::Worker => 0x4202_e670,
+                    WifiImage::WorkerL3 => 0x4202_e74c,
                 };
                 if pc0 == want_rx
                     && let Some(frame) = self.soc.net_take_rx()
@@ -565,6 +568,65 @@ impl Esp32S3 {
                     n += 1;
                     continue;
                 }
+            }
+            // BLE VHCI TX capture (NimBLE host→controller path): the linked
+            // `esp_vhci_host_send_packet(data, len)` callee (BLE image only,
+            // 0x42025f90 — nm on the esp32s3_ble ELF; sibling images never
+            // link libbt so no gate is needed) takes NimBLE's H4 HCI frame
+            // (type 0x01 CMD / 0x02 ACL + payload). Caller args are
+            // windowed (callee a2/a3 = caller a10/a11), read BEFORE
+            // `step_one` while wb still names the caller — same discipline
+            // as the TX-tap arm above. Capture is read-only w.r.t. CPU
+            // state: the call RUNS unmodified (the closed
+            // `API_vhci_host_send_packet` descends into function-pointer
+            // tables that read 0 on the emulator and return an error the
+            // NimBLE TX path tolerates — `ble_hci_trans_hs_cmd_tx` frees
+            // the mbuf either way); the frame bytes land in `pending_tx`
+            // + an EVT_BLE_HCI event for the host (Bumble bridge) to
+            // drain via `bt_hci_take_tx`.
+            //
+            // SEMAPHORE NOTE (proven live: only ONE `BLE TX` line ever
+            // fires): NimBLE's `ble_hci_trans_hs_cmd_tx` takes
+            // `vhci_send_sem` (0x3fc9d6d0, BLE image only) before EVERY
+            // send with a ~2s (`0x7d0`-tick) timeout, and NOTHING on the
+            // emulator ever gives it — silicon's controller gives it via
+            // `controller_rcv_pkt_ready` after each TX completes (see
+            // esp_nimble_hci.c; `notify_host_send_available` wakes the
+            // same semaphore). The Host → `host_rcv_pkt` reply path does
+            // NOT unblock it (the Command Complete event only flows into
+            // the NimBLE event queue, which the stalled sender task never
+            // drains). So the tap gives the semaphore here, once per
+            // captured packet: `vhci_send_sem` counts INITIALLY 1 (set by
+            // `esp_nimble_hci_init`), each send takes 1, each completion
+            // gives 1 back — one give per captured TX is exactly the
+            // controller's contract. The give itself runs IN FIRMWARE
+            // (same call8-frame synthesis as `run_ble_host_recv`, on the
+            // CURRENT core, callee `controller_rcv_pkt_ready` at
+            // 0x4200507c which gives iff the handle is nonzero).
+            //
+            // ROM-LOOPBACK NOTE (proven live 2026-09-30: the REAL ROM
+            // binary at 0x4002dd10/0x4002ded8 implements a controller
+            // loopback — it takes the host's TX command and synthesizes
+            // the Command Complete into 0x3fcacfd6 itself, then calls
+            // `host_rcv_pkt` with its OWN buffer — no host/bridge needed
+            // for basic commands). The tap therefore captures READ-ONLY
+            // (bridge observability) and runs NOTHING in firmware: no
+            // sem give (`run_ble_send_ready`), no ack deliver, no pool
+            // top-up. All three were proven harmful or redundant:
+            // - the give pumped `vhci_send_sem` the ROM loopback already
+            //   manages (double-completion → stale acks);
+            // - `ble_ack_deliver_at` overwrote the live TX mbuf with a
+            //   STALE bridge reply (previous command's CC → opcode
+            //   mismatch → `HCI process ack returned 12`);
+            // - `ble_pool_top_up` linked the checked-out mbuf as free
+            //   while live (double-ownership vs the ROM loopback's own
+            //   alloc/free pairing → `assert failed: 0x42014482`).
+            // The helpers stay (unit-tested, wired for a future external-
+            // controller mode) but the tap does not call them.
+            if pc0 == 0x4202_5f90 {
+                let data = self.cpu[core].reg(10);
+                let len = self.cpu[core].reg(11);
+                self.soc.bt_hci_capture_tx(data, len);
             }
             let r = self.cpu[core].step_one(&mut self.soc);
             // `step_one` records the fetched length even on exception paths,
@@ -590,13 +652,14 @@ impl Esp32S3 {
         (StepResult::Ok, n)
     }
 
-    /// Run one staged ESP-NOW callback invocation IN FIRMWARE on `core`
-    /// (host frontend — the machine owns the CPUs, the SoC only stages;
-    /// see `Soc::wifi_espnow_take_call`). Saves the core's full windowed
-    /// state, calls the closed driver's registered wrapper with the
-    /// windowed-ABI args staged in the scratch window, runs it to `retw`,
-    /// then restores everything except the callback's own memory writes
-    /// (the sketch-visible `sent_ok`/`got_rx` flags + peer dispatch).
+    /// Run one staged host-context callback invocation IN FIRMWARE on
+    /// `core` (host frontend — the machine owns the CPUs, the SoC only
+    /// stages; see `Soc::wifi_espnow_take_call`). Saves the core's full
+    /// windowed state, calls the closed driver's registered wrapper with
+    /// the windowed-ABI args staged in the scratch window, runs it to
+    /// `retw`, then restores everything except the callback's own memory
+    /// writes (the sketch-visible `sent_ok`/`got_rx` flags + peer
+    /// dispatch).
     ///
     /// Window discipline (ISA RM Ch.4, verified against exec.rs CALL8):
     /// the caller (host) synthesizes a call8 frame — rotate wb by 2 (the
@@ -606,6 +669,10 @@ impl Esp32S3 {
     /// callback's ENTRY rotates wb back; its `retw` rotates forward to
     /// the host frame and lands at the stashed return pc, where the host
     /// detects completion and restores the saved state.
+    ///
+    /// Shared by the ESP-NOW fixture legs AND the BLE VHCI recv path
+    /// (see `run_ble_host_recv`: same call8-frame synthesis, 2-arg
+    /// `host_rcv_pkt(data, len)` form).
     pub fn run_espnow_callback(&mut self, core: usize) -> bool {
         let Some((entry, a2, a3)) = self.soc.wifi_espnow_take_call() else {
             return false;
@@ -669,6 +736,164 @@ impl Esp32S3 {
         // harness resumes — a stale wb would misname every reg).
         cpu.set_windowbase(saved_wb);
         ok
+    }
+
+    /// Run the registered BLE VHCI `notify_host_recv` callback IN FIRMWARE
+    /// on `core` with one staged controller→host HCI packet (host
+    /// frontend — the Bumble bridge reply path; the packet bytes were
+    /// staged by the host via `Soc::bt_hci_inject_rx`).
+    ///
+    /// Same call8-frame synthesis as `run_espnow_callback` (2-arg form):
+    /// `host_rcv_pkt(data, len)` = NimBLE's `ble_transport_to_hs_evt_impl`
+    /// path via `host_rcv_pkt` at 0x420050a0 (BLE image only — nm on the
+    /// esp32s3_ble ELF; sibling images never link NimBLE so the hook
+    /// address never matches). The packet bytes are copied into the host
+    /// scratch window first (`Soc::bt_hci_stage_rx` at
+    /// `WIFI_SCRATCH + 0x2500`, past the net-RX slots — never heap, never
+    /// the TLSF pool: `host_rcv_pkt` only READS the bytes into an mbuf it
+    /// allocates itself, same class as the `WIFI_SCRATCH` fixture
+    /// window). `entry` is the firmware's `notify_host_recv` pointer
+    /// (read once from the `vhci_host_cb` rodata by the host); while
+    /// undiscovered the call is skipped and the packet stays queued
+    /// (level, not edge — silicon with an unregistered callback drops
+    /// it, but retrying is harmless and covers the
+    /// register-then-reply race).
+    ///
+    /// PARKED (see the run_flash BLE leg note): driving the reply into
+    /// the firmware via a synthetic `host_rcv_pkt` call walks the mbuf
+    /// pool free path with a block the pool does not recognize (`assert
+    /// failed: 0x42014482` in `os_memblock_from(pool_cmd)`,
+    /// panic_abort EPC1=0x4037fdc4 — proven live via pb5: the plain
+    /// `host_rcv_pkt` firmware path asserts with NO hook and NO bridge
+    /// traffic). The reply must enter through the firmware's OWN VHCI
+    /// poll (`host_rcv_pkt` at 0x420050a0, called by the controller glue
+    /// with its own buffer at 0x3fcacfd6) — until the controller-glue
+    /// poll is modeled (the RWBLE ISR path that hands the firmware its
+    /// own buffer), this stays parked and UNCALLED (kept for the day the
+    /// poll lands; the overflow-aware loop + full-phys save + INTENABLE
+    /// mask below are all verified correct — the failure is the FOREIGN
+    /// buffer, not the synthesis).
+    ///
+    /// Returns true when a packet was delivered (callback ran to `retw`);
+    /// false when idle (no packet, or no callback yet).
+    #[allow(dead_code)]
+    pub fn run_ble_host_recv(&mut self, core: usize, entry: u32) -> bool {
+        if !(0x4000_0000..0x4240_0000).contains(&entry) {
+            // No callback yet — idle WITHOUT consuming the packet (level,
+            // not edge: the FIFO still holds it, so the next step retries
+            // once the callback is discovered). NOTE: no event is queued
+            // or drained here — `bt_hci_inject_rx` already queued the RX
+            // event at stage time.
+            return false;
+        }
+        let Some((buf, len)) = self.soc.bt_hci_stage_rx() else {
+            return false;
+        };
+        let cpu = &mut self.cpu[core];
+        let saved_pc = cpu.pc;
+        let saved_wb = cpu.windowbase();
+        // Save the FULL physical window file (all 64 regs): the
+        // synthetic call rotates wb+2 and runs thousands of firmware
+        // instructions (allocators, queues, window spills), clobbering
+        // physical registers across MULTIPLE windows. Saving only the
+        // current view (proven live: a0-a15 of one window) misses the
+        // caller's spilled window — the restore then resumes with a
+        // clobbered a1 (stack pointer — observed 0xffffff05 post-hook
+        // vs 0x3fcaec30 pre-hook), so the very next `entry` spills
+        // through a wild sp and dies with EPC1 at the resumed pc
+        // (0x420050ba). Cost: 64 u32 copies per delivered packet
+        // (packets are rare). `phys_regs` exposes the raw file; the
+        // restore writes it back verbatim (wb restored after, so the
+        // view names the same window again).
+        let saved_phys = *cpu.phys_regs();
+        // Mask interrupts across the synthetic call (proven live: the
+        // callee's `entry a1,32` takes a WindowOverflow vector, and a
+        // pending level-1 line arriving MID-call vectors into the real
+        // kernel queue with a HOST-saved wb — on return the restore
+        // writes the wrong window (a3 garbage → EPC1+illegal inside
+        // `host_rcv_pkt`, EPC1=0x420050ba). Silicon runs the VHCI
+        // callback in interrupt context with the line already claimed;
+        // INTENABLE=0 is the faithful equivalent, restored below.
+        // (Same hazard class as `run_espnow_callback` — its wrappers are
+        // leaf enough to usually survive, but the mask is correct for
+        // both; the espnow path is left untouched per minimal-diff.)
+        let saved_ie = cpu.sreg(xtensa_core::cpu::SR_INTENABLE);
+        cpu.set_sreg(xtensa_core::cpu::SR_INTENABLE, 0);
+        let wb = (saved_wb + 2) & 0xf;
+        cpu.set_windowbase(wb);
+        cpu.pc = entry;
+        cpu.set_reg(8, 0x4000_0000);
+        cpu.set_reg(10, buf);
+        cpu.set_reg(11, len);
+        for _ in 0..10_000 {
+            // Window overflow/underflow (causes 32..=37) is NORMAL
+            // control flow for a call this deep (proven live:
+            // `ble_transport_alloc_evt → os_memblock_get` takes
+            // WindowOverflow8 mid-call — the vector spills windows and
+            // resumes the caller). The run only ends at the fake-RETW
+            // pc; any OTHER non-Ok result aborts the call (state still
+            // restored below). NOTE: the loop must NOT break on
+            // overflow — breaking leaves pc at the vector
+            // (0x40374080), `ok` reads false, and worse, the restore
+            // then resumes the firmware INSIDE the overflow handler
+            // state. `step_one` already vectored correctly; just keep
+            // stepping (same discipline as `step_fast`'s block loop,
+            // which only ends runs on pc deviation, not on overflow
+            // exceptions).
+            let r = self.cpu[core].step_one(&mut self.soc);
+            if self.cpu[core].pc == 0x4000_0000 {
+                break;
+            }
+            if !matches!(r, StepResult::Ok | StepResult::Exception { cause: 32..=37 }) {
+                break;
+            }
+        }
+        let ok = self.cpu[core].pc == 0x4000_0000;
+        let cpu = &mut self.cpu[core];
+        cpu.pc = saved_pc;
+        *cpu.phys_regs_mut() = saved_phys;
+        cpu.set_sreg(xtensa_core::cpu::SR_INTENABLE, saved_ie);
+        cpu.set_windowbase(saved_wb);
+        ok
+    }
+
+    /// Run the emulator-side equivalent of the controller's TX-done
+    /// signal: `controller_rcv_pkt_ready` (0x4200507c, BLE image only —
+    /// nm on the esp32s3_ble ELF) gives `vhci_send_sem` iff the handle
+    /// is nonzero. Same 0-arg call8-frame synthesis as `run_ble_host_recv`
+    /// (fake-RETW at 0x4000_0000); the callee's `beqz` skips the give
+    /// when unregistered, so this is safe to call unconditionally from
+    /// the TX-tap arm.
+    ///
+    /// PARKED with the rest of the firmware-synthesis BLE path (see the
+    /// tap note): the ROM loopback already manages `vhci_send_sem`, and
+    /// an extra give double-completes TX (stale acks → opcode mismatch).
+    #[allow(dead_code)]
+    fn run_ble_send_ready(&mut self, core: usize) {
+        const READY: u32 = 0x4200_507c;
+        const RETPC: u32 = 0x4000_0000;
+        let cpu = &mut self.cpu[core];
+        let saved_pc = cpu.pc;
+        let saved_wb = cpu.windowbase();
+        let saved_a0 = cpu.reg(0);
+        let saved_a1 = cpu.reg(1);
+        let saved_a8 = cpu.reg(8);
+        let wb = (saved_wb + 2) & 0xf;
+        cpu.set_windowbase(wb);
+        cpu.pc = READY;
+        cpu.set_reg(8, RETPC);
+        for _ in 0..10_000 {
+            self.cpu[core].step_one(&mut self.soc);
+            if self.cpu[core].pc == RETPC {
+                break;
+            }
+        }
+        let cpu = &mut self.cpu[core];
+        cpu.pc = saved_pc;
+        cpu.set_reg(0, saved_a0);
+        cpu.set_reg(1, saved_a1);
+        cpu.set_reg(8, saved_a8);
+        cpu.set_windowbase(saved_wb);
     }
 
     /// Re-run the boot sequence from the last loaded flash image.  Used when a

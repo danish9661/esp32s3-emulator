@@ -379,6 +379,21 @@ impl Cpu {
         self.phys[i] = v;
     }
 
+    /// Raw physical window file (64 regs, wb-independent view). Host
+    /// synthetic calls (`Esp32S3::run_ble_host_recv`) snapshot + restore
+    /// the whole file across the call — saving only the current window
+    /// view misses spilled caller windows the callee clobbers.
+    #[inline]
+    pub fn phys_regs(&self) -> &[u32; 64] {
+        &self.phys
+    }
+
+    /// Mutable raw physical window file (see `phys_regs`).
+    #[inline]
+    pub fn phys_regs_mut(&mut self) -> &mut [u32; 64] {
+        &mut self.phys
+    }
+
     /// Floating-point register fN as f32 (raw bits via u32::from_bits).
     #[inline]
     pub fn freg(&self, n: u32) -> f32 {

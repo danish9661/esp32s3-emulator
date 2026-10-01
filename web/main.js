@@ -26,6 +26,11 @@ const els = {
   gwDisconnect: document.getElementById('gwDisconnect'),
   gwStatus: document.getElementById('gwStatus'),
   netlog: document.getElementById('netlog'),
+  bleUrl: document.getElementById('bleUrl'),
+  bleConnect: document.getElementById('bleConnect'),
+  bleDisconnect: document.getElementById('bleDisconnect'),
+  bleStatus: document.getElementById('bleStatus'),
+  blelog: document.getElementById('blelog'),
   searchInput: document.getElementById('searchInput'),
   searchBtn: document.getElementById('searchBtn'),
   searchPrevBtn: document.getElementById('searchPrevBtn'),
@@ -338,6 +343,97 @@ function gwDisconnect() {
 if (els.gwConnect) els.gwConnect.addEventListener('click', gwConnect);
 if (els.gwDisconnect) els.gwDisconnect.addEventListener('click', gwDisconnect);
 
+// ── BLE HCI bridge (browser → Bumble virtual controller → board) ──
+// board→host: `bridge.ble.onPacket` (EVT_BLE_HCI + `bt_hci_take_tx`)
+// sends each captured firmware→controller HCI packet as one WebSocket
+// binary message (raw H4 HCI, same bytes the run_flash BLE_GW TCP leg
+// forwards length-prefixed). host→board: the bridge is a byte pump
+// (Go gateway /api/ble-gateway ↔ Bumble :9544), so replies arrive as raw
+// HCI and stage via `bt_hci_inject_rx`. Default URL targets a locally-run
+// gateway (`go run .` in tools/gateway + `python3 tools/ble_bridge.py`,
+// ws://127.0.0.1:5050/api/ble-gateway); without it the panel stays
+// disconnected and HCI stays local (ROM loopback still boots to DONE).
+let bleSocket = null;
+let bleLineCount = 0;
+let bleTxCount = 0;
+let bleRxCount = 0;
+function bleStatus(msg) {
+  if (els.bleStatus) els.bleStatus.textContent = msg;
+}
+function appendBle(text) {
+  if (!els.blelog) return;
+  const line = document.createElement('div');
+  line.className = 'net-line';
+  line.textContent = text;
+  els.blelog.appendChild(line);
+  if (++bleLineCount > 200) els.blelog.removeChild(els.blelog.firstChild);
+  els.blelog.scrollTop = els.blelog.scrollHeight;
+}
+function bleCounters() {
+  bleStatus(`ble: ${bleSocket && bleSocket.readyState === 1 ? 'connected' : 'disconnected'} — TX ${bleTxCount} pkts, RX ${bleRxCount} pkts`);
+}
+function bleConnect() {
+  if (!emu || !bridge) { bleStatus('ble: load firmware first'); return; }
+  if (bleSocket && bleSocket.readyState === 1) { bleStatus('ble: already connected'); return; }
+  const url = (els.bleUrl && els.bleUrl.value.trim()) || 'ws://127.0.0.1:5050/api/ble-gateway';
+  let ws;
+  try {
+    ws = new WebSocket(url);
+  } catch (err) {
+    bleStatus(`ble: connect failed (${err.message})`);
+    return;
+  }
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    bleStatus(`ble: connected — ${url}`);
+    appendBle(`connected ${url}`);
+    bleCounters();
+  };
+  ws.onmessage = (ev) => {
+    // Bridge→board reply: raw H4 HCI (H4 type + payload, no length
+    // prefix — the Go proxy is a byte pump; Bumble reframes the stream).
+    if (typeof ev.data === 'string') { appendBle(`info: ${ev.data}`); return; }
+    if (!(ev.data instanceof ArrayBuffer)) return;
+    const bytes = new Uint8Array(ev.data);
+    if (!bytes.length || bytes.length > 4096) return;
+    emu.bt_hci_inject_rx(bytes);
+    bleRxCount++;
+    appendBle(`RX ${bytes.length}B h4=0x${bytes[0].toString(16).padStart(2, '0')}`);
+    bleCounters();
+  };
+  ws.onclose = () => {
+    appendBle('disconnected');
+    bleStatus('ble: disconnected — HCI stays local (ROM loopback still boots to DONE)');
+    bleSocket = null;
+  };
+  ws.onerror = () => {
+    bleStatus('ble: error — is the Go gateway + ble_bridge.py running? (go run . in tools/gateway, python3 tools/ble_bridge.py)');
+  };
+  // (Re)arm the TX leg on every (re)connect so no capture is missed even
+  // if the socket opens after HCI already flowed: onPacket callbacks
+  // accumulate on the bridge, so guard against double-arming.
+  if (!bleConnect._armed) {
+    bridge.ble.onPacket((pkt) => {
+      if (!pkt || !pkt.length) return;
+      bleTxCount++;
+      appendBle(`TX ${pkt.length}B h4=0x${pkt[0].toString(16).padStart(2, '0')}`);
+      bleCounters();
+      if (bleSocket && bleSocket.readyState === 1) {
+        try { bleSocket.send(pkt); } catch (_) { /* drop, keep stepping */ }
+      }
+    });
+    bleConnect._armed = true;
+  }
+  bleSocket = ws;
+  bleStatus(`ble: connecting — ${url}`);
+}
+function bleDisconnect() {
+  if (bleSocket) { try { bleSocket.close(); } catch (_) { /* closed */ } bleSocket = null; }
+  bleStatus('ble: disconnected — HCI stays local (ROM loopback still boots to DONE)');
+}
+if (els.bleConnect) els.bleConnect.addEventListener('click', bleConnect);
+if (els.bleDisconnect) els.bleDisconnect.addEventListener('click', bleDisconnect);
+
 // ── Virtual devices ──
 let vdevLineCount = 0;
 function appendVdev(text) {
@@ -495,6 +591,16 @@ async function loadFlash(bytes, keyHex) {
   // `bridge.net.onFrame` (gateway WebSocket, see emu_api.js).
   if (currentGalleryItem && currentGalleryItem.wifiWorker !== null) {
     emu.wifi_worker_fixture(currentGalleryItem.wifiWorker || 'EmuNet,-50,6,02:11:22:33:44:55');
+  }
+  // L3 worker (mirrors run_flash WIFI_STA_CONN=1 on the L3 image):
+  // same AP list + fixed LAN as wifi-sta, own linked pcs under
+  // `WifiImage::WorkerL3` (see wasm-bridge `wifi_worker_l3_fixture`).
+  // Like the net worker, TX frames route via `bridge.net.onFrame`
+  // (gateway WebSocket) and replies come back via `net_inject_rx` —
+  // the L3 legs (DNS/NTP/UDP-echo) answer from gateway-local services
+  // (tools/gateway/handleL7.go), so no live netif is needed.
+  if (currentGalleryItem && currentGalleryItem.wifiWorkerL3 !== null) {
+    emu.wifi_worker_l3_fixture(currentGalleryItem.wifiWorkerL3 || 'EmuNet,-50,6,02:11:22:33:44:55');
   }
 
   if (typeof PeripheralBridge !== 'undefined') {
@@ -722,6 +828,8 @@ try {
       if (item.wifi_ap !== undefined) opt.dataset.wifiAp = JSON.stringify(item.wifi_ap);
       if (item.espnow === true) opt.dataset.espnow = '1';
       if (item.wifi_worker !== undefined) opt.dataset.wifiWorker = item.wifi_worker;
+      if (item.wifi_worker_l3 !== undefined) opt.dataset.wifiWorkerL3 = item.wifi_worker_l3;
+      if (item.ble === true) opt.dataset.ble = '1';
       // Gallery MicroPython entries (`"micropython": true`) fetch the raw
       // Release .bin — flagged so the select handler pads + partitions
       // before load (same transform the ▶ REPL preset applies).
@@ -753,6 +861,8 @@ els.gallery.addEventListener('change', async (e) => {
     wifiAp,
     espnow: sel.dataset.espnow === '1',
     wifiWorker: sel.dataset.wifiWorker !== undefined ? sel.dataset.wifiWorker : null,
+    wifiWorkerL3: sel.dataset.wifiWorkerL3 !== undefined ? sel.dataset.wifiWorkerL3 : null,
+    ble: sel.dataset.ble === '1',
     micropython: sel.dataset.micropython === '1',
   };
   try {

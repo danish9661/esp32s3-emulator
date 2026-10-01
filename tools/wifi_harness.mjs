@@ -2,9 +2,11 @@
 //
 // Drives the nodejs-target wasm build of the emulator through the SAME
 // bridge APIs the browser uses (`wifi_scan_fixture` / `wifi_sta_fixture` /
-// `wifi_ap_fixture` / `wifi_espnow_fixture` / `wifi_worker_fixture`),
+// `wifi_ap_fixture` / `wifi_espnow_fixture` / `wifi_worker_fixture` /
+// `wifi_worker_l3_fixture`),
 // running tools/sketches/esp32s3_wifi_scan, esp32s3_wifi_sta,
-// esp32s3_wifi_ap, esp32s3_espnow and esp32s3_test_worker_net. Mirrors
+// esp32s3_wifi_ap, esp32s3_espnow, esp32s3_test_worker_net and
+// esp32s3_test_worker_l3. Mirrors
 // web/main.js load order: load_flash, arm fixture, step, drain UART.
 //
 // Asserts:
@@ -153,6 +155,12 @@ const MODES = {
     arm: (emu) => emu.wifi_worker_fixture(APS),
     wants: ['WORKER NET START', 'WORKER NET status 3', 'WORKER NET netif 1', 'WORKER NET tx1 -11', 'WORKER NET tx2 -12', 'WORKER NET keep 14', 'WORKER NET rx1 1 -13', 'WORKER NET rx2 1 -14', 'WORKER NET DONE'],
   },
+  worker_l3: {
+    bin: 'tools/sketches/esp32s3_test_worker_l3/esp32s3_test_worker_l3.merged.bin',
+    budget: 350_000_000,
+    arm: (emu) => emu.wifi_worker_l3_fixture(APS),
+    wants: ['WORKER L3 START', 'WORKER L3 status 3', 'WORKER L3 netif 1', 'WORKER L3 DONE'],
+  },
 };
 
 function run(binRel, arm, wants, budget, liveGw) {
@@ -217,6 +225,7 @@ function modeForBin(argBin) {
   // sketch names. `wifi_sta` must win over the `wifi_scan` prefix test —
   // match exact sketch stems, not substrings.
   const b = argBin ?? '';
+  if (b.includes('esp32s3_test_worker_l3')) return 'worker_l3';
   if (b.includes('esp32s3_test_worker_net')) return 'worker';
   if (b.includes('esp32s3_wifi_ap')) return 'wifi_ap';
   if (b.includes('esp32s3_espnow')) return 'espnow';
@@ -225,8 +234,8 @@ function modeForBin(argBin) {
 }
 
 let fails = [];
-// Direct runs take an optional mode word (`scan|sta|ap|espnow|worker`,
-// `wifi_scan`/`wifi_sta`/`wifi_ap`/`espnow`/`worker` spellings too) or a
+// Direct runs take an optional mode word (`scan|sta|ap|espnow|worker|worker_l3`,
+// `wifi_scan`/`wifi_sta`/`wifi_ap`/`espnow`/`worker`/`worker_l3` spellings too) or a
 // bin path; default to scan when run by hand.
 // WIFI_HARNESS_GW=<host:port> (worker mode only) feeds captured TX frames
 // to a live Go gateway over its TCP ingest leg and asserts the live ARP
@@ -234,7 +243,7 @@ let fails = [];
 // it the worker asserts the empty-FIFO verdicts (-13/-14) — same binary,
 // purely a host-leg difference (battery default: no gateway).
 const arg = process.argv[2];
-const MODE_ALIAS = { scan: 'wifi_scan', sta: 'wifi_sta', ap: 'wifi_ap', espnow: 'espnow', worker: 'worker' };
+const MODE_ALIAS = { scan: 'wifi_scan', sta: 'wifi_sta', ap: 'wifi_ap', espnow: 'espnow', worker: 'worker', worker_l3: 'worker_l3' };
 const explicit = (arg && MODES[arg]) ? arg : (arg && MODE_ALIAS[arg] ? MODE_ALIAS[arg] : null);
 const mode = explicit ?? modeForBin(arg);
 const m = MODES[mode];
@@ -254,7 +263,7 @@ const m = MODES[mode];
     : m.wants;
   const r = run(explicit ? m.bin : (arg ?? m.bin), m.arm, wants, m.budget, liveGw);
   if (liveGw) liveSock.destroy();
-  const tag = `WIFI ${mode === 'espnow' ? 'ESPNOW' : mode === 'worker' ? 'WORKER NET' : mode.split('_')[1].toUpperCase()}`;
+  const tag = `WIFI ${mode === 'espnow' ? 'ESPNOW' : mode === 'worker' ? 'WORKER NET' : mode === 'worker_l3' ? 'WORKER L3' : mode.split('_')[1].toUpperCase()}`;
   if (r.fails.length) {
     console.error(`${tag} HARNESS FAIL: missing ` + JSON.stringify(r.fails));
     console.error('--- uart tail ---');

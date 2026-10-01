@@ -15,6 +15,7 @@
 //   bridge.spi.onTransfer((chan, tx) => { return rxBytes; });   // inject MISO
 //   bridge.i2c.onRead((chan) => 0x57);                            // inject RX byte
 //   bridge.net.onFrame((frame) => gatewaySocket.send(frame));    // live-IP backhaul
+//   bridge.ble.onPacket((pkt) => bleSocket.send(pkt));              // BLE HCI bridge
 //   // inside the animation loop, right after emu.step(n):
 //   bridge.dispatch();
 
@@ -26,6 +27,7 @@ export const EVT = {
   I2C_READ: 4,
   I2C_STOP: 5,
   NET_FRAME: 6,
+  BLE_HCI: 7,
 };
 
 export class PeripheralBridge {
@@ -35,6 +37,7 @@ export class PeripheralBridge {
     this.spi = new SpiPeripheral();
     this.i2c = new I2cPeripheral();
     this.net = new NetPeripheral();
+    this.ble = new BlePeripheral();
   }
 
   // Drain the emulator's event queue and dispatch each event to the matching
@@ -80,6 +83,14 @@ export class PeripheralBridge {
           this.net._emit(frame);
           break;
         }
+        case EVT.BLE_HCI: {
+          // A captured firmware→controller HCI packet is available via
+          // bt_hci_take_tx; the BLE bridge forwards it length-prefixed
+          // to tools/ble_bridge.py (Bumble virtual controller).
+          const pkt = this.emu.bt_hci_take_tx();
+          this.ble._emit(pkt);
+          break;
+        }
       }
     }
   }
@@ -109,6 +120,14 @@ class NetPeripheral {
   // cb(frame: Uint8Array) — one captured board→host Ethernet frame.
   onFrame(cb) { this._cbs.push(cb); }
   _emit(frame) { for (const cb of this._cbs) cb(frame); }
+}
+
+class BlePeripheral {
+  constructor() { this._cbs = []; }
+  // cb(pkt: Uint8Array) — one captured firmware→controller HCI packet
+  // (H4 type byte + payload).
+  onPacket(cb) { this._cbs.push(cb); }
+  _emit(pkt) { for (const cb of this._cbs) cb(pkt); }
 }
 
 class I2cPeripheral {

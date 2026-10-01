@@ -22,6 +22,17 @@ Serves web/ over HTTP, loads index.html in Chromium, and asserts:
   9. espnow gallery entry boots in-wasm to 'WIFI ESPNOW DONE' (proves the
      `"espnow": true` manifest flag wires the virtual-peer loopback
      through the new `wifi_espnow_fixture` bridge call)
+ 10. test_worker_net gallery entry boots in-wasm to 'WORKER NET DONE'
+     (proves the `"wifi_worker"` manifest string wires the worker STA
+     fixture through `wifi_worker_fixture`; empty-FIFO verdicts expected)
+ 11. Live-IP panel fails soft with no gateway (no page error)
+ 12. test_worker_l3 gallery entry boots in-wasm to 'WORKER L3 DONE'
+     (proves the `"wifi_worker_l3"` manifest string wires the L3 worker
+     fixture through the new `wifi_worker_l3_fixture` bridge call)
+ 13. ble gallery entry boots in-wasm to 'BLE DONE' (proves the gallery
+     entry loads; the ROM controller loopback answers basic commands
+     locally, no bridge needed)
+ 14. BLE panel (Connect with no gateway/bridge fails soft, no page error)
 
 Fails loudly on any page error. Exits 0 on PASS, 1 on FAIL.
 """
@@ -262,6 +273,65 @@ try:
         except Exception:
             tail = page.eval_on_selector("#gwStatus", "el => el.textContent.slice(-200)")
             check("gw-connect-fails-soft", False, f"(tail={tail!r})")
+
+        # --- Test 12: test_worker_l3 gallery entry boots in-wasm to DONE ---
+        # (proves the `"wifi_worker_l3"` manifest string wires the L3 worker
+        # fixture through the new `wifi_worker_l3_fixture` bridge call;
+        # same empty-FIFO discipline as the net worker — no gateway)
+        page.click("#stop")
+        page.select_option("#gallery", value="./firmware/esp32s3_test_worker_l3.merged.bin")
+        page.wait_for_function(
+            "() => !document.getElementById('run').disabled",
+            timeout=120000,
+        )
+        page.click("#run")
+        try:
+            page.wait_for_function(
+                "() => document.getElementById('console').textContent.includes('WORKER L3 DONE')",
+                timeout=240000,
+            )
+            check("worker-l3-inwasm-done", True)
+        except Exception:
+            tail = page.eval_on_selector("#console", "el => el.textContent.slice(-800)")
+            check("worker-l3-inwasm-done", False, f"(tail={tail!r})")
+
+        # --- Test 13: ble gallery entry boots in-wasm to BLE DONE ---
+        # (proves the gallery entry loads and the ROM controller loopback
+        # answers the init commands locally — no bridge needed for DONE)
+        page.click("#stop")
+        page.select_option("#gallery", value="./firmware/esp32s3_ble.merged.bin")
+        page.wait_for_function(
+            "() => !document.getElementById('run').disabled",
+            timeout=120000,
+        )
+        page.click("#run")
+        try:
+            page.wait_for_function(
+                "() => document.getElementById('console').textContent.includes('BLE DONE')",
+                timeout=240000,
+            )
+            check("ble-inwasm-done", True)
+        except Exception:
+            tail = page.eval_on_selector("#console", "el => el.textContent.slice(-800)")
+            check("ble-inwasm-done", False, f"(tail={tail!r})")
+
+        # --- Test 14: BLE panel wires the bridge without errors ---
+        # (proves the new panel exists and Connect with no gateway/bridge
+        # fails soft into the disconnected status — no page error)
+        try:
+            check("ble-url-present", page.is_visible("#bleUrl"))
+            check("ble-connect-present", page.is_visible("#bleConnect"))
+            check("ble-status-present", page.locator("#bleStatus").count() == 1)
+            page.fill("#bleUrl", "ws://127.0.0.1:59999/api/ble-gateway")
+            page.click("#bleConnect")
+            page.wait_for_function(
+                "() => document.getElementById('bleStatus').textContent.includes('disconnected') || document.getElementById('bleStatus').textContent.includes('connecting') || document.getElementById('bleStatus').textContent.includes('error') || document.getElementById('bleStatus').textContent.includes('failed')",
+                timeout=15000,
+            )
+            check("ble-connect-fails-soft", True)
+        except Exception:
+            tail = page.eval_on_selector("#bleStatus", "el => el.textContent.slice(-200)")
+            check("ble-connect-fails-soft", False, f"(tail={tail!r})")
 
         # --- Test 7: MicroPython REPL preset (bundled same-origin image) ---
         # (proves the ▶ REPL button + vfs-partition pad + UART0 flip: load

@@ -20,6 +20,7 @@ use xtensa_core::generated::{Opcode, decode_inst, decode_inst16a, decode_inst16b
 
 use crate::adc::Adc;
 use crate::aes::Aes;
+use crate::ble::{BLE_INTR_SOURCE, BT_BASE, Ble};
 use crate::cache::{Cache, CacheTarget};
 use crate::ds::Ds;
 use crate::ecdsa::Ecdsa;
@@ -79,6 +80,12 @@ use crate::wifi::Wifi;
 ///   the Go SLIRP/NAT gateway over its WebSocket Ethernet bridge
 ///   (`tools/gateway`, `ws://127.0.0.1:5050/api/network-gateway`) and writes
 ///   them to a tcpdump-readable pcap (see `run_flash` NET_PCAP/NET_GW).
+/// * `EVT_BLE_HCI` (7): `a` = direction (0 = host→controller TX, 1 =
+///   controller→host RX), `b` = packet byte count; the bytes themselves
+///   are retrieved via [`Soc::bt_hci_take_tx`]. Emitted by the firmware
+///   VHCI send path (see `Soc::bt_hci_capture_tx`); the host forwards
+///   them length-prefixed to the Bumble BLE bridge (`tools/ble_bridge.py`)
+///   and stages replies via [`Soc::bt_hci_inject_rx`].
 #[derive(Clone, Copy, Debug)]
 pub struct EmuEvent {
     pub kind: u8,
@@ -93,6 +100,7 @@ pub const EVT_I2C_WRITE: u8 = 3;
 pub const EVT_I2C_READ: u8 = 4;
 pub const EVT_I2C_STOP: u8 = 5;
 pub const EVT_NET_FRAME: u8 = 6;
+pub const EVT_BLE_HCI: u8 = 7;
 
 /// RTC-retained state (slow/fast memory + ULP core) snapshotted before a
 /// deep-sleep reboot and restored after (silicon retention behavior).
@@ -179,6 +187,11 @@ pub enum WifiImage {
     /// Live-IP backhaul worker (test-worker-net sketch): STA-side cells,
     /// own linked pcs (see `wifi_fixture_layout` Worker arm).
     Worker,
+    /// L3 application-protocol worker (test-worker-l3 sketch): same
+    /// STA-side cells as Worker, own linked pcs (see `wifi_fixture_layout`
+    /// WorkerL3 arm — nm on the test-worker-l3 ELF; the sketch source
+    /// pins the layout like every other image).
+    WorkerL3,
 }
 
 /// Per-image linked addresses for the Wi-Fi fixture engine (see
@@ -358,6 +371,10 @@ pub struct Soc {
     /// (0x60038000), NOT UART0 — the S3's ROM messages come out of the USB-CDC
     /// port on real hardware. `Esp32S3::take_usb_serial_tx` drains this too.
     usb: UsbSerialJtag,
+    /// BLE VHCI tap (host <-> Bumble virtual-controller bridge, see
+    /// `crate::ble`): firmware HCI sends captured here, bridge replies
+    /// staged here. Register page `DR_REG_BT_BASE` = 0x6001_1000.
+    ble: Ble,
     /// ULP-RISC-V coprocessor (its own rv32im core; runs from RTC_SLOW_MEM).
     ulp: Ulp,
     uarts: [Uart; 3],
@@ -545,6 +562,12 @@ pub struct Soc {
     /// `clk_on` below gates frozen peripherals on these (see there).
     sys_clk_en0: u32,
     sys_clk_en1: u32,
+    /// SYSTEM.BT_LPCK_DIV_NUM (0x600C0028) / LPCLK_FRAC (0x600C002C): BT
+    /// low-power-clock divider + LPCLK select bits (system_reg.h). Seeded
+    /// with the silicon reset defaults (DIV_NUM 255, SEL_8M set) — the BLE
+    /// controller RMWs them at init and asserts on the readback.
+    sys_bt_lpck_div: u32,
+    sys_lpclk_frac: u32,
 
     /// SYSTEM.CPU_INT_FROM_CPU_0..3 (0x600C0030/4/8/C): cross-core
     /// interrupt registers.  +0x30 asserts FROM_CPU_INTR0 (source 79, used
@@ -667,6 +690,7 @@ impl Soc {
             uarts: [Uart::new(), Uart::new(), Uart::new()],
             uhci: Uhci::new(),
             usb: UsbSerialJtag::new(),
+            ble: Ble::new(),
             ulp: Ulp::new(),
             gpio: Gpio::new(),
             ledc: Lcdc::new(),
@@ -740,6 +764,8 @@ impl Soc {
             appcpu_ctrl_a: 0,
             sys_clk_en0: 0xF9C1_E06F,
             sys_clk_en1: 0x0000_0600,
+            sys_bt_lpck_div: 255,
+            sys_lpclk_frac: 1 << 25,
             cpu_int_from_cpu: [0, 0, 0, 0],
             rom_boot_mode: false,
             loader_scratch_len: 0x6_0000,
@@ -2178,6 +2204,38 @@ impl Soc {
                     esp_wifi_start: 0x4206_3824,
                 }
             }
+            WifiImage::WorkerL3 => {
+                // test-worker-l3 image layout (nm on the test-worker-l3
+                // ELF 2026-09-29: scan_start 0x42063d18, connect 0x4203c9d4,
+                // event vars WIFI_EVENT 0x3c0b42b0 / IP_EVENT 0x3c0b3bac,
+                // transmit 0x4202e6e8 / receive 0x4202e74c (machine.rs
+                // wifi_image gate); the remaining cells mirror the
+                // net-worker shape with the L3 image's own link addresses
+                // (pxReadyTasksLists 0x3fc9b8ec, uxTopReadyPriority
+                // 0x3fc9b85c, pxCurrentTCBs 0x3fc9bae0, sta netif
+                // 0x3fc9ae78, delete site 0x42004419). The L3 sketch
+                // never scans, so records_check is an unused placeholder
+                // (scan leg never arms on this image). CAUTION: the
+                // sketch source pins this layout — EVERY .ino edit
+                // relinks the closed libs (all pcs above move); re-nm
+                // after every sketch change (proven live 4x this file).
+                WifiImageLayout {
+                    scan_start: 0x4206_3d18,
+                    connect: 0x4203_c9d4,
+                    wifi_event_var: 0x3c0b_42b0,
+                    ip_event_var: 0x3c0b_3bac,
+                    count_cell: 0x3fc9_f936,
+                    scan_count: 0x3fc9_aef0,
+                    scan_result: 0x3fc9_aeec,
+                    records_check: 0x4200_3fb0,
+                    ready_lists: 0x3fc9_b8ec,
+                    top_prio: 0x3fc9_b85c,
+                    reg_heaps: 0x3fc9_b7a4,
+                    pxcur: 0x3fc9_bae0,
+                    sta_network_if: 0x3fc9_ae78,
+                    esp_wifi_start: 0x4206_39c4,
+                }
+            }
         }
     }
     /// Re-apply the active layout addresses after a boot/reset (which
@@ -2220,6 +2278,12 @@ impl Soc {
     /// Select the live-IP worker image (nm on the test-worker-net ELF).
     pub fn wifi_fixture_image_worker(&mut self) {
         self.wifi_image = WifiImage::Worker;
+        self.wifi_fixture_layout_program();
+    }
+
+    /// Select the L3 worker image (nm on the test-worker-l3 ELF).
+    pub fn wifi_fixture_image_worker_l3(&mut self) {
+        self.wifi_image = WifiImage::WorkerL3;
         self.wifi_fixture_layout_program();
     }
 
@@ -3062,6 +3126,7 @@ impl Soc {
             WifiImage::Ap => 0x4200_42ad,
             WifiImage::EspNow => 0x4200_450d,
             WifiImage::Worker => 0x4200_433d,
+            WifiImage::WorkerL3 => 0x4200_4419,
         }
     }
 
@@ -3079,6 +3144,7 @@ impl Soc {
             WifiImage::Ap => 0x4202_e838,
             WifiImage::EspNow => 0x4202_ea9c,
             WifiImage::Worker => 0x4202_e8b0,
+            WifiImage::WorkerL3 => 0x4202_e98c,
         }
     }
 
@@ -3090,6 +3156,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_4164,
             WifiImage::EspNow => 0x4206_a298,
             WifiImage::Worker => 0x4206_41dc,
+            WifiImage::WorkerL3 => 0x4206_42b8,
         }
     }
 
@@ -3102,6 +3169,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_3f0c,
             WifiImage::EspNow => 0x4206_9f98,
             WifiImage::Worker => 0x4206_3f84,
+            WifiImage::WorkerL3 => 0x4206_4060,
         }
     }
 
@@ -3114,6 +3182,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_3ea4,
             WifiImage::EspNow => 0x4206_9f30,
             WifiImage::Worker => 0x4206_3f1c,
+            WifiImage::WorkerL3 => 0x4206_3ff8,
         }
     }
 
@@ -3135,6 +3204,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_3f50,
             WifiImage::EspNow => 0x4206_9fdc,
             WifiImage::Worker => 0x4206_3fc8,
+            WifiImage::WorkerL3 => 0x4206_40a4,
         }
     }
 
@@ -3146,6 +3216,7 @@ impl Soc {
             WifiImage::Ap => 0x4203_c88c,
             WifiImage::EspNow => 0x4203_caf0,
             WifiImage::Worker => 0x4203_c904,
+            WifiImage::WorkerL3 => 0x4203_c9e0,
         }
     }
 
@@ -3394,6 +3465,15 @@ impl Soc {
         core::mem::take(&mut self.events)
     }
 
+    /// Push one host-observable event back onto the queue (host frontend —
+    /// the BLE VHCI RX hook re-queues a packet whose callback is not yet
+    /// discovered: `bt_hci_inject_rx` queues an RX event the host already
+    /// owns, so the hook drains + pops exactly that event and re-queues
+    /// the survivors; see `run_ble_host_recv`).
+    pub fn push_event(&mut self, e: EmuEvent) {
+        self.events.push(e);
+    }
+
     /// Retrieve the MOSI byte stream of the most recent SPI transfer on
     /// `chan` (0=GPSPI2, 1=GPSPI3) and clear it. Call this when an
     /// `EVT_SPI_XFER` event arrives; feed the response back with
@@ -3516,6 +3596,379 @@ impl Soc {
             b: n,
         });
         buf
+    }
+
+    /// Capture one firmware→controller HCI packet at the VHCI send path
+    /// (called by the machine when firmware calls
+    /// `esp_vhci_host_send_packet(data, len)` — NimBLE's H4 HCI frame:
+    /// type 0x01 CMD / 0x02 ACL + payload). Copies `len` bytes (capped at
+    /// 4096, the longest single HCI packet class) into the BLE tap and
+    /// queues an `EVT_BLE_HCI` event (`a` = 0); the host drains the bytes
+    /// via [`Soc::bt_hci_take_tx`] and forwards them length-prefixed to
+    /// the Bumble bridge. Same no-panic discipline as `net_capture_tx`.
+    ///
+    /// FLOW-CONTROL NOTE: the closed `API_vhci_host_send_packet` descends
+    /// into the controller's function-pointer tables, which read 0 on the
+    /// emulator and return an error the NimBLE TX path tolerates — the
+    /// packet would otherwise never reach the bridge. The machine
+    /// therefore captures at the `esp_vhci_host_send_packet` ENTRY
+    /// (0x42025f90, BLE image only) BEFORE the call runs. NO semaphore
+    /// give is modeled here: NimBLE's `ble_hci_trans_hs_cmd_tx` DOES take
+    /// `vhci_send_sem` before every send, but that take has a ~2s timeout
+    /// and `esp_nimble_hci_init` pre-gives the semaphore — and more
+    /// importantly the take only blocks the *sending task*, which the
+    /// host-side bridge keeps fed with Command Complete replies (each
+    /// reply lets the next send proceed, exactly like silicon's
+    /// `notify_host_send_available` waking the taker). A model-side give
+    /// would corrupt the FreeRTOS queue count (proven class: the sys_evt
+    /// 32/32 storm wedge) — so the semaphore is left for the firmware +
+    /// bridge round-trip to pump, same as every other FreeRTOS primitive
+    /// the emulator never shortcuts.
+    pub fn bt_hci_capture_tx(&mut self, data: u32, len: u32) {
+        use xtensa_core::Bus as _Bus;
+        let n = (len as usize).min(4096);
+        let mut frame = alloc::vec::Vec::with_capacity(n);
+        for k in 0..n {
+            frame.push(self.read8(data + k as u32) as u8);
+        }
+        let blen = frame.len();
+        self.ble.capture_tx(&frame);
+        self.events.push(EmuEvent {
+            kind: EVT_BLE_HCI,
+            a: 0, // 0 = host→controller TX
+            b: blen as u32,
+        });
+    }
+
+    /// Retrieve the most recent captured firmware→controller HCI packet
+    /// and clear it. Call this when an `EVT_BLE_HCI` event arrives, then
+    /// forward the bytes length-prefixed to the Bumble bridge.
+    pub fn bt_hci_take_tx(&mut self) -> Vec<u8> {
+        self.ble.take_tx()
+    }
+
+    /// Stage one controller→firmware HCI packet for injection (Bumble
+    /// bridge replies: Command Complete/Status events, ACL data, LE
+    /// advertising reports). FIFO, bounded at 8 — excess drops increment
+    /// the BLE drop counter. Empty packets are ignored. Queues an
+    /// `EVT_BLE_HCI` event with `a` = 1 so event-driven hosts observe
+    /// the reply without polling.
+    ///
+    /// CONSUMED BY the machine's TX-tap arm (`run_fast_core` pc
+    /// 0x42025f90 hook): when a fresh firmware TX is captured while a
+    /// reply is queued, the tap routes the reply through
+    /// `ble_ack_deliver` (the `ble_hs_hci_rx_evt` ACK path — store ack +
+    /// sem release — the same path silicon's controller→host event
+    /// takes) instead of leaving it for the parked `host_rcv_pkt`
+    /// synthetic call. See `ble_ack_deliver`.
+    pub fn bt_hci_inject_rx(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.ble.inject_rx(bytes);
+        self.events.push(EmuEvent {
+            kind: EVT_BLE_HCI,
+            a: 1, // 1 = controller→host RX
+            b: bytes.len() as u32,
+        });
+    }
+
+    /// Deliver one queued controller→host HCI reply through the
+    /// firmware's OWN ack path (`ble_hs_hci_rx_evt` at 0x4200df48, BLE
+    /// image only — nm on the esp32s3_ble ELF): store the event bytes in
+    /// `ble_hs_hci_ack` (0x3fc9e2b4, BLE image only) and release
+    /// `ble_hs_hci_sem` (0x3fc9e2b8) so the `ble_hs_hci_cmd_tx` waiter in
+    /// `npl_freertos_sem_pend` wakes with the ack in place — exactly what
+    /// silicon's controller→host Command Complete does (see NimBLE
+    /// `ble_hs_hci.c`: `ble_hs_hci_rx_evt` → non-NOP opcode →
+    /// `ble_hs_hci_rx_ack`: store + `ble_npl_sem_release`). The ack bytes
+    /// ride the SAME pool_cmd block the in-flight TX allocated
+    /// (`ble_transport_alloc_cmd` at send time — the free path's
+    /// `os_memblock_from(pool_cmd)` then recognizes the block, proven
+    /// live: a foreign scratch buffer trips `assert failed: 0x42014482`
+    /// while the pool's own block frees clean).
+    ///
+    /// Layout (all BLE-image nm addrs): the ack store is a 4-byte pointer
+    /// cell; the event bytes (H4 type stripped — the firmware's
+    /// `host_rcv_pkt` buffer starts at the 0x04 EVT marker, same bytes
+    /// the controller glue hands over) are written into the CURRENT
+    /// in-flight TX block, found by scanning pool_cmd's live blocks for
+    /// the H4 command echo (first 4 bytes == last TX sent). The sem
+    /// release is a raw queue post (`queue_post_raw` + unblock +
+    /// ready — same helper the WiFi SCAN_DONE post uses) since the
+    /// waiter is parked in `npl_freertos_sem_pend`
+    /// (`xQueueSemaphoreTake`), not in an ISR.
+    ///
+    /// Returns true when a reply was delivered (caller stages the woken
+    /// TCB via `ble_ready_task` — the SoC cannot ready tasks itself,
+    /// same split as `wifi_scan_post_event`).
+    ///
+    /// TAP-ARG form (see `ble_ack_deliver_at`): the machine's TX-tap arm
+    /// calls THAT with the tap's (data, len) — the live mbuf address —
+    /// never this arg-less form (which cannot see the checked-out block
+    /// and is kept only for unit tests).
+    pub fn ble_ack_deliver(&mut self) -> Option<u32> {
+        self.ble_ack_deliver_at(0, 0)
+    }
+
+    /// Deliver one queued reply for the TX captured at (`data`, `len`)
+    /// (machine TX-tap frontend — see the block-match note in
+    /// `ble_ack_deliver`): `data` IS the live pool_cmd mbuf (checked out
+    /// at tap time, freed by the firmware's own `ble_transport_free`
+    /// after the ack is consumed — alloc/free stay paired 1:1). The
+    /// reply's EVT bytes (H4 stripped, see below) overwrite the command
+    /// bytes in place; `ble_hs_hci_ack` points at the block; the sem is
+    /// released. Returns the woken TCB (`None` = no reply queued, reply
+    /// not a 0x04 event, no waiter parked, opcode mismatch, or wild
+    /// block — all re-queued, level-triggered).
+    ///
+    /// TWO GATES (both proven live, both load-bearing):
+    /// 1. WAITER-PARKED: the sem must have a task parked in
+    ///    `npl_freertos_sem_pend` (`queue_recv_waiting`). Without it the
+    ///    deliver would CONSUME the FIFO frame, store the ack and bump
+    ///    the sem for a waiter that never comes — and WORSE, the NEXT
+    ///    tap would then deliver a STALE reply (previous command's CC)
+    ///    as the current TX's ack → opcode mismatch → `HCI process ack
+    ///    returned 12`. The unconsumed frame stays queued instead.
+    /// 2. OPCODE MATCH: a Command Complete echoes its command opcode at
+    ///    EVT bytes 3:5 (LE — `ev->data` = num_pkts[0] + opcode[1:3] +
+    ///    status[3] + params[4:]); it must equal the in-flight TX opcode
+    ///    (H4 frame bytes 1:3, read back from the live mbuf — the tap's
+    ///    `len` arg is trusted only for bounds). A stale reply (previous
+    ///    command's CC arriving after its waiter already consumed /
+    ///    timed out) stays queued for the waiter it belongs to — which
+    ///    never comes either, so it sits until a matching TX arrives
+    ///    (bounded FIFO of 8, then drops with a counter — same
+    ///    discipline as every other RX path here).
+    pub fn ble_ack_deliver_at(&mut self, data: u32, len: u32) -> Option<u32> {
+        use xtensa_core::Bus as _Bus;
+        // BLE-image fixed cells (nm on the esp32s3_ble ELF; sibling
+        // images never link NimBLE so these addrs never alias live RAM
+        // there — and this only runs from the BLE TX-tap arm anyway).
+        const ACK_CELL: u32 = 0x3fc9_e2b4;
+        const SEM_CELL: u32 = 0x3fc9_e2b8;
+        const POOL_CMD: u32 = 0x3fc9_ea3c;
+        // Sanity: `data` must be a pool_cmd-range block (the tap's mbuf).
+        // Pool bounds: header + 1 block (0x102 + link) — the pool holds
+        // a single command mbuf (proven live: one live block per TX).
+        // A wild `data` (never observed — the tap reads caller a10/a11
+        // at the true callee entry) re-queues instead of corrupting RAM.
+        let lo = POOL_CMD + 16;
+        if data < lo || data >= lo + 0x200 {
+            return None;
+        }
+        let _ = len;
+        let target = data;
+        // GATE 1 — waiter parked on the ack sem? The sem cell is 0 until
+        // `esp_nimble_hci_init` creates it; the waiter parks only while
+        // blocked in `npl_freertos_sem_pend` (between send and ack).
+        let sem = self.read32(SEM_CELL);
+        if sem == 0 || !self.queue_recv_waiting(sem) {
+            return None;
+        }
+        let frame = self.ble.take_rx()?;
+        if frame.is_empty() || frame[0] != 0x04 {
+            return None;
+        }
+        // GATE 2 — opcode match: CC echoes the command opcode at EVT
+        // bytes 3:5 (LE). The live TX opcode rides the mbuf at bytes
+        // 1:3 (H4 type at 0). Mismatch → re-queue (stale reply).
+        if frame.len() >= 6 {
+            let want_op = (self.read8(target + 1) as u16) | ((self.read8(target + 2) as u16) << 8);
+            let got_op = (frame[4] as u16) | ((frame[5] as u16) << 8);
+            if want_op != got_op {
+                self.ble.inject_rx(&frame);
+                return None;
+            }
+        }
+        // Write the EVT bytes over the TX block (the ack reuses the
+        // command's mbuf — `ble_hs_hci_cmd_tx` frees exactly this block
+        // after `ble_hs_hci_process_ack` consumes it, so alloc/free stay
+        // paired 1:1). STRIP the H4 type byte: the firmware's
+        // `ble_hci_ev` struct starts at the EVT opcode (the controller
+        // glue's `host_rcv_pkt` buffer starts at the 0x04 marker, but
+        // `ble_hs_hci_rx_evt` dereferences `ev->opcode` at offset 0 —
+        // keeping the H4 byte shifts opcode/length/data by one and the
+        // ack parses as garbage → `HCI process ack returned 12`,
+        // proven live). The H4 byte is bridge framing, not event data.
+        for (k, b) in frame.iter().skip(1).enumerate() {
+            self.write8(target + k as u32, *b as u32);
+        }
+        self.write32(ACK_CELL, target);
+        // Release the sem (counting semaphore = length-1 queue of zero-
+        // sized items; a post bumps mw + unblocks the waiter). ITEMSIZE
+        // is 0 for a counting semaphore (`xQueueCreateCountingSemaphore`
+        // → `xQueueGenericCreate(1, 0, ...)`) — `queue_post_raw` rejects
+        // `isz == 0`, so bump mw directly (the take side decrements it;
+        // no bytes move for a zero-sized item). The waiter-parked gate
+        // above guarantees a waiter exists, so the unblock below always
+        // finds one (no silent mw-only bump).
+        let mw = self.read32(sem + 56);
+        let len = self.read32(sem + 60);
+        if mw >= len {
+            self.write32(ACK_CELL, 0);
+            self.ble.inject_rx(&frame);
+            return None;
+        }
+        self.write32(sem + 56, mw + 1);
+        self.queue_unblock_receiver(sem)
+    }
+
+    /// Top up the pool_cmd free list at `ble_transport_alloc_cmd` ENTRY
+    /// (machine frontend — the BLE TX-tap arm fires this BEFORE the
+    /// firmware's own `os_memblock_get` runs; see the POOL-TOP-UP NOTE
+    /// there). Proven live: the pool holds exactly ONE command mbuf —
+    /// the alloc returns NULL(a10=0) while the in-flight TX is checked
+    /// out, and the firmware then builds at NULL → sends NULL → frees
+    /// NULL → `assert failed: 0x42014482` in `os_memblock_from`.
+    /// Silicon never hits this: the controller acks (frees) BEFORE the
+    /// next alloc. Emulate that ordering: when the pool is DRY (free
+    /// count 0 at +6) AND the ack cell is EMPTY (no unconsumed reply —
+    /// i.e. the previous TX fully completed), the controller would have
+    /// already completed the in-flight TX — complete it NOW by linking
+    /// the checked-out mbuf back as the free head (head at +20 —
+    /// `os_memblock_get` pops `l32i a7,[a2,20]`; count at +6, max at
+    /// +8 — all proven by the get/put disassembly) so the firmware's
+    /// own get succeeds. When the pool is NOT dry, or an ack is still
+    /// unconsumed (genuinely live TX), this is a no-op.
+    pub fn ble_pool_top_up(&mut self) {
+        use xtensa_core::Bus as _Bus;
+        // BLE-image fixed cells (nm on the esp32s3_ble ELF).
+        const POOL_CMD: u32 = 0x3fc9_ea3c;
+        // Fire only when dry (free count 0 at +6) — a live pool is
+        // untouched (zero behavioral delta when the bridge keeps up).
+        // NOTE: NO ack-cell guard (an earlier revision refused when
+        // `ble_hs_hci_ack != 0` — wrong: the ack routinely holds a
+        // pool_EVT block from the firmware's own poll path while
+        // pool_CMD sits dry; the pools are independent). Double-link
+        // safety instead: skip when the arena block is already on the
+        // free chain (checked-out-vs-free is decided by chain
+        // membership, not by the ack cell).
+        if self.read16(POOL_CMD + 6) != 0 {
+            return;
+        }
+        // The checked-out mbuf is the block the last TX captured
+        // (`pending_tx` is only drained by the host when BLE_GW is up;
+        // the tap re-captures every TX, so the snapshot is fresh even
+        // quiet). Find it by rescanning the pool ARENA (not the free
+        // chain — the block is checked out): the arena is one block
+        // (0x102 + 4B link) at POOL_CMD+16; the live mbuf holds the H4
+        // command echo (first byte 0x01). A zeroed arena (never
+        // observed) is left alone.
+        let arena = POOL_CMD + 16;
+        if self.read8(arena) != 0x01 {
+            return;
+        }
+        // Already linked? Scan the free chain (max 8) — linking twice
+        // would hand the same block out two allocs in a row (heap
+        // corruption, proven live as the pre-existing NULL-alloc
+        // class this replaces).
+        let mut cur = self.read32(POOL_CMD + 20);
+        for _ in 0..8 {
+            if cur == 0 {
+                break;
+            }
+            if cur == arena {
+                return;
+            }
+            cur = self.read32(cur);
+        }
+        // Mirror `os_memblock_put_from_cb` EXACTLY (proven live by the
+        // word trace + disassembly: put writes count+1 ONLY to +6
+        // (`l16ui a8,[a2,6]` / `addi +1` / `s16i a8,[a2,6]`); +8 is
+        // NEVER written by put (an earlier revision wrongly wrote +8
+        // too — the get EMPTY check `a8(count-1) >= a9([+8])` then
+        // misfires: with count=1/+8=0 forced to 1... precisely, the
+        // stale +8 theory was backwards). The +8 word is NimBLE's own
+        // high-water bookkeeping, maintained by init/get paths, NOT by
+        // put — so the top-up must set ONLY +6 (like put does) and
+        // leave +8 alone.
+        let head = self.read32(POOL_CMD + 20);
+        self.write32(arena, head);
+        self.write32(POOL_CMD + 20, arena);
+        self.write16(POOL_CMD + 6, 1);
+    }
+
+    /// Ready a TCB woken by `ble_ack_deliver` (host frontend — the machine
+    /// calls this right after a `Some(tcb)` deliver): inserts on the
+    /// BLE image's OWN ready lists (nm on the esp32s3_ble ELF:
+    /// `pxReadyTasksLists` 0x3fc9f424 / `uxTopReadyPriority` 0x3fc9f394 —
+    /// same `ready_task_on_list` primitive the WiFi posts use, but the
+    /// WiFi layout cells point at ANOTHER image's lists and must NOT be
+    /// reused here). `pxCurrentTCBs` (0x3fc9f618, BLE image nm) selects
+    /// the yield targets directly (the WiFi path reads them via the
+    /// programmed `wifi_pxcur` cell, which is unset on BLE runs).
+    pub fn ble_ready_task(&mut self, tcb: u32) {
+        use xtensa_core::Bus as _Bus;
+        self.ready_task_on_list(tcb, 0x3fc9_f424, 0x3fc9_f394);
+        const PXCUR: u32 = 0x3fc9_f618;
+        let prio = self.read32(tcb + 44);
+        for core in 0..2 {
+            let cur = self.read32(PXCUR + core as u32 * 4);
+            if cur != 0 && cur != tcb && self.read32(cur + 44) < prio {
+                self.cpu_int_from_cpu[core as usize] |= 1;
+            }
+        }
+    }
+
+    /// Stage one BLE controller→host HCI packet into firmware-visible
+    /// memory for the `host_rcv_pkt(data, len)` in-firmware call (host
+    /// frontend — the Bumble bridge reply path; the packet bytes were
+    /// staged by the host via `bt_hci_inject_rx` and popped here). Copies
+    /// the oldest queued frame into the host scratch window
+    /// (`WIFI_SCRATCH + 0x2400`, past the net-RX slots at +0xC00..0x2500
+    /// — never heap, never the TLSF pool, same class as `net_rx_stage`),
+    /// and returns `(buf, len)`. Returns `None` while the FIFO is empty
+    /// (firmware then observes no packet, like silicon with a quiet
+    /// controller).
+    pub fn bt_hci_stage_rx(&mut self) -> Option<(u32, u32)> {
+        use xtensa_core::Bus as _Bus;
+        let frame = self.ble.take_rx()?;
+        // Past the net-RX slots (4 × 1600B at +0xC00 = +0xC00..0x2500):
+        // HCI max is 4096B (see `bt_hci_capture_tx`), so one slot of
+        // 4096B at +0x2400 would overlap the last net slot — use +0x2500
+        // (past the pool-end run the WIFI_SCRATCH comment verifies).
+        const BLE_RX_BASE: u32 = Soc::WIFI_SCRATCH + 0x2500;
+        let n = frame.len().min(4096) as u32;
+        for (k, b) in frame.iter().take(n as usize).enumerate() {
+            self.write8(BLE_RX_BASE + k as u32, *b as u32);
+        }
+        Some((BLE_RX_BASE, n))
+    }
+
+    /// Pop the oldest staged controller→firmware HCI packet (firmware
+    /// VHCI-recv path — the machine copies it into the firmware's
+    /// `notify_host_recv` buffer). Returns `None` while the FIFO is
+    /// empty (firmware then observes no packet, like silicon with a
+    /// quiet controller).
+    pub fn bt_hci_take_rx(&mut self) -> Option<alloc::vec::Vec<u8>> {
+        self.ble.take_rx()
+    }
+
+    /// Queued BLE-reply count (host frontend — level-triggered deliver,
+    /// see `ble_ack_sem`).
+    pub fn bt_hci_rx_pending(&self) -> usize {
+        self.ble.rx_pending()
+    }
+
+    /// The BLE ack semaphore queue (host frontend — `ble_hs_hci_sem`
+    /// 0x3fc9e2b8, BLE image only; 0 while the NimBLE stack hasn't
+    /// created it yet). The run_flash RX drain delivers a queued reply
+    /// only while a waiter is parked on this queue (see below).
+    pub fn ble_ack_sem(&mut self) -> u32 {
+        use xtensa_core::Bus as _Bus;
+        self.read32(0x3fc9_e2b8)
+    }
+
+    /// Single-block pool_cmd arena (host frontend — 0x3fc9ea4c =
+    /// POOL_CMD+16, BLE image only): with a one-block pool the arena IS
+    /// the checked-out mbuf whenever a TX is in flight, so the RX drain
+    /// can deliver without the tap's (data, len) args.
+    pub const BLE_POOL_CMD_ARENA: u32 = 0x3fc9_ea4c;
+
+    /// Dropped BLE-RX counter (packets lost while the RX FIFO was full).
+    pub fn bt_hci_rx_dropped(&self) -> u32 {
+        self.ble.rx_dropped()
     }
 
     /// Dropped-RX counter (host frontend for the NET_RX_DROPPED battery
@@ -4301,18 +4754,26 @@ impl Soc {
         }
         match dev {
             UART0_BASE | UART1_BASE | UART2_BASE => {
-                let n = if dev == UART0_BASE {
-                    0
-                } else if dev == UART1_BASE {
-                    1
-                } else {
-                    2
-                };
-                if is_write {
-                    self.uarts[n].write32(off, value);
+                if off >= 0x80 {
+                    // Past the UART register file (`Uart::regs` is 0x80
+                    // long): reserved on silicon, reads 0 / writes dropped
+                    // (never forwarded — forwarding would index the regs
+                    // array out of bounds and panic).
                     0
                 } else {
-                    self.uarts[n].read32(off)
+                    let n = if dev == UART0_BASE {
+                        0
+                    } else if dev == UART1_BASE {
+                        1
+                    } else {
+                        2
+                    };
+                    if is_write {
+                        self.uarts[n].write32(off, value);
+                        0
+                    } else {
+                        self.uarts[n].read32(off)
+                    }
                 }
             }
             UHCI0_BASE => {
@@ -5353,6 +5814,27 @@ impl Soc {
                     } else {
                         self.sys_clk_en1
                     }
+                } else if off == 0x028 || off == 0x02C {
+                    // BT_LPCK divider + LPCLK select (SYSTEM_BT_LPCK_DIV_NUM
+                    // @ +0x28, SYSTEM_BT_LPCK_DIV_FRAC @ +0x2C): the BLE
+                    // controller's `btdm_lpclk_select_src` / `set_div` RMW
+                    // these then read them back and assert on the result
+                    // (esp_bt_controller_init dies at bt.c:1753 when the
+                    // readback is 0). Plain RMW-able stores like the EN0/1
+                    // gates — seeded with the silicon reset defaults (DIV
+                    // 255, SEL_8M) so a pre-init read already observes them.
+                    if is_write {
+                        if off == 0x028 {
+                            self.sys_bt_lpck_div = value;
+                        } else {
+                            self.sys_lpclk_frac = value;
+                        }
+                        0
+                    } else if off == 0x028 {
+                        self.sys_bt_lpck_div
+                    } else {
+                        self.sys_lpclk_frac
+                    }
                 } else if off == 0x030 || off == 0x034 || off == 0x038 || off == 0x03C {
                     // Cross-core interrupt: write 1 asserts the FROM_CPU
                     // source for the target core (+0x30/+0x38 -> core 0 as
@@ -5451,6 +5933,26 @@ impl Soc {
                     self.wifi.read32(dev, off)
                 }
             }
+            BT_BASE => {
+                // BLE VHCI register page (`DR_REG_BT_BASE` = 0x6001_1000):
+                // the emulator's own VHCI tap registers live here at
+                // offsets 0x00/0x04/0x08/0x0C (INT_RAW/ST/ENA/CLR, see
+                // ble.rs `write32_vhci`/`read32_vhci`), driving the RWBLE
+                // line (source 8) behind the firmware's back. Split
+                // ownership is REQUIRED: the closed `libbt.a` BB init
+                // (`bt_bb_v2_rx_set` etc.) RMWs cell 0x008 — the same
+                // 12-bit offset as the tap's INT_ENA slot — so a shared
+                // state lets the BB init's RMW clobber the tap's INT_ENA
+                // (proven live: shared-state ENA read 0xFFFF0001 after
+                // the BB loop, wedging the RWBLE line). HCI bytes
+                // themselves move through the `bt_hci_*` tap, not MMIO.
+                if is_write {
+                    self.ble.write32_vhci(off, value);
+                    0
+                } else {
+                    self.ble.read32_vhci(off)
+                }
+            }
             0x600C_E000 => store_dispatch(is_write, off, value, &mut self.assist_debug),
             USB_OTG_BASE => {
                 // DWC core (0x60080000).
@@ -5505,6 +6007,29 @@ impl Soc {
             // USB_WRAP (OTG PHY wrapper, 0x60039000): plain store.
             0x6003_9000 => store_dispatch(is_write, off, value, &mut self.usb_wrap),
             0x600D_0000 => store_dispatch(is_write, off, value, &mut self.wcl),
+            // Modem-EM alias window (UART2 +0x3000 = 0x60031000, the
+            // RWBT/RWBLE register files the closed `libbt.a` pokes during
+            // `btdm_controller_init` / `ble_util_buf_reset`): objdump
+            // labels these `UART2+0x3xxx` because 0x60031000 - 0x6002E000
+            // = 0x3000, but silicon has NO page at 0x60031000 (reg_base.h
+            // lists no DR_REG_* there — the 0x6002xxxx block ends at
+            // USB_SERIAL_JTAG 0x60038000 and UART2's own block is only
+            // 0xFFF long). No engine is modeled (the air interface is
+            // bridged through the BLE VHCI tap in ble.rs instead), but
+            // INIT code RMWs these cells and asserts on readback (proven:
+            // `emi_reset_em_mapping_by_offset` dies in
+            // `BLE assert emi.c:164` when the EM base reads 0). Route the
+            // whole alias window into the BLE tap's benign store so init
+            // RMWs round-trip; the VHCI bytes themselves move through
+            // `bt_hci_*`, not MMIO.
+            0x6003_1000 => {
+                if is_write {
+                    self.ble.write_bt_mac(off, value);
+                    0
+                } else {
+                    self.ble.read_bt_mac(off)
+                }
+            }
             // Everything else in the APB space: no model yet (reads 0 /
             // writes dropped, like QEMU's unimplemented devices).
             _ => 0,
@@ -6217,6 +6742,12 @@ impl Soc {
         // USB-OTG DWC core (quiet without a host counterparty).
         if self.usb_otg.int_pending() {
             src |= 1 << crate::usb_otg::USB_OTG_INTR_SOURCE;
+        }
+        // BLE RWBLE (`ETS_RWBLE_INTR_SOURCE` = 8): raised while staged
+        // controller→host HCI packets wait, gated by INT_ENA (the NimBLE
+        // VHCI driver enables it when it arms `notify_host_recv`).
+        if self.ble.int_st() != 0 {
+            src |= 1 << BLE_INTR_SOURCE;
         }
         // UHCI0 DMA bridge event interrupts (TX/RX_START via INT_ST).
         if self.uhci.int_st() {

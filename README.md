@@ -19,32 +19,48 @@ peripherals) with no server-side emulation.
   and a broad set of peripherals.
 - **P5 (peripheral validation) complete**: every SoC peripheral is
   validated end-to-end by booting **real arduino-cli firmware** and asserting
-  both serial output and internal emulator state. Battery: **117/0/0**
-  (117 pass, 0 fail, 0 skipped) across 62 gallery entries (60 images + the
-  MicroPython stock image) + driver/poke
+  both serial output and internal emulator state. Battery: **120/0/0**
+  (120 pass, 0 fail, 0 skipped) across 64 gallery entries + driver/poke
   sketches, plus Playwright browser E2E ALL PASS.
 - **P6 (browser frontend) complete**: Serial console + serial input row
-  (USB-CDC/UART0/1/2 + Send), GPIO LED grid, firmware gallery (62 entries:
+  (USB-CDC/UART0/1/2 + Send), GPIO LED grid, firmware gallery (64 entries:
   every major peripheral + SDSPI with in-browser card attach, emmc_driver,
-  usb_device, Wi-Fi scan/station/SoftAP/ESP-NOW/worker via in-wasm fixtures,
+  usb_device, Wi-Fi scan/station/SoftAP/ESP-NOW/worker/worker-L3 via in-wasm
+  fixtures, BLE GATT server via the Bumble bridge panel,
   MicroPython REPL via the bundled stock image; flashenc reuses the
   hello bin with a `key` field), MIPS meter,
   Playwright E2E (hello boot, serial echo, UART1 round-trip, SDSPI mount,
   touch read, Wi-Fi scan, SoftAP + ESP-NOW, worker).
-- **Remaining known gaps**: live L3–L7 IP suites (DHCP, DNS, HTTP, MQTT, CoAP
-  client+server, IPv6) — the L2 Ethernet bridge now flows both ways
-  (`test_worker_net`: TX tap → pcap + gateway TCP ingest on 127.0.0.1:5051;
-  RX injection via the `esp_netif_receive` hook; gateway SLIRP/NAT +
-  DHCP/DNS/ARP/IPv6-RA/UDP-forward under `tools/gateway/`), but the closed
-  lwIP stack needs a live netif binding the emulator cannot provide
-  offline, so no L3–L7 client/server flow completes end-to-end yet
-  (see `AGENTS.md`). The
+- **Live-IP backhaul (L2 + gateway-local L3–L7)**: the L2 Ethernet bridge
+  flows both ways (`test_worker_net`: TX tap → pcap + gateway TCP ingest
+  on 127.0.0.1:5051; RX injection via the `esp_netif_receive` hook;
+  gateway SLIRP/NAT + DHCP/DNS/ARP/IPv6-RA/UDP-forward under
+  `tools/gateway/`), and `test_worker_l3` speaks real lwIP client frames
+  at gateway-local services answered synchronously in
+  `tools/gateway/handleL7.go` (DNS static table, NTP fixed epoch, UDP
+  echo on the CoAP port — no live netif needed; `go test ./...` pins the
+  wire contract). Full Internet egress (HTTP/MQTT via gVisor NAT) works
+  when the gateway host is online (proven live: EGRESS_TCP80_OK,
+  EGRESS_MQTT_OK); the in-browser gallery covers both workers via the
+  Live-IP panel + `wifi_worker`/`wifi_worker_l3` fixtures.
+- **BLE via Bumble bridge**: the `esp32s3_ble` NimBLE GATT-server sketch
+  boots to `BLE DONE` (advertise + Battery service + echo characteristic)
+  through the emulator's VHCI tap (`BT page 0x60011000`, RWBLE source 8):
+  firmware HCI captures forward length-prefixed over `BLE_GW` to
+  `tools/ble_bridge.py` (Google Bumble virtual controller + Battery/echo
+  GATT app, no radio, no root), with a `/api/ble-gateway` byte-pump in
+  the Go gateway and a BLE panel in the browser. The on-silicon ROM
+  controller loopback answers basic commands locally (proven live), so
+  the sketch passes with or without the bridge; the bridge proves the
+  host↔controller path end-to-end.
+- **Remaining known gaps**: full Internet L3–L7 client/server suites that
+  need a live outside counterparty beyond the gateway host (see
+  `AGENTS.md`). The
   Arduino `Wire` (I2C) empty-bus scan reporting "other" is verified
   silicon-true behavior (esp-idf NG-driver maps the NACK path's
   `ESP_ERR_INVALID_STATE` to 4), not a model gap — see `AGENTS.md`. Xtensa
   `ee.*` DSP/TIE: 218/218 execute; unmapped patterns trap loud (correct).
   Touch validated.
-- **Out of scope**: BLE.
 
 ## Quickstart
 

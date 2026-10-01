@@ -116,6 +116,28 @@ const MAC_REV_VAL: u32 = 0x45 << 12;
 pub const TXDC_OFF: u32 = 0x4C;
 pub const TXDC_DONE_BIT: u32 = 1 << 24;
 
+/// Closed-RF dispatch-table completion (see module docs + `memmap::RF_NOP_BODY`).
+///
+/// The heap-resident `g_phyFuns` table (pointer cell at `G_PHYFUNS_PTR`,
+/// nm on every WiFi image: BSS `g_phyFuns`, e.g. 0x3fca0060 on the
+/// test-worker-l3 ELF) is filled by `phy_get_romfunc_addr` (~30 slots)
+/// plus the real ROM's `phy_get_romfuncs` callee — but slot `0x24c`
+/// (read by `chip_v7_set_chan_misc` on EVERY channel set, including
+/// periodic recalibration) is written by NEITHER (proven whole-ELF: no
+/// store targets it — the fill loop's offsets skip it). It holds heap
+/// garbage, so the first recalibration after boot jumps wild
+/// (`callx8` to 0x2c/0x4022d8b8, EPC varies by heap history — proven
+/// live 2026-09-29 on the L3 image: pc-history ends
+/// `... -> chip_v7_set_chan_misc+0x30 (l32r g_phyFuns) -> 0x2c`).
+/// RF effects are abstracted via done-bits anyway, so the emulator
+/// completes the slot with the benign no-op at fill time (see
+/// `Soc::write32` hook on the pointer store). Sibling slot `0x160`
+/// (read by `chip_v7_set_chan` itself) is left alone — it holds a valid
+/// ROM address at every observed crash, i.e. the ROM fill covers it.
+pub const G_PHYFUNS_PTR: u32 = 0x3FCA_0060;
+/// Dispatch-table slot never filled by app or ROM (see above).
+pub const PHYFUNS_UNFILLED_OFF: u32 = 0x24C;
+
 /// FE2 IQ-estimate bit-17 overlay: REMOVED 2026-09-19 (was wrong).
 /// Live single-step forensics proved the `ram_iq_est_enable` inner poll
 /// at 0x4208012b loads from `[a10 = FE+0x174 = 0x60006174]` (logged the

@@ -256,6 +256,16 @@
     "wifi_worker": "EmuNet,-50,6,02:11:22:33:44:55"
   },
   {
+    "name": "test_worker_l3 — L3–L7 app protocols via gateway (fixture)",
+    "file": "esp32s3_test_worker_l3.merged.bin",
+    "wifi_worker_l3": "EmuNet,-50,6,02:11:22:33:44:55"
+  },
+  {
+    "name": "ble — BLE GATT server via Bumble bridge",
+    "file": "esp32s3_ble.merged.bin",
+    "ble": true
+  },
+  {
     "name": "micropython — Python REPL (UART0, pads + vfs)",
     "file": "ESP32_GENERIC_S3-20260824-v1.29.0.bin",
     "micropython": true

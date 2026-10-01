@@ -472,6 +472,19 @@ func handleTCPFrame(client *Client, room *Room, msg []byte) {
 	if divertTCPUDPForward(packet, room) {
 		return
 	}
+	// Gateway-local L3–L7 services (DNS/NTP — see handleL7.go): answer
+	// board->gateway queries here so they never reach the gVisor pipe
+	// (which has no UDP:53/123 listener and would drop them). TCP
+	// (HTTP/MQTT) falls through to gVisor NAT by design.
+	if snoopDNS(msg, client, room) {
+		return
+	}
+	if snoopNTP(msg, client, room) {
+		return
+	}
+	if snoopUDPEcho(msg, client, room) {
+		return
+	}
 	if snoopTCPIPv6(msg, client, room) {
 		return
 	}
@@ -631,6 +644,18 @@ func handleClient(client *Client, room *Room) {
 			// IPv6 gateway services (RS/RA, NS/NA, echo, UDP echo):
 			// board <-> gateway only, never entering gVisor (v4-NAT only).
 			if snoopIPv6(msg, client, room) {
+				continue
+			}
+
+			// Gateway-local L3–L7 services (DNS/NTP/UDP-echo — see
+			// handleL7.go): same placement as the TCP leg above.
+			if snoopDNS(msg, client, room) {
+				continue
+			}
+			if snoopNTP(msg, client, room) {
+				continue
+			}
+			if snoopUDPEcho(msg, client, room) {
 				continue
 			}
 

@@ -225,5 +225,15 @@ pub const MMU_TABLE_BASE: u32 = 0x600C_5000;
 pub const APB_START: u32 = 0x6000_0000;
 pub const APB_END: u32 = 0x6010_0000;
 
+/// Benign RF-dispatch no-op (`retw.n` body in our ROM glue, see
+/// `rom_stub::RF_NOP_BODY`): the emulator writes this address into closed-RF
+/// dispatch-table slots the app image never fills (proven whole-ELF: no
+/// store targets them), so recalibration paths complete instantly instead
+/// of jumping to heap garbage. RF effects are abstracted via done-bits
+/// anyway (see `wifi.rs`), so a no-op return is behaviorally identical as
+/// observed by firmware. Lives in the QSORT–BOOT gap (0x3C6), inside the
+/// live glue region (below GLUE_END 0x570).
+pub const RF_NOP_BODY: u32 = 0x4000_03C6;
+
 /// Total internal SRAM in bytes.
 pub const SRAM_BYTES: usize = DRAM_SIZE as usize;

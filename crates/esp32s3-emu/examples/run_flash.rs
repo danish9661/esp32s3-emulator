@@ -51,7 +51,9 @@ fn main() {
     let flash = fs::read(&path).expect("read flash image");
     // Image layout selection for the WiFi fixtures (scan vs STA sketch
     // link the pool/RAM differently; used by the layout tables below).
-    let bin_name_contains_wifi_sta = path.contains("wifi_sta") || path.contains("test_worker_net");
+    let bin_name_contains_wifi_sta = path.contains("wifi_sta")
+        || path.contains("test_worker_net")
+        || path.contains("test_worker_l3");
 
     let mut m = Esp32S3::new();
     // Secure-boot fixture: SECURE_BOOT_EN=1 burns eFuse SECURE_BOOT_EN
@@ -117,6 +119,9 @@ fn main() {
         let layout = if path.contains("wifi_ap") {
             m.soc.wifi_fixture_image_ap();
             &AP_LAYOUT
+        } else if path.contains("test_worker_l3") {
+            m.soc.wifi_fixture_image_worker_l3();
+            &WORKER_L3_LAYOUT
         } else if path.contains("test_worker_net") {
             m.soc.wifi_fixture_image_worker();
             &WORKER_LAYOUT
@@ -325,6 +330,44 @@ fn main() {
     let net_gw_addr: Option<String> = env::var("NET_GW").ok();
     let mut net_gw: Option<std::net::TcpStream> = None;
     let net_rx_log = env::var("NET_RX_LOG").is_ok();
+    // BLE HCI bridge (ble-sketch support): BLE_GW=<host:port> dials the
+    // Bumble bridge's emulator leg (`tools/ble_bridge.py --emu-port`,
+    // default 127.0.0.1:9545; length-prefixed HCI both directions — the
+    // same framing discipline as the NET_GW Ethernet leg). Host drains
+    // each captured firmware→controller frame via `bt_hci_take_tx` and
+    // forwards it; bridge replies are staged via `bt_hci_inject_rx` for
+    // the firmware's `host_rcv_pkt` VHCI-recv path, then delivered
+    // IN-FIRMWARE by running the registered callback (see the VHCI RX
+    // hook below — same windowed-ABI discipline as `run_espnow_callback`).
+    // With BLE_GW unset the leg compiles out (zero-cost when idle) and
+    // the firmware observes a quiet controller (silicon with no peer).
+    let ble_gw_addr: Option<String> = env::var("BLE_GW").ok();
+    let mut ble_gw: Option<std::net::TcpStream> = None;
+    let mut ble_rx_buf: Vec<u8> = Vec::new();
+    // vhci_host_cb addresses (BLE image only — nm on the esp32s3_ble ELF;
+    // sibling images never link libbt/NimBLE so the addrs never match):
+    // `vhci_host_cb` rodata (notify_host_recv fn pointer slot), the
+    // `host_rcv_pkt` entry itself, and `vhci_send_sem` (the counting
+    // semaphore `controller_rcv_pkt_ready` gives). The RX hook stages
+    // one queued bridge reply per `host_rcv_pkt` call.
+    const BLE_HOST_CB: u32 = 0x3c06_b7c8;
+    let mut ble_cb_entry: Option<u32> = None;
+    if let Some(ref addr) = ble_gw_addr {
+        match std::net::TcpStream::connect(addr.as_str()) {
+            Ok(s) => {
+                if let Err(e) = s.set_nonblocking(true) {
+                    println!("[host] BLE bridge nonblocking failed: {e} (HCI leg disabled)");
+                    ble_gw = None;
+                } else {
+                    println!("[host] BLE bridge connected to {addr}");
+                    ble_gw = Some(s);
+                }
+            }
+            Err(e) => {
+                println!("[host] BLE bridge connect to {addr} failed: {e} (quiet-controller mode)")
+            }
+        }
+    }
     // Reassembly buffer for the nonblocking reply drain (length header
     // + body may arrive split across steps; never reset except on
     // fatal framing errors).
@@ -459,6 +502,24 @@ fn main() {
         reg_heaps: 0x3fc9_b794,
         pxcur: 0x3fc9_bad0,
         sta_network_if: 0x3fc9_ae6c,
+    };
+    // test-worker-l3 image layout (nm on the test-worker-l3 ELF
+    // 2026-09-29 — same field order as WORKER_LAYOUT; the sketch source
+    // pins the layout like every other image, re-nm after any .ino edit).
+    const WORKER_L3_LAYOUT: WifiLayout = WifiLayout {
+        scan_start: 0x4206_3d18,
+        connect: 0x4203_c9d4,
+        wifi_event_var: 0x3c0b_42b0,
+        ip_event_var: 0x3c0b_3bac,
+        count_cell: 0x3fc9_f936,
+        scan_count: 0x3fc9_aef0,
+        scan_result: 0x3fc9_aeec,
+        records_check: 0x4200_3fb0,
+        ready_lists: 0x3fc9_b8ec,
+        top_prio: 0x3fc9_b85c,
+        reg_heaps: 0x3fc9_b7a4,
+        pxcur: 0x3fc9_bae0,
+        sta_network_if: 0x3fc9_ae78,
     };
     // wifi-ap image layout (nm on the wifi-ap ELF; sta_network_if =
     // `_ZL14_ap_network_if` bss static; esp_wifi_start = 0x42063870
@@ -827,6 +888,152 @@ fn main() {
             }
         }
 
+        // BLE HCI bridge legs (Bumble virtual controller): forward each
+        // captured firmware→controller frame length-prefixed, and drain
+        // bridge replies into the RX FIFO. Same nonblocking +
+        // reassembly-buffer discipline as the NET_GW leg above (never
+        // `read_exact` on a nonblocking socket). Replies are consumed by
+        // the VHCI RX hook below (one queued packet per `host_rcv_pkt`
+        // call), not staged blindly here.
+        if ble_gw.is_some() {
+            let frame = m.soc.bt_hci_take_tx();
+            if !frame.is_empty() {
+                use std::io::Write as _BleW;
+                let ok = if let Some(ref mut gw) = ble_gw {
+                    let len = (frame.len() as u32).to_be_bytes();
+                    gw.write_all(&len).and(gw.write_all(&frame)).is_ok()
+                } else {
+                    false
+                };
+                if !ok {
+                    println!("[host] BLE bridge write failed; dropping HCI leg");
+                    ble_gw = None;
+                } else if frame.len() >= 4 {
+                    println!(
+                        "[host] BLE TX {}B h4={:#04x} op={:#06x}",
+                        frame.len(),
+                        frame[0],
+                        u16::from_le_bytes([frame[1], frame[2]])
+                    );
+                }
+            }
+            let mut drop_ble = false;
+            if let Some(ref mut gw) = ble_gw {
+                use std::io::Read as _BleR;
+                for _ in 0..4 {
+                    let mut tmp = [0u8; 4096];
+                    match gw.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => ble_rx_buf.extend_from_slice(&tmp[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => {
+                            println!("[host] BLE bridge read failed; dropping HCI leg");
+                            drop_ble = true;
+                            ble_rx_buf.clear();
+                            break;
+                        }
+                    }
+                    loop {
+                        if ble_rx_buf.len() < 4 {
+                            break;
+                        }
+                        let rlen = u32::from_be_bytes([
+                            ble_rx_buf[0],
+                            ble_rx_buf[1],
+                            ble_rx_buf[2],
+                            ble_rx_buf[3],
+                        ]) as usize;
+                        if rlen == 0 || rlen > 4096 {
+                            println!("[host] BLE bridge bad reply length {rlen}; dropping HCI leg");
+                            drop_ble = true;
+                            ble_rx_buf.clear();
+                            break;
+                        }
+                        if ble_rx_buf.len() < 4 + rlen {
+                            break;
+                        }
+                        let rbuf: Vec<u8> = ble_rx_buf[4..4 + rlen].to_vec();
+                        ble_rx_buf.drain(..4 + rlen);
+                        println!("[host] BLE RX {}B h4={:#04x}", rbuf.len(), rbuf[0]);
+                        m.soc.bt_hci_inject_rx(&rbuf);
+                    }
+                    if ble_rx_buf.len() < 4 {
+                        break;
+                    }
+                }
+            }
+            if drop_ble {
+                ble_gw = None;
+            }
+        }
+        // BLE reply deliver (level-triggered ACK path — see
+        // `Soc::ble_ack_deliver_at`): whenever a bridge reply is queued
+        // AND the firmware's ack waiter is parked on `ble_hs_hci_sem`
+        // (`npl_freertos_sem_pend` → `xQueueSemaphoreTake`), route the
+        // oldest reply through the firmware's OWN ack path (store EVT
+        // bytes on the in-flight TX block + sem release + ready the
+        // woken waiter). The waiter-parked gate is load-bearing: with a
+        // one-block pool the arena block is the checked-out TX mbuf ONLY
+        // while its owner is blocked waiting — delivering into it while
+        // the firmware runs free would race the next alloc (proven live
+        // class: foreign-buffer `assert failed: 0x42014482`). With no
+        // waiter the reply stays queued (the tap-time deliver covers
+        // the send-side race; this covers the RX-arrival side). One
+        // deliver per step max (replies are rare — the checks are two
+        // word reads + a FIFO-length check when idle).
+        if ble_gw.is_some() && m.soc.bt_hci_rx_pending() > 0 {
+            let sem = m.soc.ble_ack_sem();
+            if sem != 0 && m.soc.queue_recv_waiting(sem) {
+                use esp32s3_soc::Soc as _BleSoc;
+                if let Some(tcb) = m.soc.ble_ack_deliver_at(_BleSoc::BLE_POOL_CMD_ARENA, 0) {
+                    m.soc.ble_ready_task(tcb);
+                    println!("[host] BLE ack delivered (rx-arrival)");
+                }
+            }
+        }
+        // BLE VHCI RX hook: deliver ONE queued controller→host packet per
+        // step by running the registered `notify_host_recv` callback
+        // IN FIRMWARE (same windowed-ABI discipline as
+        // `run_espnow_callback`: 2-arg call, args in caller a10/a11 =
+        // callee a2/a3, fake-RETW on return). Drained every step the leg
+        // is up (packets are rare — the take is a single empty-FIFO check
+        // when idle, same discipline as the UART fast path).
+        // The callback address is discovered once from the `vhci_host_cb`
+        // rodata (`BLE_HOST_CB`, BLE image only): slot 0 =
+        // `notify_host_send_available`, slot 1 = `notify_host_recv`
+        // (struct order in esp_nimble_hci.c, proven by the 0x42005004 /
+        // 0x4200a050 words at 0x3c06b7c8). The packet bytes ride the
+        // host scratch window (`Soc::bt_hci_stage_rx` at
+        // `WIFI_SCRATCH + 0x2500`, past the net-RX slots — never heap,
+        // never freed: `host_rcv_pkt` only READS the bytes into an mbuf
+        // it allocates itself, same class as the `WIFI_SCRATCH` fixture
+        // window).
+        //
+        // SCOPE (proven live via pb5: the plain `host_rcv_pkt` firmware
+        // path asserts in `ble_transport_free` even with NO hook and NO
+        // bridge traffic): the bare-metal firmware→controller leg is
+        // validated (TX tap captures the HCI Reset, the bridge answers
+        // Command Complete, the RX FIFO stages it — all observable in
+        // the `[host] BLE TX/RX` lines). Driving the reply INTO the
+        // firmware via a synthetic `host_rcv_pkt` call is NOT wired:
+        // the reply must enter through the firmware's OWN VHCI poll
+        // (`host_rcv_pkt` at 0x420050a0, called by the controller glue
+        // with its own buffer at 0x3fcacfd6) — a host-staged buffer at a
+        // foreign address walks the mbuf pool free path with a block the
+        // pool does not recognize (`assert failed: 0x42014482` in
+        // `os_memblock_from(pool_cmd)`, panic_abort EPC1=0x4037fdc4).
+        // Until the controller-glue poll is modeled (the RWBLE ISR path
+        // that hands the firmware its own buffer), the hook stays parked
+        // here and the firmware runs its quiet-controller path.
+        if ble_gw.is_some() && ble_cb_entry.is_none() {
+            let cb0 = m.soc.read32(BLE_HOST_CB);
+            let cb1 = m.soc.read32(BLE_HOST_CB + 4);
+            if (0x4000_0000..0x4240_0000).contains(&cb1) && cb0 != 0 {
+                ble_cb_entry = Some(cb1);
+                println!("[host] BLE vhci_host_cb: notify_host_recv={cb1:#010x}");
+            }
+        }
+
         // UART1 RX injection: once the app prints the ready marker, push
         // the host payload into UART1 RX (the echo sketch reads it back).
         // Gated on new bytes: the buffer only changes when a drain above
@@ -1117,7 +1324,9 @@ fn main() {
         // edge: the arm fires once per scan; the completion retries until
         // the queue/group handles are valid, then latches done.
         if wifi_scan_fixture && !wifi_scan_done {
-            let layout = if path.contains("test_worker_net") {
+            let layout = if path.contains("test_worker_l3") {
+                &WORKER_L3_LAYOUT
+            } else if path.contains("test_worker_net") {
                 &WORKER_LAYOUT
             } else if bin_name_contains_wifi_sta {
                 &STA_LAYOUT
@@ -1166,7 +1375,9 @@ fn main() {
             && !wifi_scan_records_done
             && !wifi_scan_aps.is_empty()
         {
-            let layout = if path.contains("test_worker_net") {
+            let layout = if path.contains("test_worker_l3") {
+                &WORKER_L3_LAYOUT
+            } else if path.contains("test_worker_net") {
                 &WORKER_LAYOUT
             } else if bin_name_contains_wifi_sta {
                 &STA_LAYOUT
@@ -1224,7 +1435,9 @@ fn main() {
         // a flat ip/mask/gw@0 layout corrupts the sized-delete and panics,
         // proven live at 0x4037bf00).
         if wifi_sta_conn && !wifi_sta_done {
-            let layout = if path.contains("test_worker_net") {
+            let layout = if path.contains("test_worker_l3") {
+                &WORKER_L3_LAYOUT
+            } else if path.contains("test_worker_net") {
                 &WORKER_LAYOUT
             } else if bin_name_contains_wifi_sta {
                 &STA_LAYOUT
@@ -1336,7 +1549,9 @@ fn main() {
         // `wifi_ard_idle` (mw back to 0) — the two arduino events must not
         // race in the same queue — but the IDF half posts immediately.
         if wifi_sta_conn && wifi_sta_conn_stage == 1 && !wifi_sta_ip_done {
-            let layout = if path.contains("test_worker_net") {
+            let layout = if path.contains("test_worker_l3") {
+                &WORKER_L3_LAYOUT
+            } else if path.contains("test_worker_net") {
                 &WORKER_LAYOUT
             } else if bin_name_contains_wifi_sta {
                 &STA_LAYOUT
@@ -1444,7 +1659,7 @@ fn main() {
         // association down, and the run parks at `esp_wifi_connect`
         // forever; the worker sketch never calls `WiFi.disconnect()`
         // itself, so nothing is lost by skipping).
-        let needs_disc_leg = !path.contains("test_worker_net");
+        let needs_disc_leg = !path.contains("test_worker_net") && !path.contains("test_worker_l3");
         if wifi_sta_conn
             && needs_disc_leg
             && wifi_sta_ip_done
@@ -1463,7 +1678,9 @@ fn main() {
             && !wifi_sta_disc_done
             && m.soc.wifi_ard_idle()
         {
-            let layout = if path.contains("test_worker_net") {
+            let layout = if path.contains("test_worker_l3") {
+                &WORKER_L3_LAYOUT
+            } else if path.contains("test_worker_net") {
                 &WORKER_LAYOUT
             } else if bin_name_contains_wifi_sta {
                 &STA_LAYOUT
