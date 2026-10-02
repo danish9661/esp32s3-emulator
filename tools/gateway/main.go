@@ -39,6 +39,16 @@ type Client struct {
 // hub→client reply paths must use this — never `Conn.WriteMessage`
 // directly — so TCP-ingest peers get their DHCP/ARP/IPv6/gVisor
 // replies back.
+//
+// BLOCKING-WRITE NOTE (proven live 2026-10-01): the TCP-ingest socket
+// is NONBLOCKING on the EMULATOR side (run_flash sets it for its reply
+// drain), but on THIS side it is a plain blocking socket — so a
+// `Write` here can only fail if the peer went away (broken pipe =
+// run_flash dropped the leg after a failed `write_all`, or exited).
+// Callers already log-and-continue on error; no retry belongs here
+// (a dead peer means the run is over — the emulator dropped the leg
+// itself). The run_flash side was fixed to retry WouldBlock instead of
+// dropping the leg; this side needs no change.
 func sendFrame(client *Client, frame []byte) error {
 	if client.TCP != nil {
 		return sendToTCPClientRaw(client, frame)
@@ -472,10 +482,11 @@ func handleTCPFrame(client *Client, room *Room, msg []byte) {
 	if divertTCPUDPForward(packet, room) {
 		return
 	}
-	// Gateway-local L3–L7 services (DNS/NTP — see handleL7.go): answer
+	// Gateway-local L3–L7 services (DNS/NTP/TCP — see handleL7.go): answer
 	// board->gateway queries here so they never reach the gVisor pipe
-	// (which has no UDP:53/123 listener and would drop them). TCP
-	// (HTTP/MQTT) falls through to gVisor NAT by design.
+	// (which has no UDP:53/123 listener and would drop them, and owns no
+	// gateway-IP TCP listener). TCP to anywhere else still falls through
+	// to gVisor NAT by design (EGRESS_*_OK relies on it).
 	if snoopDNS(msg, client, room) {
 		return
 	}
@@ -483,6 +494,9 @@ func handleTCPFrame(client *Client, room *Room, msg []byte) {
 		return
 	}
 	if snoopUDPEcho(msg, client, room) {
+		return
+	}
+	if l7TCPSnoop(msg, client, room) {
 		return
 	}
 	if snoopTCPIPv6(msg, client, room) {
@@ -647,7 +661,7 @@ func handleClient(client *Client, room *Room) {
 				continue
 			}
 
-			// Gateway-local L3–L7 services (DNS/NTP/UDP-echo — see
+			// Gateway-local L3–L7 services (DNS/NTP/UDP-echo/TCP — see
 			// handleL7.go): same placement as the TCP leg above.
 			if snoopDNS(msg, client, room) {
 				continue
@@ -656,6 +670,9 @@ func handleClient(client *Client, room *Room) {
 				continue
 			}
 			if snoopUDPEcho(msg, client, room) {
+				continue
+			}
+			if l7TCPSnoop(msg, client, room) {
 				continue
 			}
 

@@ -292,6 +292,15 @@ impl Esp32S3 {
                 return (StepResult::Ok, n);
             }
             let pc0 = self.cpu[core].pc;
+            // Fixture-engine pre-op sample (browser/bridge path): the
+            // engine's post-step poll (after both blocks, same point
+            // run_flash uses) observes a transient CALLEE-ENTRY pc only
+            // when a macro-step happens to END exactly on it; the per-op
+            // sample here observes EVERY pc the core executes, so arming
+            // here is airtight where post-step is luck. The post-step
+            // poll stays for steady-state legs (scan_start spins,
+            // records_check traps).
+            self.soc.wifi_fixture_poll_pre(pc0);
             let _ = pc0;
             // Host-pool free interception (WiFi fixture support — same as
             // the `step` hook above): skip the `_ZdlPvj` call for host-pool
@@ -516,7 +525,7 @@ impl Esp32S3 {
                     WifiImage::Scan => 0x4202_e560,
                     WifiImage::EspNow => 0x4202_e7f8,
                     WifiImage::Worker => 0x4202_e60c,
-                    WifiImage::WorkerL3 => 0x4202_e6e8,
+                    WifiImage::WorkerL3 => 0x4202_f924,
                 };
                 if pc0 == want {
                     let data = self.cpu[core].reg(11);
@@ -547,7 +556,7 @@ impl Esp32S3 {
                     WifiImage::Scan => 0x4202_e5c4,
                     WifiImage::EspNow => 0x4202_e85c,
                     WifiImage::Worker => 0x4202_e670,
-                    WifiImage::WorkerL3 => 0x4202_e74c,
+                    WifiImage::WorkerL3 => 0x4202_f988,
                 };
                 if pc0 == want_rx
                     && let Some(frame) = self.soc.net_take_rx()

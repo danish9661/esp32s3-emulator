@@ -235,6 +235,18 @@ struct WifiFixtureState {
     espnow_tx_done: bool,
     espnow_rx_done: bool,
     espnow_send_seen: bool,
+    /// Set by the pre-op sample (`wifi_fixture_poll_pre`) when it arms
+    /// the STA dwell mid-block; consumed by the next post-step poll as
+    /// `just_armed` (stage-1 posts on the arming poll itself — a fresh
+    /// `wifi_scan_begin` can never read back `tick_complete()` in the
+    /// same poll). Without this the post-step-only engine never posts
+    /// stage 1: the dwell was armed mid-block, `tick_complete()` reads
+    /// false on every later poll (dwell still counting down... no —
+    /// it reads TRUE once the dwell elapses, and stage 1 posts THEN,
+    /// one dwell late. The `just_armed` fast path exists because
+    /// run_flash posts on the arming poll; matching it keeps both
+    /// paths' timing identical).
+    sta_just_armed: bool,
 }
 
 /// Five layout/address cells (`wifi_layout_set` /
@@ -263,6 +275,31 @@ pub struct WifiFixtureRuntime {
     espnow_a4: Option<(u32, u32)>,
     espnow_call: Option<(u32, u32, u32)>,
     fixture_st: Option<WifiFixtureState>,
+    /// Live-completed phyFuns slot (table base + filled word): the RF
+    /// dispatch-table completion is a DRAM write like any other, so a
+    /// WDT/system reset (fresh `Soc::new()` + loader re-copy) WIPES it —
+    /// and after the wipe the pointer cell already holds the published
+    /// pointer, so the word-store hook never re-fires and the first
+    /// post-reboot recalibration jumps wild (proven live: L3+gateway
+    /// ILLEGAL @ EPC1 0x4022d8b8 on the SECOND boot, i.e. after the
+    /// core-0 Unknown-reason WDT reset at ~21M steps — the first boot's
+    /// completion died with the old SoC). Restoring the word here makes
+    /// the completion reset-persistent, exactly like the table fill itself
+    /// (which the loader re-copies from flash... no — the fill re-RUNS
+    /// post-reboot and re-publishes; but the publish store hits the same
+    /// already-published cell value, and the hook fires on the STORE, not
+    /// the value change — wait, it DOES re-fire (every publish completes,
+    /// idempotent). Hmm — then why did the second boot crash? Because the
+    /// re-published pointer names the NEW table, whose 0x160 probe reads
+    /// garbage until the ROM fill covers it — the dangling-table guard
+    /// (correctly) refuses the early publish, and NO later publish ever
+    /// comes (the fill publishes once). So the restore below is what
+    /// completes the real table post-reboot: it re-applies the proven
+    /// completion to the CURRENT table. `None` = no completion yet (first
+    /// boot pre-fill) — restore is then a no-op. The word is re-validated
+    /// on restore (table still DRAM, slot still in range) so a stale
+    /// snapshot can never corrupt a relinked image.
+    phyfuns_completed: Option<(u32, u32)>,
 }
 
 /// An armed Wi-Fi fixture run: parsed AP list + fixed LAN + engine state.
@@ -2206,34 +2243,35 @@ impl Soc {
             }
             WifiImage::WorkerL3 => {
                 // test-worker-l3 image layout (nm on the test-worker-l3
-                // ELF 2026-09-29: scan_start 0x42063d18, connect 0x4203c9d4,
-                // event vars WIFI_EVENT 0x3c0b42b0 / IP_EVENT 0x3c0b3bac,
-                // transmit 0x4202e6e8 / receive 0x4202e74c (machine.rs
-                // wifi_image gate); the remaining cells mirror the
-                // net-worker shape with the L3 image's own link addresses
-                // (pxReadyTasksLists 0x3fc9b8ec, uxTopReadyPriority
-                // 0x3fc9b85c, pxCurrentTCBs 0x3fc9bae0, sta netif
-                // 0x3fc9ae78, delete site 0x42004419). The L3 sketch
-                // never scans, so records_check is an unused placeholder
-                // (scan leg never arms on this image). CAUTION: the
-                // sketch source pins this layout — EVERY .ino edit
-                // relinks the closed libs (all pcs above move); re-nm
-                // after every sketch change (proven live 4x this file).
+                // ELF — re-nm'd after the print-first keep-alive .ino edit:
+                // scan_start 0x42065064, connect 0x4203dc10, event vars
+                // WIFI_EVENT 0x3c0b4474 / IP_EVENT 0x3c0b3d70 (unchanged);
+                // TX/RX tap + hook pcs re-nm'd in machine.rs/soc.rs below.
+                // The bss cells below did NOT move
+                // (scan/count/heaps/tcb/netif).
+                // scans, so records_check is an unused placeholder
+                // (scan leg never arms on this image).
+                // CAUTION: the sketch source pins this layout — EVERY
+                // .ino edit relinks the closed libs (all pcs above move);
+                // re-nm after every sketch change (proven live 7x here).
                 WifiImageLayout {
-                    scan_start: 0x4206_3d18,
-                    connect: 0x4203_c9d4,
-                    wifi_event_var: 0x3c0b_42b0,
-                    ip_event_var: 0x3c0b_3bac,
+                    scan_start: 0x4206_5064,
+                    connect: 0x4203_dc10,
+                    wifi_event_var: 0x3c0b_4474,
+                    ip_event_var: 0x3c0b_3d70,
                     count_cell: 0x3fc9_f936,
                     scan_count: 0x3fc9_aef0,
                     scan_result: 0x3fc9_aeec,
-                    records_check: 0x4200_3fb0,
+                    // records_check = the `call8 get_ap_records` INSIDE
+                    // `_scanDoneEv` (0x420053fd — NOT the get_ap_num call
+                    // at 0x420053bf one slot earlier; objdump-verified).
+                    records_check: 0x4200_53fd,
                     ready_lists: 0x3fc9_b8ec,
                     top_prio: 0x3fc9_b85c,
                     reg_heaps: 0x3fc9_b7a4,
                     pxcur: 0x3fc9_bae0,
                     sta_network_if: 0x3fc9_ae78,
-                    esp_wifi_start: 0x4206_39c4,
+                    esp_wifi_start: 0x4206_4d10,
                 }
             }
         }
@@ -2394,6 +2432,35 @@ impl Soc {
             .is_some_and(|f| f.st.records_done)
     }
 
+    /// Per-op pre-step fixture sample (machine `run_fast_core` hook —
+    /// same point as the TX-tap/delete-site arms). Arms transient-entry
+    /// legs the post-step poll can never observe (notably the STA dwell
+    /// at `esp_wifi_connect`: a callee entry the ENTRY op advances past
+    /// before any post-step sample — proven live on worker-L3 2026-10-01
+    /// where the post-step-only engine never armed and the run printed
+    /// NO AP). Idempotent (arm-once latch inside); no-op while no
+    /// fixture is armed. ONLY arms — completions stay in the post-step
+    /// poll (they need queue/heap borrows + UART bytes the pre-op point
+    /// cannot provide).
+    pub fn wifi_fixture_poll_pre(&mut self, pc: u32) {
+        let Some(fx) = self.wifi_fixture.clone() else {
+            return;
+        };
+        if fx.st.sta_done || fx.st.sta_armed {
+            return;
+        }
+        let l = self.wifi_fixture_layout();
+        if pc == l.connect {
+            self.wifi_scan_begin();
+            if let Some(f) = self.wifi_fixture.as_mut() {
+                f.st.sta_armed = true;
+                // Consumed by the next post-step poll as `just_armed`
+                // (see `WifiFixtureState::sta_just_armed`).
+                f.st.sta_just_armed = true;
+            }
+        }
+    }
+
     /// Drive one engine step (call once per macro-step from the machine,
     /// with both cores' pcs sampled post-step like run_flash does after
     /// `step_fast`). Runs the armed scan / STA / AP / ESP-NOW legs.
@@ -2539,6 +2606,16 @@ impl Soc {
                 self.wifi_scan_begin();
                 st.sta_armed = true;
                 just_armed = true;
+                dirty = true;
+            }
+            // `sta_just_armed`: armed mid-block by the pre-op sample
+            // (`wifi_fixture_poll_pre`) — the arming poll's post-step pc
+            // is already past the entry, so the check above never fires;
+            // consume the flag as `just_armed` (stage-1 posts on the
+            // arming poll itself, same as run_flash).
+            if st.sta_just_armed {
+                just_armed = true;
+                st.sta_just_armed = false;
                 dirty = true;
             }
             if st.sta_armed && st.sta_stage == 0 && (just_armed || self.wifi_scan_tick_complete()) {
@@ -3126,7 +3203,7 @@ impl Soc {
             WifiImage::Ap => 0x4200_42ad,
             WifiImage::EspNow => 0x4200_450d,
             WifiImage::Worker => 0x4200_433d,
-            WifiImage::WorkerL3 => 0x4200_4419,
+            WifiImage::WorkerL3 => 0x4200_5645,
         }
     }
 
@@ -3144,7 +3221,7 @@ impl Soc {
             WifiImage::Ap => 0x4202_e838,
             WifiImage::EspNow => 0x4202_ea9c,
             WifiImage::Worker => 0x4202_e8b0,
-            WifiImage::WorkerL3 => 0x4202_e98c,
+            WifiImage::WorkerL3 => 0x4202_fbc8,
         }
     }
 
@@ -3156,7 +3233,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_4164,
             WifiImage::EspNow => 0x4206_a298,
             WifiImage::Worker => 0x4206_41dc,
-            WifiImage::WorkerL3 => 0x4206_42b8,
+            WifiImage::WorkerL3 => 0x4206_5604,
         }
     }
 
@@ -3169,7 +3246,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_3f0c,
             WifiImage::EspNow => 0x4206_9f98,
             WifiImage::Worker => 0x4206_3f84,
-            WifiImage::WorkerL3 => 0x4206_4060,
+            WifiImage::WorkerL3 => 0x4206_53ac,
         }
     }
 
@@ -3182,7 +3259,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_3ea4,
             WifiImage::EspNow => 0x4206_9f30,
             WifiImage::Worker => 0x4206_3f1c,
-            WifiImage::WorkerL3 => 0x4206_3ff8,
+            WifiImage::WorkerL3 => 0x4206_5344,
         }
     }
 
@@ -3204,7 +3281,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_3f50,
             WifiImage::EspNow => 0x4206_9fdc,
             WifiImage::Worker => 0x4206_3fc8,
-            WifiImage::WorkerL3 => 0x4206_40a4,
+            WifiImage::WorkerL3 => 0x4206_53f0,
         }
     }
 
@@ -3216,7 +3293,7 @@ impl Soc {
             WifiImage::Ap => 0x4203_c88c,
             WifiImage::EspNow => 0x4203_caf0,
             WifiImage::Worker => 0x4203_c904,
-            WifiImage::WorkerL3 => 0x4203_c9e0,
+            WifiImage::WorkerL3 => 0x4203_dc1c,
         }
     }
 
@@ -4571,7 +4648,6 @@ impl Soc {
             _ => {}
         }
     }
-
     fn ram_write8(&mut self, addr: u32, val: u8) {
         // Host event-block pool (see `ram8`).
         if in_range!(addr, Self::WIFI_ARD_POOL, 768) {
@@ -4587,6 +4663,94 @@ impl Soc {
             self.iram0[(addr - IRAM_BASE) as usize] = val;
         } else {
             self.sram[(DIRAM_DATA_BASE - DRAM_BASE + (addr - DIRAM_INST_BASE)) as usize] = val;
+        }
+    }
+
+    /// Closed-RF dispatch-table completion (fired from the `write32`-fast-path
+    /// store — the fill path is word-wise, so the aligned-word hook is the
+    /// only one that fires in practice). The heap-resident `g_phyFuns` table is filled by
+    /// `phy_get_romfunc_addr` + the ROM's `phy_get_romfuncs`, but slot
+    /// 0x24c (`crate::wifi::PHYFUNS_UNFILLED_OFF`) is written by NEITHER —
+    /// it keeps heap garbage and the first recalibration `callx8`s wild
+    /// (ILLEGAL, EPC1 = heap addr like 0x4022d8b8 — proven live on the
+    /// worker-L3 image, whose gateway legs run long enough to reach the
+    /// periodic recalibration; the plain-battery run exits before it).
+    /// Complete the slot on the store that publishes the table pointer
+    /// cell: per-image `g_phyFuns` BSS addr (nm: scan 0x3fca0068,
+    /// sta/worker-net/worker-ap 0x3fca0050, worker-l3 0x3fca0060, espnow
+    /// 0x3fca0148 — all inside 0x3fc9ae60..0x3fca0200, DRAM only, so the
+    /// range check is DRAM-scoped and can never misfire on MMIO or ROM).
+    /// The cell holds the table POINTER (heap addr); slot 0x24c of THAT
+    /// table gets RF_NOP_SLOT (a real-ROM `retw.n` — see memmap.rs; it must
+    /// NEVER name a glue address: any code planted in the QSORT..BOOT gap
+    /// shifts `pad_to(BOOT)` and misaligns the reset vector — hello ILLEGAL
+    /// at EPC1=0x4037a0a8). Fires on EVERY publish of a nonzero
+    /// pointer (no slot-content gate — the fill writes the pointer cell
+    /// BEFORE filling slots, so gating on slot content observes the
+    /// pre-fill value and never fires; and heap paint is 0x00/0xA5 only
+    /// before first use while garbage later is any stale pointer — proven
+    /// live: the wild jump read 0x4022d8b8, a stale pointer, not paint).
+    /// Re-publish re-completes (idempotent); no image reads the slot
+    /// before the fill publishes the pointer (boot-neutral); a future
+    /// image whose fill COVERS 0x24c writes the slot AFTER the publish,
+    /// so our value is harmlessly overwritten (last-writer-wins, same as
+    /// the sibling 0x160 slot the ROM fill covers today).
+    fn maybe_complete_phyfuns_slot(&mut self, aligned_addr: u32) {
+        use xtensa_core::Bus as _Bus;
+        // Boot-neutrality gate (hello ILLEGAL at EPC1=0x4037a0a8, 2026-10-02):
+        // the completing write targets the table the pointer cell names, so
+        // on an image with no `g_phyFuns` BSS cell the hook must not fire at
+        // all. The ONLY images with such a cell are the Wi-Fi images, and
+        // every one of them runs with a fixture armed (run_flash arms from
+        // WIFI_SCAN_FIXTURE/WIFI_STA_CONN/WIFI_AP_FIXTURE/WIFI_ESPNOW_LOOPBACK;
+        // the bridge arms from wifi_*_fixture). Hello (BSS ends 0x3fc99398,
+        // proven via nm — no BSS in this window) runs fixture-less, and the
+        // default-constructed SoC (wifi_image=Scan, fixture=None) is exactly
+        // that state — so fixture-armed is the SOUND gate: it is true on
+        // precisely the images that link the cell, regardless of which
+        // WifiImage variant the host selected (a stale/wrong variant must
+        // never re-arm the hook — proven by the STA run dying when the gate
+        // keyed on the variant instead).
+        if self.wifi_fixture.is_none() {
+            return;
+        }
+        if !in_range!(aligned_addr, 0x3FC9_AE60, 0x3FCA_0200 - 0x3FC9_AE60) {
+            return;
+        }
+        let tbl = self.read32(aligned_addr);
+        if tbl == 0 || tbl & 3 != 0 || !in_range!(tbl, DRAM_BASE, SRAM_BASE_RANGE) {
+            return;
+        }
+        // DANGLING-TABLE GUARD (L3+gateway ILLEGAL at EPC1=0x4022d8b8,
+        // 2026-10-02): the pointer cell is BSS — it holds heap garbage until
+        // the fill publishes the REAL table pointer, and ANY word store to
+        // the cell in that window (BSS init, an unrelated struct with the
+        // same address, a stale free) completes a DANGLING table the fill
+        // later abandons: the fill writes the real slots elsewhere while our
+        // RF_NOP lands in garbage the recalibration `callx8` then jumps
+        // through (EPC1 = the garbage word, e.g. 0x4022d8b8 — a stale flash
+        // pointer, not paint). Proven live: the gateway run's table pointer
+        // read back a plausible-but-stale DRAM address whose slot 0x24c held
+        // 0x4022d8b8 at the crash. So the hook fires ONLY when the named
+        // table already looks fill-owned: slot 0x160 (which the ROM fill
+        // covers on every observed boot — the sibling slot `chip_v7_set_chan`
+        // reads, always a valid ROM address at every crash) must point into
+        // IROM. A table whose 0x160 slot is still garbage is not yet filled
+        // — leave it alone; the later publish (post-fill) re-fires the hook
+        // (every publish completes — idempotent) and completes the real
+        // table. This costs nothing on the happy path (one extra read32 per
+        // publish) and can never misfire: no image reads slot 0x24c before
+        // the fill publishes the pointer (boot-neutral), and a future image
+        // whose fill COVERS 0x24c overwrites our value after the publish
+        // (last-writer-wins).
+        let probe = self.read32(tbl + 0x160);
+        if !(0x4000_0000..0x4006_0000).contains(&probe) {
+            return;
+        }
+        let slot = tbl + crate::wifi::PHYFUNS_UNFILLED_OFF;
+        let o = (slot - DRAM_BASE) as usize;
+        if o + 4 <= self.sram.len() {
+            self.sram[o..o + 4].copy_from_slice(&crate::memmap::RF_NOP_SLOT.to_le_bytes());
         }
     }
 
@@ -6507,6 +6671,44 @@ impl Soc {
     /// after the reboot; the ESP-NOW legs re-run from the UART marker,
     /// which persists in the host console stream).
     pub fn snapshot_wifi_fixture_runtime(&self) -> WifiFixtureRuntime {
+        // Live-completed phyFuns slot: scan the pointer-cell window for a
+        // cell whose named table's 0x24c slot already holds our RF_NOP.
+        // (There is exactly one such cell per Wi-Fi image — the `g_phyFuns`
+        // BSS — and the scan is over ~100 words once per RESET, not per
+        // step, so the cost is nil. The scan re-derives what the hook knew
+        // at fill time, surviving the `Soc::new()` rebuild by value.)
+        let mut phyfuns_completed = None;
+        {
+            // `ram8` is the `&self` byte reader (the `Bus::read32` word
+            // reader needs `&mut`); all probed addresses are DRAM by
+            // construction (range-checked cell + DRAM-bounded table), so no
+            // MMIO/cache windows are involved — plain `sram` bytes.
+            let rd32 = |a: u32| {
+                let o = (a - DRAM_BASE) as usize;
+                u32::from_le_bytes([
+                    self.sram[o],
+                    self.sram[o + 1],
+                    self.sram[o + 2],
+                    self.sram[o + 3],
+                ])
+            };
+            let mut a = 0x3FC9_AE60u32;
+            while a < 0x3FCA_0200 {
+                let tbl = rd32(a);
+                if tbl != 0
+                    && tbl & 3 == 0
+                    && in_range!(tbl, DRAM_BASE, SRAM_BASE_RANGE)
+                    && rd32(tbl + 0x160) >= 0x4000_0000
+                    && rd32(tbl + 0x160) < 0x4006_0000
+                    && rd32(tbl + crate::wifi::PHYFUNS_UNFILLED_OFF)
+                        == crate::memmap::RF_NOP_SLOT
+                {
+                    phyfuns_completed = Some((tbl, crate::memmap::RF_NOP_SLOT));
+                    break;
+                }
+                a += 4;
+            }
+        }
         WifiFixtureRuntime {
             ap_record: self.wifi_ap_record,
             ip_info: self.wifi_ip_info,
@@ -6517,6 +6719,7 @@ impl Soc {
             espnow_a4: self.wifi_espnow_a4,
             espnow_call: self.wifi_espnow_call,
             fixture_st: self.wifi_fixture.clone().map(|f| f.st),
+            phyfuns_completed,
         }
     }
 
@@ -6562,6 +6765,37 @@ impl Soc {
         self.wifi_espnow_call = s.espnow_call;
         if let (Some(slot), Some(st)) = (self.wifi_fixture.as_mut(), s.fixture_st) {
             slot.st = st;
+            // A reset can only happen AFTER boot (WDT/system reset), so a
+            // restored `sta_just_armed` is always stale (its post-step poll
+            // is long gone — proven live on worker-L3 in-wasm 2026-10-01:
+            // the flag survived a mid-run WDT reset, the rebooted run
+            // posted stage 1 with no dwell, and the association wedged).
+            // Clear it; the rebooted firmware re-enters `connect` and the
+            // pre-op sample re-arms cleanly.
+            slot.st.sta_just_armed = false;
+        }
+        // Re-apply a live phyFuns completion wiped by the reset rebuild
+        // (see `WifiFixtureRuntime::phyfuns_completed`): the loader re-copy
+        // brings back the firmware but NOT our DRAM write, and the pointer
+        // cell already holds the published value so the word-store hook
+        // never re-fires. Re-validated (table still DRAM, slot in range)
+        // so a stale snapshot can never corrupt a relinked image; a `None`
+        // snapshot (no completion yet) is a no-op. Runs at reset time, when
+        // no firmware executes — ordering vs the fill is irrelevant (the
+        // fill re-publishes the same pointer and re-completes idempotently
+        // if it runs after us; if it already ran, our word is identical).
+        if let Some((tbl, word)) = s.phyfuns_completed
+            && tbl & 3 == 0
+            && in_range!(tbl, DRAM_BASE, SRAM_BASE_RANGE)
+            && word == crate::memmap::RF_NOP_SLOT
+        {
+            let slot = tbl + crate::wifi::PHYFUNS_UNFILLED_OFF;
+            if in_range!(slot, DRAM_BASE, SRAM_BASE_RANGE) {
+                let o = (slot - DRAM_BASE) as usize;
+                if o + 4 <= self.sram.len() {
+                    self.sram[o..o + 4].copy_from_slice(&word.to_le_bytes());
+                }
+            }
         }
     }
 
@@ -7108,6 +7342,13 @@ impl Bus for Soc {
             }
             let o = (addr - DRAM_BASE) as usize;
             self.sram[o..o + 4].copy_from_slice(&bytes);
+            // Closed-RF dispatch-table completion (see
+            // `maybe_complete_phyfuns_slot` for the full proof + per-image
+            // BSS list): the `g_phyFuns` pointer cell is written word-wise
+            // by the fill path, which takes THIS fast path (not ram_write8)
+            // — so the completion must live here too (the byte path's hook
+            // was removed: no glue is assembled anymore, see memmap.rs).
+            self.maybe_complete_phyfuns_slot(addr);
             return;
         }
         if addr & 3 == 0 && in_range!(addr, IRAM_BASE, IRAM_WINDOW_SIZE) {

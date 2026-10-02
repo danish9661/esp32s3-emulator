@@ -14,34 +14,48 @@ package main
 // RX hook) directly to the gateway, which answers deterministically here.
 //
 // Services in this file (all synchronous request/response, no per-board
-// state beyond the UDP-forward relay map that already exists):
+// state beyond the UDP-forward relay map that already exists, plus a
+// per-board TCP stub table below for the connection-oriented legs):
 //   * DNS (UDP 53, board -> us): static A-record table + an 8.8.8.8
 //     fallback is NOT attempted offline — answers come from the table
 //     (example.com, test.mosquitto.org) so `gethostbyname` completes.
 //   * NTP (UDP 123, board -> us): fixed-epoch reply (2026-01-01) so
 //     `sntp_getreachability`/time-sync sketches observe a stable time.
-//   * HTTP (TCP 80, board -> us via gVisor NAT): NOT intercepted —
-//     gVisor already NATs board TCP to the outside world (proven live:
-//     EGRESS_TCP80_OK). Documented here so the pipeline order is clear.
-//   * MQTT (TCP 1883, board -> us via gVisor NAT): same — NAT handles it
-//     (proven live: EGRESS_MQTT_OK to test.mosquitto.org:1883). The
-//     gateway only needs to NOT consume these frames (no snoop arm).
+//   * HTTP (TCP 80, board -> us, gateway-local stub): minimal SYN/SYN-ACK
+//     + one-shot GET -> 200 responder keyed on the board's (ip, sport)
+//     4-tuple (see `l7TCPStub` below). The responder is a STUB, not a
+//     proxy: it serves a fixed `EXAMPLE_BODY` for `GET /` (and 404 for
+//     anything else) so a firmware HTTP-client suite observes a complete
+//     status line + headers + body with Content-Length framing. Host
+//     egress via gVisor NAT still exists for everything else (proven
+//     live: EGRESS_TCP80_OK) — the stub only claims frames whose IP dst
+//     is the gateway itself (192.168.4.1:80), which gVisor never owns.
+//   * MQTT (TCP 1883, board -> us, gateway-local stub): minimal
+//     CONNECT -> CONNACK + PUBLISH(QoS0) -> PUBACK-less accept responder
+//     on the same per-board 4-tuple table, so a firmware MQTT-client
+//     suite observes session-accepted + publish-accepted without a real
+//     broker. Same non-interference rule: only gateway-IP dst is
+//     consumed; everything else falls through to gVisor NAT (proven
+//     live: EGRESS_MQTT_OK to test.mosquitto.org:1883).
 //   * CoAP (UDP 5683): already covered both directions — inbound via the
 //     127.0.0.1:<uport> UDP-forward listener (handleUDPProxy) and board
 //     replies via divertUDPForward. No new code; pinned by tests here.
 //
 // Pipeline placement (handleTCPFrame/handleClient, in order):
 //   ARP fast/proxy reply -> ICMPv4 echo -> DHCP:67 -> UDP-forward relay
-//   -> IPv6 services -> *** L3-L7 services (this file: DNS/NTP) *** ->
+//   -> IPv6 services -> *** L3-L7 services (this file: DNS/NTP/TCP) *** ->
 //   gVisor feed + room broadcast.
 // DNS/NTP MUST sit before the gVisor feed so the frames never reach the
 // NAT stack (which has no listener for gateway-IP UDP:53/123 and would
-// drop them); everything else falls through to gVisor untouched.
+// drop them); the TCP stubs likewise claim ONLY gateway-IP dst so
+// off-LAN TCP still reaches gVisor untouched.
 
 import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"sync"
+	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -359,16 +373,468 @@ func snoopUDPEcho(msg []byte, client *Client, room *Room) bool {
 	return true
 }
 
-// ---- TCP passthrough note (HTTP/MQTT) ------------------------------------
+// ---- TCP passthrough note (HTTP/MQTT off-LAN) --------------------------
 // Board TCP to the outside world (HTTP :80, HTTPS :443, MQTT :1883,
 // test.mosquitto.org) is NATed by the gVisor stack — NO snoop arm may
 // claim these frames. This predicate documents the boundary: it returns
 // false always (never consumes); the pipeline calls it for symmetry so a
-// future intercept (e.g. a local MQTT broker) has an explicit slot.
-// Proven live: host egress to example.com:80 and test.mosquitto.org:1883
-// succeeds, so gVisor NAT carries these end-to-end once the board's
-// frames reach the pipe.
+// future intercept has an explicit slot. Proven live: host egress to
+// example.com:80 and test.mosquitto.org:1883 succeeds, so gVisor NAT
+// carries these end-to-end once the board's frames reach the pipe.
+//
+// NOTE: board TCP whose IP dst is the GATEWAY itself (192.168.4.1:80 /
+// :1883) never reaches gVisor — it is consumed by the gateway-local
+// stubs above (`l7TCPSnoop`), same placement rule as DNS/NTP/UDP-echo
+// (gVisor owns no gateway-IP listener). The two rules compose: dst==gw
+// -> stub; dst!=gw -> NAT.
 func snoopTCPProxyNote(msg []byte, client *Client, room *Room) bool {
 	_, _, _ = msg, client, room
 	return false
+}
+
+// l7SweepStubs drops TCP stubs idle > 60 s (same hygiene class as the
+// udpFwd relay map; called opportunistically from the snoop path so no
+// ticker goroutine is needed).
+func l7SweepStubs() {
+	cutoff := time.Now().Add(-60 * time.Second)
+	l7TCPMu.Lock()
+	defer l7TCPMu.Unlock()
+	for k, s := range l7TCPStubs {
+		if s.last.Before(cutoff) {
+			delete(l7TCPStubs, k)
+		}
+	}
+}
+
+// ---- Gateway-local TCP stubs (HTTP :80, MQTT :1883, board -> gateway) --
+// Minimal per-board TCP responders for the L3 worker sketch's HTTP/MQTT
+// legs. Design constraints (all load-bearing, all from live failure
+// classes elsewhere in this gateway):
+//
+//  1. ONLY gateway-IP dst is consumed (192.168.4.1). Off-LAN TCP still
+//     falls through to gVisor NAT untouched (EGRESS_*_OK relies on it).
+//  2. Emulator RX path is a dumb FIFO (`net_inject_rx` + one
+//     `esp_netif_receive` call per staged frame): the board CANNOT
+//     reassemble TCP segments or reorder out-of-order delivery, so every
+//     stub reply MUST fit in ONE Ethernet frame (≤1500B incl. headers;
+//     the HTTP body is sized accordingly) and arrive in causal order.
+//  3. No wall-clock timing dependence: the stub answers synchronously
+//     inside the snoop call (request in -> reply out), like DNS/NTP —
+//     never a delayed/periodic reply the sketch would have to poll for
+//     (cf. the worker-rx2 lesson: replies landing one step late read -14).
+//  4. No lwIP TCP-state dependency on the board: the sketch speaks RAW
+//     frames through the `esp_netif_transmit` tap (hand-built IP/TCP,
+//     like its UDP legs) and reads replies with the same receive calls —
+//     the closed lwIP TCP stack is never involved, so there is no
+//     handshake, no socket, no netconn, and no netif binding to wedge.
+//
+// Protocol served (deliberately tiny — just enough for a client-suite
+// verdict, same "well-formed reply" class as the NTP fixed epoch):
+//   * HTTP: one SYN (no opts) -> SYN-ACK; one ACK+GET / -> one ACK +
+//     `HTTP/1.0 200 OK` with Content-Length + `EXAMPLE_BODY`; FIN ->
+//     FIN-ACK close. Sequence space is per-board (keyed on sport, see
+//     below); the stub tracks only the LAST server seq it sent so the
+//     ACK numbers line up.
+//   * MQTT: CONNECT -> CONNACK(0x00 session-accepted); PUBLISH QoS0 ->
+//     accepted silently (no PUBACK exists for QoS0 — the sketch verdict
+//     is the CONNACK byte + the echoed SUBACK for its subscribe). A
+//     SUBSCRIBE (any topic, QoS0) -> SUBACK granted-QoS0. PINGREQ ->
+//     PINGRESP. DISCONNECT tears the stub down.
+//
+// State: one stub per board source port (`l7TCPStub` keyed on
+// boardIP+sport), holding only the next sequence numbers + a small
+// reassembly tail for split TCP segments (the emulator's nonblocking
+// drain splits exactly like the NET_GW leg — framing_test.go pins it).
+// Stubs are created on first SYN/CONNECT and dropped on FIN/RST or after
+// 60 s idle (same hygiene as udpFwdBySport).
+
+// l7TCPService selects the stub responder by destination port.
+type l7TCPService int
+
+const (
+	l7SvcNone l7TCPService = iota
+	l7SvcHTTP
+	l7SvcMQTT
+)
+
+// l7TCPStub is the per-board-side-port TCP responder state.
+type l7TCPStub struct {
+	svc      l7TCPService
+	boardIP  net.IP
+	boardMAC net.HardwareAddr
+	sport    uint16
+	// Next sequence numbers, board-relative. iss is OUR initial seq
+	// (fixed per stub so captures are deterministic); sndNxt is the
+	// next server byte to send; rcvNxt is the next board byte we expect
+	// (== board seq + board payload len seen so far).
+	iss    uint32
+	sndNxt uint32
+	rcvNxt uint32
+	// Pending inbound TCP payload bytes not yet consumed into a full
+	// application message (split segments arrive across frames).
+	pending []byte
+	// Whether the 3-way handshake completed (SYN-ACK acked).
+	estab bool
+	// HTTP: request bytes seen on this connection (one GET only).
+	httpReq []byte
+	// MQTT: CONNECT received (CONNACK sent).
+	mqttConn bool
+	last     time.Time
+}
+
+var (
+	l7TCPMu    sync.Mutex
+	l7TCPStubs = make(map[string]*l7TCPStub)
+)
+
+func l7TCPKey(ip net.IP, sport uint16) string {
+	return ip.String() + "|" + string(rune(sport>>8)) + string(rune(sport&0xff))
+}
+
+// l7TCPServiceFor maps a gateway-local TCP dst port to its stub.
+func l7TCPServiceFor(dport uint16) l7TCPService {
+	switch dport {
+	case 80:
+		return l7SvcHTTP
+	case 1883:
+		return l7SvcMQTT
+	}
+	return l7SvcNone
+}
+
+// l7BuildTCP crafts one gateway->board TCP segment: eth + IPv4 + TCP with
+// swapped addrs/ports, given seq/ack/flags + payload. Checksums + lengths
+// via gopacket (same builder discipline as the UDP snoops above).
+func l7BuildTCP(boardMAC net.HardwareAddr, boardIP net.IP, sport uint16, svc l7TCPService, seq, ack uint32, flags string, payload []byte) []byte {
+	var dport uint16
+	if svc == l7SvcHTTP {
+		dport = 80
+	} else {
+		dport = 1883
+	}
+	ethReply := &layers.Ethernet{
+		SrcMAC:       gwMAC,
+		DstMAC:       boardMAC,
+		EthernetType: layers.EthernetTypeIPv4,
+	}
+	ipReply := &layers.IPv4{
+		Version:  4,
+		IHL:      5,
+		TTL:      64,
+		Protocol: layers.IPProtocolTCP,
+		SrcIP:    net.IPv4(192, 168, 4, 1),
+		DstIP:    boardIP,
+	}
+	tcpReply := &layers.TCP{
+		SrcPort: layers.TCPPort(dport),
+		DstPort: layers.TCPPort(sport),
+		Seq:     seq,
+		Ack:     ack,
+		Window:  1460,
+	}
+	for _, f := range flags {
+		switch f {
+		case 'S':
+			tcpReply.SYN = true
+		case 'A':
+			tcpReply.ACK = true
+		case 'F':
+			tcpReply.FIN = true
+		case 'P':
+			tcpReply.PSH = true
+		case 'R':
+			tcpReply.RST = true
+		}
+	}
+	_ = tcpReply.SetNetworkLayerForChecksum(ipReply)
+	buffer := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true}
+	if serr := gopacket.SerializeLayers(buffer, opts, ethReply, ipReply, tcpReply, gopacket.Payload(payload)); serr != nil {
+		return nil
+	}
+	return buffer.Bytes()
+}
+
+// l7TCPSend emits one stub segment on the requesting client's transport.
+func l7TCPSend(client *Client, boardMAC net.HardwareAddr, boardIP net.IP, sport uint16, svc l7TCPService, seq, ack uint32, flags string, payload []byte, tag string) {
+	frame := l7BuildTCP(boardMAC, boardIP, sport, svc, seq, ack, flags, payload)
+	if frame == nil {
+		return
+	}
+	client.WriteMutex.Lock()
+	werr := sendFrame(client, frame)
+	client.WriteMutex.Unlock()
+	if werr != nil {
+		fmt.Printf("[L7TCP] %s send failed: %v\n", tag, werr)
+	} else {
+		fmt.Printf("[L7TCP] %s %dB seq=%d ack=%d flags=%s -> %s\n", tag, len(frame), seq, ack, flags, boardIP.String())
+	}
+}
+
+// --- HTTP stub ----------------------------------------------------------
+// Serves `GET /` (any HTTP/1.x request line with path `/`) with a fixed
+// 200 + Content-Length body; any other path -> 404 with a short body.
+// One request per connection (Connection: close semantics — the FIN leg
+// below closes after the response; a second GET needs a new stub).
+
+var l7HTTPBody = []byte("S3LAB-EMU-OK")
+
+func l7HTTPResponse(req []byte) []byte {
+	// Minimal request-line parse: `METHOD SP PATH SP`.
+	path := "/"
+	if i := indexOf(req, []byte("\r\n")); i >= 0 {
+		line := req[:i]
+		if j := indexOf(line, []byte(" ")); j >= 0 {
+			rest := line[j+1:]
+			if k := indexOf(rest, []byte(" ")); k >= 0 {
+				path = string(rest[:k])
+			} else if len(rest) > 0 {
+				path = string(rest)
+			}
+		}
+	}
+	body := l7HTTPBody
+	status := "200 OK"
+	if path != "/" {
+		body = []byte("not found")
+		status = "404 Not Found"
+	}
+	hdr := "HTTP/1.0 " + status + "\r\nContent-Length: " + itoa(len(body)) + "\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"
+	out := make([]byte, 0, len(hdr)+len(body))
+	out = append(out, hdr...)
+	out = append(out, body...)
+	return out
+}
+
+func indexOf(hay, needle []byte) int {
+	for i := 0; i+len(needle) <= len(hay); i++ {
+		match := true
+		for j := 0; j < len(needle); j++ {
+			if hay[i+j] != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [8]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
+}
+
+// --- MQTT stub ----------------------------------------------------------
+// Minimal MQTT 3.1.1 server side (spec §2-3, fixed-header only):
+// CONNECT (0x10) -> CONNACK 0x20 0x02 0x00 0x00 (session accepted);
+// SUBSCRIBE (0x82) -> SUBACK 0x90 + echoed packet-id + granted QoS0;
+// PUBLISH QoS0 (0x30) -> accepted silently (sketch verdict reads the
+// payload back from its own TX mirror + the CONNACK/SUBACK bytes);
+// PINGREQ (0xC0) -> PINGRESP (0xD0); DISCONNECT (0xE0) -> drop stub.
+// Remaining-length uses the 1-byte fast path (all sketch messages are
+// < 127 bytes; longer encodings are rejected, not parsed).
+
+func l7MQTTRespond(stub *l7TCPStub, msg []byte) (replies [][]byte, drop bool) {
+	if len(msg) < 2 {
+		return nil, false
+	}
+	typ := msg[0] & 0xF0
+	rl := int(msg[1])
+	if rl&0x80 != 0 {
+		// Multi-byte remaining length: out of stub scope.
+		return nil, false
+	}
+	if len(msg) < 2+rl {
+		// Split MQTT message across TCP segments: ask the caller to
+		// buffer more (caller holds `pending`; returning drop=false
+		// with no replies keeps the stub alive).
+		return nil, false
+	}
+	body := msg[2 : 2+rl]
+	rest := msg[2+rl:]
+	// Packet type is the HIGH nibble (low nibble is flags — notably
+	// SUBSCRIBE arrives as 0x82, type 8 with flags 0010).
+	switch typ {
+	case 0x10: // CONNECT
+		stub.mqttConn = true
+		replies = append(replies, []byte{0x20, 0x02, 0x00, 0x00}) // CONNACK accepted
+	case 0x80: // SUBSCRIBE (any flags): SUBACK + echoed pkt-id + granted QoS0
+		if len(body) >= 2 {
+			replies = append(replies, []byte{0x90, 0x03, body[0], body[1], 0x00})
+		}
+	case 0x30: // PUBLISH QoS0: accept silently (no wire reply exists)
+		// NOTE: the low nibble holds DUP/QoS/RETAIN; QoS0 from the
+		// sketch is 0x30 exactly, QoS1/2 (0x32/0x34) fall through to
+		// the default below (PUBACK lives there if ever needed).
+	case 0xC0: // PINGREQ
+		replies = append(replies, []byte{0xD0, 0x00}) // PINGRESP
+	case 0xE0: // DISCONNECT: tear down
+		return nil, true
+	default:
+		// Unknown/duplicate-flagged type with a well-formed length:
+		// consume (never falls to gVisor) but answer nothing.
+	}
+	if len(rest) > 0 {
+		// Pipelined messages in one segment (CONNECT+SUBSCRIBE back to
+		// back): recurse on the tail so one board segment can complete
+		// a whole leg without another round trip.
+		more, drop2 := l7MQTTRespond(stub, rest)
+		replies = append(replies, more...)
+		drop = drop2
+	}
+	return replies, drop
+}
+
+// l7TCPSnoop is the pipeline entry for gateway-destined TCP (IPv4 dst ==
+// 192.168.4.1, dport 80/1883). It owns the segment (caller must skip the
+// VN pipe AND the room broadcast on true) and answers synchronously:
+// SYN -> SYN-ACK (+ remembers ISS); ACK (+optional first payload) ->
+// service bytes; FIN -> FIN-ACK + drop; RST -> drop. Retransmitted SYNs
+// re-answer SYN-ACK idempotently (same ISS — the board's 200 ms re-TX
+// discipline from the UDP legs applies here too).
+func l7TCPSnoop(msg []byte, client *Client, room *Room) bool {
+	_ = room
+	packet := gopacket.NewPacket(msg, layers.LayerTypeEthernet, gopacket.Default)
+	ipLayer := packet.Layer(layers.LayerTypeIPv4)
+	tcpLayer := packet.Layer(layers.LayerTypeTCP)
+	if ipLayer == nil || tcpLayer == nil {
+		return false
+	}
+	ip, _ := ipLayer.(*layers.IPv4)
+	tcp, _ := tcpLayer.(*layers.TCP)
+	if !ip.DstIP.Equal(net.IPv4(192, 168, 4, 1)) {
+		return false
+	}
+	svc := l7TCPServiceFor(uint16(tcp.DstPort))
+	if svc == l7SvcNone {
+		return false
+	}
+	if tcp.RST {
+		l7TCPMu.Lock()
+		delete(l7TCPStubs, l7TCPKey(ip.SrcIP, uint16(tcp.SrcPort)))
+		l7TCPMu.Unlock()
+		return true // consume: a dead stub must not reach gVisor either
+	}
+	ethLayer := packet.Layer(layers.LayerTypeEthernet)
+	eth, _ := ethLayer.(*layers.Ethernet)
+	boardMAC := eth.SrcMAC
+	boardIP := ip.SrcIP
+	sport := uint16(tcp.SrcPort)
+	key := l7TCPKey(boardIP, sport)
+	l7SweepStubs()
+
+	l7TCPMu.Lock()
+	stub, ok := l7TCPStubs[key]
+	if !ok {
+		stub = &l7TCPStub{svc: svc, boardIP: append(net.IP(nil), boardIP...), boardMAC: append(net.HardwareAddr(nil), boardMAC...), sport: sport, iss: 0x1F2E3D4C, sndNxt: 0x1F2E3D4C + 1, last: time.Now()}
+		l7TCPStubs[key] = stub
+	} else if stub.svc != svc {
+		// Same sport recycled across services (never observed — sports
+		// differ per leg — but cheap to be safe): reset the stub.
+		stub.svc = svc
+		stub.pending = nil
+		stub.httpReq = nil
+		stub.mqttConn = false
+		stub.estab = false
+		stub.iss = 0x1F2E3D4C
+		stub.sndNxt = 0x1F2E3D4C + 1
+		stub.rcvNxt = 0 // re-learned from the next SYN/segment
+	}
+	stub.last = time.Now()
+	l7TCPMu.Unlock()
+
+	payload := tcp.Payload
+	tcpHdrLen := int(tcp.DataOffset) * 4
+	_ = tcpHdrLen
+
+	if tcp.SYN {
+		// SYN (or SYN retransmit): SYN-ACK with fixed ISS. rcvNxt =
+		// board seq+1 (SYN consumes one) and sndNxt = iss+1 (our SYN
+		// consumes one) — idempotent on retransmit. Data segments
+		// therefore start at iss+1, which is what the board ACKs.
+		stub.rcvNxt = tcp.Seq + 1
+		stub.sndNxt = stub.iss + 1
+		l7TCPSend(client, boardMAC, boardIP, sport, svc, stub.iss, stub.rcvNxt, "SA", nil, "SYNACK")
+		return true
+	}
+	// Data/ACK path: account board bytes first (payload len; FIN also
+	// consumes one sequence number).
+	if len(payload) > 0 {
+		stub.pending = append(stub.pending, payload...)
+		stub.rcvNxt = tcp.Seq + uint32(len(payload))
+	} else if stub.rcvNxt == 0 {
+		stub.rcvNxt = tcp.Seq
+	}
+	if tcp.FIN {
+		stub.rcvNxt++
+		l7TCPSend(client, boardMAC, boardIP, sport, svc, stub.sndNxt, stub.rcvNxt, "FA", nil, "FINACK")
+		stub.sndNxt++ // our FIN consumes one
+		l7TCPMu.Lock()
+		delete(l7TCPStubs, key)
+		l7TCPMu.Unlock()
+		return true
+	}
+	// Pure ACK (handshake completion or post-data ack): ack it only if
+	// we have something outstanding... simplest correct: always ACK
+	// back with current sndNxt (idempotent; the board's stack only
+	// checks ack coverage, and duplicate ACKs are harmless).
+	if len(stub.pending) == 0 {
+		// Nothing to serve: bare ACK (or keepalive). Stay silent unless
+		// we owe the handshake's final ACK... we already sent SYN-ACK;
+		// the board's ACK completes it. Mark established.
+		stub.estab = true
+		return true // consumed (never falls to gVisor)
+	}
+	if svc == l7SvcHTTP {
+		req := stub.pending
+		stub.pending = nil
+		stub.httpReq = append([]byte(nil), req...)
+		resp := l7HTTPResponse(req)
+		// One segment: response is ~60B headers + 12B body — far under
+		// the 1500B single-frame rule. PSH+ACK, then FIN-ACK in the
+		// same snoop (the sketch reads twice: data, then close).
+		l7TCPSend(client, boardMAC, boardIP, sport, svc, stub.sndNxt, stub.rcvNxt, "PA", resp, "HTTPRESP")
+		stub.sndNxt += uint32(len(resp))
+		l7TCPSend(client, boardMAC, boardIP, sport, svc, stub.sndNxt, stub.rcvNxt, "FA", nil, "HTTPFIN")
+		stub.sndNxt++
+		stub.estab = true
+		return true
+	}
+	// MQTT: feed the pending bytes through the message responder;
+	// short (split-segment) returns mean "need more bytes" — keep
+	// buffering (the sketch re-TXs on its 200 ms cadence, same as UDP).
+	replies, drop := l7MQTTRespond(stub, stub.pending)
+	if drop {
+		l7TCPMu.Lock()
+		delete(l7TCPStubs, key)
+		l7TCPMu.Unlock()
+		return true
+	}
+	// l7MQTTRespond returns (nil,false) both when the bytes are an
+	// incomplete message AND when the message needs no reply (PUBLISH).
+	// Distinguish: incomplete iff the first message's declared length
+	// exceeds what we hold.
+	needMore := len(stub.pending) >= 2 && len(stub.pending) < 2+int(stub.pending[1]&0x7F)
+	if needMore {
+		return true // consumed; wait for the rest
+	}
+	stub.pending = nil
+	for _, r := range replies {
+		l7TCPSend(client, boardMAC, boardIP, sport, svc, stub.sndNxt, stub.rcvNxt, "PA", r, "MQTTRESP")
+		stub.sndNxt += uint32(len(r))
+	}
+	stub.estab = true
+	return true
 }

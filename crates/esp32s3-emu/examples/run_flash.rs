@@ -503,18 +503,23 @@ fn main() {
         pxcur: 0x3fc9_bad0,
         sta_network_if: 0x3fc9_ae6c,
     };
-    // test-worker-l3 image layout (nm on the test-worker-l3 ELF
-    // 2026-09-29 — same field order as WORKER_LAYOUT; the sketch source
-    // pins the layout like every other image, re-nm after any .ino edit).
+    // test-worker-l3 image layout (nm on the test-worker-l3 ELF —
+    // re-nm'd after the print-first keep-alive .ino edit: scan_start
+    // 0x42065064, connect 0x4203dc10, event vars unchanged
+    // (WIFI_EVENT 0x3c0b4474 / IP_EVENT 0x3c0b3d70). The sketch source pins
+    // the layout like every other image, re-nm after any .ino edit.
+    // records_check is the `call8 esp_wifi_scan_get_ap_records` INSIDE
+    // `_scanDoneEv` (0x420053fd here — NOT the 0x420053bf get_ap_num call
+    // one slot earlier; verified by objdump of the linked ELF).
     const WORKER_L3_LAYOUT: WifiLayout = WifiLayout {
-        scan_start: 0x4206_3d18,
-        connect: 0x4203_c9d4,
-        wifi_event_var: 0x3c0b_42b0,
-        ip_event_var: 0x3c0b_3bac,
+        scan_start: 0x4206_5064,
+        connect: 0x4203_dc10,
+        wifi_event_var: 0x3c0b_4474,
+        ip_event_var: 0x3c0b_3d70,
         count_cell: 0x3fc9_f936,
         scan_count: 0x3fc9_aef0,
         scan_result: 0x3fc9_aeec,
-        records_check: 0x4200_3fb0,
+        records_check: 0x4200_53fd,
         ready_lists: 0x3fc9_b8ec,
         top_prio: 0x3fc9_b85c,
         reg_heaps: 0x3fc9_b7a4,
@@ -553,6 +558,35 @@ fn main() {
         .ok()
         .map(|s| esp32s3_soc::wifi::parse_scan_fixtures(&s))
         .unwrap_or_default();
+    // Arm the self-contained SoC fixture engine (browser/bridge path) for
+    // run_flash runs too: the write-path hook (`maybe_complete_phyfuns_slot`)
+    // is gated on an armed fixture (fixture-less = hello = must not fire —
+    // proven by the hello ILLEGAL at EPC1=0x4037a0a8), and the engine's
+    // post-step poll is what drives the STA/AP/ESP-NOW legs on this path
+    // (the run_flash host blocks below only handle scan + STA stage-1/2).
+    // Same arming the bridge uses (`wifi_fixture_scan` / `wifi_fixture_sta`
+    // / `wifi_fixture_ap` / `wifi_fixture_espnow`); the AP/ESP-NOW arming
+    // reads its env here so the hook gate sees an armed fixture on those
+    // runs as well.
+    // ORDER: this block runs AFTER the image-select above (load-then-arm,
+    // same as the bridge) — the selectors never touch `wifi_fixture`
+    // itself, so arming after selecting is safe and matches both paths.
+    {
+        let aps_spec = env::var("WIFI_SCAN_APS").unwrap_or_default();
+        if wifi_ap_fixture {
+            // Defaults match the sketch (see the SoftAP host block below:
+            // EmuAP/password/6 — the staged config is what `softAPSSID()`
+            // reads back via `esp_wifi_get_config`).
+            // NB: image already selected above; only arm the fixture data.
+            m.soc.wifi_fixture_ap("EmuAP", "password", 6);
+        } else if wifi_espnow_loopback {
+            m.soc.wifi_fixture_espnow();
+        } else if wifi_scan_fixture {
+            m.soc.wifi_fixture_scan(&aps_spec);
+        } else if wifi_sta_conn {
+            m.soc.wifi_fixture_sta(&aps_spec);
+        }
+    }
     let mut wifi_scan_armed = false;
     let mut wifi_scan_done = false;
     let mut wifi_scan_records_done = false;
@@ -789,8 +823,42 @@ fn main() {
                 if let Some(ref mut gw) = net_gw {
                     use std::io::Write as _WriteGw;
                     let len = (frame.len() as u32).to_be_bytes();
-                    if gw.write_all(&len).and(gw.write_all(&frame)).is_err() {
-                        println!("[host] net bridge write failed; dropping bridge leg");
+                    // NOTE: the socket is NONBLOCKING (set at connect for
+                    // the reply drain), so `write_all` can return
+                    // WouldBlock mid-frame — the old code dropped the whole
+                    // bridge leg on ANY write error, which killed the leg
+                    // exactly when the gateway answered faster than the
+                    // host drained (proven live: SYNACK staged, leg
+                    // dropped, run then wedged). Retry the single frame a
+                    // few times on WouldBlock (frames are ≤1600B; the
+                    // kernel buffer drains in ms); only a hard error drops
+                    // the leg.
+                    let mut werr: Option<std::io::Error> = None;
+                    for _ in 0..50 {
+                        match gw.write_all(&len).and(gw.write_all(&frame)) {
+                            Ok(()) => {
+                                werr = None;
+                                break;
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                werr = Some(e);
+                                std::thread::sleep(std::time::Duration::from_millis(2));
+                                continue;
+                            }
+                            Err(e) => {
+                                werr = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(e) = werr {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            println!(
+                                "[host] net bridge write still blocked after retry; dropping bridge leg"
+                            );
+                        } else {
+                            println!("[host] net bridge write failed ({e}); dropping bridge leg");
+                        }
                         net_gw = None;
                     } else {
                         // A forwarded TX almost always has a causally
