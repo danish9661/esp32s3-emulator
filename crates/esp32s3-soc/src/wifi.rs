@@ -118,9 +118,9 @@ pub const TXDC_DONE_BIT: u32 = 1 << 24;
 
 /// Closed-RF dispatch-table completion (see module docs + `memmap::RF_NOP_SLOT`).
 ///
-/// The heap-resident `g_phyFuns` table (pointer cell at `G_PHYFUNS_PTR`,
-/// nm on every WiFi image: BSS `g_phyFuns`, e.g. 0x3fca0060 on the
-/// test-worker-l3 ELF) is filled by `phy_get_romfunc_addr` (~30 slots)
+/// The heap-resident `g_phyFuns` table (pointer cell per image — nm BSS
+/// `g_phyFuns`, e.g. 0x3fca0060 on the test-worker-l3 ELF; exact cells in
+/// `Soc::wifi_phyfuns_cell`) is filled by `phy_get_romfunc_addr` (~30 slots)
 /// plus the real ROM's `phy_get_romfuncs` callee — but slot `0x24c`
 /// (read by `chip_v7_set_chan_misc` on EVERY channel set, including
 /// periodic recalibration) is written by NEITHER (proven whole-ELF: no
@@ -131,10 +131,10 @@ pub const TXDC_DONE_BIT: u32 = 1 << 24;
 /// `... -> chip_v7_set_chan_misc+0x30 (l32r g_phyFuns) -> 0x2c`).
 /// RF effects are abstracted via done-bits anyway, so the emulator
 /// completes the slot with the benign no-op at fill time (see
-/// `Soc::maybe_complete_phyfuns_slot`, hooked on the DRAM word/byte write
-/// paths and gated on a Wi-Fi fixture image — the non-Wi-Fi hello image
-/// has no BSS in the pointer-cell window so the gate keeps it
-/// boot-neutral). Sibling slot `0x160`
+/// `Soc::maybe_complete_phyfuns_slot`, hooked on the DRAM word write
+/// path and gated on a Wi-Fi fixture image — the non-Wi-Fi hello image
+/// has no `g_phyFuns` cell (proven via nm: no match) so the gate keeps
+/// it boot-neutral). Sibling slot `0x160`
 /// (read by `chip_v7_set_chan` itself) is left alone — it holds a valid
 /// ROM address at every observed crash, i.e. the ROM fill covers it.
 pub const G_PHYFUNS_PTR: u32 = 0x3FCA_0060;

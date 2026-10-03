@@ -3183,6 +3183,25 @@ impl Soc {
         (0..Self::WIFI_ARD_SLOTS).any(|s| Self::WIFI_ARD_POOL + s * Self::WIFI_ARD_SLOT == ptr)
     }
 
+    /// Per-image `g_phyFuns` BSS pointer cells (nm per Wi-Fi image) the
+    /// dispatch-table completion hook watches (see
+    /// `maybe_complete_phyfuns_slot`): scan 0x3fca0068,
+    /// sta/worker-net/ap 0x3fca0050, worker-l3 0x3fca0060, espnow
+    /// 0x3fca0148. The fill publishes the cell ONCE, after the table is
+    /// allocated (the publish store is the LAST store to the cell on
+    /// every observed boot), so gating on the exact cell loses nothing
+    /// and can never complete garbage from a neighbor-cell store.
+    pub fn wifi_phyfuns_cell(&self) -> u32 {
+        match self.wifi_image {
+            WifiImage::Sta => 0x3fca_0050,
+            WifiImage::Scan => 0x3fca_0068,
+            WifiImage::Ap => 0x3fca_0050,
+            WifiImage::EspNow => 0x3fca_0148,
+            WifiImage::Worker => 0x3fca_0050,
+            WifiImage::WorkerL3 => 0x3fca_0060,
+        }
+    }
+
     /// Per-image `callx8 _ZdlPvj` (operator delete) CALL-SITE pcs the
     /// host-pool free hook watches (see `wifi_ard_free` + machine.rs).
     /// Ground truth = disassembly of each image's `_checkForEvent`
@@ -4676,10 +4695,10 @@ impl Soc {
     /// worker-L3 image, whose gateway legs run long enough to reach the
     /// periodic recalibration; the plain-battery run exits before it).
     /// Complete the slot on the store that publishes the table pointer
-    /// cell: per-image `g_phyFuns` BSS addr (nm: scan 0x3fca0068,
-    /// sta/worker-net/worker-ap 0x3fca0050, worker-l3 0x3fca0060, espnow
-    /// 0x3fca0148 — all inside 0x3fc9ae60..0x3fca0200, DRAM only, so the
-    /// range check is DRAM-scoped and can never misfire on MMIO or ROM).
+    /// cell: per-image `g_phyFuns` BSS addr (exact cells in
+    /// `wifi_phyfuns_cell` — nm: scan 0x3fca0068, sta/worker-net/ap
+    /// 0x3fca0050, worker-l3 0x3fca0060, espnow 0x3fca0148; DRAM only,
+    /// so the hook can never misfire on MMIO or ROM).
     /// The cell holds the table POINTER (heap addr); slot 0x24c of THAT
     /// table gets RF_NOP_SLOT (a real-ROM `retw.n` — see memmap.rs; it must
     /// NEVER name a glue address: any code planted in the QSORT..BOOT gap
@@ -4714,7 +4733,16 @@ impl Soc {
         if self.wifi_fixture.is_none() {
             return;
         }
-        if !in_range!(aligned_addr, 0x3FC9_AE60, 0x3FCA_0200 - 0x3FC9_AE60) {
+        // Exact-cell gate: the publish store names the LIVE table exactly
+        // when it targets this image's `g_phyFuns` BSS cell. The fill
+        // publishes the cell ONCE, after the table is allocated, so this
+        // loses nothing — and a store ANYWHERE ELSE (BSS init of a
+        // neighbor cell, an unrelated struct with the same address, a
+        // stale free) must NOT complete, since the named table is then
+        // dangling (the fill later publishes the real table elsewhere
+        // while our RF_NOP lands in garbage the recalibration `callx8`
+        // then jumps through).
+        if aligned_addr != self.wifi_phyfuns_cell() {
             return;
         }
         let tbl = self.read32(aligned_addr);
@@ -6671,20 +6699,19 @@ impl Soc {
     /// after the reboot; the ESP-NOW legs re-run from the UART marker,
     /// which persists in the host console stream).
     pub fn snapshot_wifi_fixture_runtime(&self) -> WifiFixtureRuntime {
-        // Live-completed phyFuns slot: scan the pointer-cell window for a
-        // cell whose named table's 0x24c slot already holds our RF_NOP.
-        // (There is exactly one such cell per Wi-Fi image — the `g_phyFuns`
-        // BSS — and the scan is over ~100 words once per RESET, not per
-        // step, so the cost is nil. The scan re-derives what the hook knew
-        // at fill time, surviving the `Soc::new()` rebuild by value.)
+        // Live-completed phyFuns slot: re-derive the hook's fill from the
+        // LIVE cell (same exact-cell gate as the hook), so the completion
+        // survives the `Soc::new()` rebuild by value. Runs once per RESET,
+        // not per step, so the cost is nil.
         let mut phyfuns_completed = None;
         {
-            // `ram8` is the `&self` byte reader (the `Bus::read32` word
-            // reader needs `&mut`); all probed addresses are DRAM by
-            // construction (range-checked cell + DRAM-bounded table), so no
-            // MMIO/cache windows are involved — plain `sram` bytes.
+            // `sram` is the plain DRAM backing (cell + table are DRAM by
+            // construction), so no MMIO/cache windows are involved.
             let rd32 = |a: u32| {
                 let o = (a - DRAM_BASE) as usize;
+                if o + 4 > self.sram.len() {
+                    return 0;
+                }
                 u32::from_le_bytes([
                     self.sram[o],
                     self.sram[o + 1],
@@ -6692,21 +6719,19 @@ impl Soc {
                     self.sram[o + 3],
                 ])
             };
-            let mut a = 0x3FC9_AE60u32;
-            while a < 0x3FCA_0200 {
-                let tbl = rd32(a);
-                if tbl != 0
-                    && tbl & 3 == 0
-                    && in_range!(tbl, DRAM_BASE, SRAM_BASE_RANGE)
-                    && rd32(tbl + 0x160) >= 0x4000_0000
-                    && rd32(tbl + 0x160) < 0x4006_0000
-                    && rd32(tbl + crate::wifi::PHYFUNS_UNFILLED_OFF)
-                        == crate::memmap::RF_NOP_SLOT
-                {
-                    phyfuns_completed = Some((tbl, crate::memmap::RF_NOP_SLOT));
-                    break;
-                }
-                a += 4;
+            let cell = self.wifi_phyfuns_cell();
+            let tbl = rd32(cell);
+            if tbl != 0
+                && tbl & 3 == 0
+                && in_range!(tbl, DRAM_BASE, SRAM_BASE_RANGE)
+                && in_range!(
+                    tbl + crate::wifi::PHYFUNS_UNFILLED_OFF,
+                    DRAM_BASE,
+                    SRAM_BASE_RANGE
+                )
+                && rd32(tbl + crate::wifi::PHYFUNS_UNFILLED_OFF) == crate::memmap::RF_NOP_SLOT
+            {
+                phyfuns_completed = Some((tbl, crate::memmap::RF_NOP_SLOT));
             }
         }
         WifiFixtureRuntime {
