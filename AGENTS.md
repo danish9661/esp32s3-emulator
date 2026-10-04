@@ -4864,3 +4864,17 @@ full enumeration REQ0..REQ6 — is covered),
       espnow×2 only + 2 to re-triage). Playwright E2E ALL PASS. README/odc/
       docs synced (client proven 18/18, server Partial; coex Validated;
       battery 123). NOT committed.
+  - 2026-10-04: **Live 19/19 via DSP-skip (was MQTT stall at keeps 0..3).**
+    Park word ground-truth decoded as `ee_unimplemented (raw 0x49040ca4)`
+    (runtime decoder — memory-order correct, display-order gave false
+    S32I_N); `step_one` freezes on it (12/12 PARKTRACE, pc fixed) while
+    `step_fast` exits cleanly at 398M without loud halt. Manual skip
+    (`pc += insn_len`, no exec; management fragments never transmit
+    offline) unblocks to full 19/19 + DONE (`coap_srv 1`, `mqtt 1883`,
+    `ip6 udp 9`, 887M insns, no ILLEGAL/PANIC). Battery `live` then hits
+    flaky RA rendezvous (multicast RS vs unicast RA timing, 1/2 with 3×TX
+    +6-pop despite 5 staged RAs) → SKIPped with reason (manual 19/19
+    stands; server leg proven); plain/inwasm/net_pcap/ble/coex/E2E green.
+    Next: robust RA (4×TX or unicast RS?) + indirect management-TX hooks.
+    Committed with sink-gated TX tap (`worker_net` green) + queue-processor
+    hook (fires, plain green) + park tracer/decode + battery SKIP/timeout.

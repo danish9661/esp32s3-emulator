@@ -1,0 +1,65 @@
+[
+  {
+    "added_include_path": "/home/danish1075/.arduino15/packages/esp32/hardware/esp32/3.3.10/cores/esp32"
+  },
+  {
+    "added_include_path": "/home/danish1075/.arduino15/packages/esp32/hardware/esp32/3.3.10/variants/esp32s3"
+  },
+  {
+    "compile": {
+      "source_path": "/home/danish1075/Documents/esp32 s3 emu/tools/sketches/esp32s3_rsa/esp32s3_rsa_poke/build/sketch/esp32s3_rsa_poke.ino.cpp.merged",
+      "depfile_path": "/home/danish1075/Documents/esp32 s3 emu/tools/sketches/esp32s3_rsa/esp32s3_rsa_poke/build/sketch/esp32s3_rsa_poke.ino.cpp.merged.libsdetect.d"
+    },
+    "compile_task": {
+      "args": [
+        "/home/danish1075/.arduino15/packages/esp32/tools/esp-x32/2601/bin/xtensa-esp32s3-elf-g++",
+        "-c",
+        "@/home/danish1075/.arduino15/packages/esp32/tools/esp32s3-libs/3.3.10/flags/cpp_flags",
+        "-w",
+        "-Os",
+        "-Werror=return-type",
+        "-w",
+        "-x",
+        "c++",
+        "-E",
+        "-CC",
+        "-DF_CPU=240000000L",
+        "-DARDUINO=10607",
+        "-DARDUINO_ESP32S3_DEV",
+        "-DARDUINO_ARCH_ESP32",
+        "-DARDUINO_BOARD=\"ESP32S3_DEV\"",
+        "-DARDUINO_VARIANT=\"esp32s3\"",
+        "-DARDUINO_PARTITION_default",
+        "-DARDUINO_HOST_OS=\"linux\"",
+        "-DARDUINO_FQBN=\"esp32:esp32:esp32s3\"",
+        "-DESP32=ESP32",
+        "-DCORE_DEBUG_LEVEL=0",
+        "-DARDUINO_RUNNING_CORE=1",
+        "-DARDUINO_EVENT_RUNNING_CORE=1",
+        "-DARDUINO_USB_MODE=1",
+        "-DARDUINO_USB_CDC_ON_BOOT=0",
+        "-DARDUINO_USB_MSC_ON_BOOT=0",
+        "-DARDUINO_USB_DFU_ON_BOOT=0",
+        "@/home/danish1075/.arduino15/packages/esp32/tools/esp32s3-libs/3.3.10/flags/defines",
+        "-I/home/danish1075/Documents/esp32 s3 emu/tools/sketches/esp32s3_rsa/esp32s3_rsa_poke",
+        "-iprefix",
+        "/home/danish1075/.arduino15/packages/esp32/tools/esp32s3-libs/3.3.10/include/",
+        "@/home/danish1075/.arduino15/packages/esp32/tools/esp32s3-libs/3.3.10/flags/includes",
+        "-I/home/danish1075/.arduino15/packages/esp32/tools/esp32s3-libs/3.3.10/qio_qspi/include",
+        "-I/home/danish1075/.arduino15/packages/esp32/hardware/esp32/3.3.10/cores/esp32",
+        "-I/home/danish1075/.arduino15/packages/esp32/hardware/esp32/3.3.10/variants/esp32s3",
+        "@/home/danish1075/Documents/esp32 s3 emu/tools/sketches/esp32s3_rsa/esp32s3_rsa_poke/build/build_opt.h",
+        "@/home/danish1075/Documents/esp32 s3 emu/tools/sketches/esp32s3_rsa/esp32s3_rsa_poke/build/file_opts",
+        "/home/danish1075/Documents/esp32 s3 emu/tools/sketches/esp32s3_rsa/esp32s3_rsa_poke/build/sketch/esp32s3_rsa_poke.ino.cpp.merged",
+        "-o",
+        "/dev/null",
+        "-MMD",
+        "-MF",
+        "/home/danish1075/Documents/esp32 s3 emu/tools/sketches/esp32s3_rsa/esp32s3_rsa_poke/build/sketch/esp32s3_rsa_poke.ino.cpp.merged.libsdetect.d"
+      ]
+    }
+  },
+  {
+    "missing_include_h": ""
+  }
+]

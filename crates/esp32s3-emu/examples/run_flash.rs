@@ -481,6 +481,8 @@ fn main() {
     let mut ble_l2cap_last: Option<(usize, u32)> = None;
     // TEMP (2026-10-04, forensics — DELETE after): management-TX hook latch.
     let mut pptx_last = 0u32;
+    // TEMP (2026-10-04, RF forensics — DELETE after): park-tracer one-shot.
+    let mut park_traced = false;
     // TEMP (2026-10-03): post-delivery pc-window countdown (DELETE after).
     let mut ble_watch_n = 0u32;
     // TEMP (2026-10-03): pc rings for the canned NULL-call forensics
@@ -775,6 +777,39 @@ fn main() {
         let (r, r1, n) = m.step_fast();
         executed += n as u64;
         i += 1;
+        // TEMP (2026-10-04, RF forensics — DELETE after): park-loop tracer
+        // for the WorkerL3 management-TX stall (core0 parks at 0x42074b4f
+        // `ppTxFragmentProc+0x13f` with entry/caller/queue-processor hooks
+        // all missing — reached via wdev-table tail-jump). Fires once when
+        // parked here: single-steps 12× logging pc + raw word + regs so the
+        // polling load (same address every iteration) names the flag the
+        // host must satisfy (same discipline as the BLE sem pre-seed: direct
+        // write, no window surgery). Gated to the exact stall pc on the
+        // worker-L3 path (other images never park here; normal DONE-idles
+        // park elsewhere).
+        // (One-shot via `park_traced` latch below.)
+        if !park_traced
+            && path.contains("test_worker_l3")
+            && (m.cpu[0].pc == 0x4207_4b4f || m.cpu[1].pc == 0x4207_4b4f)
+        {
+            park_traced = true;
+            let c = if m.cpu[0].pc == 0x4207_4b4f { 0 } else { 1 };
+            // TEMP (2026-10-04, RF forensics — DELETE after): ground-truth
+            // decode of the park word via the emulator's own decoder (like
+            // the UNIMPLEMENTED trap detail — no objdump/walkvec byte-order
+            // traps). Settles ee_unimplemented vs S32I_N definitively.
+            println!("[host] PARKDECODE {}", unimp_detail(&mut m, c));
+            for _ in 0..12 {
+                let p = m.cpu[c].pc;
+                let w = m.soc.read32(p);
+                let mut regs = [0u32; 16];
+                for (k, r) in regs.iter_mut().enumerate() {
+                    *r = m.cpu[c].reg(k as u32);
+                }
+                println!("[host] PARKTRACE{c} pc={p:#010x} word={w:#010x} regs={regs:08x?}");
+                let _ = m.cpu[c].step_one(&mut m.soc);
+            }
+        }
         // TEMP (2026-10-04, forensics — DELETE after): log each new
         // l2cap_tx return code observed at 0x4200723c (machine.rs per-op
         // probe). Proves whether live-first-ATT fails via prepend (6) or
@@ -1081,8 +1116,30 @@ fn main() {
             // OVER the word (executes cleanly, proven live) and keep
             // running instead of breaking. Anything else is a real
             // trap — report LOUD and break.
-            if pc == 0x4037_7367 {
-                m.cpu[0].step_one(&mut m.soc);
+            //
+            // WiFi-TX DSP skip (WorkerL3 management-TX stall): 0x42074b4f
+            // (`ppTxFragmentProc+0x13f`, raw 0x49040ca4) decodes via the
+            // ground-truth runtime decoder as `ee_unimplemented` (PARKDECODE
+            // proven live) — an unmapped TIE/DSP pattern on the WiFi TX
+            // fragment path that `step_one` refuses to advance past (pc
+            // frozen 12/12 single-steps, PARKTRACE proven). Manually skip
+            // past it (pc += len, no exec effect) and keep running: the DSP
+            // op has zero validatable effect offline (management fragments
+            // never transmit — no RF, no pcap for management, association
+            // is fixture-driven; same discipline as the RF call-site skips
+            // which abstract unrealized RF effects via done-bits). Length
+            // from `insn_len` (ground truth, like `unimp_detail` — never
+            // objdump/walkvec byte-order guessing).
+            if pc == 0x4037_7367 || (path.contains("test_worker_l3") && pc == 0x4207_4b4f) {
+                if pc == 0x4207_4b4f {
+                    use xtensa_core::generated::insn_len;
+                    let b0 = (m.soc.read32(pc) & 0xFF) as u8;
+                    let len = insn_len(b0) as u32;
+                    m.cpu[0].pc = pc.wrapping_add(len);
+                    println!("[host] DSP-SKIP pc={pc:#010x} len={len}");
+                } else {
+                    m.cpu[0].step_one(&mut m.soc);
+                }
                 let tx = m.take_uart_tx(0);
                 let tx1 = m.take_uart_tx(1);
                 if !tx1.is_empty() {
