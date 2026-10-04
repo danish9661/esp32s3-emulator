@@ -16,6 +16,25 @@ use xtensa_core::{Bus, Cpu, StepResult};
 use crate::rom_stub;
 use crate::rom_stub::HOST_PRINTF;
 
+/// Host-owned synthetic-call stack (16KB at `WIFI_SCRATCH + 0x4000`,
+/// top at +0x8000 — clear of BLE_RX (+0x2500..+0x3500), the LLMAC beacon
+/// slot (+0x3600) and the ard pool (+0x10000); inside DRAM, past heap
+/// end like every other scratch use).
+///
+/// WHY: the deep synthetic firmware calls (`run_ble_host_recv`,
+/// `run_wifi_promisc_cb` — up to 10k insns through allocators, queues
+/// and window spills) must NOT run on the interrupted task's stack: the
+/// spill chain can exceed the task's remaining stack and overwrite the
+/// outer frames' saved registers, so a later underflow restores a
+/// garbage return address into a0 and the task `retw`s wild (proven live
+/// 2026-10-03: canned 22B delivery → `vTaskSwitchContext+retw` jumped
+/// to heap garbage 0x65a5a5a5, double-fault `break` at 0x40374340).
+/// Running on this scratch stack keeps every spill on host-owned DRAM;
+/// the full-phys restore below still brings back the original SP, so
+/// the firmware never observes the swap. (The ESP-NOW wrappers stay on
+/// the task stack — leaf calls, shallow, battery-proven.)
+const SYNTH_STACK_TOP: u32 = esp32s3_soc::Soc::WIFI_SCRATCH + 0x8000;
+
 pub struct Esp32S3 {
     /// Both ESP32-S3 LX7 cores.  Core 1 is gated at reset by the ROM stub
     /// (rom_stub.rs: PRID check) until core 0 releases it, mirroring the
@@ -55,6 +74,23 @@ pub struct Esp32S3 {
     /// op so peripheral time advances once per two ops (the single-step
     /// ratio), shared by both cores' loops within a macro-step.
     fast_tick: bool,
+    /// TEMP (2026-10-03, forensics — DELETE after): abort record for the
+    /// last `run_ble_host_recv` synthetic call: (fault pc, step result,
+    /// pc of first PS.WOE 1→0 flip if any). `None` = last call returned
+    /// cleanly (or no call yet).
+    pub last_recv_abort: Option<(u32, StepResult, Option<u32>)>,
+    /// TEMP (2026-10-03, forensics — DELETE after): pc of the step that
+    /// first clobbered IRAM 0x40380a7c inside the synthetic call (None =
+    /// never observed).
+    pub last_recv_clobber: Option<u32>,
+    /// TEMP (2026-10-03, forensics — DELETE after): (PS, EPC1, wb) at
+    /// synthetic-loop exit, pre-restore. EXCM set ⇒ aborted inside a
+    /// vector handler.
+    pub last_recv_ps: Option<(u32, u32, u32)>,
+    /// TEMP (2026-10-04, forensics — DELETE after): staged (buf, len,
+    /// first 6 bytes) for the last `run_ble_host_recv` call. Diagnoses
+    /// H4==0 dead-path faults (staged zeros = pop/write failure).
+    pub last_recv_stage: Option<(u32, u32, [u8; 6])>,
 }
 
 impl Esp32S3 {
@@ -71,6 +107,12 @@ impl Esp32S3 {
             last_console_byte: None,
             last_console_was_usb: false,
             fast_tick: false,
+            // TEMP (2026-10-03, forensics — DELETE after).
+            last_recv_abort: None,
+            last_recv_clobber: None,
+            last_recv_ps: None,
+            // TEMP (2026-10-04, forensics — DELETE after).
+            last_recv_stage: None,
         }
     }
 
@@ -580,7 +622,7 @@ impl Esp32S3 {
             }
             // BLE VHCI TX capture (NimBLE host→controller path): the linked
             // `esp_vhci_host_send_packet(data, len)` callee (BLE image only,
-            // 0x42025f90 — nm on the esp32s3_ble ELF; sibling images never
+            // 0x42026088 — nm on the esp32s3_ble ELF; sibling images never
             // link libbt so no gate is needed) takes NimBLE's H4 HCI frame
             // (type 0x01 CMD / 0x02 ACL + payload). Caller args are
             // windowed (callee a2/a3 = caller a10/a11), read BEFORE
@@ -632,12 +674,153 @@ impl Esp32S3 {
             //   alloc/free pairing → `assert failed: 0x42014482`).
             // The helpers stay (unit-tested, wired for a future external-
             // controller mode) but the tap does not call them.
-            if pc0 == 0x4202_5f90 {
+            if pc0 == 0x4202_6088 {
                 let data = self.cpu[core].reg(10);
                 let len = self.cpu[core].reg(11);
                 self.soc.bt_hci_capture_tx(data, len);
+                // Sync command-ack delivery DISABLED (was `ble_ack_deliver_at`
+                // with the live tap mbuf): the REAL ROM loopback synthesizes
+                // Command Completes itself and runs the ack path firmware-side
+                // (the sketch boots to DONE with no bridge at all), so a
+                // bridge CC written over the live TX block is a DUPLICATE that
+                // races the ROM's own ack (proven live 2026-10-03: first Reset
+                // CC delivery wedged the boot in panic_abort). The helper
+                // stays (unit-tested, for a future external-controller mode)
+                // but the tap never calls it; bridge CC/CS frames are dropped
+                // at the run_flash RX leg instead, and only async events/ACL
+                // reach `run_ble_host_recv`.
+            }
+            // Full-802.11-LL-MAC slice-1 taps (`esp32s3_llmac` sketch, nm
+            // on the llmac ELF; gated on `llmac_armed` so they can never
+            // misfire on another image — the pcs name unrelated functions
+            // there, and a fake ESP_OK there would corrupt a foreign run,
+            // same hazard class as the per-image `want` gates above).
+            // - 0x42052404 `esp_wifi_80211_tx(ifx, buffer, len,
+            //   en_sys_seq)`: capture the raw 802.11 frame and fake-return
+            //   ESP_OK. The closed driver is NOT run: pre-association its
+            //   MLME/TX path has no live state on the emulator (no scan/
+            //   association was ever driven on this image), and silicon
+            //   accepts pre-connection injection (the documented purpose
+            //   of this API — probe/beacon/action frames before assoc).
+            //   Caller args windowed (callee a2..a5 = caller r10..r13),
+            //   read BEFORE `step_one` while wb still names the caller.
+            //   The 80211 TX-done callback is unmodeled (documented).
+            // - 0x420643ec `esp_wifi_set_promiscuous_rx_cb(cb)`: capture
+            //   the callback pointer (caller r10 = callee a2), read-only —
+            //   the call RUNS (the driver stores it; harmless).
+            if self.soc.llmac_armed() {
+                if pc0 == 0x4205_2404 {
+                    let buf = self.cpu[core].reg(11);
+                    let len = self.cpu[core].reg(12);
+                    self.soc.llmac_capture_tx(buf, len);
+                    let ra = self.cpu[core].reg(8);
+                    self.cpu[core].set_reg(10, 0); // ESP_OK
+                    self.cpu[core].pc = (pc0 & 0xc000_0000) | (ra & 0x3fff_ffff);
+                    n += 1;
+                    continue;
+                }
+                if pc0 == 0x4206_43ec {
+                    let cb = self.cpu[core].reg(10);
+                    self.soc.llmac_set_promisc_cb(cb);
+                }
+            }
+            // Closed-RF dispatch-table call skips (recalibration
+            // immunization): `chip_v7_set_chan_misc` / `ram_wifi_set_tx_gain`
+            // load table slots and `callx8` them on EVERY channel set incl.
+            // periodic recalibration. A slot's heap table can be overlapped
+            // by unrelated heap users mid-run (proven live on worker-L3
+            // 2026-10-03: an lwIP DNS buffer over tbl+0x220..0x24f turned
+            // slot 0x24c into 0x4022d8b8 and the call jumped wild) — a
+            // firmware-heap/environment interaction no peripheral bit can
+            // fix (same class as the documented heap hazards). Skipping is
+            // behaviorally identical: the RF effect is abstracted via
+            // done-bits, each skipped call's return dies unread, and no
+            // window surgery is needed (the call never executes: pc+3,
+            // registers untouched).
+            // SCOPE: worker-L3 image only (nm+objdump on the test-worker-l3
+            // ELF). The closed lib links these functions at a different
+            // address per image but with an identical shape — extend per
+            // image the same way if another long run ever needs it; the
+            // other battery images never reach a clobbered slot.
+            // - 0x4207fcad: `callx8 a8` in `chip_v7_set_chan_misc` (target
+            //   = tbl[0x24c]; tail `l32i.n; mov; l32i; mov.n; callx8; retw.n`
+            //   redefines a10/a11 before any read — `mov.n a10,a2` reads
+            //   misc's own channel arg — and a8 is dead after the call).
+            // - 0x42080fe3: `callx8 a3` in `ram_wifi_set_tx_gain` (target
+            //   = tbl[0x228]; tail redefines a3/a10/a11/a12 before any
+            //   read, a8 dead, a2 keeps the function arg — verified op by
+            //   op against xtensa_core::generated).
+            // - 0x42080ff9: `callx8 a3` in the same function (target =
+            //   tbl[0x210], clobbered with non-code bytes like its
+            //   neighbors; tail redefines a3/a10/a11/a12 (mov/movi) and a2
+            //   (l32i.n) before any read, a8 dead — same verification).
+            // - 0x42081003: `callx8 a2` in the same function (target =
+            //   tbl[0x224], clobbered with DNS bytes like its neighbors;
+            //   the call is the function's last op before `retw.n`, so its
+            //   return dies with the frame unread — sound).
+            if self.soc.wifi_image == esp32s3_soc::WifiImage::WorkerL3
+                && (pc0 == 0x4207_fcad
+                    || pc0 == 0x4208_0fe3
+                    || pc0 == 0x4208_0ff9
+                    || pc0 == 0x4208_1003)
+            {
+                self.cpu[core].pc = pc0.wrapping_add(3);
+                n += 1;
+                continue;
             }
             let r = self.cpu[core].step_one(&mut self.soc);
+            // TEMP (2026-10-03): wild-jump tripwire for the canned-22B
+            // NULL-call forensics (DELETE after). Fires when an op lands
+            // pc on the known garbage target, printing the CALLER pc +
+            // window regs (one of them held the target). Per-op cost is a
+            // single comparison; silent unless hit.
+            if self.cpu[core].pc == 0x65a5a5a5 {
+                let regs: alloc::vec::Vec<u32> = (0..16).map(|r| self.cpu[core].reg(r)).collect();
+                panic!(
+                    "WILD pc0={:#010x} core={} wb={} regs={:08x?} sp={:#010x}",
+                    pc0,
+                    core,
+                    self.cpu[core].windowbase(),
+                    regs,
+                    self.cpu[core].reg(1),
+                );
+            }
+            // TEMP (2026-10-03): event-dispatch tracer (DELETE after).
+            // Records into a soc-side ring when execution reaches the
+            // evt-dispatch pcs. Gated on the soc tracer switch (canned
+            // runs only). Ring holds the last 16; run_flash dumps it.
+            // 0x42014785 is nimble_port_run's ev_cb call site — record
+            // (handler a8, ev a2/a3): EVERY dispatch through the port
+            // loop shows here with its event, whatever the handler.
+            // 0x42015234/0x4201529c are eventq_get/put: record the evq
+            // pointer to PROVE post and poll target the same queue.
+            if self.soc.ble_trace_evt()
+                && (pc0 == 0x4200_cf60
+                    || pc0 == 0x4200_cfb4
+                    || pc0 == 0x4200_e78c
+                    || pc0 == 0x4200_e254
+                    || pc0 == 0x4200_e6fc
+                    || pc0 == 0x4200_8e38
+                    || pc0 == 0x4200_3a33
+                    || pc0 == 0x4201_4785
+                    || pc0 == 0x4201_5234
+                    || pc0 == 0x4201_529c)
+            {
+                let (x, y, z) = if pc0 == 0x4201_4785 {
+                    (
+                        self.cpu[core].reg(8),
+                        self.cpu[core].reg(2),
+                        self.cpu[core].reg(3),
+                    )
+                } else {
+                    (
+                        self.cpu[core].reg(10),
+                        self.cpu[core].reg(11),
+                        self.cpu[core].reg(12),
+                    )
+                };
+                self.soc.ble_trace_push3(pc0, x, y, z);
+            }
             // `step_one` records the fetched length even on exception paths,
             // so no re-fetch is needed to verify fall-through advance.
             let elen = self.cpu[core].last_len();
@@ -754,7 +937,7 @@ impl Esp32S3 {
     ///
     /// Same call8-frame synthesis as `run_espnow_callback` (2-arg form):
     /// `host_rcv_pkt(data, len)` = NimBLE's `ble_transport_to_hs_evt_impl`
-    /// path via `host_rcv_pkt` at 0x420050a0 (BLE image only — nm on the
+    /// path via `host_rcv_pkt` at 0x42005158 (BLE image only — nm on the
     /// esp32s3_ble ELF; sibling images never link NimBLE so the hook
     /// address never matches). The packet bytes are copied into the host
     /// scratch window first (`Soc::bt_hci_stage_rx` at
@@ -768,25 +951,26 @@ impl Esp32S3 {
     /// it, but retrying is harmless and covers the
     /// register-then-reply race).
     ///
-    /// PARKED (see the run_flash BLE leg note): driving the reply into
-    /// the firmware via a synthetic `host_rcv_pkt` call walks the mbuf
-    /// pool free path with a block the pool does not recognize (`assert
-    /// failed: 0x42014482` in `os_memblock_from(pool_cmd)`,
-    /// panic_abort EPC1=0x4037fdc4 — proven live via pb5: the plain
-    /// `host_rcv_pkt` firmware path asserts with NO hook and NO bridge
-    /// traffic). The reply must enter through the firmware's OWN VHCI
-    /// poll (`host_rcv_pkt` at 0x420050a0, called by the controller glue
-    /// with its own buffer at 0x3fcacfd6) — until the controller-glue
-    /// poll is modeled (the RWBLE ISR path that hands the firmware its
-    /// own buffer), this stays parked and UNCALLED (kept for the day the
-    /// poll lands; the overflow-aware loop + full-phys save + INTENABLE
-    /// mask below are all verified correct — the failure is the FOREIGN
-    /// buffer, not the synthesis).
+    /// UNPARKED 2026-10-03 (experiment): disassembly shows `host_rcv_pkt`
+    /// only READS the staged buffer (`memcpy` into a pool mbuf it allocates
+    /// itself, NULL-safe on pool exhaustion, bounded lengths with silent
+    /// drops) — so a staged scratch buffer cannot trip the pool free path
+    /// through this call, and the pb5 assert is hypothesized to have come
+    /// from the sibling helpers (sem give / ack overwrite of a live mbuf /
+    /// pool top-up double-ownership), all of which stay parked. If this
+    /// experiment asserts, the failure pc + assert site will say exactly
+    /// which contract broke. Driven by the run_flash BLE leg (one packet
+    /// per step, EVT size-gated there).
     ///
     /// Returns true when a packet was delivered (callback ran to `retw`);
     /// false when idle (no packet, or no callback yet).
-    #[allow(dead_code)]
     pub fn run_ble_host_recv(&mut self, core: usize, entry: u32) -> bool {
+        // TEMP (2026-10-03, forensics — DELETE after): clear stale abort
+        // record so the harness only ever prints a fresh one.
+        self.last_recv_abort = None;
+        self.last_recv_clobber = None;
+        self.last_recv_ps = None;
+        self.last_recv_stage = None;
         if !(0x4000_0000..0x4240_0000).contains(&entry) {
             // No callback yet — idle WITHOUT consuming the packet (level,
             // not edge: the FIFO still holds it, so the next step retries
@@ -798,6 +982,15 @@ impl Esp32S3 {
         let Some((buf, len)) = self.soc.bt_hci_stage_rx() else {
             return false;
         };
+        // TEMP (2026-10-04, forensics — DELETE after): snapshot staged
+        // bytes for the harness (H4==0 dead-path diagnosis).
+        {
+            let mut b = [0u8; 6];
+            for (k, v) in b.iter_mut().enumerate() {
+                *v = self.soc.read8(buf.wrapping_add(k as u32)) as u8;
+            }
+            self.last_recv_stage = Some((buf, len, b));
+        }
         let cpu = &mut self.cpu[core];
         let saved_pc = cpu.pc;
         let saved_wb = cpu.windowbase();
@@ -815,6 +1008,23 @@ impl Esp32S3 {
         // restore writes it back verbatim (wb restored after, so the
         // view names the same window again).
         let saved_phys = *cpu.phys_regs();
+        // Save the FULL special-register file (256 words): the synthetic
+        // call's window-overflow/underflow vectors mutate WINDOWSTART
+        // (live-window liveness), PS (OWB/EXCM/INTLEVEL), EPC1/EXCCAUSE,
+        // SAR and the HW-loop regs — and the firmware spill/fill handlers
+        // manage WINDOWSTART via WSR. Restoring only the phys regs +
+        // WINDOWBASE leaves a stale liveness map: a later `retw` then
+        // skips its underflow fill and returns through a paint-filled
+        // slot (proven live 2026-10-03: identical canned-22B crash with
+        // the synth stack in place — spills were never the (only) vector;
+        // the wild `retw` through 0xa5a5a5a5 → 0x65a5a5a5 persisted).
+        // Restoring the whole file makes the call invisible by
+        // construction. Cost: 256 u32 copies per delivered packet
+        // (packets are rare).
+        let mut saved_sregs = [0u32; 256];
+        for (k, w) in saved_sregs.iter_mut().enumerate() {
+            *w = cpu.sreg(k as u32);
+        }
         // Mask interrupts across the synthetic call (proven live: the
         // callee's `entry a1,32` takes a WindowOverflow vector, and a
         // pending level-1 line arriving MID-call vectors into the real
@@ -830,11 +1040,40 @@ impl Esp32S3 {
         cpu.set_sreg(xtensa_core::cpu::SR_INTENABLE, 0);
         let wb = (saved_wb + 2) & 0xf;
         cpu.set_windowbase(wb);
+        // WINDOWSTART isolation (2026-10-03, live-proven): the stale
+        // firmware liveness map (1<<saved_wb) from wb+2's perspective
+        // looks like a nearly-full file — the callee's first ENTRY
+        // immediately overflows into a firmware vector whose OF handler
+        // spills through stale phys regs ([SP-12] = IRAM return addr)
+        // and clobbers IRAM code (proven: 0x40380a7c ENTRY → 0x68000000,
+        // clobber after step at 0x40374115 = OF S32E a6,a0,-40).
+        // Isolate to only the synth window live; ENTRYs then allocate
+        // fresh units with no overflow for depths <16 (BLE/LLMAC depth
+        // ~5-6). Full-sregs restore makes this invisible. Saves sregs
+        // above already cover WINDOWSTART.
+        cpu.set_sreg(xtensa_core::cpu::SR_WINDOW_START, 1u32 << wb);
         cpu.pc = entry;
         cpu.set_reg(8, 0x4000_0000);
         cpu.set_reg(10, buf);
         cpu.set_reg(11, len);
-        for _ in 0..10_000 {
+        // Run on the host-owned synthetic stack (see SYNTH_STACK_TOP):
+        // the call's window spills + ENTRY frames must not land on the
+        // interrupted task's stack. The full-phys restore below brings
+        // back the firmware SP, so the swap is invisible.
+        cpu.set_reg(1, SYNTH_STACK_TOP);
+        // TEMP (2026-10-03, forensics — DELETE after): WOE-tripwire.
+        // Record the first step where PS.WOE flips 1→0 inside the
+        // synthetic call (+ pc), pinpointing what clears it.
+        let mut woe_trip: Option<(u32, u32)> = None;
+        // TEMP (2026-10-03, forensics — DELETE after): IRAM watchpoint.
+        // 0x40380a7c (xPortInIsrContext entry) reads 0xa0004136 pre-call
+        // but 0x68000000 post-abort — something INSIDE this call writes
+        // IRAM code. Record the first step whose write lands there.
+        let mut clobber_pc: Option<u32> = None;
+        // RESTAGE-ON-ABORT (2026-10-04, DELETE after): scratch snapshot
+        // when the call faults (re-queued after the CPU restore below).
+        let mut restage: Option<Vec<u8>> = None;
+        for (si, _) in (0..10_000).enumerate() {
             // Window overflow/underflow (causes 32..=37) is NORMAL
             // control flow for a call this deep (proven live:
             // `ble_transport_alloc_evt → os_memblock_get` takes
@@ -849,20 +1088,81 @@ impl Esp32S3 {
             // stepping (same discipline as `step_fast`'s block loop,
             // which only ends runs on pc deviation, not on overflow
             // exceptions).
+            let apc = self.cpu[core].pc;
             let r = self.cpu[core].step_one(&mut self.soc);
             if self.cpu[core].pc == 0x4000_0000 {
                 break;
             }
+            // TEMP (2026-10-03, forensics — DELETE after): IRAM
+            // watchpoint sample (single word read per step — cheap).
+            // NOTE: `Bus` is already imported in this module.
+            if clobber_pc.is_none() {
+                let v: u32 = self.soc.read32(0x4038_0a7c);
+                if v != 0xa000_4136 {
+                    clobber_pc = Some(apc);
+                }
+            }
+            // TEMP (2026-10-03, forensics — DELETE after): sample WOE.
+            if woe_trip.is_none()
+                && self.cpu[core].sreg(xtensa_core::cpu::SR_PS) & xtensa_core::cpu::PS_WOE == 0
+            {
+                woe_trip = Some((si as u32, apc));
+            }
             if !matches!(r, StepResult::Ok | StepResult::Exception { cause: 32..=37 }) {
+                // TEMP (2026-10-03, forensics — DELETE after): record
+                // the abort so the harness can print it.
+                let trip = woe_trip.map(|(_, pc)| pc);
+                self.last_recv_abort = Some((apc, r, trip));
+                self.last_recv_clobber = clobber_pc;
+                // RESTAGE-ON-ABORT (2026-10-04): the stage popped the FIFO
+                // before the call, so a fault LOSES the packet (no conn,
+                // central retries on a dead link, stall). Snapshot the
+                // scratch bytes into `restage` (declared above); the tail
+                // re-queues them after the CPU restore (borrow rules
+                // forbid Soc mutation while `cpu` is live here). Faults
+                // are transient scheduler races; 10k-cap exits (no abort
+                // record) do NOT restage. A pool block may leak per abort
+                // (tolerated: 38 blocks, pool gate stops delivery if dry).
+                {
+                    let n = (len as usize).min(4096);
+                    let mut v = Vec::with_capacity(n);
+                    for k in 0..n as u32 {
+                        v.push(self.soc.read8(buf.wrapping_add(k)) as u8);
+                    }
+                    restage = Some(v);
+                }
                 break;
             }
         }
+        // TEMP (2026-10-03, forensics — DELETE after): PS snapshot at
+        // synthetic-loop exit (pre-restore): EXCM set ⇒ aborted inside a
+        // vector handler (firmware overflow path); clear ⇒ wild branch
+        // into handler code from task context.
+        self.last_recv_ps = Some((
+            self.cpu[core].sreg(xtensa_core::cpu::SR_PS),
+            self.cpu[core].sreg(xtensa_core::cpu::SR_EPC1),
+            self.cpu[core].windowbase(),
+        ));
         let ok = self.cpu[core].pc == 0x4000_0000;
         let cpu = &mut self.cpu[core];
         cpu.pc = saved_pc;
         *cpu.phys_regs_mut() = saved_phys;
+        for (k, w) in saved_sregs.iter().enumerate() {
+            cpu.set_sreg(k as u32, *w);
+        }
         cpu.set_sreg(xtensa_core::cpu::SR_INTENABLE, saved_ie);
         cpu.set_windowbase(saved_wb);
+        // RESTAGE-ON-ABORT tail (2026-10-04, DELETE after): re-queue the
+        // faulted packet (level-triggered retry when quiescent). No
+        // restage on success (ok) or 10k-cap (no abort record — handler
+        // pathology, not a transient race).
+        if !ok
+            && self.last_recv_abort.is_some()
+            && let Some(frame) = restage.take()
+            && !frame.is_empty()
+        {
+            self.soc.bt_hci_inject_rx(&frame);
+        }
         ok
     }
 
@@ -905,6 +1205,94 @@ impl Esp32S3 {
         cpu.set_windowbase(saved_wb);
     }
 
+    /// Run the registered promiscuous sniffer callback IN FIRMWARE on
+    /// `core` with one staged virtual-AP beacon (host frontend — the
+    /// run_flash LLMAC leg; the packet bytes were staged by
+    /// `Soc::llmac_stage_beacon`).
+    ///
+    /// Same 2-arg call8-frame synthesis as `run_ble_host_recv`:
+    /// `cb(buf, WIFI_PKT_MGMT)` with the fake-RETW at 0x4000_0000, full
+    /// physical-window save/restore + INTENABLE mask (the sniffer parses
+    /// IEs and touches Arduino `String`/heap state — thousands of
+    /// instructions deep, same overflow discipline). Runs on core 0:
+    /// core 1's post-setup stack proved wild for deep synthetic calls
+    /// (proven live 2026-10-03: a core-1 `host_rcv_pkt` delivery wedged
+    /// core1 at the exception vector with sp=0x1800, while core 0 keeps
+    /// a valid task SP through the same window).
+    ///
+    /// Returns true when a beacon was delivered (callback ran to `retw`);
+    /// false when idle (no callback yet, or no beacons armed).
+    pub fn run_wifi_promisc_cb(&mut self, core: usize) -> bool {
+        let entry = self.soc.llmac_promisc_cb();
+        if !(0x4000_0000..0x4240_0000).contains(&entry) {
+            // No callback yet — idle WITHOUT consuming the beacon (level,
+            // not edge: arming still holds it, so the next step retries
+            // once registration lands).
+            return false;
+        }
+        let Some((buf, ty)) = self.soc.llmac_stage_beacon() else {
+            return false;
+        };
+        let cpu = &mut self.cpu[core];
+        let saved_pc = cpu.pc;
+        let saved_wb = cpu.windowbase();
+        let saved_phys = *cpu.phys_regs();
+        // Save the FULL special-register file (256 words): the synthetic
+        // call's window-overflow/underflow vectors mutate WINDOWSTART
+        // (live-window liveness), PS (OWB/EXCM/INTLEVEL), EPC1/EXCCAUSE,
+        // SAR and the HW-loop regs — and the firmware spill/fill handlers
+        // manage WINDOWSTART via WSR. Restoring only the phys regs +
+        // WINDOWBASE leaves a stale liveness map: a later `retw` then
+        // skips its underflow fill and returns through a paint-filled
+        // slot (proven live 2026-10-03: identical canned-22B crash with
+        // the synth stack in place — spills were never the (only) vector;
+        // the wild `retw` through 0xa5a5a5a5 → 0x65a5a5a5 persisted).
+        // Restoring the whole file makes the call invisible by
+        // construction. Cost: 256 u32 copies per delivered packet
+        // (packets are rare).
+        let mut saved_sregs = [0u32; 256];
+        for (k, w) in saved_sregs.iter_mut().enumerate() {
+            *w = cpu.sreg(k as u32);
+        }
+        let saved_ie = cpu.sreg(xtensa_core::cpu::SR_INTENABLE);
+        cpu.set_sreg(xtensa_core::cpu::SR_INTENABLE, 0);
+        let wb = (saved_wb + 2) & 0xf;
+        cpu.set_windowbase(wb);
+        // WINDOWSTART isolation (same class as run_ble_host_recv 2026-10-03):
+        // stale firmware liveness from wb+2 looks nearly full → immediate
+        // overflow into firmware vectors with stale phys spill bases.
+        cpu.set_sreg(xtensa_core::cpu::SR_WINDOW_START, 1u32 << wb);
+        cpu.pc = entry;
+        cpu.set_reg(8, 0x4000_0000);
+        cpu.set_reg(10, buf);
+        cpu.set_reg(11, ty);
+        // Run on the host-owned synthetic stack (see SYNTH_STACK_TOP):
+        // the sniffer parses IEs over Arduino heap state thousands of
+        // insns deep — its spills must not land on the interrupted task's
+        // stack (same wild-`retw` class the BLE path hit). The full-phys
+        // restore below brings back the firmware SP.
+        cpu.set_reg(1, SYNTH_STACK_TOP);
+        for _ in 0..10_000 {
+            let r = self.cpu[core].step_one(&mut self.soc);
+            if self.cpu[core].pc == 0x4000_0000 {
+                break;
+            }
+            if !matches!(r, StepResult::Ok | StepResult::Exception { cause: 32..=37 }) {
+                break;
+            }
+        }
+        let ok = self.cpu[core].pc == 0x4000_0000;
+        let cpu = &mut self.cpu[core];
+        cpu.pc = saved_pc;
+        *cpu.phys_regs_mut() = saved_phys;
+        for (k, w) in saved_sregs.iter().enumerate() {
+            cpu.set_sreg(k as u32, *w);
+        }
+        cpu.set_sreg(xtensa_core::cpu::SR_INTENABLE, saved_ie);
+        cpu.set_windowbase(saved_wb);
+        ok
+    }
+
     /// Re-run the boot sequence from the last loaded flash image.  Used when a
     /// peripheral (WDT) triggers a system reset.
     pub fn reset(&mut self) {
@@ -933,12 +1321,19 @@ impl Esp32S3 {
         let wifi_fixture = self.soc.snapshot_wifi_fixture_runtime();
         let wifi_image = self.soc.wifi_image;
         let wifi_layout = self.soc.wifi_layout_cells();
+        // Closed-RF hook gate is host arming, not DRAM — the fresh SoC
+        // defaults it off, so carry it over like `wifi_image` (otherwise
+        // the first post-reboot recalibration jumps wild).
+        let wifi_phyfuns_arm = self.soc.wifi_phyfuns_armed();
         self.soc = Soc::new();
         self.soc.restore_efuse(efuse);
         self.soc.restore_psram(psram);
         self.soc.restore_rtc(rtc);
         self.soc.restore_wifi_fixture_runtime(wifi_fixture);
         self.soc.wifi_image = wifi_image;
+        if wifi_phyfuns_arm {
+            self.soc.wifi_phyfuns_gate_enable();
+        }
         self.soc.wifi_layout_restore(wifi_layout);
         self.asleep = false;
         self.boot_denied = false;

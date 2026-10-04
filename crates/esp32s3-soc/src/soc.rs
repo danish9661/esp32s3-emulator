@@ -275,31 +275,6 @@ pub struct WifiFixtureRuntime {
     espnow_a4: Option<(u32, u32)>,
     espnow_call: Option<(u32, u32, u32)>,
     fixture_st: Option<WifiFixtureState>,
-    /// Live-completed phyFuns slot (table base + filled word): the RF
-    /// dispatch-table completion is a DRAM write like any other, so a
-    /// WDT/system reset (fresh `Soc::new()` + loader re-copy) WIPES it —
-    /// and after the wipe the pointer cell already holds the published
-    /// pointer, so the word-store hook never re-fires and the first
-    /// post-reboot recalibration jumps wild (proven live: L3+gateway
-    /// ILLEGAL @ EPC1 0x4022d8b8 on the SECOND boot, i.e. after the
-    /// core-0 Unknown-reason WDT reset at ~21M steps — the first boot's
-    /// completion died with the old SoC). Restoring the word here makes
-    /// the completion reset-persistent, exactly like the table fill itself
-    /// (which the loader re-copies from flash... no — the fill re-RUNS
-    /// post-reboot and re-publishes; but the publish store hits the same
-    /// already-published cell value, and the hook fires on the STORE, not
-    /// the value change — wait, it DOES re-fire (every publish completes,
-    /// idempotent). Hmm — then why did the second boot crash? Because the
-    /// re-published pointer names the NEW table, whose 0x160 probe reads
-    /// garbage until the ROM fill covers it — the dangling-table guard
-    /// (correctly) refuses the early publish, and NO later publish ever
-    /// comes (the fill publishes once). So the restore below is what
-    /// completes the real table post-reboot: it re-applies the proven
-    /// completion to the CURRENT table. `None` = no completion yet (first
-    /// boot pre-fill) — restore is then a no-op. The word is re-validated
-    /// on restore (table still DRAM, slot still in range) so a stale
-    /// snapshot can never corrupt a relinked image.
-    phyfuns_completed: Option<(u32, u32)>,
 }
 
 /// An armed Wi-Fi fixture run: parsed AP list + fixed LAN + engine state.
@@ -575,8 +550,18 @@ pub struct Soc {
     /// Self-contained Wi-Fi fixture engine (browser/bridge path — mirrors
     /// the run_flash host blocks; see `wifi_fixture_*` below). `None` =
     /// no fixture armed (firmware runs unmodified, like silicon with no
-    /// AP in range).
+    /// AP in range). run_flash NEVER arms this (its host blocks are the
+    /// sole leg driver there).
     wifi_fixture: Option<WifiFixture>,
+    /// Host-side completion count (forensics: proves the hook fired on a
+    /// given image — e.g. wifi-scan must show >= 1 by DONE).
+    phyfuns_completed_count: u32,
+    /// Closed-RF dispatch-table hook gate (see
+    /// `maybe_complete_phyfuns_slot`): host-armed on every Wi-Fi run,
+    /// independent of the fixture engine above. run_flash arms it
+    /// directly (its host blocks own the legs); the bridge arms it via
+    /// `wifi_fixture_*` (which set it alongside the engine).
+    wifi_phyfuns_arm: bool,
     /// I2S audio controllers (I2S0 @ 0x6000F000, I2S1 @ 0x6002D000).
     /// Functional model: TX/RX FIFO + serial shift-out onto GPIO-matrix
     /// signals (BCK/WS/SD).
@@ -694,6 +679,58 @@ pub struct Soc {
     /// `net_rx_last_buf`).
     net_rx_last_len: u32,
 
+    /// Full-802.11-LL-MAC slice-1 leg (promiscuous sniffer + raw TX tap,
+    /// `esp32s3_llmac` sketch, `WIFI_LLMAC=1`): `llmac_armed` gates both
+    /// tap arms (fixed LLMAC-ELF pcs — never fires on other images, same
+    /// discipline as the `wifi_phyfuns_arm` gate); `llmac_tx` holds
+    /// captured `esp_wifi_80211_tx` frames (bounded: last 8, oldest
+    /// evicted — the sketch sends one); `llmac_promisc_cb` is the
+    /// firmware's registered promiscuous callback (captured at the
+    /// `esp_wifi_set_promiscuous_rx_cb` entry, 0 = not yet registered);
+    /// `llmac_beacons_left` counts virtual-AP beacons still to inject
+    /// (host stages one per step via `run_wifi_promisc_cb`).
+    llmac_armed: bool,
+    llmac_tx: Vec<alloc::vec::Vec<u8>>,
+    llmac_promisc_cb: u32,
+    llmac_beacons_left: u32,
+
+    /// Last VHCI TX tap (live pool_cmd mbuf + len) for the
+    /// post-connection command-ack leg (see `bt_hci_capture_tx`).
+    ble_last_tx: Option<(u32, u32)>,
+    /// Opcode of the last captured command frame (bytes 1-2, read at
+    /// capture time while the static tap buffer holds them — the buffer
+    /// is REUSED across commands and later recycled by the heap, so a
+    /// late re-read observes phantom opcodes, proven live 2026-10-03).
+    /// 0 = none yet.
+    ble_last_op: u32,
+    /// Capture sequence number: bumped on every VHCI TX tap. The canned
+    /// controller (run_flash forensics) serves one CC per command — the
+    /// tap buffer is STATIC (0x3fcb12b0, reused across commands), so the
+    /// address alone can't distinguish fresh commands from recycled
+    /// bytes (proven live: phantom opcodes 0x2008/0x0c03 re-served from
+    /// stale content). Compare against `ble_last_tx_seq` instead.
+    ble_tx_seq: u64,
+    /// True once the first async controller frame (non-CC event/ACL) has
+    /// been DELIVERED into the firmware (run_flash sets it): before that
+    /// point every Command Complete is a ROM-loopback duplicate (drop);
+    /// after it, CCs belong to post-connection commands the ROM never
+    /// sees (deliver via the async event path — the firmware's opcode
+    /// dispatch matches them to the parked waiter itself).
+    /// Proven live 2026-10-03: the conn-complete handler sends
+    /// LE-Set-Adv-Enable(0) and stalls forever without its CC (no app
+    /// `onConnect`, no ATT response) — the ROM loopback only answers the
+    /// init sequence. (An earlier direct-ack design wrote the CC over the
+    /// tap mbuf — wrong: `ble_hci_trans_hs_cmd_tx` frees it at send,
+    /// objdump 0x420052e5 — so the tap address names recycled memory by
+    /// arrival time; the helper stays parked for other images.)
+    ble_link_up: bool,
+    /// TEMP (2026-10-03): event-dispatch tracer switch (DELETE after).
+    ble_trace_evt: bool,
+    /// TEMP (2026-10-03): event-dispatch trace ring (DELETE after).
+    ble_trace: [(u32, u32, u32, u32); 16],
+    /// TEMP (2026-10-03): trace ring cursor (DELETE after).
+    ble_trace_idx: usize,
+
     /// Block-boundary cache for block-at-a-time execution (machine
     /// `step_fast`): per core, `fast_tag[c][i]` is the block-start pc
     /// (`FAST_TAG_INVALID` = empty) and `fast_len[c][i]` the instruction
@@ -797,6 +834,8 @@ impl Soc {
             wifi_espnow_call: None,
             wifi_espnow_a4: None,
             wifi_fixture: None,
+            wifi_phyfuns_arm: false,
+            phyfuns_completed_count: 0,
             lcd_cam: LcdCam::new(),
             appcpu_ctrl_a: 0,
             sys_clk_en0: 0xF9C1_E06F,
@@ -818,6 +857,17 @@ impl Soc {
             net_rx_dropped: 0,
             net_rx_last_buf: 0,
             net_rx_last_len: 0,
+            llmac_armed: false,
+            llmac_tx: Vec::new(),
+            llmac_promisc_cb: 0,
+            llmac_beacons_left: 0,
+            ble_last_tx: None,
+            ble_tx_seq: 0,
+            ble_last_op: 0,
+            ble_link_up: false,
+            ble_trace_evt: false,
+            ble_trace: [(0, 0, 0, 0); 16],
+            ble_trace_idx: 0,
             fast_tag: [
                 Box::new([FAST_TAG_INVALID; FAST_CACHE_SIZE]),
                 Box::new([FAST_TAG_INVALID; FAST_CACHE_SIZE]),
@@ -2336,12 +2386,28 @@ impl Soc {
         self.wifi_ip_event_var = Some(l.ip_event_var);
     }
 
+    /// Arm the closed-RF dispatch-table hook gate without arming the
+    /// fixture engine (run_flash path: the host blocks own every leg, so
+    /// the engine must stay `None` — but the hook still needs its gate,
+    /// which is fixture-independent by design).
+    pub fn wifi_phyfuns_gate_enable(&mut self) {
+        self.wifi_phyfuns_arm = true;
+    }
+
+    /// Read back the hook gate (reset preservation in machine.rs — the
+    /// fresh `Soc::new()` defaults it off, so the machine carries it over
+    /// like `wifi_image`).
+    pub fn wifi_phyfuns_armed(&self) -> bool {
+        self.wifi_phyfuns_arm
+    }
+
     /// Arm the scan fixture: `aps_spec` is `WIFI_SCAN_APS`
     /// (`ssid,rssi,chan,bssid[;...]`, empty = empty air). Idempotent
     /// pre-boot setup (no stepping yet — the engine fires on firmware pcs
     /// like the run_flash blocks do).
     pub fn wifi_fixture_scan(&mut self, aps_spec: &str) {
         let aps = crate::wifi::parse_scan_fixtures(aps_spec);
+        self.wifi_phyfuns_arm = true;
         self.wifi_fixture = Some(WifiFixture {
             aps,
             ip: [192, 168, 4, 2],
@@ -2361,6 +2427,7 @@ impl Soc {
         if aps.is_empty() {
             aps = crate::wifi::parse_scan_fixtures("EmuNet,-50,6,02:11:22:33:44:55");
         }
+        self.wifi_phyfuns_arm = true;
         self.wifi_fixture = Some(WifiFixture {
             aps,
             ip: [192, 168, 4, 2],
@@ -2385,6 +2452,7 @@ impl Soc {
         let pn = passphrase.len().min(64);
         let mut pass_b = [0u8; 64];
         pass_b[..pn].copy_from_slice(&passphrase.as_bytes()[..pn]);
+        self.wifi_phyfuns_arm = true;
         self.wifi_fixture = Some(WifiFixture {
             aps: crate::wifi::parse_scan_fixtures(""),
             ip: [192, 168, 4, 1],
@@ -2402,6 +2470,7 @@ impl Soc {
     /// sketch's `send()` returned (gated on the `sent 1` UART marker by
     /// the host — see run_flash WIFI_ESPNOW_LOOPBACK notes).
     pub fn wifi_fixture_espnow(&mut self) {
+        self.wifi_phyfuns_arm = true;
         self.wifi_fixture = Some(WifiFixture {
             aps: crate::wifi::parse_scan_fixtures(""),
             ip: [192, 168, 4, 2],
@@ -2433,15 +2502,14 @@ impl Soc {
     }
 
     /// Per-op pre-step fixture sample (machine `run_fast_core` hook —
-    /// same point as the TX-tap/delete-site arms). Arms transient-entry
-    /// legs the post-step poll can never observe (notably the STA dwell
-    /// at `esp_wifi_connect`: a callee entry the ENTRY op advances past
-    /// before any post-step sample — proven live on worker-L3 2026-10-01
-    /// where the post-step-only engine never armed and the run printed
-    /// NO AP). Idempotent (arm-once latch inside); no-op while no
-    /// fixture is armed. ONLY arms — completions stay in the post-step
-    /// poll (they need queue/heap borrows + UART bytes the pre-op point
-    /// cannot provide).
+    /// same point as the TX-tap/delete-site arms). Arms the transient
+    /// `esp_wifi_connect` STA dwell the post-step poll cannot reliably
+    /// observe: a callee entry the ENTRY op advances past before any
+    /// post-step sample — proven live on worker-L3 2026-10-01 where the
+    /// post-step-only engine never armed (run printed NO AP). Idempotent
+    /// (arm-once latch inside); no-op while no fixture is armed. ONLY arms
+    /// — completions stay in the post-step poll (they need queue/heap
+    /// borrows + UART bytes the pre-op point cannot provide).
     pub fn wifi_fixture_poll_pre(&mut self, pc: u32) {
         let Some(fx) = self.wifi_fixture.clone() else {
             return;
@@ -3615,19 +3683,25 @@ impl Soc {
     /// Stage one host→board Ethernet frame for injection (gateway→board
     /// replies: ARP/DHCP/IPv6/gVisor returns read off the NET_GW TCP leg,
     /// or test bytes pushed by a unit test). FIFO, bounded at 8 frames —
-    /// excess drops increment `net_rx_dropped` (host-visible, so the
-    /// bridge dropping under load is observable, not silent). Empty
-    /// frames are ignored (a zero-length `esp_netif_receive` is a no-op
-    /// on silicon too). Queues an `EVT_NET_FRAME` event with `a` = 1
-    /// (host→board RX) so event-driven hosts (browser bridge) observe
-    /// the reply without polling.
+    /// overflow evicts the OLDEST (ring overwrite) so the queue always
+    /// holds the 8 freshest replies; evictions increment `net_rx_dropped`
+    /// (host-visible, so the bridge dropping under load is observable, not
+    /// silent). Oldest-out is load-bearing for the re-TX spray discipline
+    /// the worker sketches use (15 TX rounds staging duplicate replies
+    /// with a 4-pop verdict scan — proven live 2026-10-03: drop-newest
+    /// parked 8 stale SYN-ACKs at the head and every later verdict missed
+    /// while the gateway answered correctly). Empty frames are ignored (a
+    /// zero-length `esp_netif_receive` is a no-op on silicon too). Queues
+    /// an `EVT_NET_FRAME` event with `a` = 1 (host→board RX) so
+    /// event-driven hosts (browser bridge) observe the reply without
+    /// polling.
     pub fn net_inject_rx(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
         if self.pending_net_rx.len() >= 8 {
+            self.pending_net_rx.remove(0);
             self.net_rx_dropped += 1;
-            return;
         }
         let mut v = alloc::vec::Vec::with_capacity(bytes.len());
         v.extend_from_slice(bytes);
@@ -3703,12 +3777,18 @@ impl Soc {
     /// via [`Soc::bt_hci_take_tx`] and forwards them length-prefixed to
     /// the Bumble bridge. Same no-panic discipline as `net_capture_tx`.
     ///
+    /// Records the live tap (`ble_last_tx`): NimBLE serializes HCI
+    /// commands behind `ble_hs_hci_sem`, so at most one command mbuf is
+    /// checked out at a time — the run_flash post-connection ack leg
+    /// (`ble_ack_deliver_at`) needs exactly these args when the waiter
+    /// parks (the tap fires at send-entry, before the waiter exists).
+    ///
     /// FLOW-CONTROL NOTE: the closed `API_vhci_host_send_packet` descends
     /// into the controller's function-pointer tables, which read 0 on the
     /// emulator and return an error the NimBLE TX path tolerates — the
     /// packet would otherwise never reach the bridge. The machine
     /// therefore captures at the `esp_vhci_host_send_packet` ENTRY
-    /// (0x42025f90, BLE image only) BEFORE the call runs. NO semaphore
+    /// (0x42026088, BLE image only) BEFORE the call runs. NO semaphore
     /// give is modeled here: NimBLE's `ble_hci_trans_hs_cmd_tx` DOES take
     /// `vhci_send_sem` before every send, but that take has a ~2s timeout
     /// and `esp_nimble_hci_init` pre-gives the semaphore — and more
@@ -3729,6 +3809,18 @@ impl Soc {
         }
         let blen = frame.len();
         self.ble.capture_tx(&frame);
+        self.ble_last_tx = Some((data, len));
+        // Saturating (never wraps): `ble_link_up_seq` comparisons stay
+        // monotonic forever, and debug builds never panic on overflow.
+        // Wrapping would be wrong here — after a wrap, `tx_seq >
+        // link_up_seq` goes false and the V2 leg would starve a parked
+        // waiter into a 2s-timeout sched_reset.
+        self.ble_tx_seq = self.ble_tx_seq.saturating_add(1);
+        self.ble_last_op = if frame.len() >= 3 && frame[0] == 0x01 {
+            (frame[1] as u32) | ((frame[2] as u32) << 8)
+        } else {
+            0
+        };
         self.events.push(EmuEvent {
             kind: EVT_BLE_HCI,
             a: 0, // 0 = host→controller TX
@@ -3741,6 +3833,67 @@ impl Soc {
     /// forward the bytes length-prefixed to the Bumble bridge.
     pub fn bt_hci_take_tx(&mut self) -> Vec<u8> {
         self.ble.take_tx()
+    }
+
+    /// Last VHCI TX tap args (machine/run_flash frontend for the
+    /// post-connection ack leg).
+    pub fn ble_last_tx(&self) -> Option<(u32, u32)> {
+        self.ble_last_tx
+    }
+
+    /// Capture sequence number (see `ble_tx_seq`).
+    pub fn ble_tx_seq(&self) -> u64 {
+        self.ble_tx_seq
+    }
+
+    /// Opcode of the last captured command (see `ble_last_op`; 0 when the
+    /// last frame wasn't a command).
+    pub fn ble_last_op(&self) -> u32 {
+        self.ble_last_op
+    }
+
+    /// Whether the link is up (first async frame delivered — see the
+    /// `ble_link_up` field docs). The run_flash RX leg sets it; the ack
+    /// leg and the CC-drop policy read it.
+    pub fn ble_link_up(&self) -> bool {
+        self.ble_link_up
+    }
+
+    /// Mark the link up (run_flash frontend — call when the first async
+    /// controller frame is delivered into the firmware).
+    pub fn ble_mark_link_up(&mut self) {
+        self.ble_link_up = true;
+    }
+
+    /// TEMP (2026-10-03): event-dispatch tracer switch (DELETE after).
+    /// run_flash sets it in canned mode; the machine's per-op watch
+    /// prints entry regs at the evt-dispatch pcs to locate the CC drop.
+    pub fn ble_trace_evt(&self) -> bool {
+        self.ble_trace_evt
+    }
+
+    /// TEMP (2026-10-03): set the tracer switch (DELETE after).
+    pub fn set_ble_trace_evt(&mut self, on: bool) {
+        self.ble_trace_evt = on;
+    }
+
+    /// TEMP (2026-10-03): event-dispatch trace ring (DELETE after).
+    /// Last 16 (entry pc, x, y, z) quadruples recorded by the machine
+    /// watch (caller-window args; for the port_run ev_cb site x=handler
+    /// a8, y=ev a2, z=a3).
+    pub fn ble_trace_push3(&mut self, pc: u32, x: u32, y: u32, z: u32) {
+        self.ble_trace[self.ble_trace_idx % 16] = (pc, x, y, z);
+        self.ble_trace_idx += 1;
+    }
+
+    /// TEMP (2026-10-03): dump the trace ring (DELETE after). Oldest first.
+    pub fn ble_trace_dump(&self) -> alloc::vec::Vec<(u32, u32, u32, u32)> {
+        let mut v = alloc::vec::Vec::new();
+        let n = self.ble_trace_idx.min(16);
+        for k in 0..n {
+            v.push(self.ble_trace[(self.ble_trace_idx + k) % 16]);
+        }
+        v
     }
 
     /// Stage one controller→firmware HCI packet for injection (Bumble
@@ -3863,7 +4016,16 @@ impl Soc {
             return None;
         }
         let frame = self.ble.take_rx()?;
-        if frame.is_empty() || frame[0] != 0x04 {
+        if frame.is_empty() {
+            return None;
+        }
+        // Non-event heads (ACL data, LE reports queued as raw frames)
+        // belong to the async `host_rcv_pkt` path, NOT the command-ack
+        // path — re-queue instead of dropping (proven live 2026-10-03:
+        // the ack leg ate a staged ATT response during GATT discovery and
+        // the central timed out with the bytes gone).
+        if frame[0] != 0x04 {
+            self.ble.inject_rx(&frame);
             return None;
         }
         // GATE 2 — opcode match: CC echoes the command opcode at EVT
@@ -3908,6 +4070,99 @@ impl Soc {
         }
         self.write32(sem + 56, mw + 1);
         self.queue_unblock_receiver(sem)
+    }
+
+    /// Complete a parked command waiter with a synthesized status-0
+    /// Command Complete, WITHOUT touching the RX FIFO (run_flash
+    /// post-link_up frontend — see below). Returns the woken TCB.
+    ///
+    /// WHY NOT the event path: post-connection CCs delivered as events
+    /// are silently dropped by the firmware's opcode dispatch (proven
+    /// live 2026-10-03: adv-disable + rd-rem-ver CCs flow through
+    /// `host_rcv_pkt` → enqueue → task, yet the waiter still times out
+    /// with "HCI wait for ack returned 19" → `ble_hs_sched_reset`). WHY
+    /// NOT `ble_ack_deliver_at` (write over the tap mbuf): this image
+    /// frees the command mbuf at send (`ble_hci_trans_hs_cmd_tx`,
+    /// objdump 0x420052e5), so the tap address names recycled memory by
+    /// arrival time (proven live: `inrange=false want=0x0000` — the tap
+    /// is a reused static buffer at 0x3fcb12b0).
+    ///
+    /// Instead this mirrors what silicon's controller path leaves behind:
+    /// a FRESH ev-pool block holding the stripped CC bytes, `ble_hs_hci_
+    /// ack` pointing at it, and the sem released. The waiter validates
+    /// the opcode itself (mismatch → its own error 12, never silent
+    /// corruption) and frees the block back to the ev pool on waking, so
+    /// alloc/free stays paired 1:1 — the same pairing the event-carried
+    /// CC would have had, minus the broken dispatch hop.
+    ///
+    /// Caller fires at most once per waiter episode (gate on the ack
+    /// cell being empty — a set cell means an unconsumed completion is
+    /// already staged; refiring would leak the first block and double-
+    /// bump the counting sem so the NEXT pend returns without waiting).
+    /// `None` = sem missing, pool dry, or sem full (all retried
+    /// level-triggered by the caller; nothing is consumed on failure).
+    pub fn ble_ack_write_cc(&mut self, op: u32) -> Option<u32> {
+        use xtensa_core::Bus as _Bus;
+        const ACK_CELL: u32 = 0x3fc9_e2b4;
+        const SEM_CELL: u32 = 0x3fc9_e2b8;
+        const POOL_EVT: u32 = 0x3fc9_df6c;
+        // Peek gates FIRST (all read-only, zero mutation): the ack cell
+        // must be empty (else we'd overwrite a live completion), the sem
+        // must exist, the ev pool must have a free block under a live
+        // head, and the sem must have room. Single-threaded host: no
+        // firmware runs between peek and commit, so peeks stay valid.
+        if self.read32(ACK_CELL) != 0 {
+            return None;
+        }
+        let sem = self.read32(SEM_CELL);
+        if sem == 0 {
+            return None;
+        }
+        if self.read16(POOL_EVT + 6) == 0 {
+            return None;
+        }
+        let head = self.read32(POOL_EVT + 20);
+        if head == 0 {
+            return None;
+        }
+        let mw = self.read32(sem + 56);
+        if mw >= self.read32(sem + 60) {
+            return None;
+        }
+        // Gate the unblock on the same parked observation the caller
+        // used: unlink FIRST, before popping or staging anything. If no
+        // waiter is parked (timeout path unparked it first, or the
+        // caller's check raced a slow step), return None with ZERO side
+        // effects — no popped block, no staged cell, no sem bump — so a
+        // later command's waiter can never consume this completion as
+        // its own CC. Empty-queue is the only tolerated outcome.
+        let tcb = self.queue_unblock_receiver(sem)?;
+        // Commit (infallible from here — every precondition peeked
+        // above, and u32 IS the target pointer width: LX7 intptr_t is 32
+        // bits, so the freelist link is one word load, not byte math).
+        let next = self.read32(head);
+        self.write32(POOL_EVT + 20, next);
+        let free = self.read16(POOL_EVT + 6);
+        self.write16(POOL_EVT + 6, free - 1);
+        // Stripped CC bytes: evcode, len, num_pkts, op_lo, op_hi, status.
+        let bytes = [
+            0x0Eu8,
+            0x04,
+            0x01,
+            (op & 0xFF) as u8,
+            ((op >> 8) & 0xFF) as u8,
+            0x00,
+        ];
+        for (k, b) in bytes.iter().enumerate() {
+            self.write8(head + k as u32, *b as u32);
+        }
+        self.write32(ACK_CELL, head);
+        // Sem release (same counting-sem tail as `ble_ack_deliver_at`:
+        // ITEMSIZE is 0, so bump mw directly; the unblock above already
+        // proved a waiter exists, so this bump always pairs with its
+        // take — no silent mw-only bump).
+        self.write32(sem + 56, mw + 1);
+        Some(tcb)
     }
 
     /// Top up the pool_cmd free list at `ble_transport_alloc_cmd` ENTRY
@@ -4041,6 +4296,30 @@ impl Soc {
         self.ble.take_rx()
     }
 
+    /// Peek at the oldest staged controller→firmware HCI packet: (H4 type
+    /// byte, total length), WITHOUT consuming it. Lets the host apply
+    /// size gates before delivery (an oversized EVT would drive the
+    /// firmware's own `ble_hs_sched_reset` path — silicon-true but
+    /// run-ending; dropping it with a log is observable, resetting is
+    /// not).
+    pub fn bt_hci_peek_rx(&self) -> Option<(u8, usize)> {
+        self.ble.peek_rx()
+    }
+
+    /// Peek with the event sub-code: (H4 type, second byte if present,
+    /// total length), WITHOUT consuming. The run_flash BLE leg drops sync
+    /// Command Complete/Status here (0x04 0x0E / 0x04 0x0F — the REAL ROM
+    /// loopback synthesizes those itself into 0x3fcacfd6 and calls
+    /// `host_rcv_pkt` with its own buffer, so a bridge duplicate confuses
+    /// the NimBLE init state machine — proven live 2026-10-03: delivering
+    /// the first staged Reset CC wedged the boot in `panic_abort` right
+    /// after "BLE init 1"). Async events (LE Meta 0x3E, Disconnect 0x05,
+    /// …) and ACL (0x02) are NOT synthesized by the ROM and must be
+    /// delivered via `run_ble_host_recv`.
+    pub fn bt_hci_peek_rx_evt(&self) -> Option<(u8, Option<u8>, usize)> {
+        self.ble.peek_rx_evt()
+    }
+
     /// Queued BLE-reply count (host frontend — level-triggered deliver,
     /// see `ble_ack_sem`).
     pub fn bt_hci_rx_pending(&self) -> usize {
@@ -4067,6 +4346,33 @@ impl Soc {
         self.ble.rx_dropped()
     }
 
+    /// True once the NimBLE event-mbuf pool is initialized AND has a free
+    /// block (`ble_hs_hci_ev_pool` at 0x3fc9df6c, BLE image only — nm on
+    /// the esp32s3_ble ELF; layout from the vendored NimBLE
+    /// `os_mempool.h`: `mp_num_blocks` u16 @+4, `mp_num_free` u16 @+6).
+    /// Both host delivery paths must check this BEFORE invoking anything:
+    /// `host_rcv_pkt` allocates from this pool, and during controller init
+    /// the pool is still BSS-zero (or garbage) — an early delivery kills
+    /// the boot (proven live 2026-10-03: first staged Reset CC delivered
+    /// pre-"BLE init 1" wedged core1 at the exception vector; gating on
+    /// `ble_hs_enabled_state` did NOT help — it is set before the pool
+    /// exists). Replies staged while not ready stay queued (bounded FIFO +
+    /// drop counter); init-time CCs are redundant anyway (the ROM loopback
+    /// answers them firmware-side).
+    pub fn ble_evt_pool_ready(&mut self) -> bool {
+        use xtensa_core::Bus as _Bus;
+        let blocks = self.read16(0x3fc9_df6c + 4);
+        let free = self.read16(0x3fc9_df6c + 6);
+        blocks != 0 && free != 0
+    }
+
+    /// TEMP (2026-10-03): ev-pool free count for the wake-up forensics
+    /// (DELETE after). Did the queued 22B event ever get consumed?
+    pub fn ble_evt_pool_free(&mut self) -> u32 {
+        use xtensa_core::Bus as _Bus;
+        self.read16(0x3fc9_df6c + 6)
+    }
+
     /// Dropped-RX counter (host frontend for the NET_RX_DROPPED battery
     /// assertion): frames lost while the RX FIFO was full.
     pub fn net_rx_dropped(&self) -> u32 {
@@ -4081,6 +4387,123 @@ impl Soc {
     /// Last RX-staged length (unit-test observability).
     pub fn net_rx_last_len(&self) -> u32 {
         self.net_rx_last_len
+    }
+
+    /// Arm the full-802.11-LL-MAC slice-1 leg (`esp32s3_llmac` sketch,
+    /// `WIFI_LLMAC=1`): gates the fixed-pc tap arms (TX capture at
+    /// 0x42052404, promiscuous-callback capture at 0x420643ec — nm on the
+    /// llmac ELF; unarmed on every other image so the arms can never
+    /// misfire, same discipline as `wifi_phyfuns_arm`).
+    pub fn llmac_arm(&mut self) {
+        self.llmac_armed = true;
+    }
+
+    /// Read back the LLMAC arm gate (reset preservation + machine gates).
+    pub fn llmac_armed(&self) -> bool {
+        self.llmac_armed
+    }
+
+    /// Capture one `esp_wifi_80211_tx` frame (machine TX-tap frontend —
+    /// caller buffer at (`ptr`, `len`), capped at 1600B like the net tap).
+    /// Bounded: last 8 frames (the sketch sends one; oldest evicted).
+    pub fn llmac_capture_tx(&mut self, ptr: u32, len: u32) {
+        use xtensa_core::Bus as _Bus;
+        let n = (len as usize).min(1600);
+        let mut v = alloc::vec::Vec::with_capacity(n);
+        for k in 0..n {
+            v.push(self.read8(ptr + k as u32) as u8);
+        }
+        if self.llmac_tx.len() >= 8 {
+            self.llmac_tx.remove(0);
+        }
+        self.llmac_tx.push(v);
+    }
+
+    /// Pop the oldest captured 802.11 TX frame (host assertion frontend).
+    pub fn llmac_take_tx(&mut self) -> Option<alloc::vec::Vec<u8>> {
+        if self.llmac_tx.is_empty() {
+            None
+        } else {
+            Some(self.llmac_tx.remove(0))
+        }
+    }
+
+    /// Captured-TX count (host frontend — level-triggered log, no polling
+    /// cost when 0).
+    pub fn llmac_tx_pending(&self) -> usize {
+        self.llmac_tx.len()
+    }
+
+    /// Record the firmware's promiscuous callback (machine frontend —
+    /// captured at the `esp_wifi_set_promiscuous_rx_cb` entry; 0 = not
+    /// yet registered, in which case beacons stay staged).
+    pub fn llmac_set_promisc_cb(&mut self, cb: u32) {
+        self.llmac_promisc_cb = cb;
+    }
+
+    /// The registered promiscuous callback (run_flash RX leg frontend).
+    pub fn llmac_promisc_cb(&self) -> u32 {
+        self.llmac_promisc_cb
+    }
+
+    /// Stage virtual-AP beacons still to inject (host frontend — the
+    /// sketch waits for 3; one is delivered per step via
+    /// `run_wifi_promisc_cb`).
+    pub fn llmac_arm_beacons(&mut self, n: u32) {
+        self.llmac_beacons_left = n;
+    }
+
+    /// Beacons left to inject (host frontend).
+    pub fn llmac_beacons_left(&self) -> u32 {
+        self.llmac_beacons_left
+    }
+
+    /// Stage one virtual-AP beacon as a `wifi_promiscuous_pkt_t` (machine
+    /// frontend — the run_flash RX leg stages then runs the registered
+    /// callback IN FIRMWARE via `run_wifi_promisc_cb`). Layout: 48-byte
+    /// S3 `wifi_pkt_rx_ctrl_t` (channel 6, sig_len = beacon length,
+    /// rx_state 0, RSSI -50) + 56-byte 802.11 beacon (BSSID
+    /// 02:11:22:33:44:55, SSID "EmuAP", DS channel 6). Staged at
+    /// `WIFI_SCRATCH + 0x3600` (past the BLE_RX 0x2500..0x3500 window;
+    /// next use is the ard pool at +0x10000). Returns `(buf, type)` with
+    /// type = WIFI_PKT_MGMT (0). `None` while no beacons are armed
+    /// (firmware then observes quiet air, like silicon with no AP).
+    pub fn llmac_stage_beacon(&mut self) -> Option<(u32, u32)> {
+        use xtensa_core::Bus as _Bus;
+        if self.llmac_beacons_left == 0 {
+            return None;
+        }
+        const BASE: u32 = Soc::WIFI_SCRATCH + 0x3600;
+        // rx_ctrl words (S3 layout — see `esp_wifi_types_native.h`):
+        // w0: rssi(-50) | rate(0) | sig_mode(0); w2: channel 6 @ bits 19:16.
+        let mut ctrl = [0u32; 12];
+        ctrl[0] = 0xCE; // rssi -50 as u8
+        ctrl[2] = 6 << 16; // channel 6
+        const BEACON: &[u8] = &[
+            0x80, 0x00, 0x00, 0x00, // FC beacon + duration
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // DA broadcast
+            0x02, 0x11, 0x22, 0x33, 0x44, 0x55, // SA BSSID
+            0x02, 0x11, 0x22, 0x33, 0x44, 0x55, // BSSID
+            0x00, 0x00, // seq
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // timestamp
+            0x64, 0x00, // interval 100 TU
+            0x01, 0x00, // caps ESS
+            0x00, 0x05, 0x45, 0x6D, 0x75, 0x41, 0x50, // SSID "EmuAP"
+            0x01, 0x08, 0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24, // rates
+            0x03, 0x01, 0x06, // DS channel 6
+        ];
+        ctrl[11] = (BEACON.len() as u32) & 0xFFF; // sig_len, rx_state 0
+        for (i, w) in ctrl.iter().enumerate() {
+            let b = w.to_le_bytes();
+            for (j, byte) in b.iter().enumerate() {
+                self.write8(BASE + (i * 4 + j) as u32, *byte as u32);
+            }
+        }
+        for (k, b) in BEACON.iter().enumerate() {
+            self.write8(BASE + 48 + k as u32, *b as u32);
+        }
+        self.llmac_beacons_left -= 1;
+        Some((BASE, 0)) // type WIFI_PKT_MGMT = 0
     }
 
     /// Inject MISO bytes for the next SPI transfer on `chan`
@@ -4687,50 +5110,40 @@ impl Soc {
 
     /// Closed-RF dispatch-table completion (fired from the `write32`-fast-path
     /// store — the fill path is word-wise, so the aligned-word hook is the
-    /// only one that fires in practice). The heap-resident `g_phyFuns` table is filled by
-    /// `phy_get_romfunc_addr` + the ROM's `phy_get_romfuncs`, but slot
-    /// 0x24c (`crate::wifi::PHYFUNS_UNFILLED_OFF`) is written by NEITHER —
-    /// it keeps heap garbage and the first recalibration `callx8`s wild
-    /// (ILLEGAL, EPC1 = heap addr like 0x4022d8b8 — proven live on the
-    /// worker-L3 image, whose gateway legs run long enough to reach the
-    /// periodic recalibration; the plain-battery run exits before it).
-    /// Complete the slot on the store that publishes the table pointer
-    /// cell: per-image `g_phyFuns` BSS addr (exact cells in
-    /// `wifi_phyfuns_cell` — nm: scan 0x3fca0068, sta/worker-net/ap
-    /// 0x3fca0050, worker-l3 0x3fca0060, espnow 0x3fca0148; DRAM only,
-    /// so the hook can never misfire on MMIO or ROM).
-    /// The cell holds the table POINTER (heap addr); slot 0x24c of THAT
-    /// table gets RF_NOP_SLOT (a real-ROM `retw.n` — see memmap.rs; it must
-    /// NEVER name a glue address: any code planted in the QSORT..BOOT gap
-    /// shifts `pad_to(BOOT)` and misaligns the reset vector — hello ILLEGAL
-    /// at EPC1=0x4037a0a8). Fires on EVERY publish of a nonzero
-    /// pointer (no slot-content gate — the fill writes the pointer cell
-    /// BEFORE filling slots, so gating on slot content observes the
-    /// pre-fill value and never fires; and heap paint is 0x00/0xA5 only
-    /// before first use while garbage later is any stale pointer — proven
-    /// live: the wild jump read 0x4022d8b8, a stale pointer, not paint).
-    /// Re-publish re-completes (idempotent); no image reads the slot
-    /// before the fill publishes the pointer (boot-neutral); a future
-    /// image whose fill COVERS 0x24c writes the slot AFTER the publish,
-    /// so our value is harmlessly overwritten (last-writer-wins, same as
-    /// the sibling 0x160 slot the ROM fill covers today).
+    /// only one that fires in practice). The heap-resident `g_phyFuns` table
+    /// is filled by `phy_get_romfunc_addr` + the ROM's `phy_get_romfuncs`;
+    /// slot 0x24c (`crate::wifi::PHYFUNS_UNFILLED_OFF`) is covered by the
+    /// ROM fill with a ROM helper address (proven live 2026-10-03: with the
+    /// hook fully disabled the slot still read exactly RF_NOP_SLOT after
+    /// init — the fill wrote it, not us). The hook therefore re-asserts the
+    /// same value at publish time (idempotent same-value write): it repairs
+    /// the hypothetical fill that leaves the slot at heap garbage, and can
+    /// never corrupt anything else — the value written equals the fill's
+    /// own. (History: an earlier revision wrote 0x400003C9, the byte AFTER
+    /// a bare `retw`, onto the live table and wedged wifi-scan in EXCCAUSE
+    /// 0x22 at 0x40000461 — the recalibration ran the pad bytes + BOOT
+    /// prologue as a function. The slot must name the `entry`, and it does:
+    /// see `memmap::RF_NOP_SLOT`.)
+    /// Recalibration reads of a heap-clobbered slot are NOT fixed here —
+    /// long gateway runs overlap the table with lwIP buffers (proven live:
+    /// DNS bytes at tbl+0x22f), so the vulnerable `callx8` sites are skipped
+    /// at the machine layer instead (see machine.rs RF skip table).
     fn maybe_complete_phyfuns_slot(&mut self, aligned_addr: u32) {
         use xtensa_core::Bus as _Bus;
         // Boot-neutrality gate (hello ILLEGAL at EPC1=0x4037a0a8, 2026-10-02):
         // the completing write targets the table the pointer cell names, so
         // on an image with no `g_phyFuns` BSS cell the hook must not fire at
         // all. The ONLY images with such a cell are the Wi-Fi images, and
-        // every one of them runs with a fixture armed (run_flash arms from
-        // WIFI_SCAN_FIXTURE/WIFI_STA_CONN/WIFI_AP_FIXTURE/WIFI_ESPNOW_LOOPBACK;
-        // the bridge arms from wifi_*_fixture). Hello (BSS ends 0x3fc99398,
-        // proven via nm — no BSS in this window) runs fixture-less, and the
-        // default-constructed SoC (wifi_image=Scan, fixture=None) is exactly
-        // that state — so fixture-armed is the SOUND gate: it is true on
-        // precisely the images that link the cell, regardless of which
-        // WifiImage variant the host selected (a stale/wrong variant must
-        // never re-arm the hook — proven by the STA run dying when the gate
-        // keyed on the variant instead).
-        if self.wifi_fixture.is_none() {
+        // the host arms this gate on every Wi-Fi run: run_flash via
+        // `wifi_phyfuns_gate_enable` (gated on WIFI_SCAN_FIXTURE /
+        // WIFI_STA_CONN / WIFI_AP_FIXTURE / WIFI_ESPNOW_LOOPBACK), the
+        // bridge via `wifi_fixture_*` (which arm it alongside the engine).
+        // Hello (BSS ends 0x3fc99398, proven via nm — no `g_phyFuns` cell)
+        // never arms it. Deliberately NOT keyed on `wifi_image` (hello
+        // shares the default Scan variant) and NOT on the engine fixture
+        // (run_flash keeps the engine disarmed — its host blocks are the
+        // sole leg driver there).
+        if !self.wifi_phyfuns_arm && self.wifi_fixture.is_none() {
             return;
         }
         // Exact-cell gate: the publish store names the LIVE table exactly
@@ -4738,10 +5151,7 @@ impl Soc {
         // publishes the cell ONCE, after the table is allocated, so this
         // loses nothing — and a store ANYWHERE ELSE (BSS init of a
         // neighbor cell, an unrelated struct with the same address, a
-        // stale free) must NOT complete, since the named table is then
-        // dangling (the fill later publishes the real table elsewhere
-        // while our RF_NOP lands in garbage the recalibration `callx8`
-        // then jumps through).
+        // stale free) is ignored outright.
         if aligned_addr != self.wifi_phyfuns_cell() {
             return;
         }
@@ -4749,37 +5159,47 @@ impl Soc {
         if tbl == 0 || tbl & 3 != 0 || !in_range!(tbl, DRAM_BASE, SRAM_BASE_RANGE) {
             return;
         }
-        // DANGLING-TABLE GUARD (L3+gateway ILLEGAL at EPC1=0x4022d8b8,
-        // 2026-10-02): the pointer cell is BSS — it holds heap garbage until
-        // the fill publishes the REAL table pointer, and ANY word store to
-        // the cell in that window (BSS init, an unrelated struct with the
-        // same address, a stale free) completes a DANGLING table the fill
-        // later abandons: the fill writes the real slots elsewhere while our
-        // RF_NOP lands in garbage the recalibration `callx8` then jumps
-        // through (EPC1 = the garbage word, e.g. 0x4022d8b8 — a stale flash
-        // pointer, not paint). Proven live: the gateway run's table pointer
-        // read back a plausible-but-stale DRAM address whose slot 0x24c held
-        // 0x4022d8b8 at the crash. So the hook fires ONLY when the named
-        // table already looks fill-owned: slot 0x160 (which the ROM fill
-        // covers on every observed boot — the sibling slot `chip_v7_set_chan`
-        // reads, always a valid ROM address at every crash) must point into
-        // IROM. A table whose 0x160 slot is still garbage is not yet filled
-        // — leave it alone; the later publish (post-fill) re-fires the hook
-        // (every publish completes — idempotent) and completes the real
-        // table. This costs nothing on the happy path (one extra read32 per
-        // publish) and can never misfire: no image reads slot 0x24c before
-        // the fill publishes the pointer (boot-neutral), and a future image
-        // whose fill COVERS 0x24c overwrites our value after the publish
-        // (last-writer-wins).
-        let probe = self.read32(tbl + 0x160);
-        if !(0x4000_0000..0x4006_0000).contains(&probe) {
-            return;
+        // Sanity probe: complete only when slot 0x160 already looks
+        // fill-owned (a code address — the sibling slot `chip_v7_set_chan`
+        // reads). A pre-fill publish is harmlessly completed anyway: the
+        // value written equals the fill's own, so ordering is irrelevant;
+        // the probe exists only to avoid writing into garbage named by a
+        // stray non-fill store to the cell.
+        if Self::phyfuns_code_addr(self.read32(tbl + 0x160)) {
+            self.phyfuns_complete(tbl);
         }
-        let slot = tbl + crate::wifi::PHYFUNS_UNFILLED_OFF;
-        let o = (slot - DRAM_BASE) as usize;
-        if o + 4 <= self.sram.len() {
-            self.sram[o..o + 4].copy_from_slice(&crate::memmap::RF_NOP_SLOT.to_le_bytes());
+    }
+
+    /// True for plausible closed-RF code addresses (IROM text, IRAM
+    /// windows, or flash XIP text — the app fill slots hold `ram_*`
+    /// addresses from all three, e.g. 0x4207e9c8 / 0x403796b4). DRAM
+    /// pointers, small ints, and paint never match, so a heap-garbage
+    /// probe essentially never passes.
+    fn phyfuns_code_addr(v: u32) -> bool {
+        in_range!(v, IROM_BASE, IROM_SIZE)
+            || in_range!(v, IRAM_BASE, IRAM_WINDOW_SIZE)
+            || in_range!(v, FLASH_INST_BASE, FLASH_WINDOW_SIZE)
+    }
+
+    /// Write RF_NOP_SLOT into `tbl`+0x24c (bounds-checked; no-op when the
+    /// slot is out of DRAM — a stale snapshot can never corrupt a relinked
+    /// image). Direct sram copy (not via write32) so the hook never
+    /// re-fires on its own completion.
+    fn phyfuns_complete(&mut self, tbl: u32) {
+        let slot = tbl.wrapping_add(crate::wifi::PHYFUNS_UNFILLED_OFF);
+        if in_range!(slot, DRAM_BASE, SRAM_BASE_RANGE) {
+            let o = (slot - DRAM_BASE) as usize;
+            if o + 4 <= self.sram.len() {
+                self.sram[o..o + 4].copy_from_slice(&crate::memmap::RF_NOP_SLOT.to_le_bytes());
+                self.phyfuns_completed_count += 1;
+            }
         }
+    }
+
+    /// Forensics accessor: completed 0x24c writes so far. A Wi-Fi run
+    /// that reaches recalibration must show >= 1.
+    pub fn phyfuns_debug(&self) -> u32 {
+        self.phyfuns_completed_count
     }
 
     /// GPIO_IN readback with output loopback resolved to the actual driven
@@ -6699,41 +7119,6 @@ impl Soc {
     /// after the reboot; the ESP-NOW legs re-run from the UART marker,
     /// which persists in the host console stream).
     pub fn snapshot_wifi_fixture_runtime(&self) -> WifiFixtureRuntime {
-        // Live-completed phyFuns slot: re-derive the hook's fill from the
-        // LIVE cell (same exact-cell gate as the hook), so the completion
-        // survives the `Soc::new()` rebuild by value. Runs once per RESET,
-        // not per step, so the cost is nil.
-        let mut phyfuns_completed = None;
-        {
-            // `sram` is the plain DRAM backing (cell + table are DRAM by
-            // construction), so no MMIO/cache windows are involved.
-            let rd32 = |a: u32| {
-                let o = (a - DRAM_BASE) as usize;
-                if o + 4 > self.sram.len() {
-                    return 0;
-                }
-                u32::from_le_bytes([
-                    self.sram[o],
-                    self.sram[o + 1],
-                    self.sram[o + 2],
-                    self.sram[o + 3],
-                ])
-            };
-            let cell = self.wifi_phyfuns_cell();
-            let tbl = rd32(cell);
-            if tbl != 0
-                && tbl & 3 == 0
-                && in_range!(tbl, DRAM_BASE, SRAM_BASE_RANGE)
-                && in_range!(
-                    tbl + crate::wifi::PHYFUNS_UNFILLED_OFF,
-                    DRAM_BASE,
-                    SRAM_BASE_RANGE
-                )
-                && rd32(tbl + crate::wifi::PHYFUNS_UNFILLED_OFF) == crate::memmap::RF_NOP_SLOT
-            {
-                phyfuns_completed = Some((tbl, crate::memmap::RF_NOP_SLOT));
-            }
-        }
         WifiFixtureRuntime {
             ap_record: self.wifi_ap_record,
             ip_info: self.wifi_ip_info,
@@ -6744,7 +7129,6 @@ impl Soc {
             espnow_a4: self.wifi_espnow_a4,
             espnow_call: self.wifi_espnow_call,
             fixture_st: self.wifi_fixture.clone().map(|f| f.st),
-            phyfuns_completed,
         }
     }
 
@@ -6799,29 +7183,10 @@ impl Soc {
             // pre-op sample re-arms cleanly.
             slot.st.sta_just_armed = false;
         }
-        // Re-apply a live phyFuns completion wiped by the reset rebuild
-        // (see `WifiFixtureRuntime::phyfuns_completed`): the loader re-copy
-        // brings back the firmware but NOT our DRAM write, and the pointer
-        // cell already holds the published value so the word-store hook
-        // never re-fires. Re-validated (table still DRAM, slot in range)
-        // so a stale snapshot can never corrupt a relinked image; a `None`
-        // snapshot (no completion yet) is a no-op. Runs at reset time, when
-        // no firmware executes — ordering vs the fill is irrelevant (the
-        // fill re-publishes the same pointer and re-completes idempotently
-        // if it runs after us; if it already ran, our word is identical).
-        if let Some((tbl, word)) = s.phyfuns_completed
-            && tbl & 3 == 0
-            && in_range!(tbl, DRAM_BASE, SRAM_BASE_RANGE)
-            && word == crate::memmap::RF_NOP_SLOT
-        {
-            let slot = tbl + crate::wifi::PHYFUNS_UNFILLED_OFF;
-            if in_range!(slot, DRAM_BASE, SRAM_BASE_RANGE) {
-                let o = (slot - DRAM_BASE) as usize;
-                if o + 4 <= self.sram.len() {
-                    self.sram[o..o + 4].copy_from_slice(&word.to_le_bytes());
-                }
-            }
-        }
+        // No phyFuns state to restore: the hook is stateless (gate +
+        // exact-cell publish + idempotent same-value write). Post-reboot
+        // the fill re-covers slot 0x24c itself and re-publishes the cell,
+        // which re-fires the hook naturally.
     }
 
     /// Debug accessor for the AES interrupt raw&enabled state (validation harness).

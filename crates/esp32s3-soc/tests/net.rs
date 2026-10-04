@@ -48,8 +48,9 @@ fn net_tx_capture_caps_at_1600() {
 }
 
 /// RX path: inject queues FIFO, take pops in order, event carries
-/// direction 1; empty injects are ignored; the 9th frame drops with a
-/// counter bump.
+/// direction 1; empty injects are ignored; overflow evicts the oldest
+/// (ring overwrite) with a counter bump, so the queue always holds the
+/// freshest frames (re-TX spray discipline — proven live 2026-10-03).
 #[test]
 fn net_rx_inject_take_fifo_and_bound() {
     let mut s = Soc::new();
@@ -69,17 +70,19 @@ fn net_rx_inject_take_fifo_and_bound() {
     assert_eq!(s.net_take_rx().unwrap(), vec![0xAA, 0xBB], "FIFO order");
     assert_eq!(s.net_take_rx().unwrap(), vec![0xCC]);
     assert!(s.net_take_rx().is_none(), "drained");
-    // Bound: 8 queued, 9th drops.
+    // Bound: 8 queued, 9th evicts the oldest ([0]) with a counter bump.
     for k in 0..8 {
         s.net_inject_rx(&[k]);
     }
     assert_eq!(s.net_rx_dropped(), 0);
     s.net_inject_rx(&[0xFF]);
-    assert_eq!(s.net_rx_dropped(), 1, "9th frame drops with counter");
-    // The 8 queued frames are intact (drop didn't clobber).
-    for k in 0..8 {
+    assert_eq!(s.net_rx_dropped(), 1, "9th frame evicts oldest");
+    // Freshest 8 survive ([1..8), head is [1].
+    for k in 1..8 {
         assert_eq!(s.net_take_rx().unwrap(), vec![k]);
     }
+    assert_eq!(s.net_take_rx().unwrap(), vec![0xFF]);
+    assert!(s.net_take_rx().is_none(), "drained");
 }
 
 /// RX stage: bytes land in WIFI_SCRATCH past the event-payload cursor,

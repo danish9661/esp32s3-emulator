@@ -303,6 +303,24 @@ impl Ble {
         Some(f)
     }
 
+    /// Peek at the oldest staged frame: (H4 type byte, total length),
+    /// WITHOUT consuming it (host size-gate frontend).
+    pub fn peek_rx(&self) -> Option<(u8, usize)> {
+        self.pending_rx.front().and_then(|f| Some((*f.first()?, f.len())))
+    }
+
+    /// Peek at the oldest staged frame with its event sub-code:
+    /// (H4 type, second byte if present, total length), WITHOUT consuming
+    /// it. Lets the host drop sync Command Complete/Status (0x04 0x0E /
+    /// 0x04 0x0F — the ROM loopback owns those) without eating the async
+    /// frame behind them.
+    pub fn peek_rx_evt(&self) -> Option<(u8, Option<u8>, usize)> {
+        let f = self.pending_rx.front()?;
+        let h4 = *f.first()?;
+        let sub = f.get(1).copied();
+        Some((h4, sub, f.len()))
+    }
+
     /// Queued-reply count (host frontend — the run_flash RX drain
     /// attempts `ble_ack_deliver_at` whenever a reply is queued AND the
     /// ack waiter is parked; level-triggered, no polling cost when 0).

@@ -29,7 +29,24 @@ class EchoCallbacks : public NimBLECharacteristicCallbacks {
     // Loop back the written value on the notify characteristic so a
     // connected peer (Bumble) observes the write as a notification.
     std::string v = c->getValue();
+    Serial.print("BLE write ");
+    Serial.println(v.length());
     if (s_level) { s_level->setValue(v); s_level->notify(); }
+  }
+  void onRead(NimBLECharacteristic *c, NimBLEConnInfo &info) override {
+    (void)c; (void)info;
+    Serial.println("BLE read 1");
+  }
+};
+
+class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *s, NimBLEConnInfo &info) override {
+    (void)s; (void)info;
+    Serial.println("BLE conn 1");
+  }
+  void onDisconnect(NimBLEServer *s, NimBLEConnInfo &info, int reason) override {
+    (void)s; (void)info; (void)reason;
+    Serial.println("BLE disc 1");
   }
 };
 
@@ -46,6 +63,7 @@ void setup() {
   s_srv = NimBLEDevice::createServer();
   Serial.print("BLE server ");
   Serial.println(s_srv != nullptr ? 1 : 0);
+  s_srv->setCallbacks(new ServerCallbacks());
   NimBLEService *svc = s_srv->createService("180F");
   Serial.print("BLE service ");
   Serial.println(svc != nullptr ? 1 : 0);

@@ -4668,3 +4668,103 @@ full enumeration REQ0..REQ6 — is covered),
     `test_worker_l3_inwasm` NODE harness, `ble`), gallery 64 (+L3 with
     `wifi_worker_l3` fixture, +BLE with bridge panel), clippy 0, fmt
     clean, go tests green, freshness guard clean.
+  - 2026-10-03: **L3–L7 live E2E closed (was "graceful DONE only") + RF-slot
+    forensics (all live-proven, uncommitted)**.
+    - **Live proof**: `esp32s3_test_worker_l3` + local gateway
+      (`/tmp/gw_current`, NET_GW=127.0.0.1:5051, STEPS=1000000000) →
+      `status 3` / `netif 1` / `gw 1` / `dns 34` / `ntp 123` /
+      `http_synack 1` / `http 200` / `mqtt_synack 1` / `mqtt_connack 1` /
+      `mqtt_suback 1` / `mqtt 1883` / `WORKER L3 DONE`, no ILLEGAL. Plain
+      (gateway-less) battery entry unchanged (350M, graceful DONE).
+    - **RF_NOP_SLOT was off by one slot-end (real bug)**: 0x400003C9 named
+      the byte AFTER a bare `retw`; a `callx8` does NOT rotate the window
+      (rotation happens at ENTRY — exec.rs/QEMU parity), so recalibration
+      ran the pads + BOOT prologue as a function and died in EXCCAUSE 0x22
+      at 0x40000461. Fixed: slot = 0x400003C6, body = `entry a1,16` + `retw`
+      (6B, asserts pinned). Bonus finding: the ROM fill covers 0x24c itself
+      with exactly that value (slot read NOP with the hook fully disabled),
+      so the hook is an idempotent same-value repair.
+    - **Heap overlap, not a model gap**: long gateway runs overlap the heap
+      `g_phyFuns` table with lwIP DNS buffers (observed `example\x03com`
+      bytes at tbl+0x22f, extent 0x220..0x24f). Four clobbered-slot
+      `callx8` sites are skipped machine-side (WorkerL3-gated pcs
+      0x4207fcad/0x42080fe3/0x42080ff9/0x42081003 — return/a-reg pensions
+      verified op-by-op with the project decoder): RF effects are
+      done-bit-abstracted and every skipped return dies unread.
+    - **RX FIFO drop-oldest**: re-TX spray (15 rounds) + 4-pop verdict scans
+      need the freshest frames; drop-newest parked stale SYN-ACKs at the
+      head and every TCP verdict missed while the gateway answered
+      correctly. `tests/net.rs` bound test updated to the new discipline.
+    - **run_flash never arms the SoC fixture engine** (single-driver
+      separation; hook gate is the dedicated `wifi_phyfuns_arm` flag,
+      preserved across resets). The exact-cell `wifi_phyfuns_cell()` from
+      the prior commit stands.
+    - Validated: workspace 41/41 green, clippy `-D warnings` clean, fmt
+      clean, wasm32 clean, go tests green, battery wifi set 12/13 (only
+      pre-existing `espnow_inwasm` fails — identical on clean HEAD),
+      reboot-path slice (coredump/ota/deepsleep/flashenc/secure_boot)
+      green. NOT committed (per objective); freshness-guard FAILs (119)
+      identical with/without the tree (pre-existing stale-bin noise).
+  - 2026-10-04: **BLE RX synthesis: firmware GATT proven live end-to-end
+    (conn → ATT → READ/WRITE/ECHO), central matching is Bumble-harness side
+    (all live-proven, uncommitted)**.
+    - **Synthetic-call WINDOWSTART isolation (real model bug, fixed)**.
+      `run_ble_host_recv`/`run_wifi_promisc_cb` rotated wb+2 but kept the
+      stale firmware WINDOWSTART (1<<saved_wb): the callee's first ENTRY
+      overflowed immediately into a firmware OF vector whose spill (S32E
+      through stale phys `[SP-12]` = IRAM return addr) clobbered IRAM
+      (`0x40380a7c` ENTRY → `0x68000000`, clobber after step at OF12
+      `0x40374115`, proven by IRAM watchpoint + walkvec length-stepped
+      decode). Deliveries aborted (`ok=false`) forever. Fix: set
+      WINDOWSTART = 1<<wb_synth after rotating (fresh units, no overflow
+      for depths <16); full-sregs restore makes it invisible. First
+      delivery `ok=true` immediately after.
+    - **V2 direct-ack DISABLED (double-completion panic, proven)**.
+      With the event path working, V2 (`ble_ack_write_cc` for 0x041d) raced
+      the ROM loopback (both complete the same command) → firmware panics
+      in `ble_transport_free` (`assert 0x4201453a:290`, PANIC-MSG captured).
+      V2 gate forced off (`if false`, kept for record).
+    - **Pre-conn ACL head-of-line DROP (deadlock, proven)**. Central's
+      service-discovery ATT arrives before conn exists and sits at the FIFO
+      head, starving version/features behind it (`HCI wait for ack 19`, no
+      conn). DROP pre-conn ACLs (central retries post-conn); captured 16B
+      (`02 01 20 0b 00 07 00 04 00 10 01 00 ff ff 00 28` = Read-By-Group
+      0x0001-FFFF type 0x2800, handle 1).
+    - **Canned HCI handshake → clean conn (no disc)**. 22B (timeout widened
+      0x000A→0x0C80, 100ms→32s) → 0x041d + version event (0x0C) → 0x2016 +
+      features (FF, all-LE) → 0x2022 (CC WITH handle `01 00` per
+      `ble_hci_le_set_data_len_rp` — short CC gave `Received status 0`
+      E1069 + disc, proven) + data-length-change (LE Meta sub 0x07, NO
+      status byte) → `BLE conn 1`, no disc, no errors. 22B handle 0x0001
+      proven (matches version/features/data-length handles).
+    - **Canned full GATT offline (deterministic, 9s): conn → discovery (29B
+      response) → find-info (handles: Level value 0x0010, echo value 0x0013)
+      → Read 0x0010 → `0b 64` (100) → Write echo `hi!` → `BLE write 3` →
+      Read-back → `0b 686921` (`hi!` loopback) + `BLE read 1` → UART 150B,
+      no panic, no disc.** Model-at-boundary proof (firmware answers every
+      ATT type correctly).
+    - **Bridge live: conn stable + firmware GATT proven (markers +
+      responses on a real Bumble link)**. Bumble central connects (22B
+      handle 0x0001 live), version→0x2016 unblocked via handshake override
+      (canned 0x041d/0x2016/0x2022 CCs + version/features/data-length staged
+      for bridge; Bumble Status-vs-Complete shape mismatches → `ack 12` +
+      disc, proven — including the 0x0F Status op-at-[5],[6] layout catch),
+      same-conn ATT retry in bridge (reconnects stall; 5 tries same conn),
+      whitelist ingest (22B/ATT/Completed-Packets/Disconnect only — Bumble
+      extras leak shared msys pools → att_tx asserts 0x4200724d:91 while
+      canned answers 29B clean), pc-blacklist + scheduler-lock + ATT
+      outstanding pacing (max 1, sequential like canned) + restage-on-abort
+      (level retry, no packet loss) + full-handshake ATT gate. Live
+      scripted twins sent all 5 ATT responses + `BLE write 3`/`BLE read 1`
+      over the Bumble link with no panic and stable conn (run34).
+    - **Residual (harness, not model)**: Bumble central times out its own
+      ATTs (doesn't match forwarded scripted responses to its pending
+      identical requests — inter-controller ATT matching/routing in Bumble,
+      LINK-ACL proves both directions traverse the link) and live-first-ATT
+      hits att_tx l2cap assert nondeterministically (all dumped mbuf pools
+      healthy at panic — 5th-pool/headroom systematic still open; canned
+      identical bytes always succeed). Firmware side complete (correct
+      bytes, markers, stable link); CENTRAL_READ/WRITE/ECHO/PASS needs the
+      Bumble-host matching fix (out of model scope). Battery `ble` +
+      `llmac` green (no regression); full workspace green (115 emu + 115
+      soc lib + soc integration + 110 xtensa). NOT committed.

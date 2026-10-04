@@ -477,32 +477,35 @@ pub fn rom_image() -> Vec<u8> {
     }
     debug_assert_eq!(a.pc(), QSORT_BODY + 198);
 
-    // ── RF dispatch no-op slot (bare 3-byte `retw` after the QSORT body) ─────
-    // The closed Wi-Fi PHY's dispatch table has one slot neither the app nor
-    // the ROM fill (see memmap::RF_NOP_SLOT + wifi::PHYFUNS_UNFILLED_OFF);
-    // the emulator completes it with RF_NOP_SLOT at fill time, so the
-    // recalibration `callx8` lands DIRECTLY on a bare `retw` (frame-less
-    // contract: entered AFTER the caller's ENTRY — the call already rotated
-    // the window, so no second entry; same contract as every other glue
-    // body) and returns straight to its return address: a true no-op.
-    // `pad_to(BOOT)` absorbs the 3-byte delta so the reset vector lands
+    // ── RF dispatch no-op slot (`entry` + `retw` after the QSORT body) ─────
+    // The closed Wi-Fi PHY's dispatch table slot 0x24c (see
+    // memmap::RF_NOP_SLOT + wifi::PHYFUNS_UNFILLED_OFF) is covered by the
+    // ROM fill with a ROM helper address (proven live 2026-10-03: with the
+    // hook fully disabled the slot still read exactly RF_NOP_SLOT after
+    // init); the emulator re-asserts the same value at publish time, so a
+    // recalibration `callx8` lands on a minimal windowed frame (`entry a1,
+    // 16`, the same shape as every other frame-ful glue body) and returns
+    // straight to its return address: a true no-op. The `entry` is
+    // load-bearing, NOT optional: a `callx8` does NOT rotate the window
+    // itself (exec.rs CALLX8 arm = return-addr + CALLINC + jump; the callee's
+    // ENTRY rotates — QEMU gen_callw_slot parity), so a bare `retw` without
+    // an entry would execute in the CALLER's window and fault or jump wild.
+    // (Proven live 2026-10-03: RF_NOP_SLOT wrongly named the byte AFTER a
+    // bare retw, recalibration ran the pads + BOOT prologue as a function
+    // and died in EXCCAUSE 0x22 at 0x40000461.)
+    // `pad_to(BOOT)` absorbs the 6-byte delta so the reset vector lands
     // byte-identical. (The 2026-10-02 hello ILLEGAL was NEVER these bytes —
     // it was the ungated completing WRITE firing on hello, which has no
     // `g_phyFuns` cell; the fixture-armed gate in `maybe_complete_phyfuns_slot`
     // fixes that. Proven-layout warning stays: keep this gap pure padding +
     // this one slot; any WIDER planting re-opens the `pad_to(BOOT)` shift.)
-    // NOTE: `a.retw()` advances pc by its 3 emitted bytes, so the post-slot
-    // pc (pinned by the assert) is QSORT-body end + 3. The "198" in the
-    // assert above is the historical qsort-body size comment, kept as-is
-    // (the asserts pin the live cursor either way — do NOT "fix" 198).
-    // ENCODING CHECK (against `Asm::retw` = word (9<<4)|(2<<6), len 3):
-    // the word is 0xE0 = bytes [E0,00,00]; fetch decodes b0=0xE0 (b0&0xF=0
-    // -> 3-byte form) as a bare `retw` (exec.rs RRR retour arm, verified by
-    // the passing `rom_qsort_*` machine tests that execute the adjacent
-    // QSORT body through the same fetch path — a misdecode here would break
-    // those too, and the full workspace suite is green).
-    a.retw();
+    // NOTE: the "198" in the assert above is the historical qsort-body size
+    // comment, kept as-is (the asserts pin the live cursor either way — do
+    // NOT "fix" 198). RF_NOP_SLOT names the `entry` (slot START, not end).
     debug_assert_eq!(a.pc(), esp32s3_soc::memmap::RF_NOP_SLOT);
+    a.entry(1, 16);
+    a.retw();
+    debug_assert_eq!(a.pc(), esp32s3_soc::memmap::RF_NOP_SLOT + 6);
 
     // ── reset vector + boot prologue (0x40000400) ───────────────────────────
     // XCHAL_RESET_VECTOR_PADDR (core-isa.h): the window vectors own

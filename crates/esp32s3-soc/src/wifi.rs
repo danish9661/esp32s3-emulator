@@ -121,20 +121,19 @@ pub const TXDC_DONE_BIT: u32 = 1 << 24;
 /// The heap-resident `g_phyFuns` table (pointer cell per image — nm BSS
 /// `g_phyFuns`, e.g. 0x3fca0060 on the test-worker-l3 ELF; exact cells in
 /// `Soc::wifi_phyfuns_cell`) is filled by `phy_get_romfunc_addr` (~30 slots)
-/// plus the real ROM's `phy_get_romfuncs` callee — but slot `0x24c`
-/// (read by `chip_v7_set_chan_misc` on EVERY channel set, including
-/// periodic recalibration) is written by NEITHER (proven whole-ELF: no
-/// store targets it — the fill loop's offsets skip it). It holds heap
-/// garbage, so the first recalibration after boot jumps wild
-/// (`callx8` to 0x2c/0x4022d8b8, EPC varies by heap history — proven
-/// live 2026-09-29 on the L3 image: pc-history ends
-/// `... -> chip_v7_set_chan_misc+0x30 (l32r g_phyFuns) -> 0x2c`).
-/// RF effects are abstracted via done-bits anyway, so the emulator
-/// completes the slot with the benign no-op at fill time (see
-/// `Soc::maybe_complete_phyfuns_slot`, hooked on the DRAM word write
-/// path and gated on a Wi-Fi fixture image — the non-Wi-Fi hello image
-/// has no `g_phyFuns` cell (proven via nm: no match) so the gate keeps
-/// it boot-neutral). Sibling slot `0x160`
+/// plus the real ROM's `phy_get_romfuncs` callee. Slot `0x24c` (read by
+/// `chip_v7_set_chan_misc` on EVERY channel set, including periodic
+/// recalibration) is covered by the ROM fill with a ROM helper address
+/// (proven live 2026-10-03: with the hook fully disabled the slot still
+/// read exactly RF_NOP_SLOT after init — the fill wrote it, not us; the
+/// old "written by NEITHER" note came from app-only whole-ELF analysis
+/// that missed the ROM black box). RF effects are abstracted via done-bits
+/// anyway, so the emulator re-asserts the benign no-op at publish time (see
+/// `Soc::maybe_complete_phyfuns_slot`, hooked on the DRAM word write path
+/// and gated on a Wi-Fi fixture image — the non-Wi-Fi hello image has no
+/// `g_phyFuns` cell (proven via nm: no match) so the gate keeps it
+/// boot-neutral). Reads of a heap-clobbered slot are skipped at the machine
+/// layer instead (see machine.rs RF skip table). Sibling slot `0x160`
 /// (read by `chip_v7_set_chan` itself) is left alone — it holds a valid
 /// ROM address at every observed crash, i.e. the ROM fill covers it.
 pub const G_PHYFUNS_PTR: u32 = 0x3FCA_0060;
