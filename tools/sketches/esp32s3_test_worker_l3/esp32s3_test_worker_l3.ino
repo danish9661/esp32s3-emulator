@@ -8,8 +8,15 @@
 // tools/gateway/handleL7.go — synchronous, deterministic, no wall clock):
 //   * DNS: hand-built query for example.com -> 192.168.4.1:53
 //   * NTP: 48-byte client mode-3 packet -> 192.168.4.1:123
-//   * UDP echo probe -> 192.168.4.1:5683 (CoAP port; the gateway UDP
-//     echo path answers — proves the divert/inject round trip)
+//   * UDP echo: raw datagram `HELLO-UDP` -> 192.168.4.1:5683, expect the
+//     identical bytes back (gateway UDP-echo path — proves the
+//     divert/inject round trip independently of DNS/NTP)
+//   * COAP: confirmable GET coap://192.168.4.1/t -> 2.05 Content with the
+//     `25.00C` payload (gateway parses the CoAP header + Uri-Path option
+//     and answers; anything else on :5683 falls through to UDP echo)
+//   * IPv6: RS -> RA (SLAAC fd00::/64), ICMPv6 echo -> fe80::gw, UDP/IPv6
+//     echo -> fd00::1:5683 (gateway handleIPv6.go answers all three;
+//     board link-local is EUI-64 from the STA MAC, like lwIP derives)
 //   * HTTP: raw TCP SYN -> SYN-ACK, GET / -> 200 + S3LAB-EMU-OK body
 //     via the gateway-local :80 stub (no lwIP TCP state — hand-built
 //     IP/TCP like the UDP legs, replies read with the same receive
@@ -105,6 +112,30 @@ static bool rx_contains(const uint8_t *b, const uint8_t *pat, size_t plen) {
   return false;
 }
 
+// IPv6 frame builder: eth(dst mac, board src, 86DD) + IPv6(ver 6,
+// payload len, next header, hop limit 64, src/dst 16B) + payload.
+// Checksums left zero (tap is L2; the gateway crafts without validating
+// them — same discipline as the v4 builders above).
+static size_t ipv6_frame(uint8_t *out, const uint8_t *dmac,
+                         const uint8_t *src, const uint8_t *dst,
+                         uint8_t next_hdr, const uint8_t *pay, size_t plen) {
+  memcpy(out, dmac, 6);
+  memcpy(out + 6, s_mac, 6);
+  out[12] = 0x86; out[13] = 0xDD;
+  out[14] = 0x60; out[15] = 0x00; out[16] = 0x00; out[17] = 0x00;
+  out[18] = plen >> 8; out[19] = plen & 0xff;
+  out[20] = next_hdr; out[21] = 64;
+  memcpy(out + 22, src, 16);
+  memcpy(out + 38, dst, 16);
+  memcpy(out + 54, pay, plen);
+  return 54 + plen;
+}
+
+// Board link-local from the STA MAC (EUI-64, exactly like lwIP derives:
+// flip U/L, insert FFFE). Filled once setup() learns s_mac.
+static uint8_t s_ll[16];
+static uint8_t s_rs_opt[8];
+
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -126,6 +157,16 @@ void setup() {
   Serial.println(s_netif != NULL ? 1 : 0);
   if (!s_netif) { Serial.println("WORKER L3 DONE"); return; }
   WiFi.macAddress(s_mac);
+  // Board link-local (EUI-64 from the STA MAC, exactly like lwIP derives
+  // for its own autoconfigured address — so the gateway's unicast replies
+  // to this source are addressed to us either way).
+  memset(s_ll, 0, 8);
+  s_ll[0] = 0xFE; s_ll[1] = 0x80;
+  s_ll[8] = s_mac[0] ^ 0x02; s_ll[9] = s_mac[1]; s_ll[10] = s_mac[2];
+  s_ll[11] = 0xFF; s_ll[12] = 0xFE;
+  s_ll[13] = s_mac[3]; s_ll[14] = s_mac[4]; s_ll[15] = s_mac[5];
+  s_rs_opt[0] = 1; s_rs_opt[1] = 1;
+  memcpy(s_rs_opt + 2, s_mac, 6);
 
   // GATEWAY PRESENCE PROBE (load-bearing for the whole suite): the
   // battery runs WITHOUT a gateway (plain run_flash, no NET_GW), while
@@ -258,6 +299,85 @@ void setup() {
       memset(rxb, 0, sizeof(rxb));
       esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
       Serial.print("WORKER L3 ntp drain ");
+      Serial.println(k);
+    }
+  }
+
+  // ---- UDP ECHO: raw datagram `HELLO-UDP` -> 192.168.4.1:5683, expect
+  // the identical 9 bytes back (gateway UDP-echo path swaps addrs/ports).
+  // Same gateway gate as NTP: without a gateway one TX + one pop, then
+  // the known-empty verdict (-29). With a gateway re-TX + 2-pop scan for
+  // sport 5683 + payload match (echo is unique on the wire for this port).
+  static const uint8_t udp_pay[] = "HELLO-UDP"; // 9 bytes, no NUL
+  bool udp_ok = false;
+  if (!gw_up) {
+    n = udp_frame(f, 45005, 5683, udp_pay, 9);
+    tx(f, n);
+    memset(rxb, 0, sizeof(rxb));
+    esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
+  } else {
+    n = udp_frame(f, 45005, 5683, udp_pay, 9);
+    tx(f, n);
+    for (int w = 0; w < 1; w++) { delay(200); tx(f, n); }
+    for (int k = 0; k < 2 && !udp_ok; k++) {
+      memset(rxb, 0, sizeof(rxb));
+      esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
+      // UDP payload at 42: reply sport 5683 -> 45005, 9-byte echo.
+      if (rx_type(rxb) != 0x0800) continue;
+      if (((uint16_t(rxb[34]) << 8) | rxb[35]) != 5683) continue;
+      if (memcmp(rxb + 42, udp_pay, 9) == 0) udp_ok = true;
+    }
+  }
+  Serial.print("WORKER L3 udp ");
+  Serial.println(udp_ok ? 9 : -29);
+  if (gw_up) {
+    for (int k = 0; k < 4; k++) {
+      memset(rxb, 0, sizeof(rxb));
+      esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
+      Serial.print("WORKER L3 udp drain ");
+      Serial.println(k);
+    }
+  }
+
+  // ---- COAP: confirmable GET coap://192.168.4.1/t -> 2.05 + `25.00C`.
+  // Request bytes (8): ver 1 / CON / TKL 2 (0x40), GET (0x01), MID 0x2223,
+  // token AA 55, Uri-Path "t" (delta 11, len 1: 0xB1 0x74). The gateway
+  // answers piggybacked ACK 2.05 with Content-Format text/plain + payload
+  // `25.00C`; anything else on :5683 falls through to UDP echo (which this
+  // request is NOT — ver/type/code bytes differ from HELLO-UDP — so no
+  // cross-talk either way). Verdict checks ver/type/code/MID/token + the
+  // payload marker (observe, don't assume).
+  static const uint8_t coap_req[] = {0x40, 0x01, 0x22, 0x23, 0xAA, 0x55, 0xB1, 't'};
+  static const uint8_t coap_pay[] = "25.00C";
+  bool coap_ok = false;
+  if (!gw_up) {
+    n = udp_frame(f, 45006, 5683, coap_req, sizeof(coap_req));
+    tx(f, n);
+    memset(rxb, 0, sizeof(rxb));
+    esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
+  } else {
+    n = udp_frame(f, 45006, 5683, coap_req, sizeof(coap_req));
+    tx(f, n);
+    for (int w = 0; w < 1; w++) { delay(200); tx(f, n); }
+    for (int k = 0; k < 2 && !coap_ok; k++) {
+      memset(rxb, 0, sizeof(rxb));
+      esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
+      // CoAP payload at 42: ver 1 (top bits 01), ACK (10) = 0x60;
+      // code 0x45 (2.05); MID echo 2223; token echo AA 55.
+      if (rx_type(rxb) != 0x0800) continue;
+      if (rxb[42] != 0x60 || rxb[43] != 0x45) continue;
+      if (rxb[44] != 0x22 || rxb[45] != 0x23) continue;
+      if (rxb[46] != 0xAA || rxb[47] != 0x55) continue;
+      if (rx_contains(rxb, coap_pay, sizeof(coap_pay) - 1)) coap_ok = true;
+    }
+  }
+  Serial.print("WORKER L3 coap ");
+  Serial.println(coap_ok ? 205 : -30);
+  if (gw_up) {
+    for (int k = 0; k < 4; k++) {
+      memset(rxb, 0, sizeof(rxb));
+      esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
+      Serial.print("WORKER L3 coap drain ");
       Serial.println(k);
     }
   }
@@ -455,6 +575,136 @@ void setup() {
     Serial.println((connack_ok && suback_ok && ping_ok) ? 1883 : -28);
   } // end MQTT gw_up block
   } // end outer gw_up MQTT block
+
+  // ---- IPv6: RS -> RA, ICMPv6 echo, UDP/IPv6 echo (gateway handleIPv6.go
+  // answers all three: unicast RA with fd00::/64, echo reflect, UDP echo
+  // on :5683). Gateway addrs: MAC 5a:94:ef:e4:0c:dd, link-local
+  // fe80::5894:efff:fee4:cdd, ULA fd00::1. Board source is the EUI-64
+  // link-local above. Same gateway gate as the v4 legs (one TX + one pop
+  // without a gateway, known-empty verdicts -31/-32/-33).
+  static const uint8_t gw_mac[6] = {0x5A, 0x94, 0xEF, 0xE4, 0x0C, 0xDD};
+  static const uint8_t gw_ll[16] = {0xFE, 0x80, 0, 0, 0, 0, 0, 0,
+                                    0x58, 0x94, 0xEF, 0xFF, 0xFE, 0xE4, 0x0C, 0xDD};
+  static const uint8_t gw_ula[16] = {0xFD, 0x00, 0, 0, 0, 0, 0, 0,
+                                     0, 0, 0, 0, 0, 0, 0, 0x01};
+  static const uint8_t mcast_allrouters[6] = {0x33, 0x33, 0x00, 0x00, 0x00, 0x02};
+  static const uint8_t ip6_allrouters[16] = {0xFF, 0x02, 0, 0, 0, 0, 0, 0,
+                                             0, 0, 0, 0, 0, 0, 0, 0x02};
+  // RS: ICMPv6 133 + source-link-layer option (12B).
+  uint8_t rs_pay[12];
+  rs_pay[0] = 133; rs_pay[1] = 0; rs_pay[2] = 0; rs_pay[3] = 0;
+  memcpy(rs_pay + 4, s_rs_opt, 8);
+  bool ra_ok = false;
+  if (!gw_up) {
+    n = ipv6_frame(f, mcast_allrouters, s_ll, ip6_allrouters, 58, rs_pay, 12);
+    tx(f, n);
+    memset(rxb, 0, sizeof(rxb));
+    esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
+  } else {
+    n = ipv6_frame(f, mcast_allrouters, s_ll, ip6_allrouters, 58, rs_pay, 12);
+    tx(f, n);
+    // Two re-TX (3 RS total): RA proved flaky at 1 re-TX (1/2 live runs
+    // missed with 2 TX though echo/udp passed — gateway answers every RS,
+    // but the multicast RS + unicast RA rendezvous misses intermittently).
+    // Extra TX stages another RA without extra pops (pop budget is the
+    // destabilization risk, not TX — see header). Echo/udp stay at 1 re-TX
+    // (stable 2/2).
+    for (int w = 0; w < 2; w++) { delay(200); tx(f, n); }
+    // RA = ICMPv6 134 (Router Advertisement body carries fd00::/64).
+    // 6-pop window (pop budget is the destabilization risk — 8-pop caused
+    // ILLEGAL at 856M; 6-pop passed RA/echo 2/2 before the udp-fix shuffle).
+    for (int k = 0; k < 6 && !ra_ok; k++) {
+      memset(rxb, 0, sizeof(rxb));
+      esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
+      if (rx_type(rxb) != 0x86DD || rxb[54] != 134) continue;
+      static const uint8_t fd00pfx[] = {0xFD, 0x00};
+      if (rx_contains(rxb, fd00pfx, sizeof(fd00pfx))) ra_ok = true;
+    }
+  }
+  Serial.print("WORKER L3 ip6 ra ");
+  Serial.println(ra_ok ? 134 : -31);
+  if (gw_up) {
+    for (int k = 0; k < 4; k++) {
+      memset(rxb, 0, sizeof(rxb));
+      esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
+      Serial.print("WORKER L3 ip6 drain ");
+      Serial.println(k);
+    }
+  }
+  // ICMPv6 echo: type 128 id 0x2224 + `HELLO-V6` -> type 129 echo.
+  uint8_t ec_pay[16];
+  ec_pay[0] = 128; ec_pay[1] = 0; ec_pay[2] = 0; ec_pay[3] = 0;
+  ec_pay[4] = 0x22; ec_pay[5] = 0x24; ec_pay[6] = 0x00; ec_pay[7] = 0x01;
+  memcpy(ec_pay + 8, "HELLO-V6", 8);
+  static const uint8_t ec_exp[] = "HELLO-V6";
+  bool ec_ok = false;
+  if (!gw_up) {
+    n = ipv6_frame(f, gw_mac, s_ll, gw_ll, 58, ec_pay, 16);
+    tx(f, n);
+    memset(rxb, 0, sizeof(rxb));
+    esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
+  } else {
+    n = ipv6_frame(f, gw_mac, s_ll, gw_ll, 58, ec_pay, 16);
+    tx(f, n);
+    for (int w = 0; w < 1; w++) { delay(200); tx(f, n); }
+    // 6-pop window (same broadcast flooding as the RA leg above).
+    for (int k = 0; k < 6 && !ec_ok; k++) {
+      memset(rxb, 0, sizeof(rxb));
+      esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
+      // Echo reply: type 129, same id, same 8-byte payload at 62.
+      if (rx_type(rxb) != 0x86DD || rxb[54] != 129) continue;
+      if (rxb[58] != 0x22 || rxb[59] != 0x24) continue;
+      if (memcmp(rxb + 62, ec_exp, 8) == 0) ec_ok = true;
+    }
+  }
+  Serial.print("WORKER L3 ip6 echo ");
+  Serial.println(ec_ok ? 129 : -32);
+  if (gw_up) {
+    for (int k = 0; k < 4; k++) {
+      memset(rxb, 0, sizeof(rxb));
+      esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
+      Serial.print("WORKER L3 ip6edrain ");
+      Serial.println(k);
+    }
+  }
+  // UDP/IPv6 echo: `HELLO-UDP` -> fd00::1:5683, expect identical echo
+  // (gateway UDP/IPv6 echo swaps ports like the v4 path).
+  uint8_t u6_pay[8 + 9];
+  u6_pay[0] = 45007 >> 8; u6_pay[1] = 45007 & 0xff;
+  u6_pay[2] = 5683 >> 8; u6_pay[3] = 5683 & 0xff;
+  u6_pay[4] = 0x00; u6_pay[5] = 17; u6_pay[6] = 0x00; u6_pay[7] = 0x00;
+  memcpy(u6_pay + 8, "HELLO-UDP", 9);
+  bool u6_ok = false;
+  if (!gw_up) {
+    n = ipv6_frame(f, gw_mac, s_ll, gw_ula, 17, u6_pay, 17);
+    tx(f, n);
+    memset(rxb, 0, sizeof(rxb));
+    esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
+  } else {
+    n = ipv6_frame(f, gw_mac, s_ll, gw_ula, 17, u6_pay, 17);
+    tx(f, n);
+    for (int w = 0; w < 1; w++) { delay(200); tx(f, n); }
+    // 6-pop window (same broadcast flooding as the RA leg above).
+    for (int k = 0; k < 6 && !u6_ok; k++) {
+      memset(rxb, 0, sizeof(rxb));
+      esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
+      // UDPv6: eth 14 + IPv6 40 + UDP 8 => header at 54, payload at 62
+      // (same +20 shift vs the v4 34/42 pair — IPv6 header is 20B longer).
+      if (rx_type(rxb) != 0x86DD) continue;
+      if (((uint16_t(rxb[54]) << 8) | rxb[55]) != 5683) continue;
+      if (memcmp(rxb + 62, "HELLO-UDP", 9) == 0) u6_ok = true;
+    }
+  }
+  Serial.print("WORKER L3 ip6 udp ");
+  Serial.println(u6_ok ? 9 : -33);
+  if (gw_up) {
+    for (int k = 0; k < 4; k++) {
+      memset(rxb, 0, sizeof(rxb));
+      esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
+      Serial.print("WORKER L3 ip6udrain ");
+      Serial.println(k);
+    }
+  }
 
   Serial.println("WORKER L3 DONE");
 }

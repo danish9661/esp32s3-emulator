@@ -35,6 +35,22 @@ use crate::rom_stub::HOST_PRINTF;
 /// the task stack — leaf calls, shallow, battery-proven.)
 const SYNTH_STACK_TOP: u32 = esp32s3_soc::Soc::WIFI_SCRATCH + 0x8000;
 
+/// Host-owned synthetic-call return pc (fake RETW target — never executed,
+/// only compared, LOW 30 BITS: RETW/JX compute (pc & 0xC0000000) |
+/// (a0 & 0x3FFFFFFF), so a return via a 0x4200xxxx pc lands on 0x40000000
+/// and every loop comparison masks to 30 bits). MUST have nonzero top two
+/// bits: Xtensa derives the return window (n = a0[31:30], exec.rs RETW arm,
+/// QEMU test_ill_retw parity) from the return ADDRESS, so a zero-top-bits
+/// pc (e.g. the old 0x4000_0000) makes EVERY firmware early-`retw` (and the
+/// final one) fault ILLEGAL — proven live 2026-10-04: host_rcv_pkt's
+/// `ble_hs_enabled_state==0` early `retw.n` at 0x42005172 aborted every
+/// delivery once the flag cleared, cascading into restage-loop corruption
+/// and a panic. 0x8000_0000 encodes n=2, matching the call8-frame
+/// synthesis (wb+2); the final retw then unwinds cleanly (m matches the
+/// ENTRY-built chain) instead of faulting. Unmapped on S3 (no fetch ever
+/// happens — the loop breaks on (masked) arrival, like before).
+const SYNTH_RETPC: u32 = 0x8000_0000;
+
 pub struct Esp32S3 {
     /// Both ESP32-S3 LX7 cores.  Core 1 is gated at reset by the ROM stub
     /// (rom_stub.rs: PRID check) until core 0 releases it, mirroring the
@@ -91,6 +107,12 @@ pub struct Esp32S3 {
     /// first 6 bytes) for the last `run_ble_host_recv` call. Diagnoses
     /// H4==0 dead-path faults (staged zeros = pop/write failure).
     pub last_recv_stage: Option<(u32, u32, [u8; 6])>,
+    /// TEMP (2026-10-04, forensics — DELETE after): l2cap_tx return code
+    /// at `BEQZ a10` (0x4200723c, BLE image only). a10 holds the return
+    /// (0 ok, 1 queued-ok, else assert → 6 = prepend/pullup headroom).
+    /// Recorded per-op in `run_fast_core` (airtight,unlike post-step poll).
+    /// (core, a10).
+    pub ble_l2cap_ret: Option<(usize, u32)>,
 }
 
 impl Esp32S3 {
@@ -113,6 +135,8 @@ impl Esp32S3 {
             last_recv_ps: None,
             // TEMP (2026-10-04, forensics — DELETE after).
             last_recv_stage: None,
+            // TEMP (2026-10-04, forensics — DELETE after).
+            ble_l2cap_ret: None,
         }
     }
 
@@ -334,6 +358,15 @@ impl Esp32S3 {
                 return (StepResult::Ok, n);
             }
             let pc0 = self.cpu[core].pc;
+            // TEMP (2026-10-04, forensics — DELETE after): capture
+            // `ble_l2cap_tx` return code at `BEQZ a10` (0x4200723c). a10
+            // holds 0 ok / 1 queued-ok / else assert (6 = headroom).
+            // Per-op sample here is airtight (post-step poll misses
+            // mid-block pcs). Overwrites each hit; run_flash logs
+            // transitions.
+            if pc0 == 0x4200_723c {
+                self.ble_l2cap_ret = Some((core, self.cpu[core].reg(10)));
+            }
             // Fixture-engine pre-op sample (browser/bridge path): the
             // engine's post-step poll (after both blocks, same point
             // run_flash uses) observes a transient CALLEE-ENTRY pc only
@@ -567,7 +600,7 @@ impl Esp32S3 {
                     WifiImage::Scan => 0x4202_e560,
                     WifiImage::EspNow => 0x4202_e7f8,
                     WifiImage::Worker => 0x4202_e60c,
-                    WifiImage::WorkerL3 => 0x4202_f924,
+                    WifiImage::WorkerL3 => 0x4203_036c,
                 };
                 if pc0 == want {
                     let data = self.cpu[core].reg(11);
@@ -598,7 +631,7 @@ impl Esp32S3 {
                     WifiImage::Scan => 0x4202_e5c4,
                     WifiImage::EspNow => 0x4202_e85c,
                     WifiImage::Worker => 0x4202_e670,
-                    WifiImage::WorkerL3 => 0x4202_f988,
+                    WifiImage::WorkerL3 => 0x4203_03d0,
                 };
                 if pc0 == want_rx
                     && let Some(frame) = self.soc.net_take_rx()
@@ -660,24 +693,41 @@ impl Esp32S3 {
             // loopback — it takes the host's TX command and synthesizes
             // the Command Complete into 0x3fcacfd6 itself, then calls
             // `host_rcv_pkt` with its OWN buffer — no host/bridge needed
-            // for basic commands). The tap therefore captures READ-ONLY
-            // (bridge observability) and runs NOTHING in firmware: no
-            // sem give (`run_ble_send_ready`), no ack deliver, no pool
-            // top-up. All three were proven harmful or redundant:
-            // - the give pumped `vhci_send_sem` the ROM loopback already
-            //   manages (double-completion → stale acks);
-            // - `ble_ack_deliver_at` overwrote the live TX mbuf with a
-            //   STALE bridge reply (previous command's CC → opcode
-            //   mismatch → `HCI process ack returned 12`);
-            // - `ble_pool_top_up` linked the checked-out mbuf as free
-            //   while live (double-ownership vs the ROM loopback's own
-            //   alloc/free pairing → `assert failed: 0x42014482`).
+            // for basic commands). The tap captures READ-ONLY for CMD
+            // (bridge observability) and gives the semaphore ONLY for ACL
+            // (H4==0x02, see arm below): ROM manages CMD sem itself (extra
+            // host give double-completes → stale acks, proven harmful),
+            // but ROM never gives for ACL data (its loopback is CMD-only),
+            // so ATT responses starve in the 0x7d0-tick sem take → ret 19
+            // → `assert 0x4200724d:91` (proven live via L2CAP_RET probe).
+            // `ble_ack_deliver_at`/`ble_pool_top_up` stay parked (proven
+            // harmful: stale-ack opcode mismatch, double-ownership
+            // `assert 0x42014482`). Helpers stay unit-tested.
             // The helpers stay (unit-tested, wired for a future external-
-            // controller mode) but the tap does not call them.
+            // controller mode) but the tap calls ONLY `run_ble_send_ready`
+            // for ACL (never ack/pool).
             if pc0 == 0x4202_6088 {
                 let data = self.cpu[core].reg(10);
                 let len = self.cpu[core].reg(11);
                 self.soc.bt_hci_capture_tx(data, len);
+                // ACL-only sem give (2026-10-04, proven live via L2CAP_RET
+                // ret=19): ATT responses (H4=0x02 ACL) die in `ble_hci_trans_
+                // hs_acl_tx` semaphore take (0x7d0-tick timeout → 19 →
+                // `assert 0x4200724d:91`) because NOTHING ever gives
+                // `vhci_send_sem` for ACL — silicon's controller gives via
+                // `controller_rcv_pkt_ready` after consuming, but the ROM
+                // loopback only synthesizes CMD completes (its own sem
+                // management covers CMD; an extra host give double-completes
+                // CMD → stale acks, proven harmful). Scoped to H4==0x02 so
+                // CMD stays read-only (ROM-owned) while ACL gets its
+                // completion (host-owned, no double — ROM never gives for
+                // ACL). `controller_rcv_pkt_ready` gives iff the handle is
+                // nonzero (beqz-guarded), so calling unconditionally is safe.
+                // Read H4 via the SoC bus (DRAM address, first frame byte).
+                let h4 = self.soc.read8(data);
+                if h4 == 0x02 {
+                    self.run_ble_send_ready(core);
+                }
                 // Sync command-ack delivery DISABLED (was `ble_ack_deliver_at`
                 // with the live tap mbuf): the REAL ROM loopback synthesizes
                 // Command Completes itself and runs the ack path firmware-side
@@ -738,31 +788,33 @@ impl Esp32S3 {
             // window surgery is needed (the call never executes: pc+3,
             // registers untouched).
             // SCOPE: worker-L3 image only (nm+objdump on the test-worker-l3
-            // ELF). The closed lib links these functions at a different
-            // address per image but with an identical shape — extend per
-            // image the same way if another long run ever needs it; the
-            // other battery images never reach a clobbered slot.
-            // - 0x4207fcad: `callx8 a8` in `chip_v7_set_chan_misc` (target
-            //   = tbl[0x24c]; tail `l32i.n; mov; l32i; mov.n; callx8; retw.n`
+            // ELF — re-derived after the L3-legs .ino edit: 0x420807d9,
+            // 0x42081b0f, 0x42081b25, 0x42081b2f). The closed lib links
+            // these functions at a different address per image but with an
+            // identical shape — extend per image the same way if another
+            // long run ever needs it; the other battery images never reach
+            // a clobbered slot.
+            // - 0x420807d9: `callx8 a8` in `chip_v7_set_chan_misc` (target
+            //   = tbl[0x24c]; tail `l32i.n; mov; l32i; mov.n; callx8`
             //   redefines a10/a11 before any read — `mov.n a10,a2` reads
             //   misc's own channel arg — and a8 is dead after the call).
-            // - 0x42080fe3: `callx8 a3` in `ram_wifi_set_tx_gain` (target
+            // - 0x42081b0f: `callx8 a3` in `ram_wifi_set_tx_gain` (target
             //   = tbl[0x228]; tail redefines a3/a10/a11/a12 before any
             //   read, a8 dead, a2 keeps the function arg — verified op by
             //   op against xtensa_core::generated).
-            // - 0x42080ff9: `callx8 a3` in the same function (target =
+            // - 0x42081b25: `callx8 a3` in the same function (target =
             //   tbl[0x210], clobbered with non-code bytes like its
             //   neighbors; tail redefines a3/a10/a11/a12 (mov/movi) and a2
             //   (l32i.n) before any read, a8 dead — same verification).
-            // - 0x42081003: `callx8 a2` in the same function (target =
+            // - 0x42081b2f: `callx8 a2` in the same function (target =
             //   tbl[0x224], clobbered with DNS bytes like its neighbors;
             //   the call is the function's last op before `retw.n`, so its
             //   return dies with the frame unread — sound).
             if self.soc.wifi_image == esp32s3_soc::WifiImage::WorkerL3
-                && (pc0 == 0x4207_fcad
-                    || pc0 == 0x4208_0fe3
-                    || pc0 == 0x4208_0ff9
-                    || pc0 == 0x4208_1003)
+                && (pc0 == 0x4208_07d9
+                    || pc0 == 0x4208_1b0f
+                    || pc0 == 0x4208_1b25
+                    || pc0 == 0x4208_1b2f)
             {
                 self.cpu[core].pc = pc0.wrapping_add(3);
                 n += 1;
@@ -883,7 +935,7 @@ impl Esp32S3 {
         let saved_a12 = cpu.reg(12);
         let saved_a13 = cpu.reg(13);
         // Synthesize the call8 frame: wb+2 (ENTRY rotates back), return
-        // address 0x4000_0000 (unmapped ROM hole — never executed, only
+        // address SYNTH_RETPC (0x8000_0000, unmapped — never executed, only
         // compared), args staged. a6/a7 also saved: the wrapper's
         // vtable dispatch (`l32i a8,[a6,8]` + `callx8`) runs in the
         // CURRENT window, so a live a6 would route the call through a
@@ -891,7 +943,7 @@ impl Esp32S3 {
         let wb = (saved_wb + 2) & 0xf;
         cpu.set_windowbase(wb);
         cpu.pc = entry;
-        cpu.set_reg(8, 0x4000_0000);
+        cpu.set_reg(8, SYNTH_RETPC);
         cpu.set_reg(10, a2);
         cpu.set_reg(11, a3);
         // Direct-vtable `onReceive` is a 4-arg method
@@ -908,11 +960,11 @@ impl Esp32S3 {
         // restores and reports false rather than hanging the harness).
         for _ in 0..10_000 {
             self.cpu[core].step_one(&mut self.soc);
-            if self.cpu[core].pc == 0x4000_0000 {
+            if (self.cpu[core].pc & 0x3fff_ffff) == (SYNTH_RETPC & 0x3fff_ffff) {
                 break;
             }
         }
-        let ok = self.cpu[core].pc == 0x4000_0000;
+        let ok = (self.cpu[core].pc & 0x3fff_ffff) == (SYNTH_RETPC & 0x3fff_ffff);
         let cpu = &mut self.cpu[core];
         cpu.pc = saved_pc;
         cpu.set_reg(0, saved_a0);
@@ -1053,7 +1105,7 @@ impl Esp32S3 {
         // above already cover WINDOWSTART.
         cpu.set_sreg(xtensa_core::cpu::SR_WINDOW_START, 1u32 << wb);
         cpu.pc = entry;
-        cpu.set_reg(8, 0x4000_0000);
+        cpu.set_reg(8, SYNTH_RETPC);
         cpu.set_reg(10, buf);
         cpu.set_reg(11, len);
         // Run on the host-owned synthetic stack (see SYNTH_STACK_TOP):
@@ -1090,7 +1142,7 @@ impl Esp32S3 {
             // exceptions).
             let apc = self.cpu[core].pc;
             let r = self.cpu[core].step_one(&mut self.soc);
-            if self.cpu[core].pc == 0x4000_0000 {
+            if (self.cpu[core].pc & 0x3fff_ffff) == (SYNTH_RETPC & 0x3fff_ffff) {
                 break;
             }
             // TEMP (2026-10-03, forensics — DELETE after): IRAM
@@ -1143,7 +1195,7 @@ impl Esp32S3 {
             self.cpu[core].sreg(xtensa_core::cpu::SR_EPC1),
             self.cpu[core].windowbase(),
         ));
-        let ok = self.cpu[core].pc == 0x4000_0000;
+        let ok = (self.cpu[core].pc & 0x3fff_ffff) == (SYNTH_RETPC & 0x3fff_ffff);
         let cpu = &mut self.cpu[core];
         cpu.pc = saved_pc;
         *cpu.phys_regs_mut() = saved_phys;
@@ -1170,7 +1222,7 @@ impl Esp32S3 {
     /// signal: `controller_rcv_pkt_ready` (0x4200507c, BLE image only —
     /// nm on the esp32s3_ble ELF) gives `vhci_send_sem` iff the handle
     /// is nonzero. Same 0-arg call8-frame synthesis as `run_ble_host_recv`
-    /// (fake-RETW at 0x4000_0000); the callee's `beqz` skips the give
+    /// (fake-RETW at SYNTH_RETPC); the callee's `beqz` skips the give
     /// when unregistered, so this is safe to call unconditionally from
     /// the TX-tap arm.
     ///
@@ -1180,7 +1232,7 @@ impl Esp32S3 {
     #[allow(dead_code)]
     fn run_ble_send_ready(&mut self, core: usize) {
         const READY: u32 = 0x4200_507c;
-        const RETPC: u32 = 0x4000_0000;
+        const RETPC: u32 = SYNTH_RETPC;
         let cpu = &mut self.cpu[core];
         let saved_pc = cpu.pc;
         let saved_wb = cpu.windowbase();
@@ -1193,7 +1245,7 @@ impl Esp32S3 {
         cpu.set_reg(8, RETPC);
         for _ in 0..10_000 {
             self.cpu[core].step_one(&mut self.soc);
-            if self.cpu[core].pc == RETPC {
+            if (self.cpu[core].pc & 0x3fff_ffff) == (RETPC & 0x3fff_ffff) {
                 break;
             }
         }
@@ -1211,7 +1263,7 @@ impl Esp32S3 {
     /// `Soc::llmac_stage_beacon`).
     ///
     /// Same 2-arg call8-frame synthesis as `run_ble_host_recv`:
-    /// `cb(buf, WIFI_PKT_MGMT)` with the fake-RETW at 0x4000_0000, full
+    /// `cb(buf, WIFI_PKT_MGMT)` with the fake-RETW at SYNTH_RETPC, full
     /// physical-window save/restore + INTENABLE mask (the sniffer parses
     /// IEs and touches Arduino `String`/heap state — thousands of
     /// instructions deep, same overflow discipline). Runs on core 0:
@@ -1263,7 +1315,7 @@ impl Esp32S3 {
         // overflow into firmware vectors with stale phys spill bases.
         cpu.set_sreg(xtensa_core::cpu::SR_WINDOW_START, 1u32 << wb);
         cpu.pc = entry;
-        cpu.set_reg(8, 0x4000_0000);
+        cpu.set_reg(8, SYNTH_RETPC);
         cpu.set_reg(10, buf);
         cpu.set_reg(11, ty);
         // Run on the host-owned synthetic stack (see SYNTH_STACK_TOP):
@@ -1274,14 +1326,14 @@ impl Esp32S3 {
         cpu.set_reg(1, SYNTH_STACK_TOP);
         for _ in 0..10_000 {
             let r = self.cpu[core].step_one(&mut self.soc);
-            if self.cpu[core].pc == 0x4000_0000 {
+            if (self.cpu[core].pc & 0x3fff_ffff) == (SYNTH_RETPC & 0x3fff_ffff) {
                 break;
             }
             if !matches!(r, StepResult::Ok | StepResult::Exception { cause: 32..=37 }) {
                 break;
             }
         }
-        let ok = self.cpu[core].pc == 0x4000_0000;
+        let ok = (self.cpu[core].pc & 0x3fff_ffff) == (SYNTH_RETPC & 0x3fff_ffff);
         let cpu = &mut self.cpu[core];
         cpu.pc = saved_pc;
         *cpu.phys_regs_mut() = saved_phys;

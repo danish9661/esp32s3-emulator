@@ -37,11 +37,15 @@ peripherals) with no server-side emulation.
   gateway SLIRP/NAT + DHCP/DNS/ARP/IPv6-RA/UDP-forward under
   `tools/gateway/`), and `test_worker_l3` speaks real lwIP client frames
   at gateway-local services answered synchronously in
-  `tools/gateway/handleL7.go` (DNS static table, NTP fixed epoch, UDP
-  echo on the CoAP port — no live netif needed; `go test ./...` pins the
-  wire contract). Full Internet egress (HTTP/MQTT via gVisor NAT) works
-  when the gateway host is online (proven live: EGRESS_TCP80_OK,
-  EGRESS_MQTT_OK); the in-browser gallery covers both workers via the
+  `tools/gateway/handleL7.go` — proven live 18/18 + DONE (DNS `34`, NTP
+  `123`, UDP-echo `9`, CoAP CON GET /t → 2.05 `25.00C`, HTTP SYN-ACK +
+  `200`, MQTT SYN-ACK/CONNACK/SUBACK + `1883`, IPv6 RA `134` + echo `129`
+  + UDP `9`, all through the live `esp_netif_transmit` tap with
+  `go test ./...` pinning the wire contract). Full Internet egress
+  (HTTP/MQTT via gVisor NAT) works when the gateway host is online
+  (proven live: EGRESS_TCP80_OK, EGRESS_MQTT_OK); board-as-server
+  (lwIP listen/accept) stays Partial by design — no live-netif path
+  exists offline. The in-browser gallery covers both workers via the
   Live-IP panel + `wifi_worker`/`wifi_worker_l3` fixtures.
 - **BLE via Bumble bridge**: the `esp32s3_ble` NimBLE GATT-server sketch
   boots to `BLE DONE` (advertise + Battery service + echo characteristic)
@@ -52,10 +56,15 @@ peripherals) with no server-side emulation.
   the Go gateway and a BLE panel in the browser. The on-silicon ROM
   controller loopback answers basic commands locally (proven live), so
   the sketch passes with or without the bridge; the bridge proves the
-  host↔controller path end-to-end.
-- **Remaining known gaps**: full Internet L3–L7 client/server suites that
-  need a live outside counterparty beyond the gateway host (see
-  `AGENTS.md`). The
+  host↔controller path end-to-end. Canned 9-step GATT (conn → discovery
+  → find-info → READ/WRITE/ECHO) is proven offline; live runs are panic-free
+  (`conn 1`, stable link — the first-ATT `att_tx` assert was a VHCI ACL
+  semaphore timeout, fixed with an ACL-scoped completion in the TX tap).
+  Central-side completion against a live Bumble central stays harness-side
+  (Bumble link delivery, out of model scope).
+- **Remaining known gaps**: board-as-server L3–L7 (lwIP listen/accept —
+  no live-netif counterparty offline) and live-central BLE completion
+  (Bumble link delivery — no in-firmware gap; see `AGENTS.md`). The
   Arduino `Wire` (I2C) empty-bus scan reporting "other" is verified
   silicon-true behavior (esp-idf NG-driver maps the NACK path's
   `ESP_ERR_INVALID_STATE` to 4), not a model gap — see `AGENTS.md`. Xtensa
@@ -214,7 +223,7 @@ help/                   Reference materials (gitignored)
 
 ### Windowed Register File
 
-The Xtensa LX7 uses a windowed register file (64 registers across 8窗口).
+The Xtensa LX7 uses a windowed register file (64 registers across 8 windows).
 The emulator implements this with a flat `ar: [u32; 64]` array + WINDOWBASE /
 WINDOWSTART special registers. `rotate()` shifts the physical register mapping
 on CALL/RETW, matching QEMU's `win_helper.c` behavior.
@@ -226,7 +235,7 @@ on CALL/RETW, matching QEMU's `win_helper.c` behavior.
 | I2C Wire driver | Silicon-true | Empty-bus scan reports "other" per esp-idf NG-driver mapping (verified behavior, not a gap); peripheral validated via direct poke |
 | ee.* DSP/TIE | 218/218 execute | Unmapped patterns trap loud (correct); only needed for WiFi/FFT firmware |
 | Touch | Validated | Oneshot + threshold ISR path via direct poke (see `AGENTS.md`) |
-| WiFi/BLE | Partial / Out of scope | WiFi scan/STA/AP/ESP-NOW + live-IP L2 bridge validated; L3–L7 suites pending; BLE out of scope (months of work; not required for core milestone) |
+| WiFi/BLE | Partial / Out of scope | WiFi scan/STA/AP/ESP-NOW + live-IP L2 bridge + L3–L7 client legs (DNS/NTP/UDP/CoAP/HTTP/MQTT/IPv6, 18/18 live) + pcap validated; board-as-server L3–L7 stays Partial (no live-netif path offline); BLE GATT server boots + canned 9-step GATT + panic-free live conn (central completion is harness-side Bumble link delivery, out of model scope) |
 | I2S TDM/PDM | Modeled | Master/slave clock-gen, TDM, PDM all functional |
 | LCD_CAM 8080/6800 | Partial | FIFO + transfer-done functional; RGB FSM not modeled |
 | ULP rv32imc | Functional | C extension supported; compressed decode working |

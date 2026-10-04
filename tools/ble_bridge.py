@@ -620,6 +620,23 @@ async def run_central(device: object) -> None:
                 await _asyncio.sleep(5)
                 continue
             logger.info("CENTRAL_CONN ok")
+            # ADDRESS ALIAS (2026-10-04, proven live via `!!! no connection
+            # for ...` drops): the firmware programs a RANDOM controller
+            # address via 0x2005 while advertising own=PUBLIC, so central
+            # connects to 13:37.../P but link data arrives sourced from the
+            # random address (e.g. CE:D0:...) and emu-ctrl's
+            # le_connections.get() misses — every firmware→central ATT
+            # response is dropped before the host. Alias the live connection
+            # under emu-wire's current random address (re-aliased per
+            # connect; same-run stable). Harness-only (model untouched).
+            try:
+                _emu_wire = device._emu_controller  # type: ignore[attr-defined]
+                _emu_host_ctrl = device._emu_host_controller  # type: ignore[attr-defined]
+                _rand = _emu_wire.random_address
+                _emu_host_ctrl.le_connections[_rand] = connection
+                logger.info("CENTRAL_ALIAS %s ok", str(_rand))
+            except Exception as e:
+                logger.warning("CENTRAL_ALIAS failed: %s", e)
             # SAME-CONNECTION ATT RETRY (2026-10-04, proven live): the first
             # ATT (service discovery) goes out immediately after connect,
             # before the firmware finishes version/features/data-length —

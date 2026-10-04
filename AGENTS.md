@@ -4768,3 +4768,58 @@ full enumeration REQ0..REQ6 — is covered),
       Bumble-host matching fix (out of model scope). Battery `ble` +
       `llmac` green (no regression); full workspace green (115 emu + 115
       soc lib + soc integration + 110 xtensa). NOT committed.
+  - 2026-10-04: **L3–L7 live E2E CLOSED at 18/18 + DONE (was 17/18 + graceful
+    DONE)**. `esp32s3_test_worker_l3` + gateway-local Go services now prove
+    every validatable client leg live through the real `esp_netif_transmit`
+    tap + `esp_netif_receive` entry (per-image WorkerL3 pcs, fake-RETW):
+    `dns 34` / `ntp 123` / `udp 9` (raw `HELLO-UDP` echo :5683) / `coap 205`
+    (CON GET /t → 2.05 + `25.00C`, new `snoopCoAP` in `handleL7.go` with
+    strict 8B shape so `HELLO-UDP` still falls through to echo — pinned by
+    `TestCoAPTempGet` + `TestCoAPFallsThroughToEcho`) / `http_synack 1` +
+    `http 200` / `mqtt_synack/connack/suback 1` + `mqtt 1883` / `ip6 ra 134`
+    + `ip6 echo 129` + `ip6 udp 9` (EUI-64 link-local like lwIP, RS→RA +
+    echo + UDP/5683 via `handleIPv6.go`) → `WORKER L3 DONE` (1B STEPS,
+    ~825s @1.2 MIPS, no ILLEGAL). Three real sketch bugs fixed live, each
+    proven by gateway/pcap ground truth (not guessing): (1) IPv6-UDP
+    offsets were +28 not +20 (checked 62/70, correct 54/55 + payload 62 —
+    IPv6 header is 20B longer than v4; echo/RA offsets were already right,
+    which is why they passed while udp missed despite 71B replies arriving
+    twice, proven by `net RX 71B` with `NET_RX_LOG`); (2) 8-pop scans
+    destabilize (ILLEGAL at 856M — header warned dozens of pops kill the
+    run; 6-pop passes RA/echo, so 8-pop reverted); (3) RA flaky 1/2 at 2 TX
+    → 3 TX (extra RS stages another unicast RA without extra pops; echo/udp
+    stay 2 TX, stable). Relink discipline held 4× (every .ino edit moves
+    closed libs; all WorkerL3 code +0x10 this round, BSS stable; the
+    Arduino-core delete site moved separately to `0x42006085` — bulk +0x10
+    missed it and broke assoc→sketch wakeup until objdump-verified; RF
+    skips re-derived). Battery +2 (`test_worker_l3_live` 18 markers,
+    `net_pcap` ARP+IPv4 artifact check) with 900s timeout for ≥1B steps
+    (300s killed live mid-leg) + space-in-ROOT harness fix (pcap path
+    cannot ride unquoted `env` split — empty log + `missing [DONE]`).
+    Server legs (board as lwIP listener) stay Partial by design (no
+    live-netif path offline — raw tap proves client + pcap; lwIP
+    bind/listen has no validatable flow). Battery `test_worker_l3` (plain
+    negatives + DONE) + `live` (18/18) + `inwasm` + `net_pcap` (17
+    packets) + `ble` green; workspace/clippy/fmt/wasm32/go green.
+  - 2026-10-04: **BLE live-first-ATT panic ROOT-CAUSED to VHCI sem timeout
+    (`ret=19`, not headroom) + ACL-scoped give lands, panic gone**.
+    Per-op `0x4200723c` probe (new `ble_l2cap_ret`, airtight vs post-step
+    miss) proved `l2cap_tx` returns 19 on the first live discovery (same
+    bytes canned answers clean). Disassembly chain: `att_tx` asserts on
+    nonzero `l2cap_tx` → `ble_hs_hci_acl_tx_now` → `ble_hs_tx_data` →
+    `ble_transport_to_ll_acl_impl` → `ble_hci_trans_hs_acl_tx` takes
+    `vhci_send_sem` (0x7d0-tick) → `mov a2,19` on timeout → assert
+    `0x4200724d:91`. ROM loopback manages CMD sem itself (extra host give
+    double-completes → stale acks, proven harmful) but never gives for ACL
+    data (CMD-only loopback), so ATT responses starve. Fix: TX-tap gives
+    via `run_ble_send_ready` ONLY for H4==0x02 ACL (CMD stays read-only;
+    `controller_rcv_pkt_ready` beqz-guarded so unconditional call is safe).
+    Result: 400M live runs clean (no ILLEGAL/assert, `conn 1`, link stable,
+    no disc) vs deterministic panic before. REMAINING (harness, not
+    firmware): central→firmware ATT never reaches the emulator (5×
+    `LINK-ACL emu-ctrl` sent, zero `WIRE-ACL`/`BLE RX` received — Bumble
+    LocalLink addressing, not model; firmware side proven by canned 9-step
+    GATT + live markers + stable conn). `CENTRAL_READ/WRITE/ECHO/PASS`
+    needs the Bumble-link delivery fix (out of model scope). TEMP
+    forensics kept (`ble_l2cap_ret`, `SYNTH_RETPC`, gates/rings — DELETE
+    after live GATT passes). NOT committed.

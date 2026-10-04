@@ -2293,35 +2293,33 @@ impl Soc {
             }
             WifiImage::WorkerL3 => {
                 // test-worker-l3 image layout (nm on the test-worker-l3
-                // ELF — re-nm'd after the print-first keep-alive .ino edit:
-                // scan_start 0x42065064, connect 0x4203dc10, event vars
-                // WIFI_EVENT 0x3c0b4474 / IP_EVENT 0x3c0b3d70 (unchanged);
+                // ELF — re-nm'd after the L3-legs .ino edit (udp/coap/ipv6
+                // builders): scan_start 0x42065b90, connect 0x4203e658,
+                // event vars WIFI_EVENT 0x3c0b45a8 / IP_EVENT 0x3c0b3ea4;
                 // TX/RX tap + hook pcs re-nm'd in machine.rs/soc.rs below.
-                // The bss cells below did NOT move
-                // (scan/count/heaps/tcb/netif).
+                // BSS cells shifted +0x18 uniformly (symbol-verified).
                 // scans, so records_check is an unused placeholder
                 // (scan leg never arms on this image).
                 // CAUTION: the sketch source pins this layout — EVERY
                 // .ino edit relinks the closed libs (all pcs above move);
                 // re-nm after every sketch change (proven live 7x here).
                 WifiImageLayout {
-                    scan_start: 0x4206_5064,
-                    connect: 0x4203_dc10,
-                    wifi_event_var: 0x3c0b_4474,
-                    ip_event_var: 0x3c0b_3d70,
+                    scan_start: 0x4206_5b90,
+                    connect: 0x4203_e658,
+                    wifi_event_var: 0x3c0b_45a8,
+                    ip_event_var: 0x3c0b_3ea4,
                     count_cell: 0x3fc9_f936,
-                    scan_count: 0x3fc9_aef0,
-                    scan_result: 0x3fc9_aeec,
+                    scan_count: 0x3fc9_af08,
+                    scan_result: 0x3fc9_af04,
                     // records_check = the `call8 get_ap_records` INSIDE
-                    // `_scanDoneEv` (0x420053fd — NOT the get_ap_num call
-                    // at 0x420053bf one slot earlier; objdump-verified).
-                    records_check: 0x4200_53fd,
-                    ready_lists: 0x3fc9_b8ec,
-                    top_prio: 0x3fc9_b85c,
-                    reg_heaps: 0x3fc9_b7a4,
-                    pxcur: 0x3fc9_bae0,
-                    sta_network_if: 0x3fc9_ae78,
-                    esp_wifi_start: 0x4206_4d10,
+                    // `_scanDoneEv` (0x42005e25 — objdump-verified).
+                    records_check: 0x4200_5e25,
+                    ready_lists: 0x3fc9_b904,
+                    top_prio: 0x3fc9_b874,
+                    reg_heaps: 0x3fc9_b7bc,
+                    pxcur: 0x3fc9_baf8,
+                    sta_network_if: 0x3fc9_ae90,
+                    esp_wifi_start: 0x4206_583c,
                 }
             }
         }
@@ -3254,7 +3252,7 @@ impl Soc {
     /// Per-image `g_phyFuns` BSS pointer cells (nm per Wi-Fi image) the
     /// dispatch-table completion hook watches (see
     /// `maybe_complete_phyfuns_slot`): scan 0x3fca0068,
-    /// sta/worker-net/ap 0x3fca0050, worker-l3 0x3fca0060, espnow
+    /// sta/worker-net/ap 0x3fca0050, worker-l3 0x3fca0078, espnow
     /// 0x3fca0148. The fill publishes the cell ONCE, after the table is
     /// allocated (the publish store is the LAST store to the cell on
     /// every observed boot), so gating on the exact cell loses nothing
@@ -3266,7 +3264,7 @@ impl Soc {
             WifiImage::Ap => 0x3fca_0050,
             WifiImage::EspNow => 0x3fca_0148,
             WifiImage::Worker => 0x3fca_0050,
-            WifiImage::WorkerL3 => 0x3fca_0060,
+            WifiImage::WorkerL3 => 0x3fca_0078,
         }
     }
 
@@ -3290,7 +3288,7 @@ impl Soc {
             WifiImage::Ap => 0x4200_42ad,
             WifiImage::EspNow => 0x4200_450d,
             WifiImage::Worker => 0x4200_433d,
-            WifiImage::WorkerL3 => 0x4200_5645,
+            WifiImage::WorkerL3 => 0x4200_6085,
         }
     }
 
@@ -3308,7 +3306,7 @@ impl Soc {
             WifiImage::Ap => 0x4202_e838,
             WifiImage::EspNow => 0x4202_ea9c,
             WifiImage::Worker => 0x4202_e8b0,
-            WifiImage::WorkerL3 => 0x4202_fbc8,
+            WifiImage::WorkerL3 => 0x4203_0610,
         }
     }
 
@@ -3320,7 +3318,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_4164,
             WifiImage::EspNow => 0x4206_a298,
             WifiImage::Worker => 0x4206_41dc,
-            WifiImage::WorkerL3 => 0x4206_5604,
+            WifiImage::WorkerL3 => 0x4206_6130,
         }
     }
 
@@ -3333,7 +3331,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_3f0c,
             WifiImage::EspNow => 0x4206_9f98,
             WifiImage::Worker => 0x4206_3f84,
-            WifiImage::WorkerL3 => 0x4206_53ac,
+            WifiImage::WorkerL3 => 0x4206_5ed8,
         }
     }
 
@@ -3346,7 +3344,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_3ea4,
             WifiImage::EspNow => 0x4206_9f30,
             WifiImage::Worker => 0x4206_3f1c,
-            WifiImage::WorkerL3 => 0x4206_5344,
+            WifiImage::WorkerL3 => 0x4206_5e70,
         }
     }
 
@@ -3368,7 +3366,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_3f50,
             WifiImage::EspNow => 0x4206_9fdc,
             WifiImage::Worker => 0x4206_3fc8,
-            WifiImage::WorkerL3 => 0x4206_53f0,
+            WifiImage::WorkerL3 => 0x4206_5f1c,
         }
     }
 
@@ -3380,7 +3378,7 @@ impl Soc {
             WifiImage::Ap => 0x4203_c88c,
             WifiImage::EspNow => 0x4203_caf0,
             WifiImage::Worker => 0x4203_c904,
-            WifiImage::WorkerL3 => 0x4203_dc1c,
+            WifiImage::WorkerL3 => 0x4203_e664,
         }
     }
 

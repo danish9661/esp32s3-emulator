@@ -416,16 +416,6 @@ fn main() {
     // GATT server path works; if it panics in att_tx (0x4200724d:91), the
     // PANIC-POOL dump says which pool.
     let mut ble_canned_att_done = false;
-    // TEMP (2026-10-04, forensics — DELETE after): SIZE TEST (small Read
-    // before large discovery). If prepend NULL is size/headroom/chain
-    // dependent, a small Read Response (2B ATT: 0x0B + 100) succeeds
-    // while large discovery (20B) panics; if small also panics, it is
-    // not size (conn/chan/sem/pool-selection). Handle 0x0010 known
-    // (Find-Info decoded). One-shot after dl_done; discovery below now
-    // waits for the read response (acl_tx_n>=1) instead of firing first.
-    // TEMPORARY ORDER — revert after verdict (or keep if small-first
-    // proves pool-safe; large-first is the silicon/central order).
-    let mut ble_canned_readfirst_done = false;
     // TEMP (2026-10-04, forensics — DELETE after): canned ATT script
     // (Find-Info → Read → Write → Read-back) for full GATT proof offline.
     // Phase 1 (this run): Find-Info 0x000e-0xFFFF after the discovery
@@ -464,6 +454,12 @@ fn main() {
     let mut ble_link_up_seq = 0u64;
     // TEMP (2026-10-03): host-task-seen latch (DELETE after).
     let mut ble_host_seen = false;
+    // HOST-ENABLED deferral latch (2026-10-04, DELETE after): transition
+    // logging for the enabled_state==0 deferral (per-step spam floods).
+    let mut ble_host_disabled = false;
+    // TEMP (2026-10-04, forensics — DELETE after): l2cap_tx return latch.
+    // Logs each NEW (core, ret) observed at 0x4200723c (see machine.rs).
+    let mut ble_l2cap_last: Option<(usize, u32)> = None;
     // TEMP (2026-10-03): post-delivery pc-window countdown (DELETE after).
     let mut ble_watch_n = 0u32;
     // TEMP (2026-10-03): pc rings for the canned NULL-call forensics
@@ -625,27 +621,29 @@ fn main() {
         sta_network_if: 0x3fc9_ae6c,
     };
     // test-worker-l3 image layout (nm on the test-worker-l3 ELF —
-    // re-nm'd after the print-first keep-alive .ino edit: scan_start
-    // 0x42065064, connect 0x4203dc10, event vars unchanged
-    // (WIFI_EVENT 0x3c0b4474 / IP_EVENT 0x3c0b3d70). The sketch source pins
-    // the layout like every other image, re-nm after any .ino edit.
+    // re-nm'd after the L3-legs .ino edit (udp/coap/ipv6 builders):
+    // scan_start 0x42065b90 (= esp_wifi_scan_start entry),
+    // connect 0x4203e658 (= esp_wifi_connect entry), event vars
+    // WIFI_EVENT 0x3c0b45a8 / IP_EVENT 0x3c0b3ea4; TX/RX tap + hook pcs
+    // re-nm'd in machine.rs/soc.rs below. BSS cells shifted +0x18
+    // uniformly vs the previous link (ready_lists/top_prio/pxcur/netif/
+    // scan_count/scan_result verified by symbol name).
     // records_check is the `call8 esp_wifi_scan_get_ap_records` INSIDE
-    // `_scanDoneEv` (0x420053fd here — NOT the 0x420053bf get_ap_num call
-    // one slot earlier; verified by objdump of the linked ELF).
+    // `_scanDoneEv` (0x42005e25 here — objdump-verified on the new ELF).
     const WORKER_L3_LAYOUT: WifiLayout = WifiLayout {
-        scan_start: 0x4206_5064,
-        connect: 0x4203_dc10,
-        wifi_event_var: 0x3c0b_4474,
-        ip_event_var: 0x3c0b_3d70,
+        scan_start: 0x4206_5b90,
+        connect: 0x4203_e658,
+        wifi_event_var: 0x3c0b_45a8,
+        ip_event_var: 0x3c0b_3ea4,
         count_cell: 0x3fc9_f936,
-        scan_count: 0x3fc9_aef0,
-        scan_result: 0x3fc9_aeec,
-        records_check: 0x4200_53fd,
-        ready_lists: 0x3fc9_b8ec,
-        top_prio: 0x3fc9_b85c,
-        reg_heaps: 0x3fc9_b7a4,
-        pxcur: 0x3fc9_bae0,
-        sta_network_if: 0x3fc9_ae78,
+        scan_count: 0x3fc9_af08,
+        scan_result: 0x3fc9_af04,
+        records_check: 0x4200_5e25,
+        ready_lists: 0x3fc9_b904,
+        top_prio: 0x3fc9_b874,
+        reg_heaps: 0x3fc9_b7bc,
+        pxcur: 0x3fc9_baf8,
+        sta_network_if: 0x3fc9_ae90,
     };
     // wifi-ap image layout (nm on the wifi-ap ELF; sta_network_if =
     // `_ZL14_ap_network_if` bss static; esp_wifi_start = 0x42063870
@@ -738,6 +736,16 @@ fn main() {
         let (r, r1, n) = m.step_fast();
         executed += n as u64;
         i += 1;
+        // TEMP (2026-10-04, forensics — DELETE after): log each new
+        // l2cap_tx return code observed at 0x4200723c (machine.rs per-op
+        // probe). Proves whether live-first-ATT fails via prepend (6) or
+        // another path, without exact-pc post-step polling.
+        if m.ble_l2cap_ret != ble_l2cap_last {
+            ble_l2cap_last = m.ble_l2cap_ret;
+            if let Some((core, ret)) = m.ble_l2cap_ret {
+                println!("[host] BLE L2CAP_RET core{core} ret={ret}");
+            }
+        }
         let pc = m.cpu[0].pc;
         if ble_canned {
             ring0[ring_i % 64] = pc;
@@ -802,6 +810,22 @@ fn main() {
                         m.soc.read32(sp.wrapping_add(4)),
                         m.soc.read32(sp.wrapping_add(8)),
                         m.soc.read32(sp.wrapping_add(12)),
+                    );
+                    // TEMP (2026-10-04, forensics — DELETE after): VHCI
+                    // semaphore + HCI credits post-mortem. `ble_hs_hci_acl_
+                    // tx_now` can only fail the att_tx assert via the VHCI
+                    // send itself (all pools healthy at every panic, queue
+                    // paths return 1 not assert): vhci_send_sem 0x3fc9d6d0
+                    // (1 initial, taken per send, given per TX-done) and
+                    // avail_pkts 0x3fc9e110 / buf_sz 0x3fc9e2b0 (ROM-
+                    // reported controller buffers). sem 0 => exhaustion
+                    // (fix = host give per captured ACL TX); avail 0 =>
+                    // queue path (rc 1, rules out credits).
+                    println!(
+                        "[host] PANIC-VHCI sem={} avail={} bufsz={}",
+                        m.soc.read32(0x3fc9_d6d0),
+                        m.soc.read16(0x3fc9_e110),
+                        m.soc.read16(0x3fc9_e2b0),
                     );
                     // TEMP (2026-10-04, forensics — DELETE after): mbuf pool
                     // free counts. Pools at these addrs are `os_mbuf_pool`
@@ -1554,235 +1578,262 @@ fn main() {
                     );
                 } else if let Some(cb) = ble_cb_entry
                     && {
-                        // TEMP (2026-10-03): pool drain watch (DELETE after).
-                        // Did the synthetic call consume an ev-pool block?
-                        // Plus the SMP interleaving: both cores' pcs + the
-                        // scheduler lock (xKernelLock 0x3fc99110 — nm on the
-                        // ble ELF). If the other core sits mid-critical-
-                        // section when we synthesize scheduler-touching
-                        // firmware, lists corrupt -> garbage TCB -> wild
-                        // retw through paint.
-                        let f0 = m.soc.ble_evt_pool_free();
-                        // TEMP (2026-10-03): capture the pre-call pool
-                        // free-list head (DELETE after) — the block our
-                        // call will check out. NPL event = {queued@0,
-                        // fn@4, arg@8} per npl_freertos.h.
-                        let pre_head = m.soc.read32(0x3fc9_df6c + 20);
-                        // TEMP (2026-10-03): queue depth pre/post (DELETE
-                        // after). Corrected layout (from the sem mw/len
-                        // offsets the ack path proves: counts at +56/+60):
-                        // depth=[q+56]. 0→1 = our post landed; 1→0 = task
-                        // took it.
-                        let evq0 = m.soc.read32(0x3fc9_dd50);
-                        let q0 = m.soc.read32(evq0);
-                        let depth0 = m.soc.read32(q0.wrapping_add(56));
-                        println!(
-                            "[host] BLE pre core0={:#010x} core1={:#010x} lock={:#010x}",
-                            m.cpu[0].pc,
-                            m.cpu[1].pc,
-                            m.soc.read32(0x3fc9_9110)
-                        );
-                        // TEMP (2026-10-03): evq waiter check (DELETE after).
-                        // Is any task parked on ble_hs_evq when we post?
-                        // ble_hs_evq (0x3fc9dd50) word0 = 0x3fc9ea68 =
-                        // g_eventq_dflt STRUCT whose word0 (0x3fcb1430)
-                        // is the real FreeRTOS Queue_t (heap). Check the
-                        // waiter on the QUEUE, not the wrapper, and dump
-                        // both layouts. PLUS the receive list itself
-                        // (+36: count, pxIndex+40, end.next+44): whose TCB
-                        // is parked? (host_task_h for comparison.)
-                        // PLUS pre-call IRAM probe (DELETE after): is
-                        // 0x40380a7c still intact right BEFORE the
-                        // synthetic call? Splits synthetic-call clobber
-                        // vs idle-time drift.
-                        // PLUS window-liveness snapshot (DELETE after):
-                        // stale WINDOWSTART bits (never cleared) make
-                        // overflow rotate into ALIASED live windows (a1
-                        // = another task's SP, [SP-12] = its saved
-                        // retaddr) → spill base wild → IRAM clobber.
-                        println!(
-                            "[host] BLE pre IRAM @0x40380a7c = {:#010x}",
-                            m.soc.read32(0x4038_0a7c)
-                        );
-                        println!(
-                            "[host] BLE pre wb={} wstart={:#010x} excsave1={:#010x}",
-                            m.cpu[0].windowbase(),
-                            m.cpu[0].sreg(xtensa_core::cpu::SR_WINDOW_START),
-                            m.cpu[0].sreg(xtensa_core::cpu::SR_EXCSAVE1),
-                        );
-                        // TEMP (2026-10-03, forensics — DELETE after): OF12
-                        // handler inputs — a13 (scratch base) + [SP-12]
-                        // (spill base) in the CURRENT (wb+2-rotated? no:
-                        // pre-call, firmware) view. If either names IRAM
-                        // code, the first overflow spill clobbers it.
-                        {
-                            let sp = m.cpu[0].reg(1);
-                            println!(
-                                "[host] BLE pre a13={:#010x} sp={:#010x} sp-12-mem={:#010x}",
-                                m.cpu[0].reg(13),
-                                sp,
-                                m.soc.read32(sp.wrapping_sub(12)),
-                            );
-                        }
-                        // PLUS waiter pre/post (DELETE after): does our
-                        // post unblock it? Sampled around the synthetic
-                        // call — unblock is synchronous inside Send.
-                        let evq = m.soc.read32(0x3fc9_dd50);
-                        let queue = m.soc.read32(evq);
-                        let evq_wait = if queue != 0 {
-                            m.soc.queue_recv_waiting(queue)
-                        } else {
-                            false
-                        };
-                        let ht0 = m.soc.read32(0x3fc9_eac8);
-                        println!(
-                            "[host] BLE pre evq={evq:#010x} queue={queue:#010x} q_wait={evq_wait} host={ht0:#010x}"
-                        );
-                        println!(
-                            "[host] BLE pre rlist-detail count={} first={:#010x}",
-                            m.soc.read32(queue.wrapping_add(32)),
-                            m.soc.read32(queue.wrapping_add(40)),
-                        );
-                        // TEMP (2026-10-03): full Queue_t dump (DELETE
-                        // after). Is the queue FULL when we post (post
-                        // fails silently -> block leaks -> waiter stays
-                        // parked -> silence)? Words +0..+64.
-                        println!(
-                            "[host] BLE pre qstruct={:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}",
-                            m.soc.read32(queue),
-                            m.soc.read32(queue.wrapping_add(4)),
-                            m.soc.read32(queue.wrapping_add(8)),
-                            m.soc.read32(queue.wrapping_add(12)),
-                            m.soc.read32(queue.wrapping_add(16)),
-                            m.soc.read32(queue.wrapping_add(20)),
-                            m.soc.read32(queue.wrapping_add(24)),
-                            m.soc.read32(queue.wrapping_add(28)),
-                        );
-                        // TEMP (2026-10-03): queue length/occupancy words
-                        // (DELETE after). Standard Queue_t has
-                        // uxMessagesWaiting@48, uxLength@52, uxItemSize@56
-                        // (after two 16B lists at +16/+32). A length-1
-                        // queue + an occupying timer event at post time =
-                        // our post fails silently (0 timeout) and leaks.
-                        // Dump +32..+72 to find the real count fields
-                        // (small ints among pointers; sample twice).
-                        println!(
-                            "[host] BLE pre qlen={:#010x} {:#010x} {:#010x} {:#010x}",
-                            m.soc.read32(queue.wrapping_add(48)),
-                            m.soc.read32(queue.wrapping_add(52)),
-                            m.soc.read32(queue.wrapping_add(56)),
-                            m.soc.read32(queue.wrapping_add(60)),
-                        );
-                        println!(
-                            "[host] BLE pre qx32={:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}",
-                            m.soc.read32(queue.wrapping_add(32)),
-                            m.soc.read32(queue.wrapping_add(36)),
-                            m.soc.read32(queue.wrapping_add(40)),
-                            m.soc.read32(queue.wrapping_add(44)),
-                            m.soc.read32(queue.wrapping_add(64)),
-                            m.soc.read32(queue.wrapping_add(68)),
-                        );
-                        let ok = m.run_ble_host_recv(0, cb);
-                        println!(
-                            "[host] BLE RX host_rcv_pkt ok={ok} evfree {f0}->{})",
-                            m.soc.ble_evt_pool_free()
-                        );
-                        // TEMP (2026-10-04, forensics — DELETE after): staged
-                        // bytes (H4==0 dead-path diagnosis).
-                        if let Some((sb, sl, sx)) = m.last_recv_stage {
-                            println!(
-                                "[host] BLE RX staged buf={sb:#010x} len={sl} bytes={sx:02x?}"
-                            );
-                        }
-                        // TEMP (2026-10-03, forensics — DELETE after): print
-                        // the synthetic-call abort record (fault pc + step
-                        // result) when delivery fails.
-                        if !ok {
-                            if let Some((apc, ar, trip)) = m.last_recv_abort {
+                        // HOST-ENABLED gate (2026-10-04, DELETE after):
+                        // host_rcv_pkt opens with `if (!ble_hs_enabled_state)
+                        // return 0` (BSS 0x3fc9dd70, nm on the BLE ELF —
+                        // BLE-image-only leg, like ble_cb_entry itself). A
+                        // disabled host means the packet would be CONSUMED
+                        // (stage pops first) and dropped on the floor; worse,
+                        // pre-SYNTH_RETPC builds faulted the early retw and
+                        // corrupted state into a restage loop. Skip WITHOUT
+                        // consuming while disabled (level-triggered retry,
+                        // same discipline as no-callback-yet). Log
+                        // transitions only (per-step spam would flood).
+                        // NOTE: a host that never re-enables stalls here by
+                        // design (firmware-side waiter timeout → reset is
+                        // observable + diagnosable; silent corruption is not).
+                        if m.soc.read32(0x3fc9_dd70) == 0 {
+                            if !ble_host_disabled {
                                 println!(
-                                    "[host] BLE RX abort at {apc:#010x}: {ar:?} woe_trip={trip:#010x?}"
+                                    "[host] BLE host disabled (enabled_state==0), deferring delivery"
                                 );
-                                // TEMP (2026-10-03, forensics — DELETE
-                                // after): IRAM clobber site, if observed.
-                                if let Some(cpc) = m.last_recv_clobber {
-                                    println!(
-                                        "[host] BLE RX clobber first seen after step at {cpc:#010x}"
-                                    );
-                                }
-                                // TEMP (2026-10-03, forensics — DELETE
-                                // after): PS at synthetic exit (EXCM set
-                                // ⇒ inside a vector handler).
-                                if let Some((ps, epc1, wb)) = m.last_recv_ps {
-                                    println!(
-                                        "[host] BLE RX exit ps={ps:#010x} epc1={epc1:#010x} wb={wb}"
-                                    );
-                                }
-                                // TEMP (2026-10-03, forensics — DELETE
-                                // after): dump what the CPU actually
-                                // fetched at the fault pc (IRAM backing
-                                // may differ from the ELF file).
-                                println!(
-                                    "[host] BLE RX fault bytes @ {apc:#010x} = {:#010x}",
-                                    m.soc.read32(apc)
-                                );
-                            } else {
-                                println!("[host] BLE RX abort: clean exit without retw (10k cap?)");
+                                ble_host_disabled = true;
                             }
-                        }
-                        // TEMP (2026-10-03): WOE snapshot (DELETE after).
-                        // ENTRY faults cause 0 iff PS.WOE==0 — snapshot PS
-                        // at every delivery attempt: was WOE already clear
-                        // in the idle task state, or cleared mid-call?
-                        println!(
-                            "[host] BLE pre ps={:#010x} woe={}",
-                            m.cpu[0].sreg(xtensa_core::cpu::SR_PS),
-                            (m.cpu[0].sreg(xtensa_core::cpu::SR_PS) & xtensa_core::cpu::PS_WOE)
-                                != 0,
-                        );
-                        // TEMP (2026-10-03): waiter post/post (DELETE
-                        // after). Unblock is synchronous inside Send: if
-                        // still parked after our post, the post didn't
-                        // unblock (wrong queue/full/silent error).
-                        println!(
-                            "[host] BLE pre waiter_post={} depth_post={}",
-                            if queue != 0 {
+                            false
+                        } else {
+                            ble_host_disabled = false;
+                            // TEMP (2026-10-03): pool drain watch (DELETE after).
+                            // Did the synthetic call consume an ev-pool block?
+                            // Plus the SMP interleaving: both cores' pcs + the
+                            // scheduler lock (xKernelLock 0x3fc99110 — nm on the
+                            // ble ELF). If the other core sits mid-critical-
+                            // section when we synthesize scheduler-touching
+                            // firmware, lists corrupt -> garbage TCB -> wild
+                            // retw through paint.
+                            let f0 = m.soc.ble_evt_pool_free();
+                            // TEMP (2026-10-03): capture the pre-call pool
+                            // free-list head (DELETE after) — the block our
+                            // call will check out. NPL event = {queued@0,
+                            // fn@4, arg@8} per npl_freertos.h.
+                            let pre_head = m.soc.read32(0x3fc9_df6c + 20);
+                            // TEMP (2026-10-03): queue depth pre/post (DELETE
+                            // after). Corrected layout (from the sem mw/len
+                            // offsets the ack path proves: counts at +56/+60):
+                            // depth=[q+56]. 0→1 = our post landed; 1→0 = task
+                            // took it.
+                            let evq0 = m.soc.read32(0x3fc9_dd50);
+                            let q0 = m.soc.read32(evq0);
+                            let depth0 = m.soc.read32(q0.wrapping_add(56));
+                            println!(
+                                "[host] BLE pre core0={:#010x} core1={:#010x} lock={:#010x}",
+                                m.cpu[0].pc,
+                                m.cpu[1].pc,
+                                m.soc.read32(0x3fc9_9110)
+                            );
+                            // TEMP (2026-10-03): evq waiter check (DELETE after).
+                            // Is any task parked on ble_hs_evq when we post?
+                            // ble_hs_evq (0x3fc9dd50) word0 = 0x3fc9ea68 =
+                            // g_eventq_dflt STRUCT whose word0 (0x3fcb1430)
+                            // is the real FreeRTOS Queue_t (heap). Check the
+                            // waiter on the QUEUE, not the wrapper, and dump
+                            // both layouts. PLUS the receive list itself
+                            // (+36: count, pxIndex+40, end.next+44): whose TCB
+                            // is parked? (host_task_h for comparison.)
+                            // PLUS pre-call IRAM probe (DELETE after): is
+                            // 0x40380a7c still intact right BEFORE the
+                            // synthetic call? Splits synthetic-call clobber
+                            // vs idle-time drift.
+                            // PLUS window-liveness snapshot (DELETE after):
+                            // stale WINDOWSTART bits (never cleared) make
+                            // overflow rotate into ALIASED live windows (a1
+                            // = another task's SP, [SP-12] = its saved
+                            // retaddr) → spill base wild → IRAM clobber.
+                            println!(
+                                "[host] BLE pre IRAM @0x40380a7c = {:#010x}",
+                                m.soc.read32(0x4038_0a7c)
+                            );
+                            println!(
+                                "[host] BLE pre wb={} wstart={:#010x} excsave1={:#010x}",
+                                m.cpu[0].windowbase(),
+                                m.cpu[0].sreg(xtensa_core::cpu::SR_WINDOW_START),
+                                m.cpu[0].sreg(xtensa_core::cpu::SR_EXCSAVE1),
+                            );
+                            // TEMP (2026-10-03, forensics — DELETE after): OF12
+                            // handler inputs — a13 (scratch base) + [SP-12]
+                            // (spill base) in the CURRENT (wb+2-rotated? no:
+                            // pre-call, firmware) view. If either names IRAM
+                            // code, the first overflow spill clobbers it.
+                            {
+                                let sp = m.cpu[0].reg(1);
+                                println!(
+                                    "[host] BLE pre a13={:#010x} sp={:#010x} sp-12-mem={:#010x}",
+                                    m.cpu[0].reg(13),
+                                    sp,
+                                    m.soc.read32(sp.wrapping_sub(12)),
+                                );
+                            }
+                            // PLUS waiter pre/post (DELETE after): does our
+                            // post unblock it? Sampled around the synthetic
+                            // call — unblock is synchronous inside Send.
+                            let evq = m.soc.read32(0x3fc9_dd50);
+                            let queue = m.soc.read32(evq);
+                            let evq_wait = if queue != 0 {
                                 m.soc.queue_recv_waiting(queue)
                             } else {
                                 false
-                            },
-                            m.soc.read32(queue.wrapping_add(56)),
-                        );
-                        // TEMP (2026-10-03): depth after (DELETE after).
-                        let evq1 = m.soc.read32(0x3fc9_dd50);
-                        let q1 = m.soc.read32(evq1);
-                        println!(
-                            "[host] BLE pre depth {depth0}->{}",
-                            m.soc.read32(q1.wrapping_add(56))
-                        );
-                        // TEMP (2026-10-03): handler set on our block?
-                        // (DELETE after). Expect fn == ble_hs_event_rx_hci_ev.
-                        // PLUS the data mbuf head (ev_arg points at it):
-                        // [0]==0x3E means H4-stripped (correct), 0x04 means
-                        // the H4 byte leaked into the mbuf (dispatcher then
-                        // misindexes the LE table and drops).
-                        println!(
-                            "[host] BLE pre ev_fn={:#010x} ev_arg={:#010x}",
-                            m.soc.read32(pre_head.wrapping_add(4)),
-                            m.soc.read32(pre_head.wrapping_add(8)),
-                        );
-                        let dm = m.soc.read32(pre_head.wrapping_add(8));
-                        println!(
-                            "[host] BLE pre dmbuf={:02x?}",
-                            [
-                                m.soc.read8(dm) as u8,
-                                m.soc.read8(dm.wrapping_add(1)) as u8,
-                                m.soc.read8(dm.wrapping_add(2)) as u8,
-                                m.soc.read8(dm.wrapping_add(3)) as u8,
-                                m.soc.read8(dm.wrapping_add(4)) as u8,
-                                m.soc.read8(dm.wrapping_add(5)) as u8,
-                            ]
-                        );
-                        ok
+                            };
+                            let ht0 = m.soc.read32(0x3fc9_eac8);
+                            println!(
+                                "[host] BLE pre evq={evq:#010x} queue={queue:#010x} q_wait={evq_wait} host={ht0:#010x}"
+                            );
+                            println!(
+                                "[host] BLE pre rlist-detail count={} first={:#010x}",
+                                m.soc.read32(queue.wrapping_add(32)),
+                                m.soc.read32(queue.wrapping_add(40)),
+                            );
+                            // TEMP (2026-10-03): full Queue_t dump (DELETE
+                            // after). Is the queue FULL when we post (post
+                            // fails silently -> block leaks -> waiter stays
+                            // parked -> silence)? Words +0..+64.
+                            println!(
+                                "[host] BLE pre qstruct={:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}",
+                                m.soc.read32(queue),
+                                m.soc.read32(queue.wrapping_add(4)),
+                                m.soc.read32(queue.wrapping_add(8)),
+                                m.soc.read32(queue.wrapping_add(12)),
+                                m.soc.read32(queue.wrapping_add(16)),
+                                m.soc.read32(queue.wrapping_add(20)),
+                                m.soc.read32(queue.wrapping_add(24)),
+                                m.soc.read32(queue.wrapping_add(28)),
+                            );
+                            // TEMP (2026-10-03): queue length/occupancy words
+                            // (DELETE after). Standard Queue_t has
+                            // uxMessagesWaiting@48, uxLength@52, uxItemSize@56
+                            // (after two 16B lists at +16/+32). A length-1
+                            // queue + an occupying timer event at post time =
+                            // our post fails silently (0 timeout) and leaks.
+                            // Dump +32..+72 to find the real count fields
+                            // (small ints among pointers; sample twice).
+                            println!(
+                                "[host] BLE pre qlen={:#010x} {:#010x} {:#010x} {:#010x}",
+                                m.soc.read32(queue.wrapping_add(48)),
+                                m.soc.read32(queue.wrapping_add(52)),
+                                m.soc.read32(queue.wrapping_add(56)),
+                                m.soc.read32(queue.wrapping_add(60)),
+                            );
+                            println!(
+                                "[host] BLE pre qx32={:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}",
+                                m.soc.read32(queue.wrapping_add(32)),
+                                m.soc.read32(queue.wrapping_add(36)),
+                                m.soc.read32(queue.wrapping_add(40)),
+                                m.soc.read32(queue.wrapping_add(44)),
+                                m.soc.read32(queue.wrapping_add(64)),
+                                m.soc.read32(queue.wrapping_add(68)),
+                            );
+                            let ok = m.run_ble_host_recv(0, cb);
+                            println!(
+                                "[host] BLE RX host_rcv_pkt ok={ok} evfree {f0}->{})",
+                                m.soc.ble_evt_pool_free()
+                            );
+                            // TEMP (2026-10-04, forensics — DELETE after): staged
+                            // bytes (H4==0 dead-path diagnosis).
+                            if let Some((sb, sl, sx)) = m.last_recv_stage {
+                                println!(
+                                    "[host] BLE RX staged buf={sb:#010x} len={sl} bytes={sx:02x?}"
+                                );
+                            }
+                            // TEMP (2026-10-03, forensics — DELETE after): print
+                            // the synthetic-call abort record (fault pc + step
+                            // result) when delivery fails.
+                            if !ok {
+                                if let Some((apc, ar, trip)) = m.last_recv_abort {
+                                    println!(
+                                        "[host] BLE RX abort at {apc:#010x}: {ar:?} woe_trip={trip:#010x?}"
+                                    );
+                                    // TEMP (2026-10-03, forensics — DELETE
+                                    // after): IRAM clobber site, if observed.
+                                    if let Some(cpc) = m.last_recv_clobber {
+                                        println!(
+                                            "[host] BLE RX clobber first seen after step at {cpc:#010x}"
+                                        );
+                                    }
+                                    // TEMP (2026-10-03, forensics — DELETE
+                                    // after): PS at synthetic exit (EXCM set
+                                    // ⇒ inside a vector handler).
+                                    if let Some((ps, epc1, wb)) = m.last_recv_ps {
+                                        println!(
+                                            "[host] BLE RX exit ps={ps:#010x} epc1={epc1:#010x} wb={wb}"
+                                        );
+                                    }
+                                    // TEMP (2026-10-03, forensics — DELETE
+                                    // after): dump what the CPU actually
+                                    // fetched at the fault pc (IRAM backing
+                                    // may differ from the ELF file).
+                                    println!(
+                                        "[host] BLE RX fault bytes @ {apc:#010x} = {:#010x}",
+                                        m.soc.read32(apc)
+                                    );
+                                } else {
+                                    println!(
+                                        "[host] BLE RX abort: clean exit without retw (10k cap?)"
+                                    );
+                                }
+                            }
+                            // TEMP (2026-10-03): WOE snapshot (DELETE after).
+                            // ENTRY faults cause 0 iff PS.WOE==0 — snapshot PS
+                            // at every delivery attempt: was WOE already clear
+                            // in the idle task state, or cleared mid-call?
+                            println!(
+                                "[host] BLE pre ps={:#010x} woe={}",
+                                m.cpu[0].sreg(xtensa_core::cpu::SR_PS),
+                                (m.cpu[0].sreg(xtensa_core::cpu::SR_PS) & xtensa_core::cpu::PS_WOE)
+                                    != 0,
+                            );
+                            // TEMP (2026-10-03): waiter post/post (DELETE
+                            // after). Unblock is synchronous inside Send: if
+                            // still parked after our post, the post didn't
+                            // unblock (wrong queue/full/silent error).
+                            println!(
+                                "[host] BLE pre waiter_post={} depth_post={}",
+                                if queue != 0 {
+                                    m.soc.queue_recv_waiting(queue)
+                                } else {
+                                    false
+                                },
+                                m.soc.read32(queue.wrapping_add(56)),
+                            );
+                            // TEMP (2026-10-03): depth after (DELETE after).
+                            let evq1 = m.soc.read32(0x3fc9_dd50);
+                            let q1 = m.soc.read32(evq1);
+                            println!(
+                                "[host] BLE pre depth {depth0}->{}",
+                                m.soc.read32(q1.wrapping_add(56))
+                            );
+                            // TEMP (2026-10-03): handler set on our block?
+                            // (DELETE after). Expect fn == ble_hs_event_rx_hci_ev.
+                            // PLUS the data mbuf head (ev_arg points at it):
+                            // [0]==0x3E means H4-stripped (correct), 0x04 means
+                            // the H4 byte leaked into the mbuf (dispatcher then
+                            // misindexes the LE table and drops).
+                            println!(
+                                "[host] BLE pre ev_fn={:#010x} ev_arg={:#010x}",
+                                m.soc.read32(pre_head.wrapping_add(4)),
+                                m.soc.read32(pre_head.wrapping_add(8)),
+                            );
+                            let dm = m.soc.read32(pre_head.wrapping_add(8));
+                            println!(
+                                "[host] BLE pre dmbuf={:02x?}",
+                                [
+                                    m.soc.read8(dm) as u8,
+                                    m.soc.read8(dm.wrapping_add(1)) as u8,
+                                    m.soc.read8(dm.wrapping_add(2)) as u8,
+                                    m.soc.read8(dm.wrapping_add(3)) as u8,
+                                    m.soc.read8(dm.wrapping_add(4)) as u8,
+                                    m.soc.read8(dm.wrapping_add(5)) as u8,
+                                ]
+                            );
+                            ok
+                        } // end else (host enabled): ok from the call above
                     }
                 {
                     println!("[host] BLE RX delivered via host_rcv_pkt");
@@ -2120,28 +2171,12 @@ fn main() {
             ble_canned_dl_done = true;
             println!("[host] BLE canned data-length event staged");
         }
-        // TEMP (2026-10-04, forensics — DELETE after): SIZE TEST small Read
-        // FIRST (see flag docs). Read Battery Level (0x0A + 0x0010, 12B
-        // ACL) one-shot after dl_done; discovery below waits for its
-        // response (acl_tx_n>=1). Small response (2B ATT) vs large (20B).
-        if ble_canned
-            && ble_canned_dl_done
-            && !ble_canned_readfirst_done
-            && m.soc.bt_hci_rx_pending() == 0
-        {
-            m.soc.bt_hci_inject_rx(&[
-                0x02, 0x01, 0x20, 0x07, 0x00, 0x03, 0x00, 0x04, 0x00, 0x0A, 0x10, 0x00,
-            ]);
-            ble_canned_readfirst_done = true;
-            println!("[host] BLE canned READFIRST staged");
-        }
         // TEMP (2026-10-04, forensics — DELETE after): canned ATT replay
         // (see flag docs). SIZE TEST ORDER: after the READFIRST response
         // (acl_tx_n>=1), not directly after dl_done.
         if ble_canned
-            && ble_canned_readfirst_done
+            && ble_canned_dl_done
             && !ble_canned_att_done
-            && ble_canned_acl_tx_n >= 1
             && m.soc.bt_hci_rx_pending() == 0
         {
             m.soc.bt_hci_inject_rx(&[
@@ -2160,7 +2195,7 @@ fn main() {
         if ble_canned
             && ble_canned_att_done
             && !ble_canned_findinfo_done
-            && ble_canned_acl_tx_n >= 2
+            && ble_canned_acl_tx_n >= 1
             && m.soc.bt_hci_rx_pending() == 0
         {
             m.soc.bt_hci_inject_rx(&[
@@ -2175,7 +2210,7 @@ fn main() {
         if ble_canned
             && ble_canned_findinfo_done
             && !ble_canned_read_done
-            && ble_canned_acl_tx_n >= 3
+            && ble_canned_acl_tx_n >= 2
             && m.soc.bt_hci_rx_pending() == 0
         {
             m.soc.bt_hci_inject_rx(&[
@@ -2189,7 +2224,7 @@ fn main() {
         if ble_canned
             && ble_canned_read_done
             && !ble_canned_write_done
-            && ble_canned_acl_tx_n >= 4
+            && ble_canned_acl_tx_n >= 3
             && m.soc.bt_hci_rx_pending() == 0
         {
             m.soc.bt_hci_inject_rx(&[
@@ -2204,7 +2239,7 @@ fn main() {
         if ble_canned
             && ble_canned_write_done
             && !ble_canned_readback_done
-            && ble_canned_acl_tx_n >= 5
+            && ble_canned_acl_tx_n >= 4
             && m.soc.bt_hci_rx_pending() == 0
         {
             m.soc.bt_hci_inject_rx(&[

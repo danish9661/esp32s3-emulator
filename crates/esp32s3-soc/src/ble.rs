@@ -306,7 +306,9 @@ impl Ble {
     /// Peek at the oldest staged frame: (H4 type byte, total length),
     /// WITHOUT consuming it (host size-gate frontend).
     pub fn peek_rx(&self) -> Option<(u8, usize)> {
-        self.pending_rx.front().and_then(|f| Some((*f.first()?, f.len())))
+        self.pending_rx
+            .front()
+            .and_then(|f| Some((*f.first()?, f.len())))
     }
 
     /// Peek at the oldest staged frame with its event sub-code:
