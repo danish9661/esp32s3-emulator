@@ -76,7 +76,8 @@ fn main() {
     // link the pool/RAM differently; used by the layout tables below).
     let bin_name_contains_wifi_sta = path.contains("wifi_sta")
         || path.contains("test_worker_net")
-        || path.contains("test_worker_l3");
+        || path.contains("test_worker_l3")
+        || path.contains("coex");
 
     let mut m = Esp32S3::new();
     // Secure-boot fixture: SECURE_BOOT_EN=1 burns eFuse SECURE_BOOT_EN
@@ -145,6 +146,9 @@ fn main() {
         } else if path.contains("test_worker_l3") {
             m.soc.wifi_fixture_image_worker_l3();
             &WORKER_L3_LAYOUT
+        } else if path.contains("coex") {
+            m.soc.wifi_fixture_image_coex();
+            &COEX_LAYOUT
         } else if path.contains("test_worker_net") {
             m.soc.wifi_fixture_image_worker();
             &WORKER_LAYOUT
@@ -351,6 +355,10 @@ fn main() {
     let mut net_pcap_file: Option<std::fs::File> = None;
     let mut net_pcap_n: u64 = 0;
     let net_gw_addr: Option<String> = env::var("NET_GW").ok();
+    // TX-sink presence for the machine's `esp_netif_transmit` tap (see
+    // soc.rs `net_sink_present`): fake success only when pcap/gateway
+    // drains exist; otherwise the driver runs (gateway-less fail verdicts).
+    m.soc.net_sink_present = net_pcap_path.is_some() || net_gw_addr.is_some();
     let mut net_gw: Option<std::net::TcpStream> = None;
     let net_rx_log = env::var("NET_RX_LOG").is_ok();
     // BLE HCI bridge (ble-sketch support): BLE_GW=<host:port> dials the
@@ -457,9 +465,22 @@ fn main() {
     // HOST-ENABLED deferral latch (2026-10-04, DELETE after): transition
     // logging for the enabled_state==0 deferral (per-step spam floods).
     let mut ble_host_disabled = false;
+    // PRE-DL HOLD (2026-10-04, DELETE after): pop-and-hold the premature
+    // ATT instead of DROPPING it. DROP was correct for a retrying central
+    // (30s GATT timeout → try 0,1,2… eventually hits post-dl), but fatal
+    // for a patient central (300s timeout for slow emulator answers → the
+    // single pre-dl discovery is dropped and never resent within the run).
+    // HOLD pops the ATT into this slot (FIFO goes empty → the data-length
+    // stager unblocks → dl_done sets), and the re-inject below restores it
+    // AFTER the data-length event delivers (handshake fully established,
+    // so the ATT TX no longer asserts). One slot: a second premature ATT
+    // while held drops (log) — central sends one at a time (semaphore).
+    let mut ble_held_att: Option<Vec<u8>> = None;
     // TEMP (2026-10-04, forensics — DELETE after): l2cap_tx return latch.
     // Logs each NEW (core, ret) observed at 0x4200723c (see machine.rs).
     let mut ble_l2cap_last: Option<(usize, u32)> = None;
+    // TEMP (2026-10-04, forensics — DELETE after): management-TX hook latch.
+    let mut pptx_last = 0u32;
     // TEMP (2026-10-03): post-delivery pc-window countdown (DELETE after).
     let mut ble_watch_n = 0u32;
     // TEMP (2026-10-03): pc rings for the canned NULL-call forensics
@@ -623,27 +644,45 @@ fn main() {
     // test-worker-l3 image layout (nm on the test-worker-l3 ELF —
     // re-nm'd after the L3-legs .ino edit (udp/coap/ipv6 builders):
     // scan_start 0x42065b90 (= esp_wifi_scan_start entry),
-    // connect 0x4203e658 (= esp_wifi_connect entry), event vars
+    // connect 0x4203e95c (= esp_wifi_connect entry), event vars
     // WIFI_EVENT 0x3c0b45a8 / IP_EVENT 0x3c0b3ea4; TX/RX tap + hook pcs
     // re-nm'd in machine.rs/soc.rs below. BSS cells shifted +0x18
     // uniformly vs the previous link (ready_lists/top_prio/pxcur/netif/
     // scan_count/scan_result verified by symbol name).
     // records_check is the `call8 esp_wifi_scan_get_ap_records` INSIDE
-    // `_scanDoneEv` (0x42005e25 here — objdump-verified on the new ELF).
+    // `_scanDoneEv` (0x42006129 here — objdump-verified on the new ELF).
     const WORKER_L3_LAYOUT: WifiLayout = WifiLayout {
-        scan_start: 0x4206_5b90,
-        connect: 0x4203_e658,
-        wifi_event_var: 0x3c0b_45a8,
-        ip_event_var: 0x3c0b_3ea4,
+        scan_start: 0x4206_5f18,
+        connect: 0x4203_e95c,
+        wifi_event_var: 0x3c0b_45ec,
+        ip_event_var: 0x3c0b_3ee8,
         count_cell: 0x3fc9_f936,
         scan_count: 0x3fc9_af08,
         scan_result: 0x3fc9_af04,
-        records_check: 0x4200_5e25,
+        records_check: 0x4200_6129,
         ready_lists: 0x3fc9_b904,
         top_prio: 0x3fc9_b874,
         reg_heaps: 0x3fc9_b7bc,
         pxcur: 0x3fc9_baf8,
         sta_network_if: 0x3fc9_ae90,
+    };
+    // coex image layout (nm on the esp32s3_coex ELF; STA-side assoc + BLE
+    // init concurrently; never scans so records_check is 0/unused; RF skips
+    // unneeded for this short run — see soc.rs Coex arm).
+    const COEX_LAYOUT: WifiLayout = WifiLayout {
+        scan_start: 0x4208_6f54,
+        connect: 0x4205_0eb8,
+        wifi_event_var: 0x3c0d_6fcc,
+        ip_event_var: 0x3c0d_68c8,
+        count_cell: 0x3fc9_f97c,
+        scan_count: 0x3fc9_f97c,
+        scan_result: 0x3fc9_f978,
+        records_check: 0x0000_0000,
+        ready_lists: 0x3fca_179c,
+        top_prio: 0x3fca_170c,
+        reg_heaps: 0x3fca_1654,
+        pxcur: 0x3fca_1990,
+        sta_network_if: 0x3fc9_f904,
     };
     // wifi-ap image layout (nm on the wifi-ap ELF; sta_network_if =
     // `_ZL14_ap_network_if` bss static; esp_wifi_start = 0x42063870
@@ -746,6 +785,13 @@ fn main() {
                 println!("[host] BLE L2CAP_RET core{core} ret={ret}");
             }
         }
+        // TEMP (2026-10-04, forensics — DELETE after): log management-TX
+        // hook fires (counter increments). Proves the ppTxFragmentProc
+        // fake-return arm fires vs misses (0 = still parks inside).
+        if m.pptx_hook_fires != pptx_last {
+            pptx_last = m.pptx_hook_fires;
+            println!("[host] PPTX hook fires={pptx_last}");
+        }
         let pc = m.cpu[0].pc;
         if ble_canned {
             ring0[ring_i % 64] = pc;
@@ -786,6 +832,30 @@ fn main() {
                     m.cpu[0].windowbase(),
                     m.soc.read8(epc)
                 );
+                // TEMP (2026-10-04, RF forensics — DELETE after): dump the
+                // g_phyFuns dispatch table around the heap-overlap window
+                // (tbl+0x200..0x27f) on worker-L3 ILLEGALs. Long gateway
+                // runs overlap heap network buffers into the table (proven:
+                // DNS "example" bytes at tbl+0x22f); each clobbered slot
+                // needs a done-bit-abstracted skip in machine.rs (4 known:
+                // 0x24c/0x228/0x210/0x224). A 19-leg crash here means a 5th
+                // slot joined — the ASCII side names the buffer (DNS vs
+                // CoAP-server READY/GET/2.05 vs MQTT), the offset names the
+                // slot. WorkerL3-gated (other images have their own cells).
+                if path.contains("test_worker_l3") {
+                    let cell = m.soc.wifi_phyfuns_cell();
+                    let tbl = m.soc.read32(cell);
+                    let mut words = [0u32; 32];
+                    for (k, v) in words.iter_mut().enumerate() {
+                        *v = m.soc.read32(tbl.wrapping_add(0x200 + (k as u32) * 4));
+                    }
+                    let mut asc = [0u8; 128];
+                    for (k, b) in asc.iter_mut().enumerate() {
+                        *b = m.soc.read8(tbl.wrapping_add(0x200 + k as u32)) as u8;
+                    }
+                    println!("[host] RF-TBL tbl={tbl:#010x} {words:08x?}");
+                    println!("[host] RF-ASC {:?}", String::from_utf8_lossy(&asc));
+                }
                 // TEMP (2026-10-03, forensics — DELETE after): dump panic
                 // message when the `ill` is panic_abort's deliberate trap
                 // (EPC1 in its range). a2 often holds the message pointer.
@@ -827,6 +897,21 @@ fn main() {
                         m.soc.read16(0x3fc9_e110),
                         m.soc.read16(0x3fc9_e2b0),
                     );
+                    // TEMP (2026-10-04, forensics — DELETE after): pointed-to
+                    // queue dump (8 words at *handle) to locate
+                    // uxMessagesWaiting (binary count 0/1). The handle word
+                    // itself is a pointer (not the count — proven: reads
+                    // 0x3fcb13c4). Compare with the pre-delivery dump below
+                    // (healthy=1 vs timed-out=0) to find the count offset;
+                    // the pre-seed writes queue+0x38 (I2C Queue_t precedent).
+                    {
+                        let h = m.soc.read32(0x3fc9_d6d0);
+                        let mut w = [0u32; 8];
+                        for (k, v) in w.iter_mut().enumerate() {
+                            *v = m.soc.read32(h.wrapping_add((k as u32) * 4));
+                        }
+                        println!("[host] PANIC-SEM [{h:#010x}] {w:08x?}");
+                    }
                     // TEMP (2026-10-04, forensics — DELETE after): mbuf pool
                     // free counts. Pools at these addrs are `os_mbuf_pool`
                     // (omp_databuf_len u16 @+0, omp_pool *os_mempool @+4);
@@ -1546,23 +1631,46 @@ fn main() {
                     // behind it (firmware times out `HCI wait for ack 19`,
                     // no conn, central GATT timeout). The old leave-queued
                     // policy deadlocks (ACL needs conn, conn needs events
-                    // behind the ACL). DROP pre-conn ACLs — the central
-                    // retries GATT forever (new ATT arrives post-conn and
-                    // delivers). Log so the drop is observable.
-                    let dropped = m.soc.bt_hci_take_rx();
-                    // TEMP (2026-10-04, forensics — DELETE after): full hex
-                    // of the premature ATT (replay it post-conn in canned
-                    // to prove ATT→response offline).
-                    if let Some(ref f) = dropped {
-                        println!(
-                            "[host] BLE RX pre-conn ACL dropped ({}B, central retries post-conn) bytes={:02x?}",
-                            f.len(),
-                            f,
-                        );
+                    // behind the ACL).
+                    //
+                    // HOLD vs DROP (2026-10-04): pre-dl/pre-conn ATTs are
+                    // HELD (pop into `ble_held_att`, FIFO goes empty so the
+                    // data-length stager unblocks; re-injected after the
+                    // data-length event delivers — see below). DROP only
+                    // applies when already held (second premature ATT) or
+                    // when pacing-blocked post-dl (outstanding>0, central
+                    // pipelines — retry covers it). DROP for a patient
+                    // (300s-timeout) central is fatal (single discovery
+                    // never resent); HOLD preserves it.
+                    if (!conn_up || !ble_canned_dl_done) && ble_held_att.is_none() {
+                        ble_held_att = m.soc.bt_hci_take_rx();
+                        if let Some(ref f) = ble_held_att {
+                            println!(
+                                "[host] BLE RX pre-dl ATT held ({}B, re-inject after data-length) bytes={:02x?}",
+                                f.len(),
+                                &f[..f.len().min(16)],
+                            );
+                        } else {
+                            println!(
+                                "[host] BLE RX pre-dl ATT hold missed (0B, central retries post-handshake)"
+                            );
+                        }
                     } else {
-                        println!(
-                            "[host] BLE RX pre-conn ACL dropped (0B, central retries post-conn)"
-                        );
+                        let dropped = m.soc.bt_hci_take_rx();
+                        // TEMP (2026-10-04, forensics — DELETE after): full hex
+                        // of the premature ATT (replay it post-conn in canned
+                        // to prove ATT→response offline).
+                        if let Some(ref f) = dropped {
+                            println!(
+                                "[host] BLE RX pre-conn ACL dropped ({}B, central retries post-conn) bytes={:02x?}",
+                                f.len(),
+                                f,
+                            );
+                        } else {
+                            println!(
+                                "[host] BLE RX pre-conn ACL dropped (0B, central retries post-conn)"
+                            );
+                        }
                     }
                 } else if acl_drop {
                     let dropped = m.soc.bt_hci_take_rx();
@@ -1730,6 +1838,18 @@ fn main() {
                                 m.soc.read32(queue.wrapping_add(64)),
                                 m.soc.read32(queue.wrapping_add(68)),
                             );
+                            // TEMP (2026-10-04, forensics — DELETE after):
+                            // pre-delivery pointed-queue dump (8 words at
+                            // *handle) to compare with PANIC-SEM (find count
+                            // offset; pre-seed writes queue+0x38).
+                            {
+                                let h = m.soc.read32(0x3fc9_d6d0);
+                                let mut w = [0u32; 8];
+                                for (k, v) in w.iter_mut().enumerate() {
+                                    *v = m.soc.read32(h.wrapping_add((k as u32) * 4));
+                                }
+                                println!("[host] BLE pre-SEM [{h:#010x}] {w:08x?}");
+                            }
                             let ok = m.run_ble_host_recv(0, cb);
                             println!(
                                 "[host] BLE RX host_rcv_pkt ok={ok} evfree {f0}->{})",
@@ -1741,6 +1861,27 @@ fn main() {
                                 println!(
                                     "[host] BLE RX staged buf={sb:#010x} len={sl} bytes={sx:02x?}"
                                 );
+                            }
+                            // PRE-DL HOLD re-inject (2026-10-04, DELETE after):
+                            // when the data-length event itself delivers (14B
+                            // LE-meta subevent 0x07 — the handshake is now
+                            // fully established firmware-side), restore the
+                            // held ATT to the FIFO back. Next steps deliver
+                            // it with conn_up + dl_done true, so the ATT TX
+                            // no longer asserts. Fires once per hold (slot
+                            // clears); a failed delivery (ok=false) still
+                            // re-injects (the data-length event reached the
+                            // handler queue either way — abort records show
+                            // delivery faults, not staging faults).
+                            if m.last_recv_stage
+                                .is_some_and(|(_, sl, sx)| sl == 14 && sx[3] == 0x07)
+                                && let Some(held) = ble_held_att.take()
+                            {
+                                println!(
+                                    "[host] BLE held ATT re-injected ({}B) after data-length",
+                                    held.len(),
+                                );
+                                m.soc.bt_hci_inject_rx(&held);
                             }
                             // TEMP (2026-10-03, forensics — DELETE after): print
                             // the synthetic-call abort record (fault pc + step
@@ -2566,7 +2707,9 @@ fn main() {
         // edge: the arm fires once per scan; the completion retries until
         // the queue/group handles are valid, then latches done.
         if wifi_scan_fixture && !wifi_scan_done {
-            let layout = if path.contains("test_worker_l3") {
+            let layout = if path.contains("coex") {
+                &COEX_LAYOUT
+            } else if path.contains("test_worker_l3") {
                 &WORKER_L3_LAYOUT
             } else if path.contains("test_worker_net") {
                 &WORKER_LAYOUT
@@ -2617,7 +2760,9 @@ fn main() {
             && !wifi_scan_records_done
             && !wifi_scan_aps.is_empty()
         {
-            let layout = if path.contains("test_worker_l3") {
+            let layout = if path.contains("coex") {
+                &COEX_LAYOUT
+            } else if path.contains("test_worker_l3") {
                 &WORKER_L3_LAYOUT
             } else if path.contains("test_worker_net") {
                 &WORKER_LAYOUT
@@ -2677,7 +2822,9 @@ fn main() {
         // a flat ip/mask/gw@0 layout corrupts the sized-delete and panics,
         // proven live at 0x4037bf00).
         if wifi_sta_conn && !wifi_sta_done {
-            let layout = if path.contains("test_worker_l3") {
+            let layout = if path.contains("coex") {
+                &COEX_LAYOUT
+            } else if path.contains("test_worker_l3") {
                 &WORKER_L3_LAYOUT
             } else if path.contains("test_worker_net") {
                 &WORKER_LAYOUT
@@ -2791,7 +2938,9 @@ fn main() {
         // `wifi_ard_idle` (mw back to 0) — the two arduino events must not
         // race in the same queue — but the IDF half posts immediately.
         if wifi_sta_conn && wifi_sta_conn_stage == 1 && !wifi_sta_ip_done {
-            let layout = if path.contains("test_worker_l3") {
+            let layout = if path.contains("coex") {
+                &COEX_LAYOUT
+            } else if path.contains("test_worker_l3") {
                 &WORKER_L3_LAYOUT
             } else if path.contains("test_worker_net") {
                 &WORKER_LAYOUT
@@ -2920,7 +3069,9 @@ fn main() {
             && !wifi_sta_disc_done
             && m.soc.wifi_ard_idle()
         {
-            let layout = if path.contains("test_worker_l3") {
+            let layout = if path.contains("coex") {
+                &COEX_LAYOUT
+            } else if path.contains("test_worker_l3") {
                 &WORKER_L3_LAYOUT
             } else if path.contains("test_worker_net") {
                 &WORKER_LAYOUT
@@ -3156,6 +3307,26 @@ fn main() {
                 .unwrap_or(2_000_000);
             if idle_steps >= idle_limit {
                 println!("\n== IDLE: no output or PC change for 2M steps at step {i} ==");
+                // TEMP (2026-10-04, RF forensics — DELETE after): park-loop
+                // tracer for the WorkerL3 management-TX stall (core0 parks
+                // at 0x42074b4f `ppTxFragmentProc+0x13f` with the entry hook
+                // never firing). Single-step 12× logging pc + raw word +
+                // regs so the polling load (same address every iteration)
+                // names the flag the host must satisfy (like the BLE sem
+                // pre-seed). Gated to the stall pc range to avoid spamming
+                // normal DONE-idles on every other image.
+                if path.contains("test_worker_l3") && (0x4207_4a10..0x4207_519c).contains(&pc) {
+                    for _ in 0..12 {
+                        let p = m.cpu[0].pc;
+                        let w = m.soc.read32(p);
+                        let mut regs = [0u32; 16];
+                        for (k, r) in regs.iter_mut().enumerate() {
+                            *r = m.cpu[0].reg(k as u32);
+                        }
+                        println!("[host] PARKTRACE pc={p:#010x} word={w:#010x} regs={regs:08x?}");
+                        let _ = m.cpu[0].step_one(&mut m.soc);
+                    }
+                }
                 break;
             }
         } else {

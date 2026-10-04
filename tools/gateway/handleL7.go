@@ -451,6 +451,76 @@ func snoopCoAP(msg []byte, client *Client, room *Room) bool {
 	return true
 }
 
+// ---- CoAP server direction (gateway -> board) ---------------------------
+// Minimal gateway-initiated GET for the worker-L3 `coap_srv` leg: when the
+// board sends `READY` (5B) to :5683 on sport 45008 (the server-leg sport,
+// distinct from the client 45005/45006), answer with CON GET /t (MID 0x2224,
+// token BB 66 — distinct from the client MID 2223/token AA 55) instead of
+// echoing. The board serves it with piggybacked ACK 2.05 (roles reversed
+// from `snoopCoAP` above). Anything else on :5683 falls through (HELLO-UDP
+// echo, board CoAP GETs answered by `snoopCoAP`). Returns true when
+// consumed.
+func snoopCoAPServer(msg []byte, client *Client, room *Room) bool {
+	packet := gopacket.NewPacket(msg, layers.LayerTypeEthernet, gopacket.Default)
+	ipLayer := packet.Layer(layers.LayerTypeIPv4)
+	udpLayer := packet.Layer(layers.LayerTypeUDP)
+	if ipLayer == nil || udpLayer == nil {
+		return false
+	}
+	ip, _ := ipLayer.(*layers.IPv4)
+	udp, _ := udpLayer.(*layers.UDP)
+	if !ip.DstIP.Equal(net.IPv4(192, 168, 4, 1)) {
+		return false
+	}
+	if udp.DstPort != 5683 {
+		return false
+	}
+	if udpFwdLookup(uint16(udp.SrcPort)) != nil {
+		return false
+	}
+	if string(udp.Payload) != "READY" {
+		return false
+	}
+	// CON GET /t: ver 1 / CON / TKL 2 (0x40), GET (0x01), MID 0x2224,
+	// token BB 66, Uri-Path "t" (0xB1 0x74). Sport 5683 -> board sport
+	// (the READY's source, 45008 in-sketch).
+	coap := []byte{0x40, 0x01, 0x22, 0x24, 0xBB, 0x66, 0xB1, 't'}
+	ethLayer := packet.Layer(layers.LayerTypeEthernet)
+	eth, _ := ethLayer.(*layers.Ethernet)
+	ethReply := &layers.Ethernet{
+		SrcMAC:       gwMAC,
+		DstMAC:       eth.SrcMAC,
+		EthernetType: layers.EthernetTypeIPv4,
+	}
+	ipReply := &layers.IPv4{
+		Version:  4,
+		IHL:      5,
+		TTL:      64,
+		Protocol: layers.IPProtocolUDP,
+		SrcIP:    net.IPv4(192, 168, 4, 1),
+		DstIP:    ip.SrcIP,
+	}
+	udpReply := &layers.UDP{
+		SrcPort: udp.DstPort,
+		DstPort: udp.SrcPort,
+	}
+	_ = udpReply.SetNetworkLayerForChecksum(ipReply)
+	buffer := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true}
+	if serr := gopacket.SerializeLayers(buffer, opts, ethReply, ipReply, udpReply, gopacket.Payload(coap)); serr != nil {
+		return false
+	}
+	client.WriteMutex.Lock()
+	werr := sendFrame(client, buffer.Bytes())
+	client.WriteMutex.Unlock()
+	if werr != nil {
+		fmt.Printf("[COAP-SRV] GET send failed: %v\n", werr)
+	} else {
+		fmt.Printf("[COAP-SRV] GET /t -> %s\n", ip.SrcIP.String())
+	}
+	return true
+}
+
 // ---- TCP passthrough note (HTTP/MQTT off-LAN) --------------------------
 // Board TCP to the outside world (HTTP :80, HTTPS :443, MQTT :1883,
 // test.mosquitto.org) is NATed by the gVisor stack — NO snoop arm may

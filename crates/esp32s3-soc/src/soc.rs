@@ -192,6 +192,11 @@ pub enum WifiImage {
     /// WorkerL3 arm — nm on the test-worker-l3 ELF; the sketch source
     /// pins the layout like every other image).
     WorkerL3,
+    /// WiFi+BLE coexistence worker (esp32s3_coex sketch): STA-side cells,
+    /// own linked pcs (see `wifi_fixture_layout` Coex arm — nm on the coex
+    /// ELF). Runs WiFi STA assoc + BLE GATT init concurrently to prove no
+    /// RF/interrupt/heap interference offline (both media virtual).
+    Coex,
 }
 
 /// Per-image linked addresses for the Wi-Fi fixture engine (see
@@ -660,6 +665,15 @@ pub struct Soc {
     /// `net_capture_tx` / `net_take_tx`). Grows only while frames are
     /// captured; drained per event like the SPI path.
     pending_net_tx: Vec<u8>,
+    /// True while host drains captured TX frames (NET_PCAP file and/or NET_GW
+    /// bridge configured — set once by the host at startup). The machine's
+    /// `esp_netif_transmit` tap fake-returns ESP_OK only here (frames have
+    /// somewhere to go: pcap + gateway prove every byte left the board).
+    /// Without a sink the call RUNS unmodified (original driver behavior:
+    /// TX fails without an RF/gateway drain — the gateway-less battery
+    /// verdicts `-11`/`-12`/`-21`/… depend on it; always-succeed would flip
+    /// them to lengths and break those entries, proven live 2026-10-04).
+    pub net_sink_present: bool,
     /// Host→board Ethernet frames staged for injection (gateway→board
     /// replies: ARP/DHCP/IPv6/gVisor returns read off the NET_GW TCP leg).
     /// FIFO: `net_inject_rx` pushes, the machine's `esp_netif_receive`
@@ -853,6 +867,7 @@ impl Soc {
             last_gpio_out: 0,
             pending_spi_tx: [Vec::new(), Vec::new()],
             pending_net_tx: Vec::new(),
+            net_sink_present: false,
             pending_net_rx: Vec::new(),
             net_rx_dropped: 0,
             net_rx_last_buf: 0,
@@ -2294,8 +2309,8 @@ impl Soc {
             WifiImage::WorkerL3 => {
                 // test-worker-l3 image layout (nm on the test-worker-l3
                 // ELF — re-nm'd after the L3-legs .ino edit (udp/coap/ipv6
-                // builders): scan_start 0x42065b90, connect 0x4203e658,
-                // event vars WIFI_EVENT 0x3c0b45a8 / IP_EVENT 0x3c0b3ea4;
+                // builders): scan_start 0x42065f18, connect 0x4203e95c,
+                // event vars WIFI_EVENT 0x3c0b45ec / IP_EVENT 0x3c0b3ee8;
                 // TX/RX tap + hook pcs re-nm'd in machine.rs/soc.rs below.
                 // BSS cells shifted +0x18 uniformly (symbol-verified).
                 // scans, so records_check is an unused placeholder
@@ -2304,22 +2319,49 @@ impl Soc {
                 // .ino edit relinks the closed libs (all pcs above move);
                 // re-nm after every sketch change (proven live 7x here).
                 WifiImageLayout {
-                    scan_start: 0x4206_5b90,
-                    connect: 0x4203_e658,
-                    wifi_event_var: 0x3c0b_45a8,
-                    ip_event_var: 0x3c0b_3ea4,
+                    scan_start: 0x4206_5f18,
+                    connect: 0x4203_e95c,
+                    wifi_event_var: 0x3c0b_45ec,
+                    ip_event_var: 0x3c0b_3ee8,
                     count_cell: 0x3fc9_f936,
                     scan_count: 0x3fc9_af08,
                     scan_result: 0x3fc9_af04,
                     // records_check = the `call8 get_ap_records` INSIDE
-                    // `_scanDoneEv` (0x42005e25 — objdump-verified).
-                    records_check: 0x4200_5e25,
+                    // `_scanDoneEv` (0x42006129 — objdump-verified).
+                    records_check: 0x4200_6129,
                     ready_lists: 0x3fc9_b904,
                     top_prio: 0x3fc9_b874,
                     reg_heaps: 0x3fc9_b7bc,
                     pxcur: 0x3fc9_baf8,
                     sta_network_if: 0x3fc9_ae90,
-                    esp_wifi_start: 0x4206_583c,
+                    esp_wifi_start: 0x4206_5bc4,
+                }
+            }
+            WifiImage::Coex => {
+                // coex image layout (nm on the esp32s3_coex ELF — WiFi STA
+                // assoc + BLE init concurrently): scan_start 0x42086f54,
+                // connect 0x42050eb8, event vars WIFI_EVENT 0x3c0d6fcc /
+                // IP_EVENT 0x3c0d68c8; hook pcs re-nm'd in machine.rs/soc.rs
+                // below; BSS cells symbol-verified. The sketch never scans,
+                // so records_check is 0 (never hit — pc never 0). RF skips
+                // unneeded (short run, no heap-overlap DNS traffic like the
+                // long WorkerL3 gateway runs). CAUTION: sketch source pins
+                // the layout — re-nm after every .ino edit.
+                WifiImageLayout {
+                    scan_start: 0x4208_6f54,
+                    connect: 0x4205_0eb8,
+                    wifi_event_var: 0x3c0d_6fcc,
+                    ip_event_var: 0x3c0d_68c8,
+                    count_cell: 0x3fc9_f97c,
+                    scan_count: 0x3fc9_f97c,
+                    scan_result: 0x3fc9_f978,
+                    records_check: 0x0000_0000,
+                    ready_lists: 0x3fca_179c,
+                    top_prio: 0x3fca_170c,
+                    reg_heaps: 0x3fca_1654,
+                    pxcur: 0x3fca_1990,
+                    sta_network_if: 0x3fc9_f904,
+                    esp_wifi_start: 0x4208_6c00,
                 }
             }
         }
@@ -2370,6 +2412,12 @@ impl Soc {
     /// Select the L3 worker image (nm on the test-worker-l3 ELF).
     pub fn wifi_fixture_image_worker_l3(&mut self) {
         self.wifi_image = WifiImage::WorkerL3;
+        self.wifi_fixture_layout_program();
+    }
+
+    /// Select the coex image (nm on the esp32s3_coex ELF).
+    pub fn wifi_fixture_image_coex(&mut self) {
+        self.wifi_image = WifiImage::Coex;
         self.wifi_fixture_layout_program();
     }
 
@@ -3265,6 +3313,7 @@ impl Soc {
             WifiImage::EspNow => 0x3fca_0148,
             WifiImage::Worker => 0x3fca_0050,
             WifiImage::WorkerL3 => 0x3fca_0078,
+            WifiImage::Coex => 0x3fca_5f10,
         }
     }
 
@@ -3288,7 +3337,8 @@ impl Soc {
             WifiImage::Ap => 0x4200_42ad,
             WifiImage::EspNow => 0x4200_450d,
             WifiImage::Worker => 0x4200_433d,
-            WifiImage::WorkerL3 => 0x4200_6085,
+            WifiImage::WorkerL3 => 0x4200_6389,
+            WifiImage::Coex => 0x4200_429d,
         }
     }
 
@@ -3306,7 +3356,8 @@ impl Soc {
             WifiImage::Ap => 0x4202_e838,
             WifiImage::EspNow => 0x4202_ea9c,
             WifiImage::Worker => 0x4202_e8b0,
-            WifiImage::WorkerL3 => 0x4203_0610,
+            WifiImage::WorkerL3 => 0x4203_0914,
+            WifiImage::Coex => 0x4204_2e68,
         }
     }
 
@@ -3318,7 +3369,8 @@ impl Soc {
             WifiImage::Ap => 0x4206_4164,
             WifiImage::EspNow => 0x4206_a298,
             WifiImage::Worker => 0x4206_41dc,
-            WifiImage::WorkerL3 => 0x4206_6130,
+            WifiImage::WorkerL3 => 0x4206_64b8,
+            WifiImage::Coex => 0x4208_74f4,
         }
     }
 
@@ -3331,7 +3383,8 @@ impl Soc {
             WifiImage::Ap => 0x4206_3f0c,
             WifiImage::EspNow => 0x4206_9f98,
             WifiImage::Worker => 0x4206_3f84,
-            WifiImage::WorkerL3 => 0x4206_5ed8,
+            WifiImage::WorkerL3 => 0x4206_6260,
+            WifiImage::Coex => 0x4208_729c,
         }
     }
 
@@ -3344,7 +3397,8 @@ impl Soc {
             WifiImage::Ap => 0x4206_3ea4,
             WifiImage::EspNow => 0x4206_9f30,
             WifiImage::Worker => 0x4206_3f1c,
-            WifiImage::WorkerL3 => 0x4206_5e70,
+            WifiImage::WorkerL3 => 0x4206_61f8,
+            WifiImage::Coex => 0x4208_7234,
         }
     }
 
@@ -3366,7 +3420,8 @@ impl Soc {
             WifiImage::Ap => 0x4206_3f50,
             WifiImage::EspNow => 0x4206_9fdc,
             WifiImage::Worker => 0x4206_3fc8,
-            WifiImage::WorkerL3 => 0x4206_5f1c,
+            WifiImage::WorkerL3 => 0x4206_62a4,
+            WifiImage::Coex => 0x4208_72e0,
         }
     }
 
@@ -3378,7 +3433,8 @@ impl Soc {
             WifiImage::Ap => 0x4203_c88c,
             WifiImage::EspNow => 0x4203_caf0,
             WifiImage::Worker => 0x4203_c904,
-            WifiImage::WorkerL3 => 0x4203_e664,
+            WifiImage::WorkerL3 => 0x4203_e968,
+            WifiImage::Coex => 0x4205_0ec4,
         }
     }
 

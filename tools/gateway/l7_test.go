@@ -329,6 +329,79 @@ func TestCoAPFallsThroughToEcho(t *testing.T) {
 	}
 }
 
+func TestCoAPServerReadyTriggersGet(t *testing.T) {
+	// Board `READY` (5B) on :5683 gets a CON GET /t (MID 0x2224, token
+	// BB 66) — not a raw echo. Same pipe-backed client harness as the
+	// CoAP tests above.
+	mac := net.HardwareAddr{0x66, 0x55, 0x44, 0x33, 0x22, 0xC0}
+	pay := []byte("READY")
+	eth := &layers.Ethernet{SrcMAC: mac, DstMAC: gwMAC, EthernetType: layers.EthernetTypeIPv4}
+	ip := &layers.IPv4{Version: 4, IHL: 5, TTL: 64, Protocol: layers.IPProtocolUDP,
+		SrcIP: net.IPv4(192, 168, 4, 2), DstIP: net.IPv4(192, 168, 4, 1)}
+	udp := &layers.UDP{SrcPort: 45008, DstPort: 5683}
+	_ = udp.SetNetworkLayerForChecksum(ip)
+	buf := gopacket.NewSerializeBuffer()
+	if serr := gopacket.SerializeLayers(buf, gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true},
+		eth, ip, udp, gopacket.Payload(pay)); serr != nil {
+		t.Fatal(serr)
+	}
+	frame := buf.Bytes()
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	client := &Client{TCP: c2}
+	room := &Room{}
+	done := make(chan []byte, 1)
+	go func() {
+		var hdr [4]byte
+		if _, err := c1.Read(hdr[:]); err != nil {
+			return
+		}
+		n := int(binary.BigEndian.Uint32(hdr[:]))
+		body := make([]byte, n)
+		off := 0
+		for off < n {
+			m, err := c1.Read(body[off:])
+			if err != nil {
+				return
+			}
+			off += m
+		}
+		done <- body
+	}()
+	if !snoopCoAPServer(frame, client, room) {
+		t.Fatal("READY not consumed by CoAP-server snoop")
+	}
+	// NOTE: `snoopUDPEcho` would also answer READY as a raw echo, so the
+	// production order (server before echo in main.go, both legs) is what
+	// keeps the two apart — reviewed, not unit-probed here (probing echo
+	// after the server consumed would block on the pipe with no reader).
+	select {
+	case rep := <-done:
+		pkt := gopacket.NewPacket(rep, layers.LayerTypeEthernet, gopacket.Default)
+		udpl := pkt.Layer(layers.LayerTypeUDP)
+		if udpl == nil {
+			t.Fatal("reply has no UDP layer")
+		}
+		u, _ := udpl.(*layers.UDP)
+		if u.SrcPort != 5683 || u.DstPort != 45008 {
+			t.Fatalf("ports not swapped to board server leg: %d -> %d", u.SrcPort, u.DstPort)
+		}
+		p := u.Payload
+		if len(p) != 8 || p[0] != 0x40 || p[1] != 0x01 {
+			t.Fatalf("not CON GET: %x", p)
+		}
+		if p[2] != 0x22 || p[3] != 0x24 || p[4] != 0xBB || p[5] != 0x66 {
+			t.Fatalf("MID/token not server-leg values: %x", p)
+		}
+		if p[6] != 0xB1 || p[7] != 't' {
+			t.Fatalf("path not /t: %x", p)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no CoAP GET arrived")
+	}
+}
+
 func TestSnoopDNSPortGate(t *testing.T) {
 	// A UDP frame to port 80 must NOT be consumed by the DNS snoop
 	// (nil client is safe exactly when unconsumed — same discipline as

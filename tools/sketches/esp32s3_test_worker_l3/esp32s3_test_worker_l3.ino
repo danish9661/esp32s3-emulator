@@ -14,6 +14,12 @@
 //   * COAP: confirmable GET coap://192.168.4.1/t -> 2.05 Content with the
 //     `25.00C` payload (gateway parses the CoAP header + Uri-Path option
 //     and answers; anything else on :5683 falls through to UDP echo)
+//   * COAP SERVER: board serves coap://192.168.4.2/t (`READY` rendezvous on
+//     sport 45008 → gateway CON GET /t with MID 2224/token BB 66 → board
+//     piggybacked ACK 2.05 + `25.00C`). Proves the server direction at L7
+//     with no lwIP listen socket (raw frames both ways); TCP-server legs
+//     (HTTP/MQTT listen) stay Partial — no live-netif lwIP bind path
+//     exists offline, documented in README/odc.
 //   * IPv6: RS -> RA (SLAAC fd00::/64), ICMPv6 echo -> fe80::gw, UDP/IPv6
 //     echo -> fd00::1:5683 (gateway handleIPv6.go answers all three;
 //     board link-local is EUI-64 from the STA MAC, like lwIP derives)
@@ -378,6 +384,60 @@ void setup() {
       memset(rxb, 0, sizeof(rxb));
       esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
       Serial.print("WORKER L3 coap drain ");
+      Serial.println(k);
+    }
+  }
+
+  // ---- COAP SERVER: board serves coap://192.168.4.2/t, gateway initiates.
+  // Reverse roles of the client leg above (proves the server direction at
+  // L7 with no lwIP listen socket — raw frames both ways, like every other
+  // leg here). Rendezvous: board sends `READY` (sport 45008, distinct from
+  // the client 45005/45006 so the two never cross-talk) → gateway answers
+  // with CON GET /t (MID 0x2224, token BB 66 — distinct from the client
+  // MID 2223/token AA 55) → board replies piggybacked ACK 2.05 + `25.00C`
+  // (same 15B shape the gateway's server sends, roles reversed). Verdict
+  // = received GET (proves gateway-initiated request arrived; pcap proves
+  // the 2.05 left the board). Same gateway gate as the client legs (one TX
+  // + one pop without a gateway → known-empty -34; re-TX + 2-pop scan with
+  // 4 drains with one, mirroring the stable v4 legs — 6-pop is unnecessary
+  // here, no broadcast flood on v4 unicast).
+  static const uint8_t srv_ready[] = "READY"; // 5 bytes, no NUL
+  static const uint8_t srv_resp[] = {0x60, 0x45, 0x22, 0x24, 0xBB, 0x66,
+                                     0xC1, 0x00, 0xFF, '2', '5', '.', '0', '0', 'C'};
+  bool srv_ok = false;
+  if (!gw_up) {
+    n = udp_frame(f, 45008, 5683, srv_ready, 5);
+    tx(f, n);
+    memset(rxb, 0, sizeof(rxb));
+    esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
+  } else {
+    n = udp_frame(f, 45008, 5683, srv_ready, 5);
+    tx(f, n);
+    for (int w = 0; w < 1; w++) { delay(200); tx(f, n); }
+    for (int k = 0; k < 2 && !srv_ok; k++) {
+      memset(rxb, 0, sizeof(rxb));
+      esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
+      // CoAP GET at 42: ver/CON 0x40, GET 0x01, MID 2224, token BB 66,
+      // Uri-Path "t" (0xB1 0x74); reply sport 5683 (gateway).
+      if (rx_type(rxb) != 0x0800) continue;
+      if (((uint16_t(rxb[34]) << 8) | rxb[35]) != 5683) continue;
+      if (rxb[42] != 0x40 || rxb[43] != 0x01) continue;
+      if (rxb[44] != 0x22 || rxb[45] != 0x24) continue;
+      if (rxb[46] != 0xBB || rxb[47] != 0x66) continue;
+      if (rxb[48] != 0xB1 || rxb[49] != 't') continue;
+      srv_ok = true;
+      // Answer with 2.05 (sport 45008 → gateway 5683, like the request).
+      n = udp_frame(f, 45008, 5683, srv_resp, sizeof(srv_resp));
+      tx(f, n);
+    }
+  }
+  Serial.print("WORKER L3 coap_srv ");
+  Serial.println(srv_ok ? 1 : -34);
+  if (gw_up) {
+    for (int k = 0; k < 4; k++) {
+      memset(rxb, 0, sizeof(rxb));
+      esp_netif_receive(s_netif, rxb, sizeof(rxb), NULL);
+      Serial.print("WORKER L3 coap_srv drain ");
       Serial.println(k);
     }
   }

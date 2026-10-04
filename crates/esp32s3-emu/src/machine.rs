@@ -113,6 +113,10 @@ pub struct Esp32S3 {
     /// Recorded per-op in `run_fast_core` (airtight,unlike post-step poll).
     /// (core, a10).
     pub ble_l2cap_ret: Option<(usize, u32)>,
+    /// TEMP (2026-10-04, forensics — DELETE after): management-TX hook
+    /// fire counter (ppTxFragmentProc entry). Proves the fake-return arm
+    /// fires (counter>0) vs misses (0, still parks inside at +0x13f).
+    pub pptx_hook_fires: u32,
 }
 
 impl Esp32S3 {
@@ -137,6 +141,8 @@ impl Esp32S3 {
             last_recv_stage: None,
             // TEMP (2026-10-04, forensics — DELETE after).
             ble_l2cap_ret: None,
+            // TEMP (2026-10-04, forensics — DELETE after).
+            pptx_hook_fires: 0,
         }
     }
 
@@ -581,17 +587,23 @@ impl Esp32S3 {
             // so a raw union would misfire (proven live 2026-09-27: on
             // the STA image the AP pc 0x4202e594 is
             // `esp_netif_dhcpc_start`, whose regs held zeros/garbage —
-            // the "1600B zeros" pcap trial). The call RUNS unmodified
-            // (capture is read-only w.r.t. CPU state — same class as the
-            // set_config capture hook); the frame bytes land in
-            // `pending_net_tx` + an EVT_NET_FRAME event for the host
-            // (gateway bridge + pcap) to drain. Caller args are windowed
-            // (callee a3/a4 = caller a11/a12), read BEFORE `step_one`
-            // while wb still names the caller. LIVE since the worker
-            // sketch drives the real stack (proven: 2 frames to pcap —
-            // ARP 0x0806 + IPv4 0x0800 — via direct `esp_netif_transmit`
-            // calls; the fixture sketches still never call it — their
-            // closed DHCP/client stack has no live netif state).
+            // the "1600B zeros" pcap trial). The call does NOT run: after
+            // capturing, the hook fake-returns ESP_OK immediately (same
+            // discipline as the LLMAC 0x42052404 tap). Running the closed
+            // WiFi TX driver would queue fragments that no RF ever drains
+            // via TX-done, so long runs eventually block forever in
+            // `ppTxFragmentProc` waiting for a free fragment (proven live
+            // 2026-10-04: 19-leg run parks at 398M with MQTT keeps 0..3);
+            // silicon with live RF drains and never blocks here. The frame
+            // bytes land in `pending_net_tx` + an EVT_NET_FRAME event for
+            // the host (gateway bridge + pcap) to drain. Caller args are
+            // windowed (callee a3/a4 = caller a11/a12), read BEFORE
+            // `step_one` while wb still names the caller. LIVE since the
+            // worker sketch drives the real stack (proven: 2 frames to
+            // pcap — ARP 0x0806 + IPv4 0x0800 — via direct
+            // `esp_netif_transmit` calls; the fixture sketches still never
+            // call it — their closed DHCP/client stack has no live netif
+            // state).
             {
                 use esp32s3_soc::WifiImage;
                 let want = match self.soc.wifi_image {
@@ -600,12 +612,29 @@ impl Esp32S3 {
                     WifiImage::Scan => 0x4202_e560,
                     WifiImage::EspNow => 0x4202_e7f8,
                     WifiImage::Worker => 0x4202_e60c,
-                    WifiImage::WorkerL3 => 0x4203_036c,
+                    WifiImage::WorkerL3 => 0x4203_0670,
+                    WifiImage::Coex => 0x4204_2bb8,
                 };
                 if pc0 == want {
                     let data = self.cpu[core].reg(11);
                     let len = self.cpu[core].reg(12);
                     self.soc.net_capture_tx(data, len);
+                    // Fake-return ESP_OK WITHOUT running the closed driver
+                    // — but ONLY with a sink present (`net_sink_present`:
+                    // pcap/gateway drains prove the bytes left the board).
+                    // Proven live 2026-10-04: 19-leg runs stall in
+                    // `ppTxFragmentProc` on the ~34th TX (fragment queue
+                    // fills, no RF TX-done drain). Without a sink the driver
+                    // RUNS (gateway-less fail verdicts `-11`/`-12` depend on
+                    // it — always-succeed flips them to lengths, proven via
+                    // battery `test_worker_net` missing `[-12]`).
+                    if self.soc.net_sink_present {
+                        let ra = self.cpu[core].reg(8);
+                        self.cpu[core].set_reg(10, 0); // ESP_OK
+                        self.cpu[core].pc = (pc0 & 0xc000_0000) | (ra & 0x3fff_ffff);
+                        n += 1;
+                        continue;
+                    }
                 }
             }
             // Ethernet RX injection (gateway→board replies: ARP/DHCP/
@@ -631,7 +660,8 @@ impl Esp32S3 {
                     WifiImage::Scan => 0x4202_e5c4,
                     WifiImage::EspNow => 0x4202_e85c,
                     WifiImage::Worker => 0x4202_e670,
-                    WifiImage::WorkerL3 => 0x4203_03d0,
+                    WifiImage::WorkerL3 => 0x4203_06d4,
+                    WifiImage::Coex => 0x4204_2c24,
                 };
                 if pc0 == want_rx
                     && let Some(frame) = self.soc.net_take_rx()
@@ -693,41 +723,22 @@ impl Esp32S3 {
             // loopback — it takes the host's TX command and synthesizes
             // the Command Complete into 0x3fcacfd6 itself, then calls
             // `host_rcv_pkt` with its OWN buffer — no host/bridge needed
-            // for basic commands). The tap captures READ-ONLY for CMD
-            // (bridge observability) and gives the semaphore ONLY for ACL
-            // (H4==0x02, see arm below): ROM manages CMD sem itself (extra
-            // host give double-completes → stale acks, proven harmful),
-            // but ROM never gives for ACL data (its loopback is CMD-only),
-            // so ATT responses starve in the 0x7d0-tick sem take → ret 19
-            // → `assert 0x4200724d:91` (proven live via L2CAP_RET probe).
+            // for basic commands). The tap captures READ-ONLY
+            // (bridge observability); the ACL semaphore pre-give lives in
+            // `run_ble_host_recv` before delivery (the take happens BEFORE
+            // this tap fires, so a post-give here is too late — proven
+            // live: L2CAP_RET ret=19 with the give here, same panic).
             // `ble_ack_deliver_at`/`ble_pool_top_up` stay parked (proven
             // harmful: stale-ack opcode mismatch, double-ownership
             // `assert 0x42014482`). Helpers stay unit-tested.
             // The helpers stay (unit-tested, wired for a future external-
-            // controller mode) but the tap calls ONLY `run_ble_send_ready`
-            // for ACL (never ack/pool).
+            // controller mode) but the tap never calls them; the ACL
+            // pre-give in `run_ble_host_recv` is the only firmware
+            // synthesis on this path.
             if pc0 == 0x4202_6088 {
                 let data = self.cpu[core].reg(10);
                 let len = self.cpu[core].reg(11);
                 self.soc.bt_hci_capture_tx(data, len);
-                // ACL-only sem give (2026-10-04, proven live via L2CAP_RET
-                // ret=19): ATT responses (H4=0x02 ACL) die in `ble_hci_trans_
-                // hs_acl_tx` semaphore take (0x7d0-tick timeout → 19 →
-                // `assert 0x4200724d:91`) because NOTHING ever gives
-                // `vhci_send_sem` for ACL — silicon's controller gives via
-                // `controller_rcv_pkt_ready` after consuming, but the ROM
-                // loopback only synthesizes CMD completes (its own sem
-                // management covers CMD; an extra host give double-completes
-                // CMD → stale acks, proven harmful). Scoped to H4==0x02 so
-                // CMD stays read-only (ROM-owned) while ACL gets its
-                // completion (host-owned, no double — ROM never gives for
-                // ACL). `controller_rcv_pkt_ready` gives iff the handle is
-                // nonzero (beqz-guarded), so calling unconditionally is safe.
-                // Read H4 via the SoC bus (DRAM address, first frame byte).
-                let h4 = self.soc.read8(data);
-                if h4 == 0x02 {
-                    self.run_ble_send_ready(core);
-                }
                 // Sync command-ack delivery DISABLED (was `ble_ack_deliver_at`
                 // with the live tap mbuf): the REAL ROM loopback synthesizes
                 // Command Completes itself and runs the ack path firmware-side
@@ -738,7 +749,9 @@ impl Esp32S3 {
                 // stays (unit-tested, for a future external-controller mode)
                 // but the tap never calls it; bridge CC/CS frames are dropped
                 // at the run_flash RX leg instead, and only async events/ACL
-                // reach `run_ble_host_recv`.
+                // reach `run_ble_host_recv`. (ACL semaphore pre-give lives
+                // in `run_ble_host_recv` before delivery — not here, because
+                // the take happens BEFORE this tap fires.)
             }
             // Full-802.11-LL-MAC slice-1 taps (`esp32s3_llmac` sketch, nm
             // on the llmac ELF; gated on `llmac_armed` so they can never
@@ -774,6 +787,63 @@ impl Esp32S3 {
                     self.soc.llmac_set_promisc_cb(cb);
                 }
             }
+            // Driver-internal management-TX fake-return (WorkerL3 only):
+            // `ppTxFragmentProc` (0x42074a10, nm on the test-worker-l3 ELF)
+            // queues TX fragments that no RF ever drains via TX-done, so
+            // long runs eventually block forever inside it waiting for a
+            // free fragment (proven live 2026-10-04: 19-leg run parks core0
+            // at 0x42074b4f on the ~34th driver TX with MQTT keeps 0..3,
+            // IDLE-exits at 398M; the sketch's own `esp_netif_transmit`
+            // frames already fake-return above and never touch this queue
+            // — the blocker is background management traffic, not test
+            // frames). Silicon with live RF drains via TX-done and never
+            // blocks here; faking success (0) matches the silicon-observed
+            // immediate return (same discipline as the netif tap above;
+            // pcap logs only netif data frames, never management, so no
+            // observability changes). Scoped to WorkerL3 (the only image
+            // proven to reach driver-TX exhaustion; other images' long runs
+            // can adopt the same arm if they ever park here — their
+            // `ppTxFragmentProc` links elsewhere, so a union would misfire).
+            //
+            // CALLER-SITE arm (2026-10-04): the entry hook above never fires
+            // (proven live: fire counter stays 0 across 200M–1.1B runs yet
+            // core0 parks at +0x13f inside) — entry is bypassed (fall-through
+            // or tail-jump into the body, not via call). Hook the proven
+            // caller instead: `ppProcessTxQ+0x...` `call8 ppTxFragmentProc`
+            // at 0x42091847 (nm+objdump on the test-worker-l3 ELF). Tail
+            // soundness: `bnez.n a10, 0x42091854` right after — faking 0
+            // falls through to the release/advance path (`lmacReleaseTxop-
+            // Queue`, dequeues + frees the frame), exactly silicon success;
+            // nonzero would branch to retry. One skip per queued frame, no
+            // leak, no block. Counter increments here (entry arm stays as
+            // defense-in-depth, still 0).
+            //
+            // QUEUE-PROCESSOR arm (2026-10-04): NEITHER entry (0x42074a10)
+            // NOR caller (0x42091847) hooks ever fire (both counters stay 0
+            // across full runs to the stall) yet core0 parks at +0x13f —
+            // entry is reached without executing a hooked call site (tail
+            // jump into the body from another TX path, not via
+            // ppProcessTxQ). Hook `ppProcessTxQ` ENTRY itself (0x4209171c):
+            // skipping whole queue-drain passes prevents ANY entry into the
+            // fragment path (no queue use at all, so no fill and no block;
+            // management frames simply never transmit offline — nothing
+            // validatable needs them: association is fixture-driven, pcap
+            // logs only netif data). Faking 0 (success) matches silicon
+            // (queue drained); the small per-run management-frame leak
+            // (queued, never freed) is bounded (tens of frames, short runs
+            // unaffected — proven by plain DONE green).
+            if self.soc.wifi_image == esp32s3_soc::WifiImage::WorkerL3
+                && (pc0 == 0x4207_4a10 || pc0 == 0x4209_1847 || pc0 == 0x4209_171c)
+            {
+                self.pptx_hook_fires += 1;
+                self.cpu[core].set_reg(10, 0);
+                self.pptx_hook_fires += 1;
+                self.cpu[core].set_reg(10, 0);
+                let ra = self.cpu[core].reg(8);
+                self.cpu[core].pc = (pc0 & 0xc000_0000) | (ra & 0x3fff_ffff);
+                n += 1;
+                continue;
+            }
             // Closed-RF dispatch-table call skips (recalibration
             // immunization): `chip_v7_set_chan_misc` / `ram_wifi_set_tx_gain`
             // load table slots and `callx8` them on EVERY channel set incl.
@@ -788,8 +858,8 @@ impl Esp32S3 {
             // window surgery is needed (the call never executes: pc+3,
             // registers untouched).
             // SCOPE: worker-L3 image only (nm+objdump on the test-worker-l3
-            // ELF — re-derived after the L3-legs .ino edit: 0x420807d9,
-            // 0x42081b0f, 0x42081b25, 0x42081b2f). The closed lib links
+            // ELF — re-derived after the CoAP-server .ino edit: 0x42080b65,
+            // 0x42080b71, 0x42081e9b, 0x42081eb1, 0x42081ebb). The closed lib links
             // these functions at a different address per image but with an
             // identical shape — extend per image the same way if another
             // long run ever needs it; the other battery images never reach
@@ -806,15 +876,23 @@ impl Esp32S3 {
             //   tbl[0x210], clobbered with non-code bytes like its
             //   neighbors; tail redefines a3/a10/a11/a12 (mov/movi) and a2
             //   (l32i.n) before any read, a8 dead — same verification).
-            // - 0x42081b2f: `callx8 a2` in the same function (target =
+            // - 0x42081ebb: `callx8 a2` in the same function (target =
             //   tbl[0x224], clobbered with DNS bytes like its neighbors;
             //   the call is the function's last op before `retw.n`, so its
             //   return dies with the frame unread — sound).
+            // - 0x42080b71: `callx8 a4` in `chip_v7_set_chan_misc` (target
+            //   = tbl[0x264]; the call is the function's last op before
+            //   `retw.n` (0x42080b74), so its return dies with the frame
+            //   unread — sound. Clobbered by the HTTP response in 19-leg
+            //   runs (RF-TBL dump: "lp/t" bytes at tbl+0x264, EPC1 match;
+            //   DNS-only 18-leg runs never reach 0x264, hence 4 skips
+            //   sufficed before the CoAP-server leg lengthened the buffer).
             if self.soc.wifi_image == esp32s3_soc::WifiImage::WorkerL3
-                && (pc0 == 0x4208_07d9
-                    || pc0 == 0x4208_1b0f
-                    || pc0 == 0x4208_1b25
-                    || pc0 == 0x4208_1b2f)
+                && (pc0 == 0x4208_0b65
+                    || pc0 == 0x4208_0b71
+                    || pc0 == 0x4208_1e9b
+                    || pc0 == 0x4208_1eb1
+                    || pc0 == 0x4208_1ebb)
             {
                 self.cpu[core].pc = pc0.wrapping_add(3);
                 n += 1;
@@ -1042,6 +1120,39 @@ impl Esp32S3 {
                 *v = self.soc.read8(buf.wrapping_add(k as u32)) as u8;
             }
             self.last_recv_stage = Some((buf, len, b));
+        }
+        // ACL semaphore PRE-GIVE (2026-10-04, proven live via L2CAP_RET
+        // ret=19): ATT responses die in `ble_hci_trans_hs_acl_tx` sem take
+        // (0x7d0-tick timeout → 19 → `assert 0x4200724d:91`) because ROM
+        // loopback never gives for ACL (CMD-only). The take happens BEFORE
+        // the TX-tap fires, so a post-give there is too late (proven: same
+        // ret=19 panic with the give in the tap). Pre-seed here, before
+        // ACL semaphore PRE-SEED (2026-10-04, direct write — replaces the
+        // synthetic `run_ble_send_ready` call, which crashed inside its own
+        // window surgery with ILLEGAL at vector 0x403743c0, zero ACL TX).
+        // ATT responses die in `ble_hci_trans_hs_acl_tx` sem take (timeout
+        // → 19 → `assert 0x4200724d:91`) because ROM loopback never gives
+        // for ACL (CMD-only). A synthetic give runs 10k firmware insns and
+        // destabilizes the caller; a direct count write is invisible (same
+        // class as every other host fixture cell write). `vhci_send_sem`
+        // at 0x3fc9d6d0 holds a QUEUE POINTER (proven live: word0 reads
+        // 0x3fcb13c4); the pointed-to Queue_t is [pcHead/pcTail/pcWriteTo/
+        // pcReadFrom (4×ptr), xTasksWaitingToSend (20B list), ...] so
+        // uxMessagesWaiting sits at +0x38 (standard FreeRTOS Queue_t after
+        // two lists + I2C-queue precedent; proven live: +0x10 hit the
+        // waiter-list count and tripped `xTaskRemoveFromEventList:3894`,
+        // while +0x38 is the count). Setting 1 when already 1 is
+        // idempotent; the TX take consumes it (balanced). EVT deliveries
+        // (no conn yet) also write 1 harmlessly (no take follows). Scoped
+        // to H4==0x02 so CMD flow (ROM-owned) is untouched.
+        if self.soc.read8(buf) == 0x02 {
+            let h = self.soc.read32(0x3fc9_d6d0);
+            // Guard the null/uninit handle (boot phase): only write when
+            // the pointer names DRAM (else skip — take will queue/fail as
+            // before, no wild write).
+            if (0x3fc8_0000..0x3fd0_0000).contains(&h) {
+                self.soc.write32(h.wrapping_add(0x38), 1);
+            }
         }
         let cpu = &mut self.cpu[core];
         let saved_pc = cpu.pc;

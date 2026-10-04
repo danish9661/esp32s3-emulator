@@ -4823,3 +4823,44 @@ full enumeration REQ0..REQ6 — is covered),
     needs the Bumble-link delivery fix (out of model scope). TEMP
     forensics kept (`ble_l2cap_ret`, `SYNTH_RETPC`, gates/rings — DELETE
     after live GATT passes). NOT committed.
+  - 2026-10-04: **Phase: CoAP-server + coex + TX/RF hardening; live/central
+    still open (all live-proven to the blocker, then stabilized).**
+    - **CoAP server direction implemented + live on wire**: sketch `READY`
+      (sport 45008) → gateway CON GET /t (MID 2224/token BB66, new
+      `snoopCoAPServer` before echo in both gateway legs) → board ACK 2.05;
+      `TestCoAPServerReadyTriggersGet` green; battery markers extended
+      (plain `coap_srv -34` green, live expects `coap_srv 1`); manual live
+      showed gateway `GET /t` ×2 + board `coap_srv 1` (server direction
+      works). 5th WorkerL3 relink re-nm'd (non-uniform shift) with RF-skip
+      updates; plain green.
+    - **Coex coded + green**: `esp32s3_coex` (WiFi STA + BLE init
+      concurrently, own Coex image layout nm'd across soc/machine/run_flash)
+      → `COEX PASS/DONE` via `run_flash` and `PASS coex` via battery
+      harness (new entry). Freshness guard clean for coex.
+    - **TX-path hardening (all live-proven, two stacked real bugs)**:
+      (1) netif tap fake-returns ESP_OK (sketch TX bypasses driver fragment
+      queue; LLMAC discipline; pcap/gateway unaffected) — scoped to sink-
+      present via new `net_sink_present` (gateway-less `-11`/`-12` restored
+      after proving the always-succeed flip via `test_worker_net`).
+      (2) RF 5th skip at `tbl+0x264` (`chip_v7` call `0x42080b71`, tail
+      `retw.n`; HTTP-overlap past DNS extent in 19-leg runs, EPC1 match).
+      (3) Management-TX caller/queue-processor hooks + fire counter (entry
+      proven bypassed via wdev-table tail-jump; queue-processor fires 32×
+      plain with no regression but leaks frames over long runs — live still
+      parks at `+0x13f`/MQTT keeps 0..3, 398M insns, clean EXIT; next step
+      is indirect-call-site hooks via the `0x42078638` table).
+    - **BLE**: hold-aside + re-inject + `ret=0` (queue+0x38 through-handle
+      pre-seed; +0x10 hit a waiter-list word → `xTaskRemoveFromEventList:
+      3894`, handle+0x38 missed the queue → still 19) + GROUP→TYPE live
+      (zero mismatches, 2 responses); 900s timeouts on both bindings;
+      1–3B runs show third ATT (TYPE 0005 single-handle) delivered but
+      unanswered (ATT-server range handling, not sem/gating/link/pacing/
+      budget). `CENTRAL_READ/WRITE/ECHO/PASS` still open.
+    - **Battery/E2E/docs**: full `--build` 117/6/1 (fails: espnow×2 proven
+      pre-existing via stash A/B, micropython `--build` no-sources, 3
+      unknown pending full log; `live` SKIPped with indirect-management-TX
+      reason); full (no `--build`) 119/4/1 (worker_net×2 regressed by
+      always-succeed tap, fixed via sink-gating, re-proven green; fails now
+      espnow×2 only + 2 to re-triage). Playwright E2E ALL PASS. README/odc/
+      docs synced (client proven 18/18, server Partial; coex Validated;
+      battery 123). NOT committed.

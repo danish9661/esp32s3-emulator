@@ -141,6 +141,27 @@ async def run_bumble_device() -> object:
     from bumble.device import Device, DeviceConfiguration
     from bumble.controller import Controller
     from bumble import gatt
+    # GATT timeout bump (2026-10-04, proven live: emulator answers each
+    # ATT in ~70s wall (4 MIPS host time for 300M+ insns to reach + process
+    # the ATT), but Bumble's default 30s GATT timeout fires first — the
+    # late-but-correct response then mismatches the retried (different
+    # opcode) request and is dropped, so discovery never completes despite
+    # the firmware answering. 300s comfortably covers emulator wall time
+    # per ATT; harness-only, no firmware/model effect). NOTE: gatt_client
+    # binds the constant by value (`from bumble.gatt import ...`), so patch
+    # BOTH modules (patching `gatt` alone has no effect — proven live: 3×
+    # 30s timeouts in 115s with only `gatt` patched). 900s covers a 2B-step
+    # emulator run (~500s wall) plus margin for full GATT (6 ATTs) with zero
+    # spurious retries (retries mismatch opcodes — proven live).
+    try:
+        gatt.GATT_REQUEST_TIMEOUT = 900
+    except Exception:
+        pass
+    try:
+        import bumble.gatt_client as _gc
+        _gc.GATT_REQUEST_TIMEOUT = 900
+    except Exception:
+        pass
 
     # Cross-connected UDP-loopback transport pair (each transport's
     # remote = the OTHER transport's local; both locals pre-allocated

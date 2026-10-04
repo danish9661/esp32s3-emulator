@@ -235,7 +235,7 @@ on CALL/RETW, matching QEMU's `win_helper.c` behavior.
 | I2C Wire driver | Silicon-true | Empty-bus scan reports "other" per esp-idf NG-driver mapping (verified behavior, not a gap); peripheral validated via direct poke |
 | ee.* DSP/TIE | 218/218 execute | Unmapped patterns trap loud (correct); only needed for WiFi/FFT firmware |
 | Touch | Validated | Oneshot + threshold ISR path via direct poke (see `AGENTS.md`) |
-| WiFi/BLE | Partial / Out of scope | WiFi scan/STA/AP/ESP-NOW + live-IP L2 bridge + L3–L7 client legs (DNS/NTP/UDP/CoAP/HTTP/MQTT/IPv6, 18/18 live) + pcap validated; board-as-server L3–L7 stays Partial (no live-netif path offline); BLE GATT server boots + canned 9-step GATT + panic-free live conn (central completion is harness-side Bumble link delivery, out of model scope) |
+| WiFi/BLE | Partial / Out of scope | WiFi scan/STA/AP/ESP-NOW + coex (STA + BLE concurrent) + live-IP L2 bridge + L3–L7 client legs (DNS/NTP/UDP/CoAP/HTTP/MQTT/IPv6, 18/18 live) + pcap validated; board-as-server L3–L7 stays Partial (no live-netif path offline); BLE GATT server boots + canned 9-step GATT + panic-free live conn (central completion is harness-side Bumble link delivery, out of model scope) |
 | I2S TDM/PDM | Modeled | Master/slave clock-gen, TDM, PDM all functional |
 | LCD_CAM 8080/6800 | Partial | FIFO + transfer-done functional; RGB FSM not modeled |
 | ULP rv32imc | Functional | C extension supported; compressed decode working |

@@ -496,6 +496,9 @@ func handleTCPFrame(client *Client, room *Room, msg []byte) {
 	if snoopCoAP(msg, client, room) {
 		return
 	}
+	if snoopCoAPServer(msg, client, room) {
+		return
+	}
 	if snoopUDPEcho(msg, client, room) {
 		return
 	}
@@ -673,6 +676,9 @@ func handleClient(client *Client, room *Room) {
 				continue
 			}
 			if snoopCoAP(msg, client, room) {
+				continue
+			}
+			if snoopCoAPServer(msg, client, room) {
 				continue
 			}
 			if snoopUDPEcho(msg, client, room) {
