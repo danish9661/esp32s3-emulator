@@ -7,8 +7,9 @@ web/firmware/*.bin
 *.merged.bin
 # sample firmware used for local browser testing (copy your own merged.bin)
 
-# arduino-cli in-tree build output
-tools/sketches/*/build/
+# arduino-cli in-tree build output (any depth — some sketches nest a project
+# dir, e.g. esp32s3_rsa/esp32s3_rsa_poke/build/)
+tools/sketches/**/build/
 
 # PGO raw training profiles (the merged profile IS committed)
 tools/pgo/raw/
