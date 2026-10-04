@@ -193,6 +193,142 @@ func TestUDPEchoRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCoAPTempGet(t *testing.T) {
+	// CON GET coap://192.168.4.1/t (MID 0x2223, token AA 55) gets a
+	// piggybacked ACK 2.05 with the same MID/token + `25.00C` payload.
+	// Same pipe-backed client harness as TestUDPEchoRoundTrip.
+	mac := net.HardwareAddr{0x66, 0x55, 0x44, 0x33, 0x22, 0xC0}
+	coap := []byte{0x40, 0x01, 0x22, 0x23, 0xAA, 0x55, 0xB1, 't'}
+	eth := &layers.Ethernet{SrcMAC: mac, DstMAC: gwMAC, EthernetType: layers.EthernetTypeIPv4}
+	ip := &layers.IPv4{Version: 4, IHL: 5, TTL: 64, Protocol: layers.IPProtocolUDP,
+		SrcIP: net.IPv4(192, 168, 4, 2), DstIP: net.IPv4(192, 168, 4, 1)}
+	udp := &layers.UDP{SrcPort: 45006, DstPort: 5683}
+	_ = udp.SetNetworkLayerForChecksum(ip)
+	buf := gopacket.NewSerializeBuffer()
+	if serr := gopacket.SerializeLayers(buf, gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true},
+		eth, ip, udp, gopacket.Payload(coap)); serr != nil {
+		t.Fatal(serr)
+	}
+	frame := buf.Bytes()
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	client := &Client{TCP: c2}
+	done := make(chan []byte, 1)
+	go func() {
+		var hdr [4]byte
+		if _, err := c1.Read(hdr[:]); err != nil {
+			return
+		}
+		n := int(binary.BigEndian.Uint32(hdr[:]))
+		body := make([]byte, n)
+		off := 0
+		for off < n {
+			m, err := c1.Read(body[off:])
+			if err != nil {
+				return
+			}
+			off += m
+		}
+		done <- body
+	}()
+	room := &Room{}
+	if !snoopCoAP(frame, client, room) {
+		t.Fatal("CoAP GET /t not consumed")
+	}
+	select {
+	case rep := <-done:
+		pkt := gopacket.NewPacket(rep, layers.LayerTypeEthernet, gopacket.Default)
+		udpl := pkt.Layer(layers.LayerTypeUDP)
+		if udpl == nil {
+			t.Fatal("reply has no UDP layer")
+		}
+		u, _ := udpl.(*layers.UDP)
+		if u.SrcPort != 5683 || u.DstPort != 45006 {
+			t.Fatalf("ports not swapped: %d -> %d", u.SrcPort, u.DstPort)
+		}
+		p := u.Payload
+		if len(p) < 8 || p[0] != 0x60 || p[1] != 0x45 {
+			t.Fatalf("not ACK 2.05: %x", p)
+		}
+		if p[2] != 0x22 || p[3] != 0x23 || p[4] != 0xAA || p[5] != 0x55 {
+			t.Fatalf("MID/token not echoed: %x", p)
+		}
+		found := false
+		for i := 0; i+6 <= len(p); i++ {
+			if string(p[i:i+6]) == "25.00C" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("payload missing 25.00C: %x", p)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no CoAP reply arrived")
+	}
+}
+
+func TestCoAPFallsThroughToEcho(t *testing.T) {
+	// Non-CoAP bytes on :5683 (the sketch's HELLO-UDP) must NOT be
+	// consumed by snoopCoAP — snoopUDPEcho still answers them as raw echo.
+	mac := net.HardwareAddr{0x66, 0x55, 0x44, 0x33, 0x22, 0xC0}
+	pay := []byte("HELLO-UDP")
+	eth := &layers.Ethernet{SrcMAC: mac, DstMAC: gwMAC, EthernetType: layers.EthernetTypeIPv4}
+	ip := &layers.IPv4{Version: 4, IHL: 5, TTL: 64, Protocol: layers.IPProtocolUDP,
+		SrcIP: net.IPv4(192, 168, 4, 2), DstIP: net.IPv4(192, 168, 4, 1)}
+	udp := &layers.UDP{SrcPort: 45005, DstPort: 5683}
+	_ = udp.SetNetworkLayerForChecksum(ip)
+	buf := gopacket.NewSerializeBuffer()
+	if serr := gopacket.SerializeLayers(buf, gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true},
+		eth, ip, udp, gopacket.Payload(pay)); serr != nil {
+		t.Fatal(serr)
+	}
+	frame := buf.Bytes()
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	client := &Client{TCP: c2}
+	room := &Room{}
+	if snoopCoAP(frame, client, room) {
+		t.Fatal("raw HELLO-UDP consumed as CoAP")
+	}
+	done := make(chan []byte, 1)
+	go func() {
+		var hdr [4]byte
+		if _, err := c1.Read(hdr[:]); err != nil {
+			return
+		}
+		n := int(binary.BigEndian.Uint32(hdr[:]))
+		body := make([]byte, n)
+		off := 0
+		for off < n {
+			m, err := c1.Read(body[off:])
+			if err != nil {
+				return
+			}
+			off += m
+		}
+		done <- body
+	}()
+	if !snoopUDPEcho(frame, client, room) {
+		t.Fatal("HELLO-UDP not consumed by echo snoop")
+	}
+	select {
+	case rep := <-done:
+		pkt := gopacket.NewPacket(rep, layers.LayerTypeEthernet, gopacket.Default)
+		udpl := pkt.Layer(layers.LayerTypeUDP)
+		if udpl == nil {
+			t.Fatal("reply has no UDP layer")
+		}
+		u, _ := udpl.(*layers.UDP)
+		if string(u.Payload) != "HELLO-UDP" {
+			t.Fatalf("payload not echoed: %q", u.Payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no echo reply arrived")
+	}
+}
+
 func TestSnoopDNSPortGate(t *testing.T) {
 	// A UDP frame to port 80 must NOT be consumed by the DNS snoop
 	// (nil client is safe exactly when unconsumed — same discipline as

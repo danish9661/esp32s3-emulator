@@ -231,9 +231,9 @@ pub const APB_END: u32 = 0x6010_0000;
 /// harmless return instead of jumping to heap garbage (proven live on the
 /// worker-L3 image, whose gateway legs run long enough to reach the periodic
 /// recalibration; the plain-battery run exits before it). The slot is the
-/// 3-byte bare `retw` the glue assembles right after the QSORT body
-/// (pinned by `debug_assert_eq!(a.pc(), RF_NOP_SLOT)` in rom_stub.rs).
-/// `pad_to(BOOT)` absorbs the delta so the reset vector lands byte-identical.
+/// 6-byte `entry a1,16` + `retw` the glue assembles right after the QSORT
+/// body (pinned by asserts in rom_stub.rs). `pad_to(BOOT)` absorbs the
+/// delta so the reset vector lands byte-identical.
 /// (The 2026-10-02 hello ILLEGAL was NEVER these bytes — it was the ungated
 /// completing WRITE firing on hello, which has no `g_phyFuns` cell; the
 /// fixture-armed gate in `maybe_complete_phyfuns_slot` fixes that.
@@ -241,9 +241,14 @@ pub const APB_END: u32 = 0x6010_0000;
 /// any WIDER planting re-opens the `pad_to(BOOT)` shift.) RF effects are
 /// abstracted via done-bits anyway (see `wifi.rs`), so a no-op return is
 /// behaviorally identical as observed by firmware.
-/// Value semantics: the slot holds a `callx8` TARGET, i.e. a full return
-/// address the callee's `retw` consumes.
-pub const RF_NOP_SLOT: u32 = 0x4000_03C9;
+/// Value semantics: the slot holds a `callx8` TARGET — the address of the
+/// `entry` (a callx8 does NOT rotate the window itself; the callee's ENTRY
+/// does, so a bare `retw` without an entry executes in the CALLER's window
+/// and faults or jumps wild — the slot must name a real entry point, and
+/// it does: the `entry` below. Proven live 2026-10-03: the old 0x3C9 value
+/// named the byte AFTER a bare retw, so recalibration ran the pad bytes +
+/// BOOT prologue as a function and died in EXCCAUSE 0x22 at 0x40000461.)
+pub const RF_NOP_SLOT: u32 = 0x4000_03C6;
 
 /// Total internal SRAM in bytes.
 pub const SRAM_BYTES: usize = DRAM_SIZE as usize;

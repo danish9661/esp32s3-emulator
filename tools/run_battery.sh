@@ -44,6 +44,36 @@ fi
 echo "== building run_flash =="
 cargo build --release -p esp32s3-emu --example run_flash 2>&1 | grep -E "^error" -A4 | head -8
 
+# Live-gateway fixture (test_worker_l3_live, net_pcap): entries whose env
+# mentions NET_GW= need the Go L3–L7 gateway on 127.0.0.1:5051 (TCP ingest
+# leg — see tools/gateway/). Build once into tools/.gateway/ (gitignored)
+# and hold it for the whole run; trap kills it on exit. Started only when
+# a selected case needs it (full runs always need it; filtered runs only
+# when the filter names a live entry).
+GWDIR="$ROOT/tools/.gateway"; GWBIN="$GWDIR/gw"; GWPID=""
+WANT_GW=0
+if [[ ${#FILTER[@]} -eq 0 ]]; then WANT_GW=1; else
+  for f in "${FILTER[@]}"; do
+    case "$f" in *test_worker_l3_live*|*net_pcap*) WANT_GW=1;; esac
+  done
+fi
+if [[ $WANT_GW == 1 ]]; then
+  mkdir -p "$GWDIR"
+  if ! command -v go >/dev/null 2>&1; then
+    echo "FAIL gateway fixture (no go toolchain)" >&2; exit 2
+  fi
+  (cd "$ROOT/tools/gateway" && go build -o "$GWBIN" .) || { echo "FAIL gateway fixture (go build)" >&2; exit 2; }
+  ("$GWBIN" >"$GWDIR/gw.log" 2>&1 & echo $! >"$GWDIR/pid")
+  GWPID=$(cat "$GWDIR/pid")
+  for _ in $(seq 1 60); do
+    (echo >/dev/tcp/127.0.0.1/5051) >/dev/null 2>&1 && break
+    sleep 1
+  done
+  (echo >/dev/tcp/127.0.0.1/5051) >/dev/null 2>&1 || { echo "FAIL gateway fixture (no listen on 5051)" >&2; kill "$GWPID" 2>/dev/null; exit 2; }
+  echo "== gateway up (pid $GWPID) =="
+  trap 'kill "$GWPID" 2>/dev/null' EXIT
+fi
+
 # Table: name|env(space-separated K=V)|required markers (; separated)|STEPS.
 # SKIP entries: name|SKIP:reason (not run).
 # NODE entries: name|NODE:path/to/harness.mjs|markers| — run under node
@@ -122,10 +152,13 @@ CASES=(
 "test_worker_net|WIFI_STA_CONN=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55|WORKER NET START;WORKER NET status 3;WORKER NET netif 1;WORKER NET tx1 -11;WORKER NET tx2 -12;WORKER NET keep 14;WORKER NET rx1 1 -13;WORKER NET rx2 1 -14;WORKER NET DONE|350000000"
 "test_worker_net_inwasm|NODE:tools/wifi_harness.mjs|WIFI WORKER NET HARNESS PASS||esp32s3_test_worker_net/esp32s3_test_worker_net.merged.bin"
 "test_worker_l3_inwasm|NODE:tools/wifi_harness.mjs|WIFI WORKER L3 HARNESS PASS||esp32s3_test_worker_l3/esp32s3_test_worker_l3.merged.bin"
-"test_worker_l3|WIFI_STA_CONN=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55|WORKER L3 START;WORKER L3 status 3;WORKER L3 netif 1;WORKER L3 DONE|350000000"
+"test_worker_l3|WIFI_STA_CONN=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55|WORKER L3 START;WORKER L3 status 3;WORKER L3 netif 1;WORKER L3 gw 0;WORKER L3 dns -21;WORKER L3 ntp -22;WORKER L3 udp -29;WORKER L3 coap -30;WORKER L3 http_synack -23;WORKER L3 http -24;WORKER L3 mqtt_synack -25;WORKER L3 mqtt -28;WORKER L3 ip6 ra -31;WORKER L3 ip6 echo -32;WORKER L3 ip6 udp -33;WORKER L3 DONE|350000000"
+"test_worker_l3_live|WIFI_STA_CONN=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55 NET_GW=127.0.0.1:5051|WORKER L3 START;WORKER L3 status 3;WORKER L3 netif 1;WORKER L3 gw 1;WORKER L3 dns 34;WORKER L3 ntp 123;WORKER L3 udp 9;WORKER L3 coap 205;WORKER L3 http_synack 1;WORKER L3 http 200;WORKER L3 mqtt_synack 1;WORKER L3 mqtt_connack 1;WORKER L3 mqtt_suback 1;WORKER L3 mqtt 1883;WORKER L3 ip6 ra 134;WORKER L3 ip6 echo 129;WORKER L3 ip6 udp 9;WORKER L3 DONE|1000000000|esp32s3_test_worker_l3/esp32s3_test_worker_l3.merged.bin"
+"net_pcap|WIFI_STA_CONN=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55 NET_GW=127.0.0.1:5051 NET_PCAP=tools/.gateway/battery.pcap|WORKER NET START;WORKER NET status 3;WORKER NET netif 1;WORKER NET DONE|350000000|esp32s3_test_worker_net/esp32s3_test_worker_net.merged.bin"
 "ble||BLE START;BLE init 1;BLE server 1;BLE service 1;BLE chars 2;BLE echo 4;BLE adv 1;BLE level 100;BLE DONE|"
 "wifi_ap|WIFI_AP_FIXTURE=1|WIFI AP softAP 1;WIFI AP IP 192.168.4.1;WIFI AP MAC 62:55:44:33:22:11;WIFI AP stations 0;WIFI AP clients 0;WIFI AP DONE|60000000"
 "espnow|WIFI_ESPNOW_LOOPBACK=1|WIFI ESPNOW init 1;WIFI ESPNOW addpeer 1;WIFI ESPNOW sent 1;WIFI ESPNOW sendcb 1;WIFI ESPNOW rxcb 1;WIFI ESPNOW rx0 68;WIFI ESPNOW rxlen 5;WIFI ESPNOW rxsum 14;WIFI ESPNOW DONE|60000000"
+"llmac|WIFI_LLMAC=1|LLMAC START;LLMAC sniff 1;LLMAC TX 0;LLMAC RX 3;LLMAC SSID 1;LLMAC DONE;LLMAC CAP len=41 fc=0x40 ssid=1|60000000"
 "usb_device|USB_HOST_ENUM=1|USB DEVICE STACK UP;USB DEVICE RESET ENUMSPD;USB DEVICE POLL RDV;USB DEVICE ENUM OK;USB DEVICE REQ1 OK;USB DEVICE REQ2 OK;USB DEVICE REQ3 OK;USB DEVICE REQ4 OK;USB DEVICE REQ5 OK;USB DEVICE REQ6 OK;USB DEVICE ENUM FULL OK;USB DEVICE PASS;USB DEVICE DONE|60000000"
 "deepsleep_poke||DEEPSLEEP PASS|"
 "deepsleep||DEEPSLEEP START;DEEPSLEEP WOKE;DEEPSLEEP PASS|50000000"
@@ -282,12 +315,66 @@ for c in "${CASES[@]}"; do
     fi
   fi
   if [[ ! -f "$bin" ]]; then echo "FAIL $name (no binary $bin)"; fail=$((fail+1)); continue; fi
-  log=$(STEPS=$steps env $envstr timeout 300 "$EMU" "$bin" 2>&1 | tr -d '\0')
+  # NET_PCAP paths in entries are repo-relative; resolve against ROOT so the
+  # run is CWD-independent (bins/EMU above are already absolute). NOTE:
+  # ROOT contains spaces, so the absolute pcap path CANNOT ride inside the
+  # unquoted `env $envstr` split below (it would break into words and `env`
+  # would try to execute the tail as a command — proven live: empty log,
+  # "missing [DONE]", gateway saw connect/EOF with zero frames). Strip
+  # NET_PCAP out of envstr and pass it as a separate quoted assignment.
+  pcap_abs=""
+  if [[ "$envstr" == *NET_PCAP=* ]]; then
+    pcap_rel="${envstr##*NET_PCAP=}"
+    pcap_rel="${pcap_rel%% *}"
+    pcap_abs="$ROOT/$pcap_rel"
+    envstr="${envstr//NET_PCAP=$pcap_rel/}"
+  fi
+  # Per-entry timeout: gateway-live runs (1B steps through the TCP bridge)
+  # sustain ~1.2 MIPS host-side (~830s for 1B), while plain runs do ~7 MIPS
+  # (~50s for 350M). A flat 300s kills live mid-leg (proven: 752-821s for
+  # 1B). Scale with budget: 900s for >=1B, else 300s.
+  case_timeout=300
+  if [[ $steps -ge 1000000000 ]]; then case_timeout=900; fi
+  # shellcheck disable=SC2086 (envstr intentionally splits on spaces —
+  # no value inside it contains spaces; NET_PCAP rides separately above).
+  if [[ -n "$pcap_abs" ]]; then
+    log=$(STEPS=$steps NET_PCAP="$pcap_abs" env $envstr timeout $case_timeout "$EMU" "$bin" 2>&1 | tr -d '\0')
+  else
+    log=$(STEPS=$steps env $envstr timeout $case_timeout "$EMU" "$bin" 2>&1 | tr -d '\0')
+  fi
   ok=1; why=""
   for m in ${markers//;/ }; do
     echo "$log" | grep -aqF -- "$m" || { ok=0; why="missing [$m]"; }
   done
   echo "$log" | grep -aq "FAIL" && { ok=0; why="FAIL in output"; }
+  # pcap artifact check (net_pcap): the run must leave a valid pcap with
+  # real gateway traffic (global magic + ARP request + ICMP echo), not
+  # just an empty header. Validated with python3 (no extra deps). NOTE:
+  # net_pcap reuses the worker_net image (ARP + ICMP echo legs), so ARP
+  # presence is the right L2 proof here (worker_l3 hardcodes the gateway
+  # MAC and never ARPs — different entry, different rule).
+  if [[ $ok == 1 && "$name" == "net_pcap" ]]; then
+    pcap="$ROOT/tools/.gateway/battery.pcap"
+    if ! python3 - "$pcap" <<'EOF'; then
+import struct, sys
+d = open(sys.argv[1], 'rb').read()
+assert d[:4] == b'\xd4\xc3\xb2\xa1', 'bad magic'
+n, off, seen = 0, 24, set()
+while off + 16 <= len(d):
+    _, _, caplen, _ = struct.unpack('<IIII', d[off:off+16])
+    body = d[off+16:off+16+caplen]
+    if len(body) < 14: break
+    seen.add(struct.unpack('>H', body[12:14])[0])
+    n += 1
+    off += 16 + caplen
+assert n >= 2, 'fewer than 2 packets: %d' % n
+assert 0x0806 in seen, 'no ARP frame'
+assert 0x0800 in seen, 'no IPv4 frame'
+print('PCAP OK %d packets' % n)
+EOF
+      ok=0; why="pcap artifact invalid"
+    fi
+  fi
   if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); fi
 done
 echo "== battery: $pass pass, $fail fail, $skipped skipped =="

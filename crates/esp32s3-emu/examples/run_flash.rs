@@ -46,6 +46,29 @@ fn unimp_detail(m: &mut Esp32S3, core: usize) -> String {
     }
 }
 
+// TEMP (2026-10-04, forensics — DELETE after): pc-blacklist for BLE
+// synthetic delivery (see gate docs). True when `pc` lies inside a
+// pool/queue/scheduler critical function (nm on the BLE ELF, 2026-10-04).
+fn ble_in_crit(pc: u32) -> bool {
+    const RANGES: [(u32, u32); 14] = [
+        (0x4038_03d4, 0x4038_04d8), // xQueueGenericSend
+        (0x4038_057c, 0x4038_0628), // xQueueGenericSendFromISR
+        (0x4038_0628, 0x4038_06bc), // xQueueGiveFromISR
+        (0x4038_06bc, 0x4038_0784), // xQueueReceive
+        (0x4038_0aa0, 0x4038_0be8), // xPortEnterCriticalTimeout
+        (0x4038_0be8, 0x4038_0c7c), // vPortExitCritical
+        (0x4038_1aec, 0x4038_1d74), // vTaskSwitchContext
+        (0x4201_44b4, 0x4201_44d4), // ble_transport_alloc_evt
+        (0x4201_44d4, 0x4201_44ec), // ble_transport_alloc_acl_from_ll
+        (0x4201_44ec, 0x4201_4540), // ble_transport_free
+        (0x4201_4e70, 0x4201_4e8c), // os_mbuf_prepend_pullup
+        (0x4201_504c, 0x4201_50b8), // os_memblock_get + put_from_cb
+        (0x4201_50b8, 0x4201_50f4), // os_memblock_put
+        (0x4201_529c, 0x4201_52f8), // npl_freertos_eventq_put
+    ];
+    RANGES.iter().any(|&(s, e)| pc >= s && pc < e)
+}
+
 fn main() {
     let path = env::args().nth(1).expect("usage: run_flash <flash image>");
     let flash = fs::read(&path).expect("read flash image");
@@ -350,8 +373,102 @@ fn main() {
     // `host_rcv_pkt` entry itself, and `vhci_send_sem` (the counting
     // semaphore `controller_rcv_pkt_ready` gives). The RX hook stages
     // one queued bridge reply per `host_rcv_pkt` call.
-    const BLE_HOST_CB: u32 = 0x3c06_b7c8;
+    const BLE_HOST_CB: u32 = 0x3c06_b82c;
     let mut ble_cb_entry: Option<u32> = None;
+    // TEMP (2026-10-03): deterministic BLE NULL-call repro (DELETE after
+    // forensics). `BLE_RX_CANNED=1` stages one canned connection-complete
+    // with no bridge; `BLE_RX_ACL_DROP=1` drops ATT ACLs instead of
+    // delivering them.
+    let ble_canned = std::env::var("BLE_RX_CANNED").is_ok();
+    let mut ble_canned_done = false;
+    // TEMP (2026-10-03, forensics — DELETE after): IRAM probe latch.
+    let mut ble_iram_probed = false;
+    // TEMP (2026-10-03): enable the event-dispatch tracer in canned mode
+    // (DELETE after).
+    if ble_canned {
+        m.soc.set_ble_trace_evt(true);
+    }
+    // TEMP (2026-10-03): last capture seq served by the canned controller
+    // (DELETE after).
+    let mut ble_canned_last_op = 0u64;
+    // TEMP (2026-10-03): opcode of the last served canned CC + version
+    // follow-up flag (DELETE after).
+    let mut ble_canned_last_cc_op = 0u32;
+    let mut ble_canned_ver_done = false;
+    // TEMP (2026-10-03): remote-features complete follow-up (DELETE after).
+    // 0x2016 (LE_RD_REM_FEAT) is async like 0x041d: the CC acks the command
+    // but the handler stalls awaiting the LE Meta Read-Remote-Features
+    // Complete event (subevent 0x04) — without it no onConnect, proven live
+    // (post-0x2016 silence with no waiter timeout).
+    let mut ble_canned_feat_done = false;
+    // TEMP (2026-10-03): data-length-change follow-up (DELETE after).
+    // 0x2022 (LE_SET_DATA_LEN) is async: CC acks, then the handler awaits
+    // the LE Meta Data-Length-Change event (subevent 0x07) — without it
+    // the link disconnects right after the CC (proven live: conn then
+    // disc with no further TX). Values mirror typical negotiated
+    // maxima (251B/2120us both directions, handle 1 from the 22B).
+    let mut ble_canned_dl_done = false;
+    // TEMP (2026-10-04, forensics — DELETE after): canned ATT Read-By-Group
+    // (service discovery) replay. Bytes captured from a live Bumble run
+    // (pre-conn 16B, dropped there as premature). Normally staged one-shot
+    // after the data-length event; SIZE TEST below reorders it after a small
+    // Read. If firmware answers with an ATT Response ACL (H4=0x02 TX), the
+    // GATT server path works; if it panics in att_tx (0x4200724d:91), the
+    // PANIC-POOL dump says which pool.
+    let mut ble_canned_att_done = false;
+    // TEMP (2026-10-04, forensics — DELETE after): canned ATT script
+    // (Find-Info → Read → Write → Read-back) for full GATT proof offline.
+    // Phase 1 (this run): Find-Info 0x000e-0xFFFF after the discovery
+    // response (first ACL TX) to learn characteristic/value handles
+    // (decoded from the TXACL response hex). Phase 2 hardcodes them for
+    // Read (Battery Level → `BLE read 1` + 100), Write (echo `hi!` →
+    // `BLE write`), Read-back (echo value → ECHO/PASS).
+    // `ble_canned_acl_tx_n` counts H4=0x02 TX drained (each ATT response).
+    let mut ble_canned_findinfo_done = false;
+    // TEMP (2026-10-04, forensics — DELETE after): Phase 2 (handles from
+    // the Find-Info response: Battery Level value 0x0010 (decl 0x000f type
+    // 0x2803 + value 0x0010 type 0x2A19), echo value 0x0013 (decl 0x0012
+    // type 0x2803, value next sequential — verified by the read-back
+    // value, loud fail otherwise). Read → `BLE read 1` + 100; Write `hi!`
+    // → `BLE write 3` + notify; Read-back → echo value `hi!` (loopback).
+    // Pace one-shot each on the response counter + empty FIFO (same
+    // discipline: request N staged after response N-1 drained).
+    let mut ble_canned_read_done = false;
+    let mut ble_canned_write_done = false;
+    let mut ble_canned_readback_done = false;
+    // ATT OUTSTANDING PACING (2026-10-04, DELETE after): live Bumble ATTs
+    // arrive unpaced (try 0,1,2 back-to-back — retries while the handler
+    // still holds the previous request/response mbufs) and exhaust the
+    // shared msys pools (prepend NULL → att_tx asserts 0x4200724d:91;
+    // canned paces strictly one-at-a-time via acl_tx_n + FIFO-empty and
+    // answers clean — proven live). Deliver an ATT only when none is
+    // outstanding (increment on successful delivery, decrement on each
+    // ATT *response* TX drained — not notify/indicate 0x1B/0x1D, which
+    // are server-initiated, not answers). Level-triggered: gated ATTs stay
+    // queued until the response drains. Shared by canned + bridge (canned
+    // script is already paced and stays green; bridge becomes paced too).
+    let mut ble_att_outstanding = 0u32;
+    let mut ble_canned_acl_tx_n = 0u32;
+    // TEMP (2026-10-03): capture seq at link-up (DELETE after — part of
+    // the V2 gating: only commands sent after link-up get completed).
+    let mut ble_link_up_seq = 0u64;
+    // TEMP (2026-10-03): host-task-seen latch (DELETE after).
+    let mut ble_host_seen = false;
+    // HOST-ENABLED deferral latch (2026-10-04, DELETE after): transition
+    // logging for the enabled_state==0 deferral (per-step spam floods).
+    let mut ble_host_disabled = false;
+    // TEMP (2026-10-04, forensics — DELETE after): l2cap_tx return latch.
+    // Logs each NEW (core, ret) observed at 0x4200723c (see machine.rs).
+    let mut ble_l2cap_last: Option<(usize, u32)> = None;
+    // TEMP (2026-10-03): post-delivery pc-window countdown (DELETE after).
+    let mut ble_watch_n = 0u32;
+    // TEMP (2026-10-03): pc rings for the canned NULL-call forensics
+    // (DELETE after). Last 64 block-start pcs per core — dumped when the
+    // run breaks on an exception, so the wild call site is identified
+    // even though the fault vectors away from it.
+    let mut ring0 = [0u32; 64];
+    let mut ring1 = [0u32; 64];
+    let mut ring_i: usize = 0;
     if let Some(ref addr) = ble_gw_addr {
         match std::net::TcpStream::connect(addr.as_str()) {
             Ok(s) => {
@@ -504,27 +621,29 @@ fn main() {
         sta_network_if: 0x3fc9_ae6c,
     };
     // test-worker-l3 image layout (nm on the test-worker-l3 ELF —
-    // re-nm'd after the print-first keep-alive .ino edit: scan_start
-    // 0x42065064, connect 0x4203dc10, event vars unchanged
-    // (WIFI_EVENT 0x3c0b4474 / IP_EVENT 0x3c0b3d70). The sketch source pins
-    // the layout like every other image, re-nm after any .ino edit.
+    // re-nm'd after the L3-legs .ino edit (udp/coap/ipv6 builders):
+    // scan_start 0x42065b90 (= esp_wifi_scan_start entry),
+    // connect 0x4203e658 (= esp_wifi_connect entry), event vars
+    // WIFI_EVENT 0x3c0b45a8 / IP_EVENT 0x3c0b3ea4; TX/RX tap + hook pcs
+    // re-nm'd in machine.rs/soc.rs below. BSS cells shifted +0x18
+    // uniformly vs the previous link (ready_lists/top_prio/pxcur/netif/
+    // scan_count/scan_result verified by symbol name).
     // records_check is the `call8 esp_wifi_scan_get_ap_records` INSIDE
-    // `_scanDoneEv` (0x420053fd here — NOT the 0x420053bf get_ap_num call
-    // one slot earlier; verified by objdump of the linked ELF).
+    // `_scanDoneEv` (0x42005e25 here — objdump-verified on the new ELF).
     const WORKER_L3_LAYOUT: WifiLayout = WifiLayout {
-        scan_start: 0x4206_5064,
-        connect: 0x4203_dc10,
-        wifi_event_var: 0x3c0b_4474,
-        ip_event_var: 0x3c0b_3d70,
+        scan_start: 0x4206_5b90,
+        connect: 0x4203_e658,
+        wifi_event_var: 0x3c0b_45a8,
+        ip_event_var: 0x3c0b_3ea4,
         count_cell: 0x3fc9_f936,
-        scan_count: 0x3fc9_aef0,
-        scan_result: 0x3fc9_aeec,
-        records_check: 0x4200_53fd,
-        ready_lists: 0x3fc9_b8ec,
-        top_prio: 0x3fc9_b85c,
-        reg_heaps: 0x3fc9_b7a4,
-        pxcur: 0x3fc9_bae0,
-        sta_network_if: 0x3fc9_ae78,
+        scan_count: 0x3fc9_af08,
+        scan_result: 0x3fc9_af04,
+        records_check: 0x4200_5e25,
+        ready_lists: 0x3fc9_b904,
+        top_prio: 0x3fc9_b874,
+        reg_heaps: 0x3fc9_b7bc,
+        pxcur: 0x3fc9_baf8,
+        sta_network_if: 0x3fc9_ae90,
     };
     // wifi-ap image layout (nm on the wifi-ap ELF; sta_network_if =
     // `_ZL14_ap_network_if` bss static; esp_wifi_start = 0x42063870
@@ -553,39 +672,29 @@ fn main() {
     let wifi_espnow_loopback = env::var("WIFI_ESPNOW_LOOPBACK").is_ok();
     let mut wifi_espnow_tx_done = false;
     let mut wifi_espnow_rx_done = false;
+    // Full-802.11-LL-MAC slice-1 leg (`esp32s3_llmac` sketch): TX tap +
+    // virtual-AP beacon injection (see the LLMAC block in the step loop).
+    let wifi_llmac = env::var("WIFI_LLMAC").is_ok();
 
     let wifi_scan_aps: Vec<esp32s3_soc::wifi::ScanFixtureAp> = env::var("WIFI_SCAN_APS")
         .ok()
         .map(|s| esp32s3_soc::wifi::parse_scan_fixtures(&s))
         .unwrap_or_default();
-    // Arm the self-contained SoC fixture engine (browser/bridge path) for
-    // run_flash runs too: the write-path hook (`maybe_complete_phyfuns_slot`)
-    // is gated on an armed fixture (fixture-less = hello = must not fire —
-    // proven by the hello ILLEGAL at EPC1=0x4037a0a8), and the engine's
-    // post-step poll is what drives the STA/AP/ESP-NOW legs on this path
-    // (the run_flash host blocks below only handle scan + STA stage-1/2).
-    // Same arming the bridge uses (`wifi_fixture_scan` / `wifi_fixture_sta`
-    // / `wifi_fixture_ap` / `wifi_fixture_espnow`); the AP/ESP-NOW arming
-    // reads its env here so the hook gate sees an armed fixture on those
-    // runs as well.
-    // ORDER: this block runs AFTER the image-select above (load-then-arm,
-    // same as the bridge) — the selectors never touch `wifi_fixture`
-    // itself, so arming after selecting is safe and matches both paths.
-    {
-        let aps_spec = env::var("WIFI_SCAN_APS").unwrap_or_default();
-        if wifi_ap_fixture {
-            // Defaults match the sketch (see the SoftAP host block below:
-            // EmuAP/password/6 — the staged config is what `softAPSSID()`
-            // reads back via `esp_wifi_get_config`).
-            // NB: image already selected above; only arm the fixture data.
-            m.soc.wifi_fixture_ap("EmuAP", "password", 6);
-        } else if wifi_espnow_loopback {
-            m.soc.wifi_fixture_espnow();
-        } else if wifi_scan_fixture {
-            m.soc.wifi_fixture_scan(&aps_spec);
-        } else if wifi_sta_conn {
-            m.soc.wifi_fixture_sta(&aps_spec);
-        }
+    // Closed-RF dispatch-table hook gate (see
+    // `Soc::maybe_complete_phyfuns_slot`): arm it on every Wi-Fi run so
+    // the recalibration `callx8` lands on the benign no-op instead of heap
+    // garbage. Fixture-less = hello = must not fire (proven by the hello
+    // ILLEGAL at EPC1=0x4037a0a8). Deliberately NOT arming the SoC fixture
+    // engine here: the run_flash host blocks below are the sole leg driver
+    // on this path (single-driver separation, the proven architecture —
+    // the engine serves the browser/bridge path, which has no host
+    // blocks).
+    if wifi_ap_fixture || wifi_espnow_loopback || wifi_scan_fixture || wifi_sta_conn || wifi_llmac {
+        m.soc.wifi_phyfuns_gate_enable();
+    }
+    if wifi_llmac {
+        m.soc.llmac_arm();
+        m.soc.llmac_arm_beacons(3);
     }
     let mut wifi_scan_armed = false;
     let mut wifi_scan_done = false;
@@ -627,7 +736,22 @@ fn main() {
         let (r, r1, n) = m.step_fast();
         executed += n as u64;
         i += 1;
+        // TEMP (2026-10-04, forensics — DELETE after): log each new
+        // l2cap_tx return code observed at 0x4200723c (machine.rs per-op
+        // probe). Proves whether live-first-ATT fails via prepend (6) or
+        // another path, without exact-pc post-step polling.
+        if m.ble_l2cap_ret != ble_l2cap_last {
+            ble_l2cap_last = m.ble_l2cap_ret;
+            if let Some((core, ret)) = m.ble_l2cap_ret {
+                println!("[host] BLE L2CAP_RET core{core} ret={ret}");
+            }
+        }
         let pc = m.cpu[0].pc;
+        if ble_canned {
+            ring0[ring_i % 64] = pc;
+            ring1[ring_i % 64] = m.cpu[1].pc;
+            ring_i += 1;
+        }
         // --- Exception handling ---
         if let StepResult::Exception { cause } = r {
             if (32..=37).contains(&cause) {
@@ -662,6 +786,119 @@ fn main() {
                     m.cpu[0].windowbase(),
                     m.soc.read8(epc)
                 );
+                // TEMP (2026-10-03, forensics — DELETE after): dump panic
+                // message when the `ill` is panic_abort's deliberate trap
+                // (EPC1 in its range). a2 often holds the message pointer.
+                if (0x4037_fdb4..0x4037_fde0).contains(&epc) {
+                    let a2 = m.cpu[0].reg(2);
+                    let mut msg = Vec::new();
+                    for k in 0..128u32 {
+                        let b = m.soc.read8(a2.wrapping_add(k)) as u8;
+                        if b == 0 {
+                            break;
+                        }
+                        msg.push(b);
+                    }
+                    println!(
+                        "[host] PANIC-MSG a2={a2:#010x} {:?}",
+                        String::from_utf8_lossy(&msg)
+                    );
+                    let sp = m.cpu[0].reg(1);
+                    println!(
+                        "[host] PANIC-STACK sp={sp:#010x} {:#010x} {:#010x} {:#010x} {:#010x}",
+                        m.soc.read32(sp),
+                        m.soc.read32(sp.wrapping_add(4)),
+                        m.soc.read32(sp.wrapping_add(8)),
+                        m.soc.read32(sp.wrapping_add(12)),
+                    );
+                    // TEMP (2026-10-04, forensics — DELETE after): VHCI
+                    // semaphore + HCI credits post-mortem. `ble_hs_hci_acl_
+                    // tx_now` can only fail the att_tx assert via the VHCI
+                    // send itself (all pools healthy at every panic, queue
+                    // paths return 1 not assert): vhci_send_sem 0x3fc9d6d0
+                    // (1 initial, taken per send, given per TX-done) and
+                    // avail_pkts 0x3fc9e110 / buf_sz 0x3fc9e2b0 (ROM-
+                    // reported controller buffers). sem 0 => exhaustion
+                    // (fix = host give per captured ACL TX); avail 0 =>
+                    // queue path (rc 1, rules out credits).
+                    println!(
+                        "[host] PANIC-VHCI sem={} avail={} bufsz={}",
+                        m.soc.read32(0x3fc9_d6d0),
+                        m.soc.read16(0x3fc9_e110),
+                        m.soc.read16(0x3fc9_e2b0),
+                    );
+                    // TEMP (2026-10-04, forensics — DELETE after): mbuf pool
+                    // free counts. Pools at these addrs are `os_mbuf_pool`
+                    // (omp_databuf_len u16 @+0, omp_pool *os_mempool @+4);
+                    // the counts live in the pointed-to `os_mempool`
+                    // (num_blocks u16 @+4, num_free u16 @+6, min_free u16
+                    // @+8). (An earlier revision read +4/+6/+8 directly off
+                    // the mbuf_pool and printed garbage — proven live.)
+                    // Walk the authoritative msys list (g_msys_pool_list
+                    // 0x3fc98e84 → os_mbuf_pool → omp_next @+8) so NO pool
+                    // is missed (a fifth dry pool explains healthy msys1/2
+                    // + failing prepend). Plus the non-msys frag/acl pools.
+                    // Pools (nm on ble ELF): msys1 0x3fc9eab8, msys2
+                    // 0x3fc9ea8c, hci_frag 0x3fc9e130, acl 0x3fc9e9c8
+                    // (mpool_acl — the ATT/ACL data pool prepend likely
+                    // uses; msys can show all-free while acl is dry).
+                    let mut mp = m.soc.read32(0x3fc9_8e84);
+                    let mut guard = 0u32;
+                    while mp != 0 && guard < 8 {
+                        let dl = m.soc.read16(mp);
+                        let ipool = m.soc.read32(mp.wrapping_add(4));
+                        let (blocks, free, min_free) = if ipool != 0 {
+                            (
+                                m.soc.read16(ipool.wrapping_add(4)),
+                                m.soc.read16(ipool.wrapping_add(6)),
+                                m.soc.read16(ipool.wrapping_add(8)),
+                            )
+                        } else {
+                            (0xFFFF, 0xFFFF, 0xFFFF)
+                        };
+                        println!(
+                            "[host] PANIC-POOL msys mp={mp:#010x} datalen={dl} blocks={blocks} free={free} min_free={min_free}",
+                        );
+                        mp = m.soc.read32(mp.wrapping_add(8));
+                        guard += 1;
+                    }
+                    for (name, base) in [
+                        ("msys1", 0x3fc9_eab8u32),
+                        ("msys2", 0x3fc9_ea8cu32),
+                        ("frag", 0x3fc9_e130u32),
+                        ("acl", 0x3fc9_e9c8u32),
+                    ] {
+                        let mp = m.soc.read32(base.wrapping_add(4));
+                        let (blocks, free, min_free) = if mp != 0 {
+                            (
+                                m.soc.read16(mp.wrapping_add(4)),
+                                m.soc.read16(mp.wrapping_add(6)),
+                                m.soc.read16(mp.wrapping_add(8)),
+                            )
+                        } else {
+                            (0xFFFF, 0xFFFF, 0xFFFF)
+                        };
+                        println!(
+                            "[host] PANIC-POOL {name} mp={mp:#010x} blocks={blocks} free={free} min_free={min_free}",
+                        );
+                    }
+                }
+                if ble_canned {
+                    println!("[host] BLE ring0 (oldest first):");
+                    for k in 0..64 {
+                        print!(" {:#010x}", ring0[(ring_i + k) % 64]);
+                        if k % 4 == 3 {
+                            println!();
+                        }
+                    }
+                    println!("[host] BLE ring1 (oldest first):");
+                    for k in 0..64 {
+                        print!(" {:#010x}", ring1[(ring_i + k) % 64]);
+                        if k % 4 == 3 {
+                            println!();
+                        }
+                    }
+                }
                 break;
             }
             let epc = m.cpu[0].sreg(SR_EPC1);
@@ -673,6 +910,33 @@ fn main() {
                 m.cpu[0].reg(1),
                 m.cpu[0].reg(2),
             );
+            // TEMP (2026-10-03, forensics — DELETE after): dump panic message
+            // when dying inside panic_abort (EPC1 in its range). a2 at wb
+            // often holds the abort-message pointer; dump 128B as C string.
+            if (0x4037_fdb4..0x4037_fde0).contains(&epc) {
+                let a2 = m.cpu[0].reg(2);
+                let mut msg = Vec::new();
+                for k in 0..128u32 {
+                    let b = m.soc.read8(a2.wrapping_add(k)) as u8;
+                    if b == 0 {
+                        break;
+                    }
+                    msg.push(b);
+                }
+                println!(
+                    "[host] PANIC-MSG a2={a2:#010x} {:?}",
+                    String::from_utf8_lossy(&msg)
+                );
+                // Also dump 8 words at sp for backtrace.
+                let sp = m.cpu[0].reg(1);
+                println!(
+                    "[host] PANIC-STACK sp={sp:#010x} {:#010x} {:#010x} {:#010x} {:#010x}",
+                    m.soc.read32(sp),
+                    m.soc.read32(sp.wrapping_add(4)),
+                    m.soc.read32(sp.wrapping_add(8)),
+                    m.soc.read32(sp.wrapping_add(12)),
+                );
+            }
             break;
         }
         if let StepResult::Exception { cause } = r1 {
@@ -983,6 +1247,19 @@ fn main() {
                         frame[0],
                         u16::from_le_bytes([frame[1], frame[2]])
                     );
+                    // TEMP (2026-10-04, forensics — DELETE after): count
+                    // ATT responses for script pacing (shared counter with
+                    // the canned drain; scripted twins pace on responses).
+                    // ATT pacing: responses (not notify 0x1B/indicate 0x1D)
+                    // clear outstanding. Opcode at [9]; guard short.
+                    if frame[0] == 0x02 {
+                        ble_canned_acl_tx_n += 1;
+                        let op = if frame.len() > 9 { frame[9] } else { 0 };
+                        if op != 0x1B && op != 0x1D {
+                            ble_att_outstanding = ble_att_outstanding.saturating_sub(1);
+                            println!("[host] BLE ATT outstanding={ble_att_outstanding}");
+                        }
+                    }
                 }
             }
             let mut drop_ble = false;
@@ -1022,7 +1299,98 @@ fn main() {
                         }
                         let rbuf: Vec<u8> = ble_rx_buf[4..4 + rlen].to_vec();
                         ble_rx_buf.drain(..4 + rlen);
-                        println!("[host] BLE RX {}B h4={:#04x}", rbuf.len(), rbuf[0]);
+                        // WHITELIST (2026-10-04, proven live — DELETE after
+                        // with the rest of the BLE TEMP): Bumble sends
+                        // post-conn extras (PHY/conn-update/encryption?/keys)
+                        // whose unexpected mbufs leak the shared msys pools
+                        // (first ATT response then fails at l2cap prepend
+                        // NULL → att_tx asserts 0x4200724d:91, while canned
+                        // with the same ATT bytes answers 29B clean — proven
+                        // live). Allow ONLY what the validated path needs:
+                        // 22B conn-complete (LE Meta sub 0x01), ATT ACL
+                        // (H4 0x02 — live Bumble ATT post-conn; pre-conn
+                        // still dropped by the conn gate below),
+                        // Number-of-Completed-Packets (ev 0x13, mbuf credits
+                        // — dropping it starves later ATT), Disconnect (ev
+                        // 0x05, link lifecycle). Everything else is dropped
+                        // here (host-side FIFO pop, no pool): handshake CCs/
+                        // version/features/data-length (ROM + canned stager
+                        // own them; Bumble's Status-vs-Complete shape
+                        // mismatches → `ack 12` + disc, proven live),
+                        // PHY/conn-update/encryption (link works at defaults;
+                        // central GATT doesn't depend on them). Drops are
+                        // logged with ev/op/len — if firmware ever stalls
+                        // awaiting a dropped packet, the log names it.
+                        let allow = (rbuf.len() == 22
+                            && rbuf[0] == 0x04
+                            && rbuf[1] == 0x3E
+                            && rbuf[3] == 0x01)
+                            || (rbuf.first().copied().unwrap_or(0) == 0x02)
+                            || (rbuf.len() >= 2 && rbuf[0] == 0x04 && rbuf[1] == 0x13)
+                            || (rbuf.len() >= 2 && rbuf[0] == 0x04 && rbuf[1] == 0x05);
+                        if !allow {
+                            if rbuf.len() >= 7 && rbuf[0] == 0x04 && rbuf[1] == 0x0E {
+                                println!(
+                                    "[host] BLE RX bridge drop CC op={:#06x} len={}",
+                                    u16::from_le_bytes([rbuf[4], rbuf[5]]),
+                                    rbuf.len()
+                                );
+                            } else if rbuf.len() >= 7 && rbuf[0] == 0x04 && rbuf[1] == 0x0F {
+                                println!(
+                                    "[host] BLE RX bridge drop CS op={:#06x} len={}",
+                                    u16::from_le_bytes([rbuf[5], rbuf[6]]),
+                                    rbuf.len()
+                                );
+                            } else if rbuf.len() >= 4 && rbuf[0] == 0x04 && rbuf[1] == 0x3E {
+                                println!(
+                                    "[host] BLE RX bridge drop LEmeta sub={:#04x} len={}",
+                                    rbuf.get(3).copied().unwrap_or(0),
+                                    rbuf.len()
+                                );
+                            } else if rbuf.len() >= 2 && rbuf[0] == 0x04 {
+                                println!(
+                                    "[host] BLE RX bridge drop ev={:#04x} len={}",
+                                    rbuf[1],
+                                    rbuf.len()
+                                );
+                            } else {
+                                println!(
+                                    "[host] BLE RX bridge drop h4={:#04x} len={}",
+                                    rbuf[0],
+                                    rbuf.len()
+                                );
+                            }
+                            continue;
+                        }
+                        if rbuf.len() == 22 && rbuf[0] == 0x04 && rbuf[1] == 0x3E {
+                            println!(
+                                "[host] BLE RX 22B h4=0x04 ev=0x3e sub=0x01 handle={:#06x} raw={:02x?}",
+                                u16::from_le_bytes([rbuf[5], rbuf[6]]),
+                                &rbuf[..]
+                            );
+                        } else if rbuf.len() >= 6
+                            && rbuf[0] == 0x04
+                            && (rbuf[1] == 0x0E || rbuf[1] == 0x0F)
+                        {
+                            let rop = u16::from_le_bytes([rbuf[4], rbuf[5]]);
+                            println!(
+                                "[host] BLE RX {}B h4={:#04x} ev={:#04x} op={:#06x}",
+                                rbuf.len(),
+                                rbuf[0],
+                                rbuf[1],
+                                rop
+                            );
+                        } else if rbuf.len() >= 4 && rbuf[0] == 0x04 {
+                            println!(
+                                "[host] BLE RX {}B h4={:#04x} ev={:#04x} sub={:#04x}",
+                                rbuf.len(),
+                                rbuf[0],
+                                rbuf[1],
+                                rbuf.get(3).copied().unwrap_or(0)
+                            );
+                        } else {
+                            println!("[host] BLE RX {}B h4={:#04x}", rbuf.len(), rbuf[0]);
+                        }
                         m.soc.bt_hci_inject_rx(&rbuf);
                     }
                     if ble_rx_buf.len() < 4 {
@@ -1034,71 +1402,877 @@ fn main() {
                 ble_gw = None;
             }
         }
-        // BLE reply deliver (level-triggered ACK path — see
-        // `Soc::ble_ack_deliver_at`): whenever a bridge reply is queued
-        // AND the firmware's ack waiter is parked on `ble_hs_hci_sem`
-        // (`npl_freertos_sem_pend` → `xQueueSemaphoreTake`), route the
-        // oldest reply through the firmware's OWN ack path (store EVT
-        // bytes on the in-flight TX block + sem release + ready the
-        // woken waiter). The waiter-parked gate is load-bearing: with a
-        // one-block pool the arena block is the checked-out TX mbuf ONLY
-        // while its owner is blocked waiting — delivering into it while
-        // the firmware runs free would race the next alloc (proven live
-        // class: foreign-buffer `assert failed: 0x42014482`). With no
-        // waiter the reply stays queued (the tap-time deliver covers
-        // the send-side race; this covers the RX-arrival side). One
-        // deliver per step max (replies are rare — the checks are two
-        // word reads + a FIFO-length check when idle).
-        if ble_gw.is_some() && m.soc.bt_hci_rx_pending() > 0 {
-            let sem = m.soc.ble_ack_sem();
-            if sem != 0 && m.soc.queue_recv_waiting(sem) {
-                use esp32s3_soc::Soc as _BleSoc;
-                if let Some(tcb) = m.soc.ble_ack_deliver_at(_BleSoc::BLE_POOL_CMD_ARENA, 0) {
-                    m.soc.ble_ready_task(tcb);
-                    println!("[host] BLE ack delivered (rx-arrival)");
+        // BLE reply deliver (async event/data path — see
+        // `Esp32S3::run_ble_host_recv`): the ROM loopback owns sync command
+        // acks firmware-side (the sketch boots to DONE with no bridge), so
+        // bridge Command Complete/Status frames (0x04 0x0E / 0x04 0x0F) are
+        // DUPLICATES — popped and dropped with a log, never delivered
+        // (proven live 2026-10-03: delivering the first Reset CC wedged the
+        // boot in panic_abort right after "BLE init 1"). Only async frames
+        // (LE Meta, Disconnect, ACL) reach `run_ble_host_recv`, one packet
+        // per step max (each delivery runs up to 10k firmware insns).
+        // EVT size gate: the firmware resets the host on EVT frames over
+        // 71B total (`host_rcv_pkt` length check → `ble_hs_sched_reset` —
+        // silicon-true but run-ending), so oversized EVTs are popped and
+        // dropped with a log instead of delivered. ACL frames rely on the
+        // firmware's own silent bounds checks. A failed delivery (callback
+        // undiscovered, or the bounded call aborts) leaves the packet
+        // consumed — observable via the central's GATT timeouts, which is
+        // the verdict that matters.
+        // Boot-phase gate: deliver only after the sketch's post-init
+        // marker, i.e. with both cores in valid task contexts. The
+        // synthetic `host_rcv_pkt` call runs ON core 1 (like the ESP-NOW
+        // closures); before setup() core 1 has no task/SP yet and the
+        // call's `entry` spills through a wild stack, smashing DRAM and
+        // killing the scheduler (proven live 2026-10-03: delivery on the
+        // first staged Reset CC wedged core1 at the exception vector with
+        // sp=0x1800). Counts (not a latch) so a mid-run reset re-closes
+        // the gate until the rebooted firmware re-inits. The pool gate
+        // below stays as defense-in-depth for the transport state.
+        let ble_starts = uart_buf
+            .windows(b"BLE START".len())
+            .filter(|w| *w == b"BLE START")
+            .count();
+        let ble_inits = uart_buf
+            .windows(b"BLE init 1".len())
+            .filter(|w| *w == b"BLE init 1")
+            .count();
+        if (ble_gw.is_some() || ble_canned)
+            && ble_starts >= 1
+            && ble_inits >= ble_starts
+            && m.soc.ble_evt_pool_ready()
+            && m.soc.bt_hci_rx_pending() > 0
+            // Scheduler-lock gate (proven live 2026-10-03: delivering
+            // while EITHER core sits in a scheduler critical section
+            // corrupts scheduler lists — the synthetic call reenters
+            // queue/scheduler primitives the frozen core holds. The
+            // smoking gun was a delivery with core0 parked inside
+            // `vTaskSwitchContext` (0x40381bf6) and the lock held,
+            // followed by a wild `retw` through heap paint 0xa5a5a5a5 →
+            // 0x65a5a5a5. xKernelLock (nm on the BLE ELF) is a mux whose
+            // unlocked word is the 0xB33FFFFF magic (observed free at
+            // boot/idle; `vPortExitCritical` writes the same magic on
+            // release —objdump 0x40380c29; independent S32C1I forensics
+            // agrees) — anything else means held. Level-triggered retry:
+            // held now just defers to a later step (critical sections
+            // are brief; the packet stays queued).
+            && m.soc.read32(0x3fc9_9110) == 0xB33F_FFFF
+            // PC-BLACKLIST gate (2026-10-04, DELETE after): SMP race fix.
+            // The xKernelLock word can read FREE while a core sits
+            // mid-pool/queue-update inside these functions (lock released
+            // but freelist inconsistent, or a *different* mutex held —
+            // pool/list corruption → wild pcs, H4==0 faults, mbuf leaks).
+            // Skip delivery while EITHER core's pc lies inside any of them
+            // (all brief; packets stay queued). Ranges from nm on the BLE
+            // ELF (start..next-symbol, verified 2026-10-04; BLE-image-only
+            // leg, so linked addrs are stable).
+            && !ble_in_crit(m.cpu[0].pc)
+            && !ble_in_crit(m.cpu[1].pc)
+        {
+            let peek = m.soc.bt_hci_peek_rx_evt();
+            let is_cc = matches!(
+                peek,
+                Some((0x04, Some(0x0E), _)) | Some((0x04, Some(0x0F), _))
+            );
+            // CC policy by link state (proven live 2026-10-03): pre-link_up
+            // every CC is a ROM-loopback duplicate (the ROM answers the
+            // whole init sequence firmware-side — drop). Post-link_up the
+            // ROM never sees these commands (proven: adv-disable stalls
+            // without its CC), so CCs route through the firmware's OWN
+            // event path (`host_rcv_pkt` → opcode dispatch → ack match →
+            // sem give — correct by construction, self-protecting against
+            // duplicates: a CC with no pending command is freed+dropped).
+            // The direct-ack shortcut (`ble_ack_deliver_at` into the TX
+            // mbuf) is WRONG here and stays parked: `ble_hci_trans_hs_cmd_
+            // tx` FREES the command mbuf right after send (objdump
+            // 0x420052e5), so by arrival time the tap address names a
+            // free-list block, not the checked-out mbuf (proven live:
+            // `inrange=false want=0x0000` — the tap at 0x3fcb12b0 names a
+            // reused static buffer, opcode bytes long gone).
+            if is_cc && !m.soc.ble_link_up() {
+                let dropped = m.soc.bt_hci_take_rx();
+                println!(
+                    "[host] BLE RX sync CC/CS dropped ({}B, ROM owns sync)",
+                    dropped.map(|f| f.len()).unwrap_or(0)
+                );
+            } else {
+                let oversize = matches!(peek, Some((0x04, _, len)) if len > 71);
+                // Connection-gate (proven live 2026-10-03): an ATT ACL for a
+                // connection the host hasn't established yet walks a NULL
+                // conn struct (wild `retw` through heap paint 0xa5a5a5a5 →
+                // 0x65a5a5a5, double-fault `break`). The 22B connection
+                // event and the 16B ATT arrive back-to-back from the
+                // bridge, but the firmware task needs many steps to turn
+                // the event into a conn object — delivering the ATT first
+                // races it. Gate ACLs on the sketch's `BLE conn 1` marker
+                // (same marker-gated discipline as ESP-NOW's `sent 1`):
+                // the packet stays queued (level-triggered retry) until
+                // the connection exists. Events are never gated (they ARE
+                // what establishes it).
+                let is_acl = matches!(peek, Some((0x02, _, _)));
+                let conn_up = uart_buf
+                    .windows(b"BLE conn 1".len())
+                    .any(|w| w == b"BLE conn 1");
+                // TEMP (2026-10-03): `BLE_RX_ACL_DROP=1` pops and drops
+                // ATT ACLs instead of delivering them (split forensics).
+                let acl_drop = is_acl && std::env::var("BLE_RX_ACL_DROP").is_ok();
+                // FULL-HANDSHAKE gate (2026-10-04, DELETE after): the `BLE
+                // conn 1` marker fires from gap onConnect EARLY (right after
+                // the 22B, before version/features/data-length complete), so
+                // marker-gated ATTs land on a HALF-ESTABLISHED conn (version
+                // unknown? features pending? data-length default?) and die
+                // in att_tx (l2cap assert 0x4200724d:91, deterministic 5/5
+                // live runs; canned stages ATT after dl_done and answers 29B
+                // clean — proven live). Require the data-length event staged
+                // too (ble_canned_dl_done is set for bridge as well via the
+                // extended stager — handshake fully driven by then). Pre-dl
+                // ATTs DROP (central retries post-handshake; same discipline
+                // as pre-conn).
+                // NOTE: ble_canned_dl_done is declared below (canned stager
+                // section) — Rust block scoping needs it visible here. It is
+                // a `let mut` in the same fn scope ABOVE this point? No —
+                // declarations sit near the top (before the loop), so it is
+                // in scope here (assigned later in-loop). Borrowck: read-only
+                // use here, mutable assign later — fine (sequential).
+                // ATT pacing (2026-10-04, DELETE after): deliver only when
+                // none outstanding (see counter docs). Gated ATTs stay queued
+                // (level-triggered) until the response drains.
+                if is_acl && (!conn_up || !ble_canned_dl_done || ble_att_outstanding > 0) {
+                    // Head-of-line block fix (2026-10-04, proven live): a
+                    // premature ATT ACL (central's service discovery sent
+                    // immediately after the 22B, before the firmware
+                    // finishes version/features/data-length) sits at the
+                    // FIFO head and STARVES the version/features events
+                    // behind it (firmware times out `HCI wait for ack 19`,
+                    // no conn, central GATT timeout). The old leave-queued
+                    // policy deadlocks (ACL needs conn, conn needs events
+                    // behind the ACL). DROP pre-conn ACLs — the central
+                    // retries GATT forever (new ATT arrives post-conn and
+                    // delivers). Log so the drop is observable.
+                    let dropped = m.soc.bt_hci_take_rx();
+                    // TEMP (2026-10-04, forensics — DELETE after): full hex
+                    // of the premature ATT (replay it post-conn in canned
+                    // to prove ATT→response offline).
+                    if let Some(ref f) = dropped {
+                        println!(
+                            "[host] BLE RX pre-conn ACL dropped ({}B, central retries post-conn) bytes={:02x?}",
+                            f.len(),
+                            f,
+                        );
+                    } else {
+                        println!(
+                            "[host] BLE RX pre-conn ACL dropped (0B, central retries post-conn)"
+                        );
+                    }
+                } else if acl_drop {
+                    let dropped = m.soc.bt_hci_take_rx();
+                    println!(
+                        "[host] BLE RX ACL dropped by BLE_RX_ACL_DROP ({}B)",
+                        dropped.map(|f| f.len()).unwrap_or(0)
+                    );
+                } else if oversize {
+                    let dropped = m.soc.bt_hci_take_rx();
+                    println!(
+                        "[host] BLE RX oversize EVT dropped ({}B)",
+                        dropped.map(|f| f.len()).unwrap_or(0)
+                    );
+                } else if let Some(cb) = ble_cb_entry
+                    && {
+                        // HOST-ENABLED gate (2026-10-04, DELETE after):
+                        // host_rcv_pkt opens with `if (!ble_hs_enabled_state)
+                        // return 0` (BSS 0x3fc9dd70, nm on the BLE ELF —
+                        // BLE-image-only leg, like ble_cb_entry itself). A
+                        // disabled host means the packet would be CONSUMED
+                        // (stage pops first) and dropped on the floor; worse,
+                        // pre-SYNTH_RETPC builds faulted the early retw and
+                        // corrupted state into a restage loop. Skip WITHOUT
+                        // consuming while disabled (level-triggered retry,
+                        // same discipline as no-callback-yet). Log
+                        // transitions only (per-step spam would flood).
+                        // NOTE: a host that never re-enables stalls here by
+                        // design (firmware-side waiter timeout → reset is
+                        // observable + diagnosable; silent corruption is not).
+                        if m.soc.read32(0x3fc9_dd70) == 0 {
+                            if !ble_host_disabled {
+                                println!(
+                                    "[host] BLE host disabled (enabled_state==0), deferring delivery"
+                                );
+                                ble_host_disabled = true;
+                            }
+                            false
+                        } else {
+                            ble_host_disabled = false;
+                            // TEMP (2026-10-03): pool drain watch (DELETE after).
+                            // Did the synthetic call consume an ev-pool block?
+                            // Plus the SMP interleaving: both cores' pcs + the
+                            // scheduler lock (xKernelLock 0x3fc99110 — nm on the
+                            // ble ELF). If the other core sits mid-critical-
+                            // section when we synthesize scheduler-touching
+                            // firmware, lists corrupt -> garbage TCB -> wild
+                            // retw through paint.
+                            let f0 = m.soc.ble_evt_pool_free();
+                            // TEMP (2026-10-03): capture the pre-call pool
+                            // free-list head (DELETE after) — the block our
+                            // call will check out. NPL event = {queued@0,
+                            // fn@4, arg@8} per npl_freertos.h.
+                            let pre_head = m.soc.read32(0x3fc9_df6c + 20);
+                            // TEMP (2026-10-03): queue depth pre/post (DELETE
+                            // after). Corrected layout (from the sem mw/len
+                            // offsets the ack path proves: counts at +56/+60):
+                            // depth=[q+56]. 0→1 = our post landed; 1→0 = task
+                            // took it.
+                            let evq0 = m.soc.read32(0x3fc9_dd50);
+                            let q0 = m.soc.read32(evq0);
+                            let depth0 = m.soc.read32(q0.wrapping_add(56));
+                            println!(
+                                "[host] BLE pre core0={:#010x} core1={:#010x} lock={:#010x}",
+                                m.cpu[0].pc,
+                                m.cpu[1].pc,
+                                m.soc.read32(0x3fc9_9110)
+                            );
+                            // TEMP (2026-10-03): evq waiter check (DELETE after).
+                            // Is any task parked on ble_hs_evq when we post?
+                            // ble_hs_evq (0x3fc9dd50) word0 = 0x3fc9ea68 =
+                            // g_eventq_dflt STRUCT whose word0 (0x3fcb1430)
+                            // is the real FreeRTOS Queue_t (heap). Check the
+                            // waiter on the QUEUE, not the wrapper, and dump
+                            // both layouts. PLUS the receive list itself
+                            // (+36: count, pxIndex+40, end.next+44): whose TCB
+                            // is parked? (host_task_h for comparison.)
+                            // PLUS pre-call IRAM probe (DELETE after): is
+                            // 0x40380a7c still intact right BEFORE the
+                            // synthetic call? Splits synthetic-call clobber
+                            // vs idle-time drift.
+                            // PLUS window-liveness snapshot (DELETE after):
+                            // stale WINDOWSTART bits (never cleared) make
+                            // overflow rotate into ALIASED live windows (a1
+                            // = another task's SP, [SP-12] = its saved
+                            // retaddr) → spill base wild → IRAM clobber.
+                            println!(
+                                "[host] BLE pre IRAM @0x40380a7c = {:#010x}",
+                                m.soc.read32(0x4038_0a7c)
+                            );
+                            println!(
+                                "[host] BLE pre wb={} wstart={:#010x} excsave1={:#010x}",
+                                m.cpu[0].windowbase(),
+                                m.cpu[0].sreg(xtensa_core::cpu::SR_WINDOW_START),
+                                m.cpu[0].sreg(xtensa_core::cpu::SR_EXCSAVE1),
+                            );
+                            // TEMP (2026-10-03, forensics — DELETE after): OF12
+                            // handler inputs — a13 (scratch base) + [SP-12]
+                            // (spill base) in the CURRENT (wb+2-rotated? no:
+                            // pre-call, firmware) view. If either names IRAM
+                            // code, the first overflow spill clobbers it.
+                            {
+                                let sp = m.cpu[0].reg(1);
+                                println!(
+                                    "[host] BLE pre a13={:#010x} sp={:#010x} sp-12-mem={:#010x}",
+                                    m.cpu[0].reg(13),
+                                    sp,
+                                    m.soc.read32(sp.wrapping_sub(12)),
+                                );
+                            }
+                            // PLUS waiter pre/post (DELETE after): does our
+                            // post unblock it? Sampled around the synthetic
+                            // call — unblock is synchronous inside Send.
+                            let evq = m.soc.read32(0x3fc9_dd50);
+                            let queue = m.soc.read32(evq);
+                            let evq_wait = if queue != 0 {
+                                m.soc.queue_recv_waiting(queue)
+                            } else {
+                                false
+                            };
+                            let ht0 = m.soc.read32(0x3fc9_eac8);
+                            println!(
+                                "[host] BLE pre evq={evq:#010x} queue={queue:#010x} q_wait={evq_wait} host={ht0:#010x}"
+                            );
+                            println!(
+                                "[host] BLE pre rlist-detail count={} first={:#010x}",
+                                m.soc.read32(queue.wrapping_add(32)),
+                                m.soc.read32(queue.wrapping_add(40)),
+                            );
+                            // TEMP (2026-10-03): full Queue_t dump (DELETE
+                            // after). Is the queue FULL when we post (post
+                            // fails silently -> block leaks -> waiter stays
+                            // parked -> silence)? Words +0..+64.
+                            println!(
+                                "[host] BLE pre qstruct={:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}",
+                                m.soc.read32(queue),
+                                m.soc.read32(queue.wrapping_add(4)),
+                                m.soc.read32(queue.wrapping_add(8)),
+                                m.soc.read32(queue.wrapping_add(12)),
+                                m.soc.read32(queue.wrapping_add(16)),
+                                m.soc.read32(queue.wrapping_add(20)),
+                                m.soc.read32(queue.wrapping_add(24)),
+                                m.soc.read32(queue.wrapping_add(28)),
+                            );
+                            // TEMP (2026-10-03): queue length/occupancy words
+                            // (DELETE after). Standard Queue_t has
+                            // uxMessagesWaiting@48, uxLength@52, uxItemSize@56
+                            // (after two 16B lists at +16/+32). A length-1
+                            // queue + an occupying timer event at post time =
+                            // our post fails silently (0 timeout) and leaks.
+                            // Dump +32..+72 to find the real count fields
+                            // (small ints among pointers; sample twice).
+                            println!(
+                                "[host] BLE pre qlen={:#010x} {:#010x} {:#010x} {:#010x}",
+                                m.soc.read32(queue.wrapping_add(48)),
+                                m.soc.read32(queue.wrapping_add(52)),
+                                m.soc.read32(queue.wrapping_add(56)),
+                                m.soc.read32(queue.wrapping_add(60)),
+                            );
+                            println!(
+                                "[host] BLE pre qx32={:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}",
+                                m.soc.read32(queue.wrapping_add(32)),
+                                m.soc.read32(queue.wrapping_add(36)),
+                                m.soc.read32(queue.wrapping_add(40)),
+                                m.soc.read32(queue.wrapping_add(44)),
+                                m.soc.read32(queue.wrapping_add(64)),
+                                m.soc.read32(queue.wrapping_add(68)),
+                            );
+                            let ok = m.run_ble_host_recv(0, cb);
+                            println!(
+                                "[host] BLE RX host_rcv_pkt ok={ok} evfree {f0}->{})",
+                                m.soc.ble_evt_pool_free()
+                            );
+                            // TEMP (2026-10-04, forensics — DELETE after): staged
+                            // bytes (H4==0 dead-path diagnosis).
+                            if let Some((sb, sl, sx)) = m.last_recv_stage {
+                                println!(
+                                    "[host] BLE RX staged buf={sb:#010x} len={sl} bytes={sx:02x?}"
+                                );
+                            }
+                            // TEMP (2026-10-03, forensics — DELETE after): print
+                            // the synthetic-call abort record (fault pc + step
+                            // result) when delivery fails.
+                            if !ok {
+                                if let Some((apc, ar, trip)) = m.last_recv_abort {
+                                    println!(
+                                        "[host] BLE RX abort at {apc:#010x}: {ar:?} woe_trip={trip:#010x?}"
+                                    );
+                                    // TEMP (2026-10-03, forensics — DELETE
+                                    // after): IRAM clobber site, if observed.
+                                    if let Some(cpc) = m.last_recv_clobber {
+                                        println!(
+                                            "[host] BLE RX clobber first seen after step at {cpc:#010x}"
+                                        );
+                                    }
+                                    // TEMP (2026-10-03, forensics — DELETE
+                                    // after): PS at synthetic exit (EXCM set
+                                    // ⇒ inside a vector handler).
+                                    if let Some((ps, epc1, wb)) = m.last_recv_ps {
+                                        println!(
+                                            "[host] BLE RX exit ps={ps:#010x} epc1={epc1:#010x} wb={wb}"
+                                        );
+                                    }
+                                    // TEMP (2026-10-03, forensics — DELETE
+                                    // after): dump what the CPU actually
+                                    // fetched at the fault pc (IRAM backing
+                                    // may differ from the ELF file).
+                                    println!(
+                                        "[host] BLE RX fault bytes @ {apc:#010x} = {:#010x}",
+                                        m.soc.read32(apc)
+                                    );
+                                } else {
+                                    println!(
+                                        "[host] BLE RX abort: clean exit without retw (10k cap?)"
+                                    );
+                                }
+                            }
+                            // TEMP (2026-10-03): WOE snapshot (DELETE after).
+                            // ENTRY faults cause 0 iff PS.WOE==0 — snapshot PS
+                            // at every delivery attempt: was WOE already clear
+                            // in the idle task state, or cleared mid-call?
+                            println!(
+                                "[host] BLE pre ps={:#010x} woe={}",
+                                m.cpu[0].sreg(xtensa_core::cpu::SR_PS),
+                                (m.cpu[0].sreg(xtensa_core::cpu::SR_PS) & xtensa_core::cpu::PS_WOE)
+                                    != 0,
+                            );
+                            // TEMP (2026-10-03): waiter post/post (DELETE
+                            // after). Unblock is synchronous inside Send: if
+                            // still parked after our post, the post didn't
+                            // unblock (wrong queue/full/silent error).
+                            println!(
+                                "[host] BLE pre waiter_post={} depth_post={}",
+                                if queue != 0 {
+                                    m.soc.queue_recv_waiting(queue)
+                                } else {
+                                    false
+                                },
+                                m.soc.read32(queue.wrapping_add(56)),
+                            );
+                            // TEMP (2026-10-03): depth after (DELETE after).
+                            let evq1 = m.soc.read32(0x3fc9_dd50);
+                            let q1 = m.soc.read32(evq1);
+                            println!(
+                                "[host] BLE pre depth {depth0}->{}",
+                                m.soc.read32(q1.wrapping_add(56))
+                            );
+                            // TEMP (2026-10-03): handler set on our block?
+                            // (DELETE after). Expect fn == ble_hs_event_rx_hci_ev.
+                            // PLUS the data mbuf head (ev_arg points at it):
+                            // [0]==0x3E means H4-stripped (correct), 0x04 means
+                            // the H4 byte leaked into the mbuf (dispatcher then
+                            // misindexes the LE table and drops).
+                            println!(
+                                "[host] BLE pre ev_fn={:#010x} ev_arg={:#010x}",
+                                m.soc.read32(pre_head.wrapping_add(4)),
+                                m.soc.read32(pre_head.wrapping_add(8)),
+                            );
+                            let dm = m.soc.read32(pre_head.wrapping_add(8));
+                            println!(
+                                "[host] BLE pre dmbuf={:02x?}",
+                                [
+                                    m.soc.read8(dm) as u8,
+                                    m.soc.read8(dm.wrapping_add(1)) as u8,
+                                    m.soc.read8(dm.wrapping_add(2)) as u8,
+                                    m.soc.read8(dm.wrapping_add(3)) as u8,
+                                    m.soc.read8(dm.wrapping_add(4)) as u8,
+                                    m.soc.read8(dm.wrapping_add(5)) as u8,
+                                ]
+                            );
+                            ok
+                        } // end else (host enabled): ok from the call above
+                    }
+                {
+                    println!("[host] BLE RX delivered via host_rcv_pkt");
+                    // First async delivery proves the link is up (see the
+                    // `ble_link_up` field docs): from here CCs belong to
+                    // post-connection commands (arrival ack leg below),
+                    // not to the ROM loopback.
+                    m.soc.ble_mark_link_up();
+                    ble_link_up_seq = m.soc.ble_tx_seq();
+                    // ATT pacing (2026-10-04, DELETE after): count this
+                    // delivery if ATT (response TX will clear it).
+                    if is_acl {
+                        ble_att_outstanding += 1;
+                        println!("[host] BLE ATT outstanding={ble_att_outstanding}");
+                    }
+                    // TEMP (2026-10-03): post-delivery pc window (DELETE
+                    // after). Record both cores' pcs for the next 150
+                    // macro-steps: what does the woken task do?
+                    ble_watch_n = 150;
                 }
             }
         }
-        // BLE VHCI RX hook: deliver ONE queued controller→host packet per
-        // step by running the registered `notify_host_recv` callback
-        // IN FIRMWARE (same windowed-ABI discipline as
-        // `run_espnow_callback`: 2-arg call, args in caller a10/a11 =
-        // callee a2/a3, fake-RETW on return). Drained every step the leg
-        // is up (packets are rare — the take is a single empty-FIFO check
-        // when idle, same discipline as the UART fast path).
-        // The callback address is discovered once from the `vhci_host_cb`
-        // rodata (`BLE_HOST_CB`, BLE image only): slot 0 =
-        // `notify_host_send_available`, slot 1 = `notify_host_recv`
-        // (struct order in esp_nimble_hci.c, proven by the 0x42005004 /
-        // 0x4200a050 words at 0x3c06b7c8). The packet bytes ride the
-        // host scratch window (`Soc::bt_hci_stage_rx` at
-        // `WIFI_SCRATCH + 0x2500`, past the net-RX slots — never heap,
-        // never freed: `host_rcv_pkt` only READS the bytes into an mbuf
-        // it allocates itself, same class as the `WIFI_SCRATCH` fixture
-        // window).
+        // TEMP (2026-10-03): post-delivery pc window (DELETE after).
+        if ble_watch_n > 0 {
+            ble_watch_n -= 1;
+            println!(
+                "[host] BLEWATCH step={i} c0={:#010x} c1={:#010x}",
+                m.cpu[0].pc, m.cpu[1].pc
+            );
+        }
+        // Command-ack arrival notes (no active leg — see the CC policy
+        // above): post-link_up CCs flow through the async event path
+        // (`host_rcv_pkt`), never through direct mbuf writes. The
+        // `ble_ack_deliver_at` helper stays parked and unit-tested for a
+        // hypothetical image whose TX mbuf stays checked out across the
+        // ack (this image frees at send — objdump 0x420052e5).
         //
-        // SCOPE (proven live via pb5: the plain `host_rcv_pkt` firmware
-        // path asserts in `ble_transport_free` even with NO hook and NO
-        // bridge traffic): the bare-metal firmware→controller leg is
-        // validated (TX tap captures the HCI Reset, the bridge answers
-        // Command Complete, the RX FIFO stages it — all observable in
-        // the `[host] BLE TX/RX` lines). Driving the reply INTO the
-        // firmware via a synthetic `host_rcv_pkt` call is NOT wired:
-        // the reply must enter through the firmware's OWN VHCI poll
-        // (`host_rcv_pkt` at 0x420050a0, called by the controller glue
-        // with its own buffer at 0x3fcacfd6) — a host-staged buffer at a
-        // foreign address walks the mbuf pool free path with a block the
-        // pool does not recognize (`assert failed: 0x42014482` in
-        // `os_memblock_from(pool_cmd)`, panic_abort EPC1=0x4037fdc4).
-        // Until the controller-glue poll is modeled (the RWBLE ISR path
-        // that hands the firmware its own buffer), the hook stays parked
-        // here and the firmware runs its quiet-controller path.
-        if ble_gw.is_some() && ble_cb_entry.is_none() {
+        // Direct-ack V2 completing parked post-connection waiters (see
+        // `ble_ack_write_cc`): fires when a waiter is parked on the ack
+        // sem for a command sent AFTER link-up (mutex-serialized, so the
+        // latest capture is the waited one — never a stale init opcode),
+        // with the scheduler lock free and the ev pool ready. The ack-cell
+        // gate inside makes it once-per-episode (no double-bump, no leak).
+        // TEMP-NOTE (2026-10-03): V2 DISABLED (proven harmful live 2026-10-04):
+        // with the WINDOWSTART fix the event path delivers (host_rcv_pkt
+        // ok=true for CCs), so V2 double-completes: V2 writes the ack cell
+        // for 0x041d while the ROM loopback ALSO answers it → firmware
+        // panics in ble_transport_free (`assert failed: 0x4201453a:290`,
+        // a2=0x3fcb78a4, proven live with bridge). V2 was load-bearing
+        // BEFORE the fix (event path ok=false, V2 the only completion);
+        // now the event path works and V2 must stay off. Kept (not deleted)
+        // for the forensics record; re-enable only with a bridge-off test.
+        // (Original note preserved: V2 ALSO covered bridge, first-come-wins
+        // was claimed safe — disproven by the 0x4201453a panic.)
+        if false
+            && (ble_gw.is_some() || ble_canned)
+            && m.soc.ble_link_up()
+            && m.soc.ble_evt_pool_ready()
+            && m.soc.read32(0x3fc9_9110) == 0xB33F_FFFF
+            && m.soc.ble_tx_seq() > ble_link_up_seq
+            && m.soc.ble_last_op() != 0
+        {
+            let sem = m.soc.ble_ack_sem();
+            if sem != 0
+                && m.soc.queue_recv_waiting(sem)
+                && let Some(tcb) = m.soc.ble_ack_write_cc(m.soc.ble_last_op())
+            {
+                m.soc.ble_ready_task(tcb);
+                println!("[host] BLE ack V2 delivered");
+            }
+        }
+        // BLE VHCI RX hook: the callback address is discovered once from
+        // the `vhci_host_cb` rodata (`BLE_HOST_CB`, BLE image only):
+        // slot 0 = `notify_host_send_available`, slot 1 =
+        // `notify_host_recv` (struct order in esp_nimble_hci.c, proven by
+        // the 0x42005134 / 0x42005158 words at 0x3c06b82c). Delivery itself
+        // happens in the block above via `run_ble_host_recv`.
+        if (ble_gw.is_some() || ble_canned) && ble_cb_entry.is_none() {
             let cb0 = m.soc.read32(BLE_HOST_CB);
             let cb1 = m.soc.read32(BLE_HOST_CB + 4);
             if (0x4000_0000..0x4240_0000).contains(&cb1) && cb0 != 0 {
                 ble_cb_entry = Some(cb1);
                 println!("[host] BLE vhci_host_cb: notify_host_recv={cb1:#010x}");
+            }
+        }
+
+        // TEMP (2026-10-03): host-task schedule watch (DELETE after).
+        // Does the NimBLE host task run AFTER our post? Latch on the
+        // first step either core currently runs it, gated on link_up
+        // (set at delivery success) so pre-delivery runs don't count.
+        // PLUS queue trend: depth (uxMessagesWaiting @ +48, same layout
+        // `queue_recv_waiting` uses) + waiter present, throttled — does
+        // the queued event ever drain?
+        if ble_canned && m.soc.ble_link_up() {
+            if !ble_host_seen {
+                let ht = m.soc.read32(0x3fc9_eac8);
+                if ht != 0 {
+                    let c0 = m.soc.read32(0x3fc9_f618);
+                    let c1 = m.soc.read32(0x3fc9_f61c);
+                    if c0 == ht || c1 == ht {
+                        println!(
+                            "[host] BLEDBG-HOST step={i} host_runs c0={c0:#010x} c1={c1:#010x} ht={ht:#010x}"
+                        );
+                        ble_host_seen = true;
+                    }
+                }
+            }
+            if i.is_multiple_of(1_000_000) {
+                let evq = m.soc.read32(0x3fc9_dd50);
+                println!(
+                    "[host] BLEDBG-Q step={i} depth={} waiter={} evfree={}",
+                    m.soc.read32(evq.wrapping_add(48)),
+                    if evq != 0 {
+                        m.soc.queue_recv_waiting(evq)
+                    } else {
+                        false
+                    },
+                    m.soc.ble_evt_pool_free(),
+                );
+            }
+        }
+
+        if ble_gw.is_some() || ble_canned {
+            // TEMP (2026-10-03): in canned mode (no bridge) drain+log TX
+            // captures so post-22B firmware commands are visible (does the
+            // conn handler send Read-Remote-Version and stall awaiting its
+            // CC?). DELETE after forensics.
+            if ble_canned {
+                let frame = m.soc.bt_hci_take_tx();
+                if !frame.is_empty() && frame.len() >= 3 {
+                    // TEMP (2026-10-03): tap-address audit (DELETE after).
+                    // Which pool does each command mbuf come from?
+                    let (ld, _ll) = m.soc.ble_last_tx().unwrap_or((0, 0));
+                    println!(
+                        "[host] BLE TX canned {}B h4={:#04x} op={:#06x} tap={:#010x}",
+                        frame.len(),
+                        frame[0],
+                        u16::from_le_bytes([frame[1], frame[2]]),
+                        ld,
+                    );
+                    // TEMP (2026-10-04, forensics — DELETE after): full hex
+                    // for ACL TX (decode ATT discovery response handles for
+                    // canned READ/WRITE replay). Count ACL TX (each ATT
+                    // response) for script pacing (see findinfo stager).
+                    // ATT pacing (2026-10-04, DELETE after): responses clear
+                    // outstanding (not notify 0x1B / indicate 0x1D — those
+                    // are server-initiated, not answers). Opcode at [9]
+                    // (H4+handle2+acl_len2+l2cap_len2+cid2); guard short.
+                    if frame[0] == 0x02 {
+                        println!("[host] BLE TXACL {:02x?}", &frame[..]);
+                        ble_canned_acl_tx_n += 1;
+                        let op = if frame.len() > 9 { frame[9] } else { 0 };
+                        if op != 0x1B && op != 0x1D {
+                            ble_att_outstanding = ble_att_outstanding.saturating_sub(1);
+                            println!("[host] BLE ATT outstanding={ble_att_outstanding}");
+                        }
+                    }
+                }
+            }
+        }
+        // Full-802.11-LL-MAC slice-1 leg (`esp32s3_llmac` sketch,
+        // `WIFI_LLMAC=1`): the machine tap arms capture the TX frame +
+        // the promiscuous callback pointer; here the host drains captures
+        // (one log line per frame, with the battery-asserted CAP marker)
+        // and injects virtual-AP beacons by running the registered
+        // callback IN FIRMWARE, one per step max (each delivery runs up
+        // to 10k firmware insns). Boot-phase gate: deliver only after the
+        // sketch's `LLMAC sniff 1` marker (setup done — the synthetic
+        // call needs a valid task stack, same wild-stack class as the
+        // BLE boot-phase gate).
+        // TEMP (2026-10-03): deterministic BLE NULL-call repro — with
+        // (no bridge needed) the first delivery opportunity after init
+        // stages a canned LE Connection Complete (bytes captured from a
+        // live Bumble run) instead of needing the central rendezvous.
+        // Isolates 22B content processing from link timing. DELETE after
+        // forensics.
+        // DONE-gate (load-bearing): staging the 22B mid-init flips
+        // `link_up` while init sends are still in flight — the CC policy
+        // switches from drop-as-ROM-dup to deliver, and V2 + the stager
+        // below start completing init commands the ROM ALSO answers
+        // (double completion → `ack returned 12/17`, `BLE adv 0`, proven
+        // live). Post-DONE the firmware sends nothing until the conn
+        // handler runs, so no capture can straddle the mark.
+        if ble_canned && !ble_canned_done && m.soc.bt_hci_rx_pending() == 0 {
+            let ble_starts = uart_buf
+                .windows(b"BLE START".len())
+                .filter(|w| *w == b"BLE START")
+                .count();
+            let ble_done = uart_buf
+                .windows(b"BLE DONE".len())
+                .any(|w| w == b"BLE DONE");
+            // TEMP (2026-10-03, forensics — DELETE after): one-shot IRAM
+            // probe — is 0x40380a7c (xPortInIsrContext entry) intact
+            // post-boot, pre-delivery? Distinguishes loader hole (bad from
+            // load) from runtime clobber.
+            if ble_done && !ble_canned_done && !ble_iram_probed {
+                println!(
+                    "[host] BLE IRAM probe @0x40380a7c = {:#010x} (expect 0xa0004136)",
+                    m.soc.read32(0x4038_0a7c)
+                );
+                ble_iram_probed = true;
+            }
+            if ble_starts >= 1 && ble_done && m.soc.ble_evt_pool_ready() {
+                // Supervision timeout widened 0x000A→0x0C80 (100ms→32s):
+                // the live-captured 100ms timeout disconnects the canned
+                // link before ATT runs (no central to sustain it); 32s
+                // keeps it up through GATT. Interval/latency/accuracy kept.
+                m.soc.bt_hci_inject_rx(&[
+                    0x04, 0x3E, 0x13, 0x01, 0x00, 0x01, 0x00, 0x01, 0x01, 0x25, 0xE3, 0xD9, 0x2E,
+                    0x18, 0xFF, 0x0A, 0x00, 0x00, 0x00, 0x80, 0x0C, 0x07,
+                ]);
+                ble_canned_done = true;
+                println!("[host] BLE canned 22B staged");
+            }
+        }
+        // TEMP (2026-10-03): canned controller (DELETE after). Once the
+        // link is up, every outstanding command needs its Command Complete
+        // (canned has no bridge): the conn handler sends adv-disable, then
+        // read-remote-version, etc., and stalls on each waiter without its
+        // CC (no app `onConnect`, no ATT response — proven live: post-22B
+        // TX then silence). Stage a status-0 CC for the outstanding TX
+        // opcode whenever the FIFO is empty (post-conn CCs are status-only;
+        // init-time commands never reach here — the ROM loopback answers
+        // those firmware-side and `ble_link_up` is false until the first
+        // async delivery).
+        // TEMP (2026-10-03): generic canned-CC stager RE-ENABLED
+        // (DELETE after). The trace proves the handler chain runs
+        // (le_meta → table[1] → gap_conn_complete) but stalls awaiting
+        // the adv-disable CC (no app `onConnect` without it). One CC per
+        // captured command (seq-guarded against the static-buffer stale
+        // reads). The `> ble_link_up_seq` gate is load-bearing: without
+        // it the first post-link-up evaluation serves the LAST INIT
+        // capture (watermark starts at 0), staging a duplicate CC the
+        // waiter consumes as a mismatch (`ack returned 12`, proven live).
+        if (ble_canned || ble_gw.is_some())
+            && m.soc.ble_link_up()
+            && m.soc.bt_hci_rx_pending() == 0
+            && m.soc.ble_tx_seq() > ble_link_up_seq
+            && m.soc.ble_tx_seq() != ble_canned_last_op
+        {
+            let op = m.soc.ble_last_op();
+            // Serve exactly one CC per captured command (see `ble_tx_seq`).
+            // Bridge override (2026-10-04, pragmatic unblock — DELETE
+            // after): with a bridge only 0x041d/0x2016/0x2022 are staged
+            // here (bridge's own replies for those are dropped at ingest;
+            // Bumble's Status-vs-Complete shape mismatches NimBLE → `ack
+            // 12` + disc, proven live). Canned serves all (no Bumble).
+            if op != 0 && (ble_canned || op == 0x041D || op == 0x2016 || op == 0x2022) {
+                // Opcode-specific CC shape (BT Core + hci_common.h): most
+                // post-conn commands ack status-only, but 0x2022
+                // (LE_SET_DATA_LEN) returns status + conn_handle
+                // (`ble_hci_le_set_data_len_rp`: u16 handle). A short CC
+                // makes the handler read handle 0, log `Received status 0`
+                // (E1069) and disconnect — proven live.
+                if op == 0x2022 {
+                    m.soc.bt_hci_inject_rx(&[
+                        0x04,
+                        0x0E,
+                        0x06,
+                        0x01,
+                        (op & 0xFF) as u8,
+                        ((op >> 8) & 0xFF) as u8,
+                        0x00,
+                        0x01,
+                        0x00,
+                    ]);
+                } else {
+                    m.soc.bt_hci_inject_rx(&[
+                        0x04,
+                        0x0E,
+                        0x04,
+                        0x01,
+                        (op & 0xFF) as u8,
+                        ((op >> 8) & 0xFF) as u8,
+                        0x00,
+                    ]);
+                }
+                ble_canned_last_op = m.soc.ble_tx_seq();
+                ble_canned_last_cc_op = op;
+                println!("[host] BLE canned CC staged for op={op:#06x}");
+            }
+        }
+        // TEMP (2026-10-03): canned version-complete event (DELETE after).
+        // Mirrors the bridge's 0x041D follow-up: after the rd-rem-ver CC
+        // is served, stage the 0x0C event (status 0, handle 1, BT 5.0,
+        // Espressif) so the handler doesn't stall awaiting it. Bridge
+        // override (2026-10-04): also serves with a bridge (its own
+        // version is dropped at ingest); Bumble owns the rest.
+        if (ble_canned || ble_gw.is_some())
+            && ble_canned_last_cc_op == 0x041D
+            && !ble_canned_ver_done
+            && m.soc.bt_hci_rx_pending() == 0
+        {
+            m.soc.bt_hci_inject_rx(&[
+                0x04, 0x0C, 0x08, 0x00, 0x01, 0x00, 0x09, 0xE5, 0x02, 0x00, 0x00,
+            ]);
+            ble_canned_ver_done = true;
+            println!("[host] BLE canned version event staged");
+        }
+        // TEMP (2026-10-03): canned remote-features-complete event (DELETE
+        // after). After the 0x2016 CC, stage the LE Meta subevent-0x04
+        // (status 0, handle 1 from the 22B, all-FF features = full LE
+        // support) so the handler completes and fires onConnect. Zeros
+        // proved the path (conn fires) but NimBLE then logs `Controller
+        // doesn't support LE` and disconnects; FF keeps the link up.
+        // Bridge override (2026-10-04): also serves with a bridge
+        // (its features event is dropped at ingest).
+        if (ble_canned || ble_gw.is_some())
+            && ble_canned_last_cc_op == 0x2016
+            && !ble_canned_feat_done
+            && m.soc.bt_hci_rx_pending() == 0
+        {
+            m.soc.bt_hci_inject_rx(&[
+                0x04, 0x3E, 0x0C, 0x04, 0x00, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                0xFF,
+            ]);
+            ble_canned_feat_done = true;
+            println!("[host] BLE canned features event staged");
+        }
+        // TEMP (2026-10-03): canned data-length-change event (DELETE after).
+        // After the 0x2022 CC, stage the LE Meta subevent-0x07 (handle 1,
+        // 251B/2120us both directions) so the handler completes instead of
+        // disconnecting. Bridge override (2026-10-04): also serves with a
+        // bridge (its data-length event is dropped at ingest).
+        if (ble_canned || ble_gw.is_some())
+            && ble_canned_last_cc_op == 0x2022
+            && !ble_canned_dl_done
+            && m.soc.bt_hci_rx_pending() == 0
+        {
+            // LE Data Length Change: subevent 0x07, NO status byte (BT Core
+            // 7.7.65.13): handle + max_tx_oct/time + max_rx_oct/time.
+            m.soc.bt_hci_inject_rx(&[
+                0x04, 0x3E, 0x0B, 0x07, 0x01, 0x00, 0xFB, 0x00, 0x48, 0x08, 0xFB, 0x00, 0x48, 0x08,
+            ]);
+            ble_canned_dl_done = true;
+            println!("[host] BLE canned data-length event staged");
+        }
+        // TEMP (2026-10-04, forensics — DELETE after): canned ATT replay
+        // (see flag docs). SIZE TEST ORDER: after the READFIRST response
+        // (acl_tx_n>=1), not directly after dl_done.
+        if ble_canned
+            && ble_canned_dl_done
+            && !ble_canned_att_done
+            && m.soc.bt_hci_rx_pending() == 0
+        {
+            m.soc.bt_hci_inject_rx(&[
+                0x02, 0x01, 0x20, 0x0B, 0x00, 0x07, 0x00, 0x04, 0x00, 0x10, 0x01, 0x00, 0xFF, 0xFF,
+                0x00, 0x28,
+            ]);
+            ble_canned_att_done = true;
+            println!("[host] BLE canned ATT staged");
+        }
+        // TEMP (2026-10-04, forensics — DELETE after): canned Find-Info
+        // (Phase 1). After the discovery response (first ACL TX) with the
+        // FIFO empty, request attributes 0x000e-0xFFFF (Find Info 0x04) to
+        // learn characteristic/value handles (decoded from the TXACL
+        // response hex). Full ACL: H4 + handle/flags 0x2001 + acl_len 9 +
+        // l2cap_len 5 + CID ATT + 04 0e00 ffff (5B ATT).
+        if ble_canned
+            && ble_canned_att_done
+            && !ble_canned_findinfo_done
+            && ble_canned_acl_tx_n >= 1
+            && m.soc.bt_hci_rx_pending() == 0
+        {
+            m.soc.bt_hci_inject_rx(&[
+                0x02, 0x01, 0x20, 0x09, 0x00, 0x05, 0x00, 0x04, 0x00, 0x04, 0x0E, 0x00, 0xFF, 0xFF,
+            ]);
+            ble_canned_findinfo_done = true;
+            println!("[host] BLE canned FINDINFO staged");
+        }
+        // TEMP (2026-10-04, forensics — DELETE after): Phase 2 (handles in
+        // flag docs). Read Battery Level (0x0A + 0x0010) after the Find-Info
+        // response (2nd ACL TX). Full ACL: acl_len 7 + l2cap_len 3 + 0A 1000.
+        if ble_canned
+            && ble_canned_findinfo_done
+            && !ble_canned_read_done
+            && ble_canned_acl_tx_n >= 2
+            && m.soc.bt_hci_rx_pending() == 0
+        {
+            m.soc.bt_hci_inject_rx(&[
+                0x02, 0x01, 0x20, 0x07, 0x00, 0x03, 0x00, 0x04, 0x00, 0x0A, 0x10, 0x00,
+            ]);
+            ble_canned_read_done = true;
+            println!("[host] BLE canned READ staged");
+        }
+        // Write echo `hi!` (0x12 + 0x0013 + 68 69 21) after the Read
+        // response (3rd ACL TX). ATT len 6, l2cap 6, acl 10 (15B total).
+        if ble_canned
+            && ble_canned_read_done
+            && !ble_canned_write_done
+            && ble_canned_acl_tx_n >= 3
+            && m.soc.bt_hci_rx_pending() == 0
+        {
+            m.soc.bt_hci_inject_rx(&[
+                0x02, 0x01, 0x20, 0x0A, 0x00, 0x06, 0x00, 0x04, 0x00, 0x12, 0x13, 0x00, 0x68, 0x69,
+                0x21,
+            ]);
+            ble_canned_write_done = true;
+            println!("[host] BLE canned WRITE staged");
+        }
+        // Read-back echo value (0x0A + 0x0013) after the Write response
+        // (4th ACL TX). Expects 0x0B + `hi!` (loopback via onWrite).
+        if ble_canned
+            && ble_canned_write_done
+            && !ble_canned_readback_done
+            && ble_canned_acl_tx_n >= 4
+            && m.soc.bt_hci_rx_pending() == 0
+        {
+            m.soc.bt_hci_inject_rx(&[
+                0x02, 0x01, 0x20, 0x07, 0x00, 0x03, 0x00, 0x04, 0x00, 0x0A, 0x13, 0x00,
+            ]);
+            ble_canned_readback_done = true;
+            println!("[host] BLE canned READBACK staged");
+        }
+        if wifi_llmac {
+            while let Some(frame) = m.soc.llmac_take_tx() {
+                let fc = frame.first().copied().unwrap_or(0);
+                let ssid = frame.windows(5).any(|w| w == b"EmuAP");
+                println!(
+                    "[host] LLMAC CAP len={} fc={:#04x} ssid={}",
+                    frame.len(),
+                    fc,
+                    ssid as u8
+                );
+            }
+            if m.soc.llmac_beacons_left() > 0
+                && uart_buf
+                    .windows(b"LLMAC sniff 1".len())
+                    .any(|w| w == b"LLMAC sniff 1")
+                // Scheduler-lock gate (same wild-`retw` class the BLE leg
+                // hit: the sniffer runs thousands of insns over Arduino
+                // heap/UART state — never synthesize it while a core sits
+                // in a scheduler critical section. xKernelLock nm on the
+                // llmac ELF; unlocked word is the 0xB33FFFFF mux magic,
+                // same protocol. Level-triggered retry).
+                && m.soc.read32(0x3fc9_5a80) == 0xB33F_FFFF
+                && m.run_wifi_promisc_cb(0)
+            {
+                println!("[host] LLMAC RX beacon delivered");
             }
         }
 
@@ -2000,6 +3174,27 @@ fn main() {
         uart_buf.extend_from_slice(&tx);
     }
 
+    // TEMP (2026-10-03): dump the event-dispatch trace ring in canned mode
+    // (DELETE after). Shows the exact handler path our delivered CCs took.
+    if ble_canned {
+        for (pc, a10, a11, a12) in m.soc.ble_trace_dump() {
+            if pc != 0 {
+                println!(
+                    "[host] BLETRACE pc={pc:#010x} a10={a10:#010x} a11={a11:#010x} a12={a12:#010x}"
+                );
+            }
+        }
+        // TEMP (2026-10-03): queue storage post-mortem (DELETE after). Is
+        // our event still sitting in the evq storage (never taken)? The
+        // storage observed at post time was 12B at 0x3fcb148c.
+        println!(
+            "[host] BLEQ post-mortem stor={:#010x} {:#010x} {:#010x}",
+            m.soc.read32(0x3fcb_148c),
+            m.soc.read32(0x3fcb_1490),
+            m.soc.read32(0x3fcb_1494),
+        );
+    }
+
     // --- USB-OTG auto-enum IN-capture report (device answering the host) ---
     // The sketch checks the IN bytes itself through DFIFO0; the harness
     // asserts the identical transfer off the virtual wire here (the two
@@ -2026,12 +3221,18 @@ fn main() {
     for c in 0..2 {
         let cpu = &m.cpu[c];
         println!(
-            "== core{c}: a0={:#010x} a2={:#010x} sp={:#010x} wb={} ps={:#x}",
+            "== core{c}: a0={:#010x} a2={:#010x} sp={:#010x} wb={} ps={:#x} a10={:#010x} a11={:#010x}",
             cpu.reg(0),
             cpu.reg(2),
             cpu.reg(1),
             cpu.windowbase(),
-            cpu.ps()
+            cpu.ps(),
+            // TEMP (2026-10-04, forensics — DELETE after): a10/a11 carry
+            // callee return codes at panic (e.g. l2cap_tx rc in a10 when
+            // ble_att_tx_with_conn asserts) — needed to distinguish
+            // ENOMEM vs EINVAL without another instrumented run.
+            cpu.reg(10),
+            cpu.reg(11),
         );
     }
     println!(

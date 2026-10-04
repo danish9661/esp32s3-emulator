@@ -96,6 +96,20 @@ def bin_for_case(name):
         # committed bin lives in build/ (no top-level copy by convention)
         b = f"{SK}/esp32s3_twai_driver/build/esp32s3_twai_driver.ino.merged.bin"
         return (b, [f"{SK}/esp32s3_twai_driver"])
+    if name == "test_worker_l3_live":
+        # live-gateway entry reuses the worker_l3 image via the 4th-field
+        # binrel (see run_battery.sh); same rule as the _inwasm alias above.
+        return (
+            f"{SK}/esp32s3_test_worker_l3/esp32s3_test_worker_l3.merged.bin",
+            [f"{SK}/esp32s3_test_worker_l3"],
+        )
+    if name == "net_pcap":
+        # pcap-artifact entry reuses the worker_net image via binrel; the
+        # pcap file itself is a gitignored rebuild artifact, not tracked.
+        return (
+            f"{SK}/esp32s3_test_worker_net/esp32s3_test_worker_net.merged.bin",
+            [f"{SK}/esp32s3_test_worker_net"],
+        )
     if name == "gdb":
         return (f"{SK}/esp32s3_hello/esp32s3_hello.merged.bin", [f"{SK}/esp32s3_hello"])
     if name in ("wifi_scan_inwasm", "wifi_sta_inwasm", "wifi_ap_inwasm", "espnow_inwasm", "test_worker_net_inwasm", "test_worker_l3_inwasm"):
