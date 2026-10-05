@@ -4893,3 +4893,14 @@ full enumeration REQ0..REQ6 — is covered),
     manual 19/19 stands). Next: re-nm DSP word + robust udp + indirect-call
     hooks for DONE; direct-handle bypass for CENTRAL third-ATT; TEMP
     deletion; speed (PGO retrain).
+  - 2026-10-05: **PGO retrained (was stale since Sep 14) — +47–57% native,
+    direction-stable 6/6.** `tools/pgo/merged.profdata` 375KB → 549KB
+    (retrained over hello + periph via `tools/pgo.sh`; hot path grown since
+    with hooks/Coex/CENTRAL forensics, hence larger profile). Rigor per the
+    committed rules: separate plain target (no PGO flags) vs PGO-use binary,
+    pinned core 4, interleaved back-to-back pairs on hello boot (100M-step
+    budget): plain 6.5–7.0 vs PGO 10.2–10.6 MIPS in ALL 6 pairs → +46–57%
+    real gain (absolutes lower than Sep 14's 15.1/23.5 because this measures
+    a 100M-step budget window incl. idle loop, not pure boot phase — ratios
+    are the honest metric). `verify OK` (hello `boot OK`). Native-only as
+    always (profiles don't carry to wasm; browser keeps the default build).
