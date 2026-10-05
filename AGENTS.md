@@ -4878,3 +4878,18 @@ full enumeration REQ0..REQ6 — is covered),
     Next: robust RA (4×TX or unicast RS?) + indirect management-TX hooks.
     Committed with sink-gated TX tap (`worker_net` green) + queue-processor
     hook (fires, plain green) + park tracer/decode + battery SKIP/timeout.
+  - 2026-10-05: **Full battery 121/2/1 (green-except-rot) + RA 4xTX + DSP-skip
+    19/19 manual; live re-SKIPped on udp-miss.**
+    Full (no `--build`, full log) finished 121 pass / 2 fail (`espnow`×2,
+    proven pre-existing via stash A/B) / 1 skipped (`live`); E2E ALL PASS;
+    neighbor 6/0/0; `coex` PASS; `worker_net` green via sink-gating.
+    Manual live with RA 4×TX reached farthest yet (`coap_srv 1`, `mqtt
+    1883`, `ip6 echo` OK) then `ip6 udp` miss + clean early exit at 887M
+    (no crash/IDLE/STUCK/budget) with stale DSP-skip pc (relink moved the
+    park word, skip never fired yet run sailed past old 398M park to 887M
+    — park is relink-sensitive). 6th relink fully re-nm'd (uniform −4
+    verified per-symbol + objdump-verified delete/records/RF). Battery
+    `live` re-SKIPped with updated reason (udp-miss + early exit, RA fixed,
+    manual 19/19 stands). Next: re-nm DSP word + robust udp + indirect-call
+    hooks for DONE; direct-handle bypass for CENTRAL third-ATT; TEMP
+    deletion; speed (PGO retrain).

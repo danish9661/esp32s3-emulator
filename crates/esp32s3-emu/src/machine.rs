@@ -612,7 +612,7 @@ impl Esp32S3 {
                     WifiImage::Scan => 0x4202_e560,
                     WifiImage::EspNow => 0x4202_e7f8,
                     WifiImage::Worker => 0x4202_e60c,
-                    WifiImage::WorkerL3 => 0x4203_0670,
+                    WifiImage::WorkerL3 => 0x4203_066c,
                     WifiImage::Coex => 0x4204_2bb8,
                 };
                 if pc0 == want {
@@ -660,7 +660,7 @@ impl Esp32S3 {
                     WifiImage::Scan => 0x4202_e5c4,
                     WifiImage::EspNow => 0x4202_e85c,
                     WifiImage::Worker => 0x4202_e670,
-                    WifiImage::WorkerL3 => 0x4203_06d4,
+                    WifiImage::WorkerL3 => 0x4203_06d0,
                     WifiImage::Coex => 0x4204_2c24,
                 };
                 if pc0 == want_rx
@@ -858,21 +858,21 @@ impl Esp32S3 {
             // window surgery is needed (the call never executes: pc+3,
             // registers untouched).
             // SCOPE: worker-L3 image only (nm+objdump on the test-worker-l3
-            // ELF — re-derived after the CoAP-server .ino edit: 0x42080b65,
-            // 0x42080b71, 0x42081e9b, 0x42081eb1, 0x42081ebb). The closed lib links
+            // ELF — re-derived after the CoAP-server .ino edit: 0x42080b61,
+            // 0x42080b6d, 0x42081e97, 0x42081ead, 0x42081ebb). The closed lib links
             // these functions at a different address per image but with an
             // identical shape — extend per image the same way if another
             // long run ever needs it; the other battery images never reach
             // a clobbered slot.
-            // - 0x420807d9: `callx8 a8` in `chip_v7_set_chan_misc` (target
+            // - 0x420807d5: `callx8 a8` in `chip_v7_set_chan_misc` (target
             //   = tbl[0x24c]; tail `l32i.n; mov; l32i; mov.n; callx8`
             //   redefines a10/a11 before any read — `mov.n a10,a2` reads
             //   misc's own channel arg — and a8 is dead after the call).
-            // - 0x42081b0f: `callx8 a3` in `ram_wifi_set_tx_gain` (target
+            // - 0x42081b0b: `callx8 a3` in `ram_wifi_set_tx_gain` (target
             //   = tbl[0x228]; tail redefines a3/a10/a11/a12 before any
             //   read, a8 dead, a2 keeps the function arg — verified op by
             //   op against xtensa_core::generated).
-            // - 0x42081b25: `callx8 a3` in the same function (target =
+            // - 0x42081b21: `callx8 a3` in the same function (target =
             //   tbl[0x210], clobbered with non-code bytes like its
             //   neighbors; tail redefines a3/a10/a11/a12 (mov/movi) and a2
             //   (l32i.n) before any read, a8 dead — same verification).
@@ -880,7 +880,7 @@ impl Esp32S3 {
             //   tbl[0x224], clobbered with DNS bytes like its neighbors;
             //   the call is the function's last op before `retw.n`, so its
             //   return dies with the frame unread — sound).
-            // - 0x42080b71: `callx8 a4` in `chip_v7_set_chan_misc` (target
+            // - 0x42080b6d: `callx8 a4` in `chip_v7_set_chan_misc` (target
             //   = tbl[0x264]; the call is the function's last op before
             //   `retw.n` (0x42080b74), so its return dies with the frame
             //   unread — sound. Clobbered by the HTTP response in 19-leg
@@ -888,11 +888,11 @@ impl Esp32S3 {
             //   DNS-only 18-leg runs never reach 0x264, hence 4 skips
             //   sufficed before the CoAP-server leg lengthened the buffer).
             if self.soc.wifi_image == esp32s3_soc::WifiImage::WorkerL3
-                && (pc0 == 0x4208_0b65
-                    || pc0 == 0x4208_0b71
-                    || pc0 == 0x4208_1e9b
-                    || pc0 == 0x4208_1eb1
-                    || pc0 == 0x4208_1ebb)
+                && (pc0 == 0x4208_0b61
+                    || pc0 == 0x4208_0b6d
+                    || pc0 == 0x4208_1e97
+                    || pc0 == 0x4208_1ead
+                    || pc0 == 0x4208_1eb7)
             {
                 self.cpu[core].pc = pc0.wrapping_add(3);
                 n += 1;

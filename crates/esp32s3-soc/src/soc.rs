@@ -2309,7 +2309,7 @@ impl Soc {
             WifiImage::WorkerL3 => {
                 // test-worker-l3 image layout (nm on the test-worker-l3
                 // ELF — re-nm'd after the L3-legs .ino edit (udp/coap/ipv6
-                // builders): scan_start 0x42065f18, connect 0x4203e95c,
+                // builders): scan_start 0x42065f14, connect 0x4203e958,
                 // event vars WIFI_EVENT 0x3c0b45ec / IP_EVENT 0x3c0b3ee8;
                 // TX/RX tap + hook pcs re-nm'd in machine.rs/soc.rs below.
                 // BSS cells shifted +0x18 uniformly (symbol-verified).
@@ -2319,22 +2319,22 @@ impl Soc {
                 // .ino edit relinks the closed libs (all pcs above move);
                 // re-nm after every sketch change (proven live 7x here).
                 WifiImageLayout {
-                    scan_start: 0x4206_5f18,
-                    connect: 0x4203_e95c,
+                    scan_start: 0x4206_5f14,
+                    connect: 0x4203_e958,
                     wifi_event_var: 0x3c0b_45ec,
                     ip_event_var: 0x3c0b_3ee8,
                     count_cell: 0x3fc9_f936,
                     scan_count: 0x3fc9_af08,
                     scan_result: 0x3fc9_af04,
                     // records_check = the `call8 get_ap_records` INSIDE
-                    // `_scanDoneEv` (0x42006129 — objdump-verified).
-                    records_check: 0x4200_6129,
+                    // `_scanDoneEv` (0x42006125 — objdump-verified).
+                    records_check: 0x4200_6125,
                     ready_lists: 0x3fc9_b904,
                     top_prio: 0x3fc9_b874,
                     reg_heaps: 0x3fc9_b7bc,
                     pxcur: 0x3fc9_baf8,
                     sta_network_if: 0x3fc9_ae90,
-                    esp_wifi_start: 0x4206_5bc4,
+                    esp_wifi_start: 0x4206_5bc0,
                 }
             }
             WifiImage::Coex => {
@@ -3337,7 +3337,7 @@ impl Soc {
             WifiImage::Ap => 0x4200_42ad,
             WifiImage::EspNow => 0x4200_450d,
             WifiImage::Worker => 0x4200_433d,
-            WifiImage::WorkerL3 => 0x4200_6389,
+            WifiImage::WorkerL3 => 0x4200_6385,
             WifiImage::Coex => 0x4200_429d,
         }
     }
@@ -3356,7 +3356,7 @@ impl Soc {
             WifiImage::Ap => 0x4202_e838,
             WifiImage::EspNow => 0x4202_ea9c,
             WifiImage::Worker => 0x4202_e8b0,
-            WifiImage::WorkerL3 => 0x4203_0914,
+            WifiImage::WorkerL3 => 0x4203_0910,
             WifiImage::Coex => 0x4204_2e68,
         }
     }
@@ -3369,7 +3369,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_4164,
             WifiImage::EspNow => 0x4206_a298,
             WifiImage::Worker => 0x4206_41dc,
-            WifiImage::WorkerL3 => 0x4206_64b8,
+            WifiImage::WorkerL3 => 0x4206_64b4,
             WifiImage::Coex => 0x4208_74f4,
         }
     }
@@ -3383,7 +3383,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_3f0c,
             WifiImage::EspNow => 0x4206_9f98,
             WifiImage::Worker => 0x4206_3f84,
-            WifiImage::WorkerL3 => 0x4206_6260,
+            WifiImage::WorkerL3 => 0x4206_625c,
             WifiImage::Coex => 0x4208_729c,
         }
     }
@@ -3397,7 +3397,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_3ea4,
             WifiImage::EspNow => 0x4206_9f30,
             WifiImage::Worker => 0x4206_3f1c,
-            WifiImage::WorkerL3 => 0x4206_61f8,
+            WifiImage::WorkerL3 => 0x4206_61f4,
             WifiImage::Coex => 0x4208_7234,
         }
     }
@@ -3420,7 +3420,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_3f50,
             WifiImage::EspNow => 0x4206_9fdc,
             WifiImage::Worker => 0x4206_3fc8,
-            WifiImage::WorkerL3 => 0x4206_62a4,
+            WifiImage::WorkerL3 => 0x4206_62a0,
             WifiImage::Coex => 0x4208_72e0,
         }
     }
@@ -3433,7 +3433,7 @@ impl Soc {
             WifiImage::Ap => 0x4203_c88c,
             WifiImage::EspNow => 0x4203_caf0,
             WifiImage::Worker => 0x4203_c904,
-            WifiImage::WorkerL3 => 0x4203_e968,
+            WifiImage::WorkerL3 => 0x4203_e964,
             WifiImage::Coex => 0x4205_0ec4,
         }
     }

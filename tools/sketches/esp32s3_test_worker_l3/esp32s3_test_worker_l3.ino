@@ -663,13 +663,13 @@ void setup() {
   } else {
     n = ipv6_frame(f, mcast_allrouters, s_ll, ip6_allrouters, 58, rs_pay, 12);
     tx(f, n);
-    // Two re-TX (3 RS total): RA proved flaky at 1 re-TX (1/2 live runs
-    // missed with 2 TX though echo/udp passed — gateway answers every RS,
-    // but the multicast RS + unicast RA rendezvous misses intermittently).
-    // Extra TX stages another RA without extra pops (pop budget is the
-    // destabilization risk, not TX — see header). Echo/udp stay at 1 re-TX
-    // (stable 2/2).
-    for (int w = 0; w < 2; w++) { delay(200); tx(f, n); }
+    // Three re-TX (4 RS total): RA proved flaky at 2 re-TX too (battery live
+    // missed with 3 TX + 6-pop despite 5 staged RAs on the manual gateway —
+    // multicast RS + unicast RA rendezvous misses intermittently under the
+    // broadcast-flooded RX FIFO). Extra TX stages another RA without extra
+    // pops (pop budget is the destabilization risk — 8-pop caused ILLEGAL
+    // at 856M; 6-pop stays). Echo/udp stay at 1 re-TX (stable).
+    for (int w = 0; w < 3; w++) { delay(200); tx(f, n); }
     // RA = ICMPv6 134 (Router Advertisement body carries fd00::/64).
     // 6-pop window (pop budget is the destabilization risk — 8-pop caused
     // ILLEGAL at 856M; 6-pop passed RA/echo 2/2 before the udp-fix shuffle).

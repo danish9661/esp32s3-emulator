@@ -646,22 +646,22 @@ fn main() {
     // test-worker-l3 image layout (nm on the test-worker-l3 ELF —
     // re-nm'd after the L3-legs .ino edit (udp/coap/ipv6 builders):
     // scan_start 0x42065b90 (= esp_wifi_scan_start entry),
-    // connect 0x4203e95c (= esp_wifi_connect entry), event vars
+    // connect 0x4203e958 (= esp_wifi_connect entry), event vars
     // WIFI_EVENT 0x3c0b45a8 / IP_EVENT 0x3c0b3ea4; TX/RX tap + hook pcs
     // re-nm'd in machine.rs/soc.rs below. BSS cells shifted +0x18
     // uniformly vs the previous link (ready_lists/top_prio/pxcur/netif/
     // scan_count/scan_result verified by symbol name).
     // records_check is the `call8 esp_wifi_scan_get_ap_records` INSIDE
-    // `_scanDoneEv` (0x42006129 here — objdump-verified on the new ELF).
+    // `_scanDoneEv` (0x42006125 here — objdump-verified on the new ELF).
     const WORKER_L3_LAYOUT: WifiLayout = WifiLayout {
-        scan_start: 0x4206_5f18,
-        connect: 0x4203_e95c,
+        scan_start: 0x4206_5f14,
+        connect: 0x4203_e958,
         wifi_event_var: 0x3c0b_45ec,
         ip_event_var: 0x3c0b_3ee8,
         count_cell: 0x3fc9_f936,
         scan_count: 0x3fc9_af08,
         scan_result: 0x3fc9_af04,
-        records_check: 0x4200_6129,
+        records_check: 0x4200_6125,
         ready_lists: 0x3fc9_b904,
         top_prio: 0x3fc9_b874,
         reg_heaps: 0x3fc9_b7bc,
