@@ -86,10 +86,11 @@ pub struct Esp32S3 {
     /// Track the last emitted byte so the UART duplicate can be dropped.
     last_console_byte: Option<u8>,
     last_console_was_usb: bool,
-    /// Global tick parity for `step_fast`: toggled before every fast-block
-    /// op so peripheral time advances once per two ops (the single-step
-    /// ratio), shared by both cores' loops within a macro-step.
-    fast_tick: bool,
+    /// Op counter for `fast_maybe_tick`: ticks fire every `tick_stride` ops
+    /// (2 in accurate mode, 8 batched in balanced/turbo — see
+    /// `Soc::tick_stride`/`tick_cycles`). Shared by both cores' loops within
+    /// a macro-step, like the old bool parity.
+    fast_tick_ctr: u8,
     /// TEMP (2026-10-03, forensics — DELETE after): abort record for the
     /// last `run_ble_host_recv` synthetic call: (fault pc, step result,
     /// pc of first PS.WOE 1→0 flip if any). `None` = last call returned
@@ -117,6 +118,121 @@ pub struct Esp32S3 {
     /// fire counter (ppTxFragmentProc entry). Proves the fake-return arm
     /// fires (counter>0) vs misses (0, still parks inside at +0x13f).
     pub pptx_hook_fires: u32,
+    /// TEMP (2026-10-05, udp-leg forensics — DELETE after): wait-skip
+    /// fire counters, fast-path arm (F) + else-branch arm (S). Host
+    /// prints transitions (no_std has no println here).
+    pub wait_skip_f: u32,
+    pub wait_skip_s: u32,
+    /// TEMP (2026-10-05 — DELETE after): ra seen by the last wait-skip
+    /// fire (F arm writes high bit set + ra, S arm plain ra — disambiguates
+    /// which site fired: 0x80000000|ra = fast path, else else-branch).
+    pub wait_last_ra: u32,
+    /// TEMP (2026-10-05, udp-leg forensics — DELETE after): last-8
+    /// `esp_netif_transmit` tap fires as (entry pc, caller ra, computed
+    /// ret, len). Proves the fake-return target is sane on every TX
+    /// (a wild ret would throw the sketch into ROM zeros — the
+    /// deterministic ~886.89M exit's prime suspect, now disproven by the
+    /// single static `call8` site but kept for the record).
+    pub tx_tap_ring: [(u32, u32, u32, u32); 8],
+    pub tx_tap_idx: usize,
+    /// TEMP (2026-10-05, udp-leg forensics — DELETE after): last-8
+    /// `esp_netif_receive` tap fires as (entry pc, buf, cap, frame len).
+    /// A garbage buf with a staged frame would wild-write up to 1600B
+    /// (the core1 ILLEGAL at `esp_cpu_wait_for_intr` smells of smashed
+    /// IRAM — this ring names the writer).
+    pub rx_tap_ring: [(u32, u32, u32, u32); 8],
+    pub rx_tap_idx: usize,
+    /// TEMP (2026-10-05, udp-leg forensics — DELETE after): idle-hook
+    /// registrations as (callback, cpuid) at
+    /// `esp_register_freertos_idle_hook_for_cpu` (0x42098acc, WorkerL3
+    /// ELF). The deterministic core1 ILLEGAL comes from zeros written
+    /// via the idle path (`esp_vApplicationIdleHook` iterates `idle_cb`
+    /// slots and `callx8`s each non-null entry) — this names the
+    /// callback so its zeroing can be attributed (modem-sleep? PM?).
+    /// The call RUNS normally (registration is harmless); only observed.
+    pub idle_hook_regs: [(u32, u32); 8],
+    pub idle_hook_idx: usize,
+    /// TEMP (2026-10-05, udp-leg forensics — DELETE after): heap regions
+    /// as (start, end) at `heap_caps_add_region` (0x4200e9b4, WorkerL3
+    /// ELF). Decisive for the heap question: if a region covers the
+    /// dummy window [0x3FC88000, 0x3FC95800), OUR heap serves alias-of-
+    /// code (divergence from silicon, where reserved rsvd4 excludes it)
+    /// and the fix is heap setup; else the writer is wild. Observed
+    /// only (call runs normally).
+    pub heap_regs: [(u32, u32, u32, u32); 8],
+    pub heap_idx: usize,
+    /// TEMP (2026-10-05, udp-leg forensics — DELETE after): per-op
+    /// store-pc ring for the alias watch: (post-op pc, hit addr, val).
+    /// Taken immediately after step_one, so the pc names the store
+    /// within ±len (vs ±16 ops for the run_flash macro-step poll).
+    /// Last-16 (boot-loader hits evicted by the late writer).
+    pub watch_op: [(u32, u32, u32, u32); 16],
+    pub watch_op_idx: usize,
+    /// TEMP (2026-10-05, udp-leg forensics — DELETE after): ROM memset
+    /// calls as (dst, len, caller-ra) for dst inside the dummy window
+    /// [0x3FC88000, 0x3FC95800) (first 4). The alias kill is a contiguous
+    /// +4 memset (core0 runs a ROM memset loop, postpcs cycling
+    /// 0x40056fce/d5/dc/e4) — this names the memset caller, i.e. the
+    /// allocator path (calloc? os_zalloc? manual?) behind it.
+    pub memset_hits: [(u32, u32, u32); 4],
+    pub memset_idx: usize,
+    /// TEMP (2026-10-06 — DELETE after): NULL-target skip fire count.
+    pub nullskip_fires: u32,
+    /// TEMP (2026-10-06 — DELETE after): pc of the last NULL skip.
+    pub nullskip_pc: u32,
+    /// TEMP (2026-10-06 — DELETE after): entry line latch (first
+    /// _xt_lowint1 entry's highest pending-enabled line, 99 = none).
+    /// The take-time bits are acked-clear by dispatch, so post-hoc
+    /// sregs read empty — this catches the line at entry instead.
+    pub entry_line: u32,
+    /// TEMP (2026-10-06 — DELETE after): trace _xt_lowint1's first
+    /// entry (40 op pcs) to map its TRUE path (tick vs external,
+    /// beqz-exit vs dispatch call) — static decode desyncs here.
+    pub lowint_trace: [u32; 40],
+    pub lowint_idx: usize,
+    /// TEMP (2026-10-06 — DELETE after): latched dispatch word for the
+    /// cheap exact-match NULL skip (0 = unlatched).
+    pub nullskip_word: u32,
+    /// TEMP (2026-10-06 — DELETE after): first-fire sources snapshot
+    /// (lo, hi, inten, intset, intr) for the storm-source hunt.
+    pub nullskip_src: (u64, u64, u32, u32, u32),
+    /// TEMP (2026-10-06 — DELETE after): first-fire snapshot
+    /// (inten, intset, intr, line, masked01) for the storm-brake audit.
+    pub nullskip_first: (u32, u32, u32, u32, u32),
+    /// TEMP (2026-10-06 — DELETE after): first-4 NULL fires as
+    /// (pc, s-reg, regval, ra) — names the dispatch site(s) when the
+    /// single-pc theory breaks.
+    pub nullskip_sites: [(u32, u32, u32, u32); 4],
+    /// TEMP (2026-10-06 — DELETE after): full reg file (a0-a15) at the
+    /// first NULL skip — the dispatch line/index sits in a reg (the
+    /// take-time bits are acked-clear by then, so sregs read empty).
+    pub nullskip_regs: [u32; 16],
+    /// TEMP (2026-10-06 — DELETE after): per-core lines masked by the
+    /// NULL-skip storm brake (re-enabled if firmware later registers).
+    pub irq_disabled: [u32; 2],
+    /// TEMP (2026-10-05, udp-leg forensics — DELETE after): NULL-jump
+    /// tripwire (from-pc of the first jump to address 0) + memset span
+    /// (min/max dst seen at the ppTx memset site). The 886M kills come
+    /// as NULL jumps (EPC1=0) out of code near _xt_lowint1; this names
+    /// the site, and the span tells whether the memset reaches below
+    /// the dummy window (vector/handler-table pages).
+    pub nulljump_from: u32,
+    /// TEMP (2026-10-05 — DELETE after): min/max watched-write addr
+    /// (maps the zeroing span; the 16-ring keeps only the tail).
+    pub watch_amin: u32,
+    pub watch_amax: u32,
+    /// TEMP (2026-10-06 — DELETE after): first table-range hit
+    /// (op pc, addr) + total table hits. Names who zeroes the handler
+    /// table (TBLCRASH zeros at crash vs intact at 200M).
+    pub watch_tbl_first: (u32, u32),
+    pub watch_tbl_n: u32,
+    /// TEMP (2026-10-05, udp-leg forensics — DELETE after): interrupt
+    /// handler registrations as (line, handler) at
+    /// `xt_set_interrupt_handler` (0x42099f74, WorkerL3 ELF; callee
+    /// a2/a3 = caller a10/a11 pre-entry). Names which lines have
+    /// handlers when the crash dispatch hits a NULL entry. Observed only.
+    pub irq_regs: [(u32, u32); 16],
+    pub irq_idx: usize,
 }
 
 impl Esp32S3 {
@@ -132,7 +248,7 @@ impl Esp32S3 {
             sleep_light: false,
             last_console_byte: None,
             last_console_was_usb: false,
-            fast_tick: false,
+            fast_tick_ctr: 0,
             // TEMP (2026-10-03, forensics — DELETE after).
             last_recv_abort: None,
             last_recv_clobber: None,
@@ -143,6 +259,49 @@ impl Esp32S3 {
             ble_l2cap_ret: None,
             // TEMP (2026-10-04, forensics — DELETE after).
             pptx_hook_fires: 0,
+            // TEMP (2026-10-05, udp-leg forensics — DELETE after).
+            wait_skip_f: 0,
+            wait_skip_s: 0,
+            wait_last_ra: 0,
+            // TEMP (2026-10-05, udp-leg forensics — DELETE after).
+            tx_tap_ring: [(0, 0, 0, 0); 8],
+            tx_tap_idx: 0,
+            // TEMP (2026-10-05, udp-leg forensics — DELETE after).
+            rx_tap_ring: [(0, 0, 0, 0); 8],
+            rx_tap_idx: 0,
+            // TEMP (2026-10-05, udp-leg forensics — DELETE after).
+            idle_hook_regs: [(0, 0); 8],
+            idle_hook_idx: 0,
+            // TEMP (2026-10-05, udp-leg forensics — DELETE after).
+            heap_regs: [(0, 0, 0, 0); 8],
+            heap_idx: 0,
+            // TEMP (2026-10-05, udp-leg forensics — DELETE after).
+            watch_op: [(0, 0, 0, 0); 16],
+            watch_op_idx: 0,
+            // TEMP (2026-10-05, udp-leg forensics — DELETE after).
+            memset_hits: [(0, 0, 0); 4],
+            memset_idx: 0,
+            // TEMP (2026-10-06 — DELETE after).
+            nullskip_fires: 0,
+            nullskip_pc: 0,
+            entry_line: 99,
+            lowint_trace: [0; 40],
+            lowint_idx: 0,
+            nullskip_word: 0,
+            nullskip_src: (0, 0, 0, 0, 0),
+            nullskip_first: (0, 0, 0, 0, 0),
+            nullskip_sites: [(0, 0, 0, 0); 4],
+            nullskip_regs: [0; 16],
+            irq_disabled: [0, 0],
+            // TEMP (2026-10-05, udp-leg forensics — DELETE after).
+            nulljump_from: 0,
+            watch_amin: 0xFFFF_FFFF,
+            watch_amax: 0,
+            watch_tbl_first: (0, 0),
+            watch_tbl_n: 0,
+            // TEMP (2026-10-05, udp-leg forensics — DELETE after).
+            irq_regs: [(0, 0); 16],
+            irq_idx: 0,
         }
     }
 
@@ -247,6 +406,33 @@ impl Esp32S3 {
         let (Some(llen), Some(flen)) = (llen, flen) else {
             // Undecodable pc (raises ILLEGAL below): single-step both cores
             // with the exact single-step plumbing for one tick.
+            // `esp_cpu_wait_for_intr` skip, second site (WorkerL3
+            // 0x40379990): a smashed (zeroed) entry word fails DECODE, so
+            // fast_len_for returns None and execution takes THIS path —
+            // never reaching the run_fast_core arms. Same fake-RETW per
+            // core (ra-guarded); without it the fatal call ILLEGALs here
+            // (proven: identical crash step with the run_fast_core arm
+            // present but bypassed).
+            for c in 0..2 {
+                if self.soc.wifi_image == esp32s3_soc::WifiImage::WorkerL3
+                    && self.cpu[c].pc == 0x4037_9990
+                {
+                    let ra = self.cpu[c].reg(8);
+                    // TEMP (2026-10-05 — DELETE after): count fires.
+                    self.wait_skip_s += 1;
+                    self.wait_last_ra = ra;
+                    {
+                        let pc = self.cpu[c].pc;
+                        let ret = (pc & 0xc000_0000) | (ra & 0x3fff_ffff);
+                        // Same reconstructed-target check as the fast
+                        // arm (see NOTE above): raw ra carries callinc
+                        // bits and must not be range-checked directly.
+                        if (0x4000_0000..0x4400_0000).contains(&ret) {
+                            self.cpu[c].pc = ret;
+                        }
+                    }
+                }
+            }
             self.soc.tick_timers(1);
             if self.soc.consume_reset() {
                 self.reset();
@@ -273,6 +459,19 @@ impl Esp32S3 {
             }
             let r1 = self.cpu[1].step(&mut self.soc);
             self.sync_dedic_out();
+            // The park word never decodes, so this slow path is exactly
+            // where it lands (see `maybe_park_step`): step over it here
+            // too, else the Unimplemented result freezes the caller.
+            let r0 = if self.maybe_park_step(0, &r0) {
+                StepResult::Ok
+            } else {
+                r0
+            };
+            let r1 = if self.maybe_park_step(1, &r1) {
+                StepResult::Ok
+            } else {
+                r1
+            };
             return (r0, r1, 2);
         };
         // Deep-sleep plumbing mirrors `step` (per macro-step; entry mid-block
@@ -332,23 +531,48 @@ impl Esp32S3 {
         (r0, r1, n0 + n1)
     }
 
-    /// One global timer tick per two executed ops (see `step_fast`): called
-    /// before every op in the fast-block loop. Preserves the single-step
-    /// tick-per-two-instructions ratio while keeping peripheral time gradual
-    /// inside blocks. A WDT/system reset raised by the tick reboots
-    /// immediately (the block is abandoned).
+    /// One timer-tick batch per `tick_stride` executed ops (see `step_fast`):
+    /// accurate mode ticks 1 cycle per 2 ops (the single-step ratio);
+    /// balanced batches 4 cycles per 8 ops (same ratio, fewer call/cache
+    /// overheads); turbo batches 8 per 8 ops (2x virtual time — demo use).
+    /// A WDT/system reset raised by the tick reboots immediately (the block
+    /// is abandoned).
     #[inline]
     fn fast_maybe_tick(&mut self) -> bool {
-        self.fast_tick = !self.fast_tick;
-        if !self.fast_tick {
+        let stride = self.soc.tick_stride();
+        self.fast_tick_ctr = self.fast_tick_ctr.wrapping_add(1);
+        if self.fast_tick_ctr < stride {
             return false;
         }
-        self.soc.tick_timers(1);
+        self.fast_tick_ctr = 0;
+        self.soc.tick_timers(self.soc.tick_cycles());
         if self.soc.consume_reset() {
             self.reset();
             return true;
         }
         false
+    }
+
+    /// Step over the known closed-blob idle word on `core` when `r` is its
+    /// Unimplemented trap: the idle `retw.n` (raw 0x00000100) the Wi-Fi/BT
+    /// blob parks a core on while the other prints. The parking word is a
+    /// FAMILY of pcs (0x40377367 in run_flash espnow runs, 0x403773b7 in
+    /// wasm runs of the same image — the landed word varies with stepping
+    /// cadence), so the discriminator is the raw word, not the pc (no real
+    /// format_32 TIE op can be all-zero; unmapped reads are 0x00000000).
+    /// Returns true when stepped over (caller treats the result as Ok).
+    /// Used by BOTH step_fast paths: the word never decodes, so the slow
+    /// path (undecodable-pc fallback) is exactly where it lands most often.
+    /// `step`/`step_one` stay loud (probes + the ee trap test rely on it).
+    fn maybe_park_step(&mut self, core: usize, r: &StepResult) -> bool {
+        if !matches!(r, StepResult::Unimplemented(_)) {
+            return false;
+        }
+        if self.soc.read32(self.cpu[core].pc) != 0x0000_0100 {
+            return false;
+        }
+        self.cpu[core].step_one(&mut self.soc);
+        true
     }
 
     /// Run up to `len` instructions on `core` via `step_one` (no per-op
@@ -612,7 +836,7 @@ impl Esp32S3 {
                     WifiImage::Scan => 0x4202_e560,
                     WifiImage::EspNow => 0x4202_e7f8,
                     WifiImage::Worker => 0x4202_e60c,
-                    WifiImage::WorkerL3 => 0x4203_066c,
+                    WifiImage::WorkerL3 => 0x4203_0670,
                     WifiImage::Coex => 0x4204_2bb8,
                 };
                 if pc0 == want {
@@ -632,9 +856,323 @@ impl Esp32S3 {
                         let ra = self.cpu[core].reg(8);
                         self.cpu[core].set_reg(10, 0); // ESP_OK
                         self.cpu[core].pc = (pc0 & 0xc000_0000) | (ra & 0x3fff_ffff);
+                        // TEMP (2026-10-05, udp-leg forensics — DELETE after).
+                        let ret = self.cpu[core].pc;
+                        let j = self.tx_tap_idx % 8;
+                        self.tx_tap_ring[j] = (pc0, ra, ret, len);
+                        self.tx_tap_idx += 1;
                         n += 1;
                         continue;
                     }
+                }
+            }
+            // TEMP (2026-10-05, udp-leg forensics — DELETE after): idle-hook
+            // registration observer (WorkerL3 ELF pc only — other images
+            // link it elsewhere; same per-image discipline as the TX tap).
+            // Records (callback, cpuid); the call runs unmodified.
+            if self.soc.wifi_image == esp32s3_soc::WifiImage::WorkerL3
+                && pc0 == 0x4209_8acc
+            {
+                let cb = self.cpu[core].reg(10);
+                let cpu = self.cpu[core].reg(11);
+                let j = self.idle_hook_idx % 8;
+                self.idle_hook_regs[j] = (cb, cpu);
+                self.idle_hook_idx += 1;
+            }
+            // `esp_cpu_wait_for_intr` skip (WorkerL3 ELF pc 0x40379990 —
+            // `entry a1,32; waiti 0; retw.n`). PROVEN live: the idle path
+            // zeroes its DIRAM-alias cells (DRAM 0x3FC899xx, heap-placed
+            // below `_data_start` in the linker-reserved `.dram0.dummy`
+            // window) around i≈98.367M, and the next core1 idle call
+            // fetches zeros → ILLEGAL (17/19 markers, twice). Skipping the
+            // whole function is behaviorally identical: our `waiti` is
+            // already a NOP (exec.rs), so entry+waiti+retw ≡ return. Same
+            // discipline as the TX-tap fake-RETW (caller ra in reg 8,
+            // pre-step while wb still names the caller); ra-guarded so a
+            // non-call entry can never wild-jump (falls through to a loud
+            // trap instead). Unconditional (healthy prefix included — the
+            // skipped 3 ops are CCOUNT-invisible at this granularity).
+            if self.soc.wifi_image == esp32s3_soc::WifiImage::WorkerL3
+                && pc0 == 0x4037_9990
+            {
+                let ra = self.cpu[core].reg(8);
+                // TEMP (2026-10-05 — DELETE after): count fires (host
+                // prints transitions; no_std has no println here).
+                self.wait_skip_f += 1;
+                self.wait_last_ra = ra | 0x8000_0000;
+                // NOTE: ra is NOT checked directly — for a windowed
+                // CALLX8 the return slot holds
+                // (callinc<<30)|(addr & 0x3fffffff) (0x82… here, proven
+                // by last_ra), so a plain 0x40… range check rejects every
+                // legitimate call (4.15M counted skips, zero taken). The
+                // reconstructed RETW target is checked instead.
+                {
+                    let ret = (pc0 & 0xc000_0000) | (ra & 0x3fff_ffff);
+                    if (0x4000_0000..0x4400_0000).contains(&ret) {
+                        self.cpu[core].pc = ret;
+                        n += 1;
+                        continue;
+                    }
+                }
+            }
+            // TEMP (2026-10-05, udp-leg forensics — DELETE after): heap
+            // region observer at `heap_caps_add_region` (0x4200e9b4,
+            // WorkerL3 ELF pc; args start=a10, end=a11 — callee a2/a3 =
+            // caller a10/a11 pre-entry). Records only; call runs normally.
+            // with_caps variant (the APP heap path — takes
+            // caps/start/end; callee a2/a3/a4 = caller a10/a11/a12
+            // pre-entry, so start/end = reg(11)/reg(12) here, unlike the
+            // plain variant where start/end = reg(10)/reg(11)).
+            // add_region (plain): start/end = reg(10)/reg(11).
+            // register_heap (the MAIN heap path — takes a region STRUCT
+            // pointer in a10; snapshot w0/w1 at the struct for post-hoc
+            // layout decode).
+            if self.soc.wifi_image == esp32s3_soc::WifiImage::WorkerL3
+                && (pc0 == 0x4200_e9b4 || pc0 == 0x4200_e8e0 || pc0 == 0x4200_e684)
+            {
+                // Plain variant: (start, end) = (a10, a11);
+                // with_caps: (start, end) = (a11, a12). Store normalized
+                // (start, end) plus the raw a10 for provenance.
+                let (st, en) = if pc0 == 0x4200_e8e0 {
+                    (self.cpu[core].reg(11), self.cpu[core].reg(12))
+                } else if pc0 == 0x4200_e684 {
+                    // Struct pointer in a10; start/end live at +12/+16
+                    // (proven by register_heap prologue: l32i [a2+12],
+                    // [a2+16], size assert vs 32 MB min).
+                    let rp = self.cpu[core].reg(10);
+                    use xtensa_core::Bus as _HeapBus;
+                    (
+                        self.soc.read32(rp.wrapping_add(12)),
+                        self.soc.read32(rp.wrapping_add(16)),
+                    )
+                } else {
+                    (self.cpu[core].reg(10), self.cpu[core].reg(11))
+                };
+                // Caller ra (return slot, callinc-encoded like TX tap).
+                let ra = self.cpu[core].reg(8);
+                let j = self.heap_idx % 8;
+                self.heap_regs[j] = (st, en, ra, pc0);
+                self.heap_idx += 1;
+            }
+            // ppTxFragmentProc memset skip (WorkerL3 call site 0x42074b45:
+            // `CALLX8 memset` — return lands at 0x42074b48, proven by
+            // constant a0=0x82074b48 across 16 per-op watch hits). PROVEN
+            // live: this memset zeroes a pool TX-fragment buffer at DRAM
+            // 0x3FC899xx (linker-reserved `.dram0.dummy` window) with a
+            // contiguous +4 stride, killing the DIRAM-aliased IRAM code
+            // (wait_for_intr, compare_and_set, tick-hook victims across
+            // runs) ~10k insns before DONE. Skipping is sound HERE
+            // because the fragment path immediately parks (queue full, no
+            // RF drain — DSP-SKIP site +0x13f): the buffer is never
+            // filled (stays as-is) nor transmitted (pcap/gateway see only
+            // netif data frames), and any later fill overwrites the same
+            // bytes silicon would. Gates (narrow by design): WorkerL3 +
+            // this exact call site + dst inside the dummy window + sane
+            // fragment length (≤2048B; anything else runs normally and
+            // fails loud, never silently). memset returns dst (already
+            // in a10); fake-RETW via caller ra like the TX tap.
+            // NOTE: exact-pc 0x42074b45 never sampled despite a0
+            // proving the call (desync or unarmed-stepper gap) — cover
+            // the whole call site range (L32R+CALLX8+return).
+            if self.soc.wifi_image == esp32s3_soc::WifiImage::WorkerL3
+                && (0x4207_4b42..0x4207_4b49).contains(&pc0)
+            {
+                let dst = self.cpu[core].reg(10);
+                let mlen = self.cpu[core].reg(12);
+                // NOTE: no small-len gate — the pool-growth memset is
+                // fragment-chunk sized (proven by the kill span covering
+                // multiple code pages); an absurd len still runs loud
+                // below via the ret-guard fallthrough. Record (dst, len)
+                // for the end-dump.
+                if (0x3FC8_8000..0x3FC9_5800).contains(&dst) {
+                    let ra = self.cpu[core].reg(8);
+                    let ret = (pc0 & 0xc000_0000) | (ra & 0x3fff_ffff);
+                    if (0x4000_0000..0x4400_0000).contains(&ret) {
+                        self.cpu[core].pc = ret;
+                        // TEMP record (DELETE after): prove it fires.
+                        let j = self.memset_idx % 4;
+                        self.memset_hits[j] = (dst, mlen, ra);
+                        self.memset_idx += 1;
+                        n += 1;
+                        continue;
+                    }
+                }
+            }
+            // TEMP (2026-10-05, udp-leg forensics — DELETE after):
+            // interrupt-handler registration observer (WorkerL3 ELF pc).
+            // (line, handler); call runs unmodified.
+            if self.soc.wifi_image == esp32s3_soc::WifiImage::WorkerL3
+                && pc0 == 0x4209_9f74
+            {
+                let n = self.cpu[core].reg(10);
+                let h = self.cpu[core].reg(11);
+                let j = self.irq_idx % 16;
+                self.irq_regs[j] = (n, h);
+                self.irq_idx += 1;
+                // Storm-brake counterpart: a (possibly deferred)
+                // registration re-enables its line on this core.
+                if n < 32 && (self.irq_disabled[core] >> n) & 1 != 0 {
+                    use xtensa_core::cpu::SR_INTENABLE;
+                    let inten = self.cpu[core].sreg(SR_INTENABLE);
+                    self.cpu[core].set_sreg(SR_INTENABLE, inten | (1 << n));
+                    self.irq_disabled[core] &= !(1 << n);
+                }
+            }
+            // NULL-target skip (WorkerL3 lowint1 dispatch zone only):
+            // indirect call/jump through a zero register (zeroed handler
+            // from the alias rot; EPC1=0 kills ~10k insns before DONE).
+            // Gated to the dispatch zone first (2 compares — the decode
+            // below is too costly per-op globally). Skips past (pc+=len,
+            // no link performed — a NULL call has no valid return
+            // anyway). NEVER fires on silicon-valid code (a null call
+            // always traps). TEMP (2026-10-06 — DELETE after): counter.
+            // NOTE: narrowed from the [0x40377900,0x403779C0) zone
+            // to the exact dispatch call (NULLJUMP from=0x4037799d and
+            // nullskip lastpc consistent across 1.5M fires): zone-wide
+            // decode costs 4x wall time (0.8 MIPS lives), exact-pc is
+            // free. Re-widen if a second site ever appears (lastpc).
+            if self.soc.wifi_image == esp32s3_soc::WifiImage::WorkerL3
+                && pc0 == 0x4037_799d
+            {
+                // CHEAP exact-word match (2026-10-07, fast-ship): the op
+                // here is fixed code (`callx4 a4`, proven by GNU objdump
+                // + 4.3M consistent fires); a full decode_inst per hit
+                // costs 4x wall time. Latch the word on first sight and
+                // compare after (1 read + 1 compare, no decode).
+                // Word 0 = unlatched.
+                let w = self.soc.read32(pc0);
+                let exp = self.nullskip_word;
+                if exp != 0 && w != exp {
+                    // Code changed under us (shouldn't happen) — fall
+                    // through to normal execution (loud on fault).
+                } else {
+                    if exp == 0 {
+                        self.nullskip_word = w;
+                    }
+                    let tgt = Some(self.cpu[core].reg(4));
+                        if tgt == Some(0) {
+                            // RFI-OUT (2026-10-07, fast-ship): return from
+                            // the ISR instead of skipping past the call.
+                            // pc+=3 lands back inside the dispatch loop
+                            // (`j top`), which re-dispatches the same
+                            // uncleared line forever (1.5M-fire storm);
+                            // returning via EPC1/EXCM resumes the
+                            // preempted code (verified NULL by live37, so
+                            // no valid handler is abandoned). Matches the
+                            // level-1 kernel take in cpu.rs (EXCCAUSE=4,
+                            // EPC1=pc, PS|=EXCM, no EPS save): undo exactly
+                            // that (pc=EPC1, PS&=~EXCM; INTLEVEL was never
+                            // raised for level 1).
+                            {
+                                use xtensa_core::cpu::{PS_EXCM, SR_EPC1, SR_PS};
+                                let epc = self.cpu[core].sreg(SR_EPC1);
+                                let ps = self.cpu[core].sreg(SR_PS);
+                                self.cpu[core].pc = epc;
+                                self.cpu[core].set_sreg(SR_PS, ps & !PS_EXCM);
+                            }
+                            self.nullskip_fires += 1;
+                            self.nullskip_pc = pc0;
+                            // First-fire reg dump (see decl).
+                            if self.nullskip_fires == 1 {
+                                for r in 0..16 {
+                                    self.nullskip_regs[r as usize] =
+                                        self.cpu[core].reg(r);
+                                }
+                            }
+                            // TEMP sites (see decl): first 4 fires as
+                            // (pc, s-reg, regval=0, ra).
+                            if self.nullskip_fires <= 4 {
+                                let j = (self.nullskip_fires as usize - 1) % 4;
+                                self.nullskip_sites[j] = (
+                                    pc0,
+                                    ((w >> 8) & 0xF) as u32,
+                                    0,
+                                    self.cpu[core].reg(8),
+                                );
+                            }
+                            // First-fire sources snapshot (see decl).
+                            if self.nullskip_fires == 1 {
+                                use xtensa_core::cpu::{SR_INTENABLE, SR_INTERRUPT, SR_INTSET};
+                                let (slo, shi, _) = self.soc.int_debug(core);
+                                self.nullskip_src = (
+                                    slo,
+                                    shi,
+                                    self.cpu[core].sreg(SR_INTENABLE),
+                                    self.cpu[core].sreg(SR_INTSET),
+                                    self.cpu[core].sreg(SR_INTERRUPT),
+                                );
+                            }
+                            // Storm brake: on the FIRST fire, mask the
+                            // enabled-but-never-registered lines {20,21,24}
+                            // PLUS the latched entry line (first _xt_lowint1
+                            // entry's pending line, 99 = none seen) on both
+                            // cores. (9 registrations cover only 0,1,2,3,5,8;
+                            // a level source on an unhandled line refires
+                            // forever once vglued.) Registered lines keep
+                            // working; a later registration re-enables via
+                            // the observer (irq_disabled latch).
+                            // NOTE: the earlier dynamic version (mask the
+                            // highest pending bit at fire time) never
+                            // applied anything: INTSET reads empty by then
+                            // (transient already acked), so pend==0 always;
+                            // entry-time latching fixes that.
+                            if self.nullskip_fires == 1 {
+                                use xtensa_core::cpu::SR_INTENABLE;
+                                let mut mask: u32 =
+                                    (1 << 20) | (1 << 21) | (1 << 24);
+                                // Plus the latched entry line, but ONLY if
+                                // nothing was ever registered for it (else
+                                // we'd mask a legitimate line like SysTick
+                                // on 1/5 and stall the scheduler).
+                                if self.entry_line < 32 {
+                                    let known = self.irq_regs.iter().any(
+                                        |e| e.0 == self.entry_line,
+                                    );
+                                    if !known {
+                                        mask |= 1 << self.entry_line;
+                                    }
+                                }
+                                for c in 0..2 {
+                                    let ie =
+                                        self.cpu[c].sreg(SR_INTENABLE);
+                                    self.cpu[c].set_sreg(
+                                        SR_INTENABLE,
+                                        ie & !mask,
+                                    );
+                                    self.irq_disabled[c] |= mask;
+                                }
+                                self.nullskip_first = (0, 0, 0, 99, 1);
+                            }
+                            n += 1;
+                            continue;
+                        }
+                }
+            }
+            // TEMP (2026-10-06 — DELETE after): trace first _xt_lowint1
+            // entry (40 ops). Fires once (idx latch); cheap (40 records).
+            if self.lowint_idx < 40
+                && self.soc.wifi_image == esp32s3_soc::WifiImage::WorkerL3
+                && pc0 == 0x4037_7914
+            {
+                // Mark start (the 40 ops are recorded below per-op).
+                self.lowint_idx = 1;
+                self.lowint_trace[0] = pc0;
+            } else if self.lowint_idx >= 1 && self.lowint_idx < 40 {
+                self.lowint_trace[self.lowint_idx] = pc0;
+                self.lowint_idx += 1;
+            }
+            // TEMP (2026-10-06 — DELETE after): latch the entry line
+            // at first _xt_lowint1 entry (WorkerL3 exact pc). Highest
+            // pending-enabled bit (NSAU mirror). Later entries ignored.
+            if self.soc.wifi_image == esp32s3_soc::WifiImage::WorkerL3
+                && pc0 == 0x4037_7946
+                && self.entry_line == 99
+            {
+                use xtensa_core::cpu::{SR_INTENABLE, SR_INTSET};
+                let pend = self.cpu[core].sreg(SR_INTENABLE)
+                    & self.cpu[core].sreg(SR_INTSET);
+                if pend != 0 {
+                    self.entry_line = 31 - pend.leading_zeros();
                 }
             }
             // Ethernet RX injection (gateway→board replies: ARP/DHCP/
@@ -660,7 +1198,7 @@ impl Esp32S3 {
                     WifiImage::Scan => 0x4202_e5c4,
                     WifiImage::EspNow => 0x4202_e85c,
                     WifiImage::Worker => 0x4202_e670,
-                    WifiImage::WorkerL3 => 0x4203_06d0,
+                    WifiImage::WorkerL3 => 0x4203_06d4,
                     WifiImage::Coex => 0x4204_2c24,
                 };
                 if pc0 == want_rx
@@ -670,6 +1208,10 @@ impl Esp32S3 {
                     let buf = self.cpu[core].reg(11);
                     let cap = self.cpu[core].reg(12) as usize;
                     let m = frame.len().min(cap).min(1600);
+                    // TEMP (2026-10-05, udp-leg forensics — DELETE after).
+                    let j = self.rx_tap_idx % 8;
+                    self.rx_tap_ring[j] = (pc0, buf, cap as u32, frame.len() as u32);
+                    self.rx_tap_idx += 1;
                     for (k, b) in frame.iter().take(m).enumerate() {
                         self.soc.write8(buf + k as u32, *b as u32);
                     }
@@ -858,8 +1400,8 @@ impl Esp32S3 {
             // window surgery is needed (the call never executes: pc+3,
             // registers untouched).
             // SCOPE: worker-L3 image only (nm+objdump on the test-worker-l3
-            // ELF — re-derived after the CoAP-server .ino edit: 0x42080b61,
-            // 0x42080b6d, 0x42081e97, 0x42081ead, 0x42081ebb). The closed lib links
+            // ELF — re-derived after the CoAP-server .ino edit: 0x42080b65,
+            // 0x42080b71, 0x42081e9b, 0x42081eb1, 0x42081ebb). The closed lib links
             // these functions at a different address per image but with an
             // identical shape — extend per image the same way if another
             // long run ever needs it; the other battery images never reach
@@ -880,25 +1422,53 @@ impl Esp32S3 {
             //   tbl[0x224], clobbered with DNS bytes like its neighbors;
             //   the call is the function's last op before `retw.n`, so its
             //   return dies with the frame unread — sound).
-            // - 0x42080b6d: `callx8 a4` in `chip_v7_set_chan_misc` (target
+            // - 0x42080b65: `callx8 a4` in `chip_v7_set_chan_misc` (target
             //   = tbl[0x264]; the call is the function's last op before
-            //   `retw.n` (0x42080b74), so its return dies with the frame
+            //   `retw.n` (0x42080b6c), so its return dies with the frame
             //   unread — sound. Clobbered by the HTTP response in 19-leg
             //   runs (RF-TBL dump: "lp/t" bytes at tbl+0x264, EPC1 match;
             //   DNS-only 18-leg runs never reach 0x264, hence 4 skips
             //   sufficed before the CoAP-server leg lengthened the buffer).
             if self.soc.wifi_image == esp32s3_soc::WifiImage::WorkerL3
-                && (pc0 == 0x4208_0b61
-                    || pc0 == 0x4208_0b6d
-                    || pc0 == 0x4208_1e97
-                    || pc0 == 0x4208_1ead
-                    || pc0 == 0x4208_1eb7)
+                && (pc0 == 0x4208_0b65
+                    || pc0 == 0x4208_0b71
+                    || pc0 == 0x4208_1e9b
+                    || pc0 == 0x4208_1eb1
+                    || pc0 == 0x4208_1ebb)
             {
                 self.cpu[core].pc = pc0.wrapping_add(3);
                 n += 1;
                 continue;
             }
+            let from_pc = self.cpu[core].pc;
             let r = self.cpu[core].step_one(&mut self.soc);
+            // TEMP (2026-10-05, udp-leg forensics — DELETE after): NULL
+            // tripwire (first jump-to-0 per core-pair run wins).
+            if self.cpu[core].pc == 0 && self.nulljump_from == 0 {
+                self.nulljump_from = from_pc;
+            }
+            // TEMP (2026-10-05, udp-leg forensics — DELETE after): take
+            // any alias-watch hit NOW (post-op pc names the store ±len).
+            if let Some((wa, wv, _ws)) = self.soc.watch_hit.take() {
+                // reg(0): memset's a0 = its caller-ra (leaf preserves
+                // it) — names the allocator path (calloc? manual?).
+                let j = self.watch_op_idx % 16;
+                self.watch_op[j] = (self.cpu[core].pc, wa, wv, self.cpu[core].reg(0));
+                self.watch_op_idx += 1;
+                // Table-range latch (see decl).
+                if (0x3FC9_6060..0x3FC9_60E0).contains(&wa) {
+                    if self.watch_tbl_n == 0 {
+                        self.watch_tbl_first = (self.cpu[core].pc, wa);
+                    }
+                    self.watch_tbl_n += 1;
+                }
+                if wa < self.watch_amin {
+                    self.watch_amin = wa;
+                }
+                if wa > self.watch_amax {
+                    self.watch_amax = wa;
+                }
+            }
             // TEMP (2026-10-03): wild-jump tripwire for the canned-22B
             // NULL-call forensics (DELETE after). Fires when an op lands
             // pc on the known garbage target, printing the CALLER pc +
@@ -967,7 +1537,16 @@ impl Esp32S3 {
                         break;
                     }
                 }
-                other => return (other, n),
+                other => {
+                    // Closed-blob idle word (see `maybe_park_step`): step
+                    // over it and continue the block; anything else traps
+                    // loud via the early return below.
+                    if self.maybe_park_step(core, &other) {
+                        n += 1;
+                    } else {
+                        return (other, n);
+                    }
+                }
             }
         }
         self.cpu[core].check_interrupts(&mut self.soc);
@@ -1003,23 +1582,38 @@ impl Esp32S3 {
         let cpu = &mut self.cpu[core];
         let saved_pc = cpu.pc;
         let saved_wb = cpu.windowbase();
-        let saved_a0 = cpu.reg(0);
-        let saved_a1 = cpu.reg(1);
-        let saved_a6 = cpu.reg(6);
-        let saved_a7 = cpu.reg(7);
-        let saved_a8 = cpu.reg(8);
-        let saved_a10 = cpu.reg(10);
-        let saved_a11 = cpu.reg(11);
-        let saved_a12 = cpu.reg(12);
-        let saved_a13 = cpu.reg(13);
-        // Synthesize the call8 frame: wb+2 (ENTRY rotates back), return
-        // address SYNTH_RETPC (0x8000_0000, unmapped — never executed, only
-        // compared), args staged. a6/a7 also saved: the wrapper's
+        // Full-isolation synthesis (mirrors run_ble_host_recv, proven
+        // 2026-10-03/04 - the old partial save (10 regs, stale WINDOWSTART,
+        // task stack, live INTENABLE) worked only from lucky core states:
+        // a stale WINDOWSTART makes the first ENTRY overflow into a
+        // firmware vector whose spill clobbers code, a nearly-full task
+        // stack overflows under the nested C++ frames, and a mid-call
+        // interrupt vectors with a host-saved wb. All three fired
+        // live as silent callback drops / wild post-callback jumps.
+        // Restoring everything makes the call invisible by construction.
+        let saved_phys = *cpu.phys_regs();
+        let mut saved_sregs = [0u32; 256];
+        for (k, w) in saved_sregs.iter_mut().enumerate() {
+            *w = cpu.sreg(k as u32);
+        }
+        // Mask interrupts across the synthetic call (same hazard as BLE:
+        // silicon runs these callbacks with the line claimed).
+        let saved_ie = cpu.sreg(xtensa_core::cpu::SR_INTENABLE);
+        cpu.set_sreg(xtensa_core::cpu::SR_INTENABLE, 0);
+        // Synthesize the call8 frame: wb+2, return address SYNTH_RETPC
+        // (0x8000_0000, unmapped - never executed, only compared), args
+        // staged. a6/a7 ride along in the saved phys file (the wrapper's
         // vtable dispatch (`l32i a8,[a6,8]` + `callx8`) runs in the
         // CURRENT window, so a live a6 would route the call through a
-        // garbage vtable (proven live: handler ENTRY saw a3=2/a4=0).
+        // garbage vtable (proven live: handler ENTRY saw a3=2/a4=0) -
+        // here a6/a7 are the firmware's own (untouched, restored below),
+        // which is what the wrapper expects from its real caller.
         let wb = (saved_wb + 2) & 0xf;
         cpu.set_windowbase(wb);
+        // WINDOWSTART isolation: stale liveness from wb+2's perspective
+        // looks nearly-full, so the first ENTRY would overflow into a
+        // firmware vector. Fresh units only; ENTRYs allocate cleanly.
+        cpu.set_sreg(xtensa_core::cpu::SR_WINDOW_START, 1u32 << wb);
         cpu.pc = entry;
         cpu.set_reg(8, SYNTH_RETPC);
         cpu.set_reg(10, a2);
@@ -1033,6 +1627,11 @@ impl Esp32S3 {
         } else {
             cpu.set_reg(12, 0);
         }
+        // Run on the host-owned synthetic stack (see SYNTH_STACK_TOP):
+        // the call's window spills + ENTRY frames must not land on the
+        // interrupted task's stack. The full-phys restore below brings
+        // back the firmware SP, so the swap is invisible.
+        cpu.set_reg(1, SYNTH_STACK_TOP);
         // Run until the callback returns to the host return pc (bounded:
         // the wrapper is a few dozen instructions; a stuck callback
         // restores and reports false rather than hanging the harness).
@@ -1045,17 +1644,11 @@ impl Esp32S3 {
         let ok = (self.cpu[core].pc & 0x3fff_ffff) == (SYNTH_RETPC & 0x3fff_ffff);
         let cpu = &mut self.cpu[core];
         cpu.pc = saved_pc;
-        cpu.set_reg(0, saved_a0);
-        cpu.set_reg(1, saved_a1);
-        cpu.set_reg(6, saved_a6);
-        cpu.set_reg(7, saved_a7);
-        cpu.set_reg(8, saved_a8);
-        cpu.set_reg(10, saved_a10);
-        cpu.set_reg(11, saved_a11);
-        cpu.set_reg(12, saved_a12);
-        cpu.set_reg(13, saved_a13);
-        // Apply the restored wb immediately (no step boundary before the
-        // harness resumes — a stale wb would misname every reg).
+        *cpu.phys_regs_mut() = saved_phys;
+        for (k, w) in saved_sregs.iter().enumerate() {
+            cpu.set_sreg(k as u32, *w);
+        }
+        cpu.set_sreg(xtensa_core::cpu::SR_INTENABLE, saved_ie);
         cpu.set_windowbase(saved_wb);
         ok
     }

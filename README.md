@@ -119,13 +119,14 @@ The page has:
 - **Serial input row** — port selector (USB-CDC/UART0/1/2) + text box + Send;
   Enter sends with trailing newline for `readStringUntil`/REPL readers
 - **40-pin GPIO LED grid** — real-time pin state visualization
-- **Examples dropdown** — 59 bundled firmware sketches (fetches + loads),
+- **Examples dropdown** — 64 bundled firmware sketches (fetches + loads),
   incl. touch (in-browser `TOUCH_INJECT` fixture), Wi-Fi scan/station/SoftAP/ESP-NOW
   (in-wasm `wifi_scan`/`wifi_sta`/`wifi_ap`/`espnow` fixtures) and SDSPI (in-browser
   card attach); flashenc reuses the hello bin with a `key` field
 - **File input** — load your own `.merged.bin`
 - **Run / Stop / Reset** — step-level control
-- **Steps-per-frame slider** — tune emulation speed vs. responsiveness
+- **Steps-per-frame slider** — base batch the worker scales adaptively
+- **Clock / Engine / Transport** — emulated time rate, worker topology, frame transport (see Docs → Speed controls)
 - **MIPS meter** — smoothed emulated instructions per wall second
 
 ## Repository Layout

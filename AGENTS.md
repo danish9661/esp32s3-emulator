@@ -4904,3 +4904,114 @@ full enumeration REQ0..REQ6 — is covered),
     a 100M-step budget window incl. idle loop, not pure boot phase — ratios
     are the honest metric). `verify OK` (hello `boot OK`). Native-only as
     always (profiles don't carry to wasm; browser keeps the default build).
+  - 2026-10-07: **Browser speed phase (all 6 items; user: "complete all")**.
+    (1) **Single worker, always**: `web/emu-worker.js` owns the Emulator +
+    bridge + vdevs + fixtures + adaptive loop; `web/main.js` keeps DOM/
+    gallery/sockets/render only. No emulation on the main thread anymore.
+    (2) **Bigger adaptive batch**: worker AIMDs the effective batch around
+    the 12ms frame budget (0.25x..25x of the slider base, ~250k..1M window);
+    slider max 500k→1M (`index.html`).
+    (3) **Per-frame JS trim**: shared streaming `TextDecoder`, 250ms console
+    paint throttle, `uart_pending()`/`events_pending()` fast-path checks
+    (new `Soc` + bridge APIs — calls skipped, never drains), GPIO mask
+    pushed per frame (no `gpio_output()` wasm call from UI).
+    (4) **Tick decoupling / Turbo**: `Soc::clock_mode` 0/1/2 + `tick_stride`/
+    `tick_cycles` + machine `fast_tick_ctr` (replaces bool parity; mode 0 is
+    the same 1-per-2 rate with a 1-op phase shift — boot-identical: 34721484
+    vs 34721427 insns, same UART). Balanced (default in UI) keeps the exact
+    1-per-2 ratio batched 4-per-8 (fewer call/cache overheads); Turbo runs
+    2x virtual time for fast demo boots (timing approx, documented).
+    Battery/run_flash never set the mode (stay 0).
+    (5) **Wasm flags**: `tools/build_wasm.sh` (bulk-memory RUSTFLAGS +
+    wasm-opt -O3 when binaryen present; absent here — documented).
+    PGO stays native-only.
+    (6) **SAB + dual**: `web/sab-rings.js` zero-copy UART/control rings
+    (auto/postMessage/SAB selector, `tools/serve.py` for COOP/COEP local
+    dev); Engine Single/Dual toggle — Dual offloads vdev dispatch to
+    `web/io-worker.js` over a MessageChannel (1-frame latency, same class
+    as before); cores stay single-owner (true per-core split needs wasm
+    threads + `Soc: Sync` refactor — documented, not attempted).
+    **Real bug found en route (prior TEMP, not speed code)**: the
+    WorkerL3 sticky guards (dummy/table/pxCurrent nonzero→zero blocks in
+    `soc.rs` ram_write8 + write32-fast) were UNGATED and corrupted any
+    other image's heap into an early `xPortEnterCriticalTimeout` assert
+    (proven: pristine-HEAD worktree boots hello 34.72M OK, tree panicked;
+    gating to WorkerL3 restores 34.72M + identical UART; forensics kept).
+    Proofs: workspace suites green, `web_bundle_check` ALL PASS (30-call
+    API-compat incl. worker `emu.*`, in-wasm boot OK 34721484 insns),
+    E2E 31/32 (only pre-existing espnow rot), freshness guard 0 FAILs
+    (now with §3). `web/pkg` rebuilt (gitignored).
+  - 2026-10-07 (speed follow-up): **E2E triage — stale gallery copies, not
+    speed code**. First full E2E landed 30/32, final 31/32 after the gallery
+    resync (only the espnow rot remains): `espnow-inwasm-done` FAIL is the
+    documented pre-existing rot (battery `espnow` PASS / `espnow_inwasm`
+    FAIL identically on clean HEAD — no action); `worker-l3-inwasm-done`
+    crashed (EXCCAUSE 0x22, PC=0) on a STALE Sep-30 gallery copy vs the
+    Oct-5 L3 relink (moved hook pcs), while battery NODE on the sketch bin
+    stayed green. Fix: `tools/sync_gallery.py` re-run (63/63, 0 stale) +
+    fresh L3 passes in-browser on BOTH Accurate and Balanced (Balanced is
+    safe — same-ratio batching holds even the fragile L3 rendezvous).
+    Process gap closed: freshness guard gains §3 (md5 gallery-copy check,
+    resync pointer). BLE gallery copy refreshed too (was stale; its test
+    passed anyway via ROM loopback).
+  - 2026-10-07 (speed completion): **SAB + Dual validated, Balanced measured**.
+    SAB transport (serve.py COOP/COEP, crossOriginIsolated=True): hello boots
+    to `boot OK`, 6.7 MIPS, zero page errors. Dual engine: hello `boot OK` +
+    virtual_demo `VIRTUAL DEMO PASS` (exercises the offloaded I2C/SPI
+    dispatch), 6.8 MIPS, zero errors. Real bug fixed: emu-worker posted
+    `{type:'attach'}` but io-worker listens for `cmd` — dispatch was silently
+    null (prime-cache defaults masked it); aligned to `cmd`.
+    Balanced (default) measured +25–35% vs HEAD-accurate in the nodejs
+    harness window (3 interleaved back-to-back pairs, same box: 5.38/5.44/
+    5.74 vs 7.25/7.08/7.10 MIPS) — batched 4-ticks-per-8 keeps the exact
+    1-per-2 ratio with fewer call/cache overheads. TEMP forensics kept
+    (live resume depends on them); per-core wasm-threads split stays future
+    (needs `Soc: Sync` refactor). espnow remains documented pre-existing rot.
+  - 2026-10-07: **ESP-NOW rot CLOSED (was pre-existing, battery 2/2 + E2E
+    32/32)**. Four stacked causes, each live-proven in order:
+    (1) **Stale EspNow engine layout** (Sep-23 cells vs Oct-4 relink):
+    10 cells re-nm'd (scan_start/connect/event vars/sta_netif/esp_wifi_
+    start/ready/heap/pxcur); the stale scan_start sat inside
+    get_total_scan_time and its bare-pc leg fired spuriously during WiFi
+    start (init never printed). Unblocked init/addpeer/sent in-wasm.
+    (2) **Park-word family**: post-`sent 1` core 0 froze at 0x403773b7
+    (run_flash only knew 0x40377367 — the landed word varies with stepping
+    cadence). New shared `maybe_park_step` helper (raw word 0x00000100 is
+    the discriminator; no real format_32 TIE op is all-zero) wired into
+    BOTH step_fast paths (the word never decodes, so the slow path is
+    where it lands most often); `step`/`step_one` stay loud for probes.
+    (3) **Snapshot starvation**: run_flash drains every macro-step, so a
+    print landing in a slow-path step (no poll) was drained before any
+    block poll saw it. `console_hist` (bounded 512B ring fed by both soc
+    takes, served by `console_snapshot`) makes marker detection
+    drain-cadence-independent for all hosts.
+    (4) **Callback-context fragility**: `run_espnow_callback` ran on the
+    task stack with stale WINDOWSTART + live INTENABLE (worked only from
+    lucky core states — host-timed, not engine-timed). Ported the BLE
+    recipe (full phys+sregs save, INTENABLE mask, WS=1<<wb, synth stack)
+    — battery espnow pair went 1/1 to 2/2 with zero host-path change.
+    Proofs: harness `WIFI ESPNOW HARNESS PASS` (47.5M insns), battery
+    espnow 2/0/0, neighbors (scan/sta/ap/L3 inwasm + L3 plain) 5/0/1
+    (live SKIP stands), workspace green, bundle ALL PASS, E2E 32/32
+    EXIT 0. All TEMP scaffolding removed (bridge dbg x4, machine
+    counters/snapshots, run_flash engine experiment); keepers are the 4
+    fixes above. Cautionary tales: (a) walkvec/objdump disagree on dense
+    Xtensa — trust the runtime decoder + aligned-from-symbol sweeps
+    (b7 turned out mid-instruction, proven by from-pc, not by reading);
+    (b) the edit tool mangles em-dashes in oldString — use ASCII or
+    line-anchored python for those hunks.
+  - 2026-10-07: **Per-core wasm-threads verdict: DEFER (assessed, not
+    attempted)**. Spike: trivial `std::thread::spawn` COMPILES for
+    wasm32-unknown-unknown +atomics on stable 1.97 (toolchain feasible).
+    Sync audit: only Cell sites (soc flash-cache, ble), no RefCell/
+    UnsafeCell/raw-ptrs/locks — Sync provable with small changes. BUT
+    `Bus` is `&mut`-exclusive end to end: sharing one `Soc` needs a
+    global Mutex (serializes everything, gain <= 0) or per-device
+    interior sync across 45 peripheral files (behavior risk in every
+    validated path + the live TEMP forensics interleaved). Granularity
+    kills the rest: barrier per ~6-insn macro-step costs what the step
+    costs (best case ~1.1-1.2x); shared tick_timers + bus + drains
+    serialize regardless. Correct parallelism for this architecture is
+    task-level (shipped Dual: emulation + IO offload, measured, no
+    behavior risk). Revisit post-live (after TEMP deletion + full
+    battery green) with fresh measurements.

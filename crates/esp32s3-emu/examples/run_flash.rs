@@ -646,22 +646,22 @@ fn main() {
     // test-worker-l3 image layout (nm on the test-worker-l3 ELF —
     // re-nm'd after the L3-legs .ino edit (udp/coap/ipv6 builders):
     // scan_start 0x42065b90 (= esp_wifi_scan_start entry),
-    // connect 0x4203e958 (= esp_wifi_connect entry), event vars
+    // connect 0x4203e95c (= esp_wifi_connect entry), event vars
     // WIFI_EVENT 0x3c0b45a8 / IP_EVENT 0x3c0b3ea4; TX/RX tap + hook pcs
     // re-nm'd in machine.rs/soc.rs below. BSS cells shifted +0x18
     // uniformly vs the previous link (ready_lists/top_prio/pxcur/netif/
     // scan_count/scan_result verified by symbol name).
     // records_check is the `call8 esp_wifi_scan_get_ap_records` INSIDE
-    // `_scanDoneEv` (0x42006125 here — objdump-verified on the new ELF).
+    // `_scanDoneEv` (0x42006129 here — objdump-verified on the new ELF).
     const WORKER_L3_LAYOUT: WifiLayout = WifiLayout {
-        scan_start: 0x4206_5f14,
-        connect: 0x4203_e958,
+        scan_start: 0x4206_5f18,
+        connect: 0x4203_e95c,
         wifi_event_var: 0x3c0b_45ec,
         ip_event_var: 0x3c0b_3ee8,
         count_cell: 0x3fc9_f936,
         scan_count: 0x3fc9_af08,
         scan_result: 0x3fc9_af04,
-        records_check: 0x4200_6125,
+        records_check: 0x4200_6129,
         ready_lists: 0x3fc9_b904,
         top_prio: 0x3fc9_b874,
         reg_heaps: 0x3fc9_b7bc,
@@ -758,6 +758,11 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(96_000_000);
+    // TEMP (2026-10-05, udp-leg park forensics — DELETE after): prove the
+    // budget the run actually uses (two deterministic exits at ~886.89M
+    // with STEPS=1.1B suggest the budget break fires early or another
+    // silent break exists; this line + the BUDGET line below name it).
+    println!("[host] budget max_insns={max_insns}");
     let t0 = Instant::now();
     let mut uart_buf: Vec<u8> = Vec::new();
     let mut last_pc = 0u32;
@@ -766,17 +771,139 @@ fn main() {
     let mut idle_steps: usize = 0;
     let mut executed: u64 = 0;
     let mut i: usize = 0; // macro-step counter (diagnostics only)
+    // TEMP (2026-10-05 — DELETE after): last step results for LOOP-EXIT.
+    let mut last_r0 = StepResult::Ok;
+    let mut last_r1 = StepResult::Ok;
+    // TEMP (2026-10-05, udp-leg forensics — DELETE after): trailing
+    // pc ring (last 32 macro-steps, both cores) dumped on any exception
+    // break — names the pre-vector pc for NULL-jump/callx8-through-zero
+    // faults (EPC1=0 tells nothing). Always-on (2 stores/step, negligible).
+    let mut pc_ring = [(0u32, 0u32); 32];
+    let mut pc_ring_i: usize = 0;
+    // TEMP (2026-10-05, udp-leg park forensics — DELETE after): watchdog
+    // for the post-`ip6edrain 3` stall (firmware stops printing after the
+    // echo drains; first udp TX reaches the tap but the 6-pop scan never
+    // runs). Arms when `ip6edrain 3` appears; if UART stays quiet for 5M
+    // macro-steps afterwards, dumps both cores once and keeps running.
+    let mut watch_quiet: usize = 0;
+    let mut last_watch_len: usize = 0;
+    let mut watch_dumped = false;
+    // TEMP (2026-10-05, udp-leg park forensics — DELETE after): liveness
+    // heartbeat (the deterministic ~886.89M exit prints NO break reason —
+    // every main-loop break prints except budget/espnow-DONE, neither of
+    // which fires — so prove the loop is alive until the end) + post-skip
+    // trajectory (where execution goes in the ~10k insns after DSP-SKIP).
+    let mut skip_trace: u32 = 0;
+    // TEMP (2026-10-05, udp-leg forensics — DELETE after): wait-skip
+    // transition log (first 6 changes of each arm counter).
+    let mut last_wsf: u32 = 0;
+    let mut last_wss: u32 = 0;
+
 
     loop {
         if executed >= max_insns as u64 {
+            // TEMP (2026-10-05 — DELETE after): the budget break was
+            // silent, hiding whether deterministic ~886.89M exits are
+            // budget-driven. Name it.
+            println!("[host] BUDGET break at executed={executed} max_insns={max_insns}");
             break;
         }
         // WiFi STA insider hooks live in `run_fast_core` (machine.rs —
         // per-op sampling inside the block loop; pre/post-step sampling
         // here would miss mid-block entry pcs).
         let (r, r1, n) = m.step_fast();
+        last_r0 = r;
+        last_r1 = r1;
         executed += n as u64;
         i += 1;
+        // TEMP (2026-10-05 — DELETE after): trailing ring (see decl).
+        pc_ring[pc_ring_i % 32] = (m.cpu[0].pc, m.cpu[1].pc);
+        pc_ring_i += 1;
+        // TEMP (2026-10-07 — DELETE after): storm-loop trace (first
+        // NULLSKIP fire + next 300 macro-steps, both pcs). Maps the
+        // take→vector→prologue→dispatch→skip→rfi loop to find what
+        // state the epilogue reads (stale line?).
+        // (first_fire_i latched below via nullskip counter edge.)
+        {
+            static mut STORM_LOGGED: bool = false;
+            // (Single-shot per run not needed — gate on counter edge via
+            // a local latch.)
+            if m.nullskip_fires >= 1 {
+                // Use watch_dumped latch repurposed? No — dedicated static:
+                // print first 300 steps after first fire, then mute by
+                // counting printed lines.
+                static mut STORM_N: u32 = 0;
+                unsafe {
+                    if STORM_N < 300 {
+                        println!(
+                            "[host] STORMLOOP i={i} pc0={:#010x} pc1={:#010x}",
+                            m.cpu[0].pc,
+                            m.cpu[1].pc
+                        );
+                        STORM_N += 1;
+                    }
+                }
+            }
+        }
+        // TEMP (2026-10-05 — DELETE after): heartbeat + post-skip trace.
+        if i.is_multiple_of(10_000_000) {
+            println!(
+                "[host] HB i={i} executed={executed} pc0={:#010x} pc1={:#010x}",
+                m.cpu[0].pc,
+                m.cpu[1].pc
+            );
+        }
+        // TEMP (2026-10-06 — DELETE after): periodic sources sampling
+        // (storm-source hunt: a level-triggered unhandled source stays
+        // asserted constantly, so it shows in EVERY late sample while
+        // transient sources come and go).
+        if i.is_multiple_of(10_000_000) {
+            let (slo, shi, lines) = m.soc.int_debug(0);
+            if slo != 0 || shi != 0 {
+                println!(
+                    "[host] IRQSAMP i={i} lo={:#018x} hi={:#018x} lines={:#010x}",
+                    slo, shi, lines
+                );
+            }
+        }
+        if i > 98_000_000
+            && last_wsf == 0
+            && (m.wait_skip_f != last_wsf || m.wait_skip_s != last_wss)
+        {
+            println!(
+                "[host] WAITSKEEP i={i} f={} s={} last_ra={:#010x}",
+                m.wait_skip_f,
+                m.wait_skip_s,
+                m.wait_last_ra
+            );
+            last_wsf = m.wait_skip_f;
+            last_wss = m.wait_skip_s;
+        }
+        // TEMP (2026-10-05 — DELETE after): end-trajectory trace (the
+        // deterministic crash lands at i≈98367376 with pc=0x40379990 never
+        // sampled by either wait-skip arm — print both pcs over the final
+        // ~80 macro-steps to see the true approach).
+        if (98_367_300..=98_367_390).contains(&i) {
+            println!(
+                "[host] TRACEND i={i} pc0={:#010x} pc1={:#010x} f={} s={}",
+                m.cpu[0].pc,
+                m.cpu[1].pc,
+                m.wait_skip_f,
+                m.wait_skip_s
+            );
+        }
+        if skip_trace > 0 {
+            skip_trace -= 1;
+            println!(
+                "[host] SKIPTRACE i={i} pc0={:#010x} pc1={:#010x}",
+                m.cpu[0].pc,
+                m.cpu[1].pc
+            );
+        }
+        // TEMP (2026-10-05, udp-leg forensics — DELETE after): the
+        // per-op ring (machine.rs) supersedes live polling; hits are
+        // dumped at end. Drain any untaken hit so the field never sticks.
+        let _ = m.soc.watch_hit.take();
         // TEMP (2026-10-04, RF forensics — DELETE after): park-loop tracer
         // for the WorkerL3 management-TX stall (core0 parks at 0x42074b4f
         // `ppTxFragmentProc+0x13f` with entry/caller/queue-processor hooks
@@ -859,6 +986,12 @@ fn main() {
                 if env::var("PANIC_CONTINUE").is_ok() {
                     continue;
                 }
+                // TEMP (2026-10-05 — DELETE after): trailing trajectory
+                // (see decl above).
+                for k in 0..32 {
+                    let e = pc_ring[(pc_ring_i + k) % 32];
+                    println!("[host] PRETRACE pc0={:#010x} pc1={:#010x}", e.0, e.1);
+                }
                 let epc = m.cpu[0].sreg(SR_EPC1);
                 println!(
                     "\n>> ILLEGAL at step {i}, pc {:#010x}, EPC1 {:#010x}, wb {}, b0={:#04x}",
@@ -867,6 +1000,50 @@ fn main() {
                     m.cpu[0].windowbase(),
                     m.soc.read8(epc)
                 );
+                // TEMP (2026-10-05, udp-leg forensics — DELETE after):
+                // firing lines at crash (INTSET & INTENABLE live) for the
+                // NULL-dispatch hunt.
+                println!(
+                    "[host] IRQSTATE intset={:#010x} intena={:#010x} intr={:#010x}",
+                    m.cpu[0].sreg(xtensa_core::cpu::SR_INTSET),
+                    m.cpu[0].sreg(xtensa_core::cpu::SR_INTENABLE),
+                    m.cpu[0].sreg(xtensa_core::cpu::SR_INTERRUPT),
+                );
+                // TEMP (2026-10-05 — DELETE after): peripheral sources
+                // bitmap + mapped lines (names the firing source).
+                {
+                    let (slo, shi, lines) = m.soc.int_debug(0);
+                    println!(
+                        "[host] IRQSRC lo={:#018x} hi={:#018x} lines={:#010x}",
+                        slo, shi, lines
+                    );
+                }
+                // TEMP (2026-10-05, udp-leg forensics — DELETE after): dump
+                // the suspect DRAM span (heap-block headers? TCB/stack
+                // 0xa5? blob struct?) to name the zeroed object class.
+                {
+                    let mut span = [0u8; 64];
+                    for (k, b) in span.iter_mut().enumerate() {
+                        *b = m.soc.read8(0x3FC8_98C0 + k as u32) as u8;
+                    }
+                    println!("[host] SPANDUMP bytes={span:02x?}");
+                    let mut hdr = [0u8; 32];
+                    for (k, b) in hdr.iter_mut().enumerate() {
+                        *b = m.soc.read8(0x3FC8_9940 + k as u32) as u8;
+                    }
+                    println!("[host] HDRDUMP bytes={hdr:02x?}");
+                }
+                // TEMP (2026-10-06 — DELETE after): handler table at crash
+                // (32B at _xt_interrupt_table — which slots read 0?
+                // distinguishes zeroed-registered (memset span reaches
+                // HIGH) vs never-registered (spurious line)).
+                {
+                    let mut t = [0u8; 32];
+                    for (k, b) in t.iter_mut().enumerate() {
+                        *b = m.soc.read8(0x3FC9_6060 + k as u32) as u8;
+                    }
+                    println!("[host] TBLCRASH bytes={t:02x?}");
+                }
                 // TEMP (2026-10-04, RF forensics — DELETE after): dump the
                 // g_phyFuns dispatch table around the heap-overlap window
                 // (tbl+0x200..0x27f) on worker-L3 ILLEGALs. Long gateway
@@ -1033,6 +1210,8 @@ fn main() {
             // TEMP (2026-10-03, forensics — DELETE after): dump panic message
             // when dying inside panic_abort (EPC1 in its range). a2 at wb
             // often holds the abort-message pointer; dump 128B as C string.
+            // (IRQSTATE for the NULL-dispatch hunt lives in the ">> ILLEGAL"
+            // arm above, which is the path that fires here.)
             if (0x4037_fdb4..0x4037_fde0).contains(&epc) {
                 let a2 = m.cpu[0].reg(2);
                 let mut msg = Vec::new();
@@ -1077,6 +1256,37 @@ fn main() {
                 m.cpu[1].pc,
                 m.cpu[1].sreg(SR_EPC1),
             );
+            // TEMP (2026-10-07 — DELETE after): trailing trajectory
+            // for core1 (mirrors the core0 PRETRACE; core1 dies via a
+            // different NULL site the 0x4037799d skip doesn't cover).
+            for k in 0..32 {
+                let e = pc_ring[(pc_ring_i + k) % 32];
+                println!("[host] PRETRACE1 pc0={:#010x} pc1={:#010x}", e.0, e.1);
+            }
+            // TEMP (2026-10-05, udp-leg forensics — DELETE after): dump
+            // the faulting word ±16B (a valid `entry` at EPC1 per objdump
+            // that fails decode in-emulator proves smashed IRAM — the
+            // deterministic core1 ILLEGAL at `esp_cpu_wait_for_intr`).
+            {
+                let epc = m.cpu[1].sreg(SR_EPC1);
+                let mut bytes = [0u8; 36];
+                for (k, b) in bytes.iter_mut().enumerate() {
+                    *b = m.soc.read8(epc.wrapping_add(k as u32).wrapping_sub(16)) as u8;
+                }
+                println!("[host] FAULTDUMP epc={epc:#010x} bytes={bytes:02x?}");
+            }
+            // TEMP (2026-10-07 — DELETE after): identify core1's current
+            // task (pxCurrentTCBs[1] at 0x3fc9baf8+4; dump 24 words:
+            // top-of-stack, lists, priority, pxStack, name at +52).
+            // Names the task that NULL-jumped (new task on dummy alias?).
+            {
+                let tcb = m.soc.read32(0x3FC9_BAF8 + 4);
+                let mut tw = [0u32; 24];
+                for (k, v) in tw.iter_mut().enumerate() {
+                    *v = m.soc.read32(tcb.wrapping_add((k as u32) * 4));
+                }
+                println!("[host] TCB1 tcb={tcb:#010x} {tw:08x?}");
+            }
             break;
         }
         // Unimplemented instructions (ee.* DSP/TIE unmapped patterns: no
@@ -1137,6 +1347,10 @@ fn main() {
                     let len = insn_len(b0) as u32;
                     m.cpu[0].pc = pc.wrapping_add(len);
                     println!("[host] DSP-SKIP pc={pc:#010x} len={len}");
+                    // TEMP (2026-10-05 — DELETE after): trace where
+                    // execution goes after the skip (the run ends ~10k
+                    // insns later with no break print — see HB above).
+                    skip_trace = 6;
                 } else {
                     m.cpu[0].step_one(&mut m.soc);
                 }
@@ -3254,7 +3468,8 @@ fn main() {
         //   `onReceive` → `got_rx = true`, `rx_byte0 = 0xA5`.
         // Level, not edge: each leg runs once (latched). The sketch's
         // own `delay(50)` poll loop observes the flags and prints.
-        if wifi_espnow_loopback && (!wifi_espnow_tx_done || !wifi_espnow_rx_done) {
+        // TEMP (2026-10-07, espnow-engine experiment — DELETE after):
+if wifi_espnow_loopback && (!wifi_espnow_tx_done || !wifi_espnow_rx_done) {
             // Closed cb cells live in closed .bss (espnow image, nm-proof
             // is impossible — discovered live: RX @0x3fc9dd28, TX
             // @0x3fc9dd2c hold the Arduino wrapper entries once
@@ -3337,6 +3552,35 @@ fn main() {
         // per-op sampling inside the block loop; pre/post-step sampling
         // here would miss mid-block entry pcs).
         let uart_len = uart_buf.len();
+        // TEMP (2026-10-05, udp-leg park forensics — DELETE after): see
+        // declaration above. Dumps both cores once after 5M quiet
+        // macro-steps past `ip6edrain 3`, then keeps running.
+        if !watch_dumped
+            && uart_buf.windows(11).any(|w| w == b"ip6edrain 3")
+        {
+            if uart_len == last_watch_len {
+                watch_quiet += 1;
+            } else {
+                watch_quiet = 0;
+                last_watch_len = uart_len;
+            }
+            if watch_quiet == 1_000_000 {
+                watch_dumped = true;
+                for c in 0..2 {
+                    println!(
+                        "[host] WATCHDOG core{c} pc={:#010x} a0={:#010x} a1={:#010x} a2={:#010x} a3={:#010x} sp={:#010x} wb={} epc1={:#010x} (executed={executed} i={i})",
+                        m.cpu[c].pc,
+                        m.cpu[c].reg(0),
+                        m.cpu[c].reg(1),
+                        m.cpu[c].reg(2),
+                        m.cpu[c].reg(3),
+                        m.cpu[c].reg(1),
+                        m.cpu[c].windowbase(),
+                        m.cpu[c].sreg(xtensa_core::cpu::SR_EPC1),
+                    );
+                }
+            }
+        }
         if pc == last_pc && uart_len == last_uart_len {
             idle_steps += 1;
             stuck += 1;
@@ -3393,6 +3637,11 @@ fn main() {
         last_pc = pc;
         last_uart_len = uart_buf.len();
     }
+    // TEMP (2026-10-05 — DELETE after): unconditional loop-exit marker
+    // on STDERR (unbuffered — settles whether silent exits are lost
+    // stdout buffering or a truly bannerless break). Carries the last
+    // step results that must have triggered it.
+    eprintln!("[host] LOOP-EXIT i={i} executed={executed} r0={last_r0:?} r1={last_r1:?}");
 
     // --- Final drain: grab any remaining UART/USB-Serial TX bytes ---
     {
@@ -3432,6 +3681,267 @@ fn main() {
     if usb_host_enum {
         let got = m.soc.usb_host_take_in();
         println!("== usb IN capture ({}): {got:02x?}", got.len());
+    }
+
+    // TEMP (2026-10-05, udp-leg forensics — DELETE after): tap history
+    // (last-8 TX ret targets + last-8 RX buf/cap — names a wild ret jump
+    // or wild RX write behind the deterministic core1 ILLEGAL).
+    {
+        for k in 0..8 {
+            let e = m.tx_tap_ring[(m.tx_tap_idx + k) % 8];
+            if e.0 != 0 {
+                println!(
+                    "[host] TXTAP pc={:#010x} ra={:#010x} ret={:#010x} len={}",
+                    e.0, e.1, e.2, e.3
+                );
+            }
+        }
+        for k in 0..8 {
+            let e = m.rx_tap_ring[(m.rx_tap_idx + k) % 8];
+            if e.0 != 0 {
+                println!(
+                    "[host] RXTAP pc={:#010x} buf={:#010x} cap={} framelen={}",
+                    e.0, e.1, e.2, e.3
+                );
+            }
+        }
+    }
+
+    // TEMP (2026-10-05, udp-leg forensics — DELETE after): IRAM content
+    // probe (DUMP_IRAM=1): prints the 16B at `esp_cpu_wait_for_intr`
+    // (0x40379990) at end of run. Verifies the stub loader copied seg2
+    // (expect `36 41 00 70 00 1d f0 ...` per the image file) vs zeros.
+    if env::var("DUMP_IRAM").is_ok() {
+        let mut bytes = [0u8; 16];
+        for (k, b) in bytes.iter_mut().enumerate() {
+            *b = m.soc.read8(0x4037_9990 + k as u32) as u8;
+        }
+        println!("[host] IRAMDUMP bytes={bytes:02x?}");
+    }
+    // TEMP (2026-10-05, heap forensics — DELETE after): flash-window
+    // probe (DUMPFLASH=1): prints 32B at the soc_memory_regions table
+    // (0x3c0b0e9c) as the EMULATOR reads them through the cache/MMU
+    // path. Must match the image file (`region1 start=0x3fc88000 ...`);
+    // a mismatch proves a flash-read-path glitch feeding heap_caps_init
+    // garbage (the 2 garbage HEAPREG fires) → garbage heap regions →
+    // heap serves the reserved alias → the 886M alias kill.
+    if env::var("DUMPFLASH").is_ok() {
+        let mut bytes = [0u8; 32];
+        for (k, b) in bytes.iter_mut().enumerate() {
+            *b = m.soc.read8(0x3C0B_0E9C + k as u32) as u8;
+        }
+        println!("[host] FLASHDUMP bytes={bytes:02x?}");
+    }
+
+    // TEMP (2026-10-05, udp-leg forensics — DELETE after): idle-hook
+    // registrations (names the callback behind the idle-path zeroing).
+    {
+        for k in 0..8 {
+            let e = m.idle_hook_regs[(m.idle_hook_idx + k) % 8];
+            if e.0 != 0 {
+                println!("[host] IDLEREG cb={:#010x} cpu={}", e.0, e.1);
+            }
+        }
+    }
+    // TEMP (2026-10-05, udp-leg forensics — DELETE after): IRQ
+    // registrations + firing lines at crash (NULL-dispatch hunt).
+    {
+        println!("[host] IRQN total={}", m.irq_idx);
+        for k in 0..16 {
+            let e = m.irq_regs[(m.irq_idx + k) % 16];
+            if e.1 != 0 {
+                println!("[host] IRQREG line={} handler={:#010x}", e.0, e.1);
+            }
+        }
+    }
+    // TEMP (2026-10-06 — DELETE after): non-default matrix routes
+    // (which source sits on unregistered lines 20/21/24?).
+    {
+        let (routes, n) = m.soc.int_routes(0);
+        for k in 0..n.min(32) {
+            println!(
+                "[host] ROUTE src={} line={}",
+                routes[k] >> 32,
+                routes[k] & 0xFFFF
+            );
+        }
+    }
+    // TEMP (2026-10-05, udp-leg forensics — DELETE after): heap regions
+    // (decisive for heap-vs-wild: dummy window covered or not).
+    {
+        println!("[host] HEAPN total={}", m.heap_idx);
+        for k in 0..8 {
+            let e = m.heap_regs[(m.heap_idx + k) % 8];
+            if e.0 != 0 || e.2 != 0 {
+                println!(
+                    "[host] HEAPREG [{:#010x}, {:#010x}) ra={:#010x} pc={:#010x}",
+                    e.0, e.1, e.2, e.3
+                );
+            }
+        }
+    }
+
+    // TEMP (2026-10-05, udp-leg forensics — DELETE after): per-op
+    // store-pc ring (post-op pc = store ± len; last-16, late writer last).
+    {
+        for k in 0..16 {
+            let e = m.watch_op[(m.watch_op_idx + k) % 16];
+            if e.1 != 0 {
+                println!(
+                    "[host] WATCHOP postpc={:#010x} addr={:#010x} val={:#010x} a0={:#010x}",
+                    e.0, e.1, e.2, e.3
+                );
+            }
+        }
+    }
+
+    // TEMP (2026-10-05, udp-leg forensics — DELETE after): ppTx
+    // memset-skip fire count + ROM memset-to-dummy calls (dst, len,
+    // caller-ra; ring stays empty now that the call is skipped).
+    {
+        println!(
+            "[host] MEMSETSKIP fires={} NULLSKIP fires={} lastpc={:#010x} entry_line={}",
+            m.memset_idx, m.nullskip_fires, m.nullskip_pc, m.entry_line
+        );
+        println!(
+            "[host] NULLSRC lo={:#018x} hi={:#018x} inten={:#010x} intset={:#010x} intr={:#010x}",
+            m.nullskip_src.0,
+            m.nullskip_src.1,
+            m.nullskip_src.2,
+            m.nullskip_src.3,
+            m.nullskip_src.4
+        );
+        println!(
+            "[host] NULLFIRST inten={:#010x} intset={:#010x} intr={:#010x} line={} masked={}",
+            m.nullskip_first.0,
+            m.nullskip_first.1,
+            m.nullskip_first.2,
+            m.nullskip_first.3,
+            m.nullskip_first.4
+        );
+        for k in 0..4 {
+            let e = m.memset_hits[(m.memset_idx + k) % 4];
+            if e.0 != 0 {
+                println!(
+                    "[host] MEMSET dst={:#010x} len={} ra={:#010x} ret={:#010x}",
+                    e.0,
+                    e.1,
+                    e.2,
+                    0x4000_0000 | (e.2 & 0x3fff_ffff)
+                );
+            }
+        }
+    }
+
+    // TEMP (2026-10-05 — DELETE after): resolve the ROM memset slot
+    // (0x400011e8 content) to hardcode the memset-entry hook pc.
+    println!("[host] MEMSETSLOT {:#010x}", m.soc.read32(0x4000_11e8));
+    // TEMP (2026-10-05 — DELETE after): dump ROM around the memset loop
+    // (WATCHOP postpcs cycle 0x40056fce/d5/dc/e4) to locate its `entry`
+    // for the caller hook.
+    {
+        let mut line = [0u8; 208];
+        for (k, b) in line.iter_mut().enumerate() {
+            *b = m.soc.read8(0x4005_6F00 + k as u32) as u8;
+        }
+        println!("[host] ROMDUMP {}", line.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(""));
+    }
+
+    // TEMP (2026-10-05, udp-leg forensics — DELETE after): NULL-jump
+    // site + memset span.
+    println!(
+        "[host] NULLJUMP from={:#010x} watch_span=[{:#010x}, {:#010x}]",
+        m.nulljump_from,
+        m.watch_amin,
+        m.watch_amax
+    );
+        // TEMP (2026-10-06 — DELETE after): first table-range hit.
+        println!(
+            "[host] TBLHIT first=({:#010x}, {:#010x}) n={}",
+            m.watch_tbl_first.0, m.watch_tbl_first.1, m.watch_tbl_n
+        );
+        // TEMP (2026-10-06 — DELETE after): handler table dump
+        // (DUMPTBL=1): 32 words at _xt_interrupt_table (0x3FC96060) to
+        // map lines to handlers (entry size? line of the NULL slot?).
+        // TEMP wider dump (second table hunt).
+        if true {
+            for k in 0..8u32 {
+                let b = 0x3FC9_60E0 + k * 16;
+                println!(
+                    "[host] TBL2 {:#010x}: {:#010x} {:#010x} {:#010x} {:#010x}",
+                    b,
+                    m.soc.read32(b),
+                    m.soc.read32(b + 4),
+                    m.soc.read32(b + 8),
+                    m.soc.read32(b + 12)
+                );
+            }
+        }
+        if env::var("DUMPTBL").is_ok() {
+            for k in 0..8u32 {
+                let b = 0x3FC9_6060 + k * 16;
+                println!(
+                    "[host] TBL {:#010x}: {:#010x} {:#010x} {:#010x} {:#010x}",
+                    b,
+                    m.soc.read32(b),
+                    m.soc.read32(b + 4),
+                    m.soc.read32(b + 8),
+                    m.soc.read32(b + 12)
+                );
+            }
+        }
+        // TEMP (2026-10-06 — DELETE after): NULL-fire sites.
+        for k in 0..4 {
+            let e = m.nullskip_sites[k];
+            if e.0 != 0 {
+                println!(
+                    "[host] NULLSITE pc={:#010x} sreg=a{} regval={:#010x} ra={:#010x}",
+                    e.0, e.1, e.2, e.3
+                );
+            }
+        }
+        // TEMP (2026-10-06 — DELETE after): first-fire regs.
+        println!("[host] NULLREGS {:08x?}", m.nullskip_regs);
+
+    // TEMP (2026-10-06 — DELETE after): lowint1 path trace.
+    {
+        let mut any = false;
+        for k in 0..40 {
+            if m.lowint_trace[k] != 0 {
+                if !any {
+                    println!("[host] LOWINT path:");
+                    any = true;
+                }
+                println!("[host] LOWINT +{} pc={:#010x}", k, m.lowint_trace[k]);
+            }
+        }
+    }
+    // TEMP (2026-10-06 — DELETE after): interrupt-take ring (storm
+    // line hunt: last takes before end).
+    {
+        for k in 0..8 {
+            let e = m.cpu[0].take_ring[(m.cpu[0].take_idx + k) % 8];
+            if e.0 != 0 || e.1 != 0 {
+                println!("[host] TAKE0 line={} level={}", e.0, e.1);
+            }
+        }
+        for k in 0..8 {
+            let e = m.cpu[1].take_ring[(m.cpu[1].take_idx + k) % 8];
+            if e.0 != 0 || e.1 != 0 {
+                println!("[host] TAKE1 line={} level={}", e.0, e.1);
+            }
+        }
+    }
+
+    // TEMP (2026-10-07 — DELETE after): pxCurrentTCBs snapshot
+    // (PXCURGATE=1): was core1's current TCB ever nonzero? Distinguishes
+    // late-zeroing (guarded ranges should block!) from never-set boot gap.
+    if env::var("PXCURGATE").is_ok() {
+        println!(
+            "[host] PXCUR tcb0={:#010x} tcb1={:#010x}",
+            m.soc.read32(0x3FC9_BAF8),
+            m.soc.read32(0x3FC9_BAF8 + 4)
+        );
     }
 
     // --- Final report (MIPS = executed instructions/sec) ---

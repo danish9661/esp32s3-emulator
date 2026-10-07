@@ -12,6 +12,7 @@
 //! space during boot).
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::Cell;
@@ -652,11 +653,33 @@ pub struct Soc {
     /// Whether `cached_rb` is current (same invalidation as `src_valid`).
     rb_valid: bool,
 
+    /// Emulated-clock mode for the web UI speed control (browser only;
+    /// native battery/run_flash keep the default 0):
+    /// 0 = accurate (1 timer tick per 2 ops, current behavior),
+    /// 1 = balanced (same 1-per-2 ratio, but batched as 4 ticks per 8 ops —
+    /// same cycle count, fewer call/cache-invalidation overheads),
+    /// 2 = turbo (2x virtual time rate: 8 ticks per 8 ops — `delay()` and
+    /// timer waits complete in fewer host instructions, at the cost of
+    /// timer/waveform timing accuracy; demo-boot use only).
+    clock_mode: u8,
+
     /// Host-observable event queue (GPIO/SPI/I2C), drained once per frame by
     /// the wasm bridge and dispatched to virtual-peripheral JS objects.
     events: Vec<EmuEvent>,
     /// Last GPIO output mask reported via `drain_events` (for edge detection).
     last_gpio_out: u32,
+    /// Recently-drained console bytes (bounded 512B ring):
+    /// every `take_uart_tx`/`take_usb_serial_tx` drain appends here, and
+    /// `console_snapshot` serves history + live FIFOs. Marker legs only
+    /// need to SEE a marker once (all verdicts latch), but aggressive hosts
+    /// (run_flash drains every macro-step) can remove a print from the live
+    /// FIFOs before any block-step poll snapshots it — proven 2026-10-07:
+    /// ESP-NOW `sent 1` printed in a slow-path step (no poll there) and
+    /// drained before the next block poll, so the engine never latched while
+    /// the host stream had it all along. History makes the snapshot
+    /// drain-cadence-independent (node harness drains every 500k insns and
+    /// always saw it — same bytes, different luck).
+    console_hist: VecDeque<u8>,
     /// Most recent SPI MOSI byte stream per channel, retrieved by the host
     /// when it sees an `EVT_SPI_XFER` event.
     pending_spi_tx: [Vec<u8>; 2],
@@ -744,6 +767,13 @@ pub struct Soc {
     ble_trace: [(u32, u32, u32, u32); 16],
     /// TEMP (2026-10-03): trace ring cursor (DELETE after).
     ble_trace_idx: usize,
+    /// TEMP (2026-10-05, udp-leg forensics — DELETE after): IRAM
+    /// write-watch for the zeroed `esp_cpu_wait_for_intr` region.
+    /// The DIRAM alias is silicon-true (data = inst - 0x6F0000), so both
+    /// views are watched: IRAM 0x40379960+96B and DRAM 0x3FC89960+96B.
+    /// Set on any RAM write into either range as (addr, val, size);
+    /// run_flash polls+takes it each macro-step to print the writer pcs.
+    pub watch_hit: Option<(u32, u32, u32)>,
 
     /// Block-boundary cache for block-at-a-time execution (machine
     /// `step_fast`): per core, `fast_tag[c][i]` is the block-start pc
@@ -863,8 +893,10 @@ impl Soc {
             src_valid: false,
             cached_rb: 0,
             rb_valid: false,
+            clock_mode: 0,
             events: Vec::new(),
             last_gpio_out: 0,
+            console_hist: VecDeque::new(),
             pending_spi_tx: [Vec::new(), Vec::new()],
             pending_net_tx: Vec::new(),
             net_sink_present: false,
@@ -883,6 +915,8 @@ impl Soc {
             ble_trace_evt: false,
             ble_trace: [(0, 0, 0, 0); 16],
             ble_trace_idx: 0,
+            // TEMP (2026-10-05, udp-leg forensics — DELETE after).
+            watch_hit: None,
             fast_tag: [
                 Box::new([FAST_TAG_INVALID; FAST_CACHE_SIZE]),
                 Box::new([FAST_TAG_INVALID; FAST_CACHE_SIZE]),
@@ -928,6 +962,35 @@ impl Soc {
     /// image.
     pub fn flash_image(&self) -> &[u8] {
         &self.flash[..]
+    }
+
+    /// TEMP (2026-10-05, udp-leg forensics — DELETE after): sources
+    /// bitmap + mapped lines at crash (NULL-dispatch hunt: which
+    /// peripheral source fires on a line with no handler). Returns
+    /// (sources lo64, sources hi64, lines). Fresh scan (ignores the
+    /// per-step cache so post-mortem reads are current).
+    pub fn int_debug(&mut self, cpu: usize) -> (u64, u64, u32) {
+        let src = self.scan_peripheral_sources();
+        let lines = self.intc.pending_lines(cpu, src);
+        (src as u64, (src >> 64) as u64, lines)
+    }
+
+    /// TEMP (2026-10-06 — DELETE after): non-default matrix routes as
+    /// packed (source, line) pairs for the NULL-dispatch hunt (which
+    /// source sits on unregistered lines 20/21/24?). Format: up to 8
+    /// pairs packed as u64s [(src<<32|line)], plus count. Only routes
+    /// with line != 6 (the default) are listed.
+    pub fn int_routes(&self, cpu: usize) -> ([u64; 32], usize) {
+        let mut out = [0u64; 32];
+        let mut n = 0usize;
+        for src in 0..96u32 {
+            let l = self.intc.map_entry(cpu, src as usize);
+            if l != 6 && n < 32 {
+                out[n] = ((src as u64) << 32) | (l as u64);
+                n += 1;
+            }
+        }
+        (out, n)
     }
 
     /// Owned plaintext view of the whole flash image (block-decrypted when
@@ -1139,7 +1202,19 @@ impl Soc {
     }
 
     pub fn take_uart_tx(&mut self, n: usize) -> Vec<u8> {
-        self.uarts[n].take_tx()
+        let out = self.uarts[n].take_tx();
+        self.console_note_drained(&out);
+        out
+    }
+
+    /// Remember drained console bytes for  (bounded:
+    /// keeps the newest 512 — marker search needs ~20B windows; bursts of
+    /// early-boot doubling fit with margin).
+    fn console_note_drained(&mut self, bytes: &[u8]) {
+        self.console_hist.extend(bytes.iter());
+        while self.console_hist.len() > 512 {
+            self.console_hist.pop_front();
+        }
     }
 
     /// True when UART `n` has undrained console bytes. Cheap field read for
@@ -1153,6 +1228,57 @@ impl Soc {
     #[inline]
     pub fn usb_tx_pending(&self) -> bool {
         self.usb.tx_len() != 0
+    }
+
+    /// Total undrained console bytes (UART0/1/2 + USB-CDC). Cheap field reads
+    /// for the web worker fast path: skip the `take_uart_tx` Vec handoff when
+    /// zero (the common case — the old per-step paired drain is required for
+    /// correctness, but the *call* is skipped, not the drain).
+    #[inline]
+    pub fn uart_pending_total(&self) -> usize {
+        self.uarts[0].tx_len() + self.uarts[1].tx_len() + self.uarts[2].tx_len() + self.usb.tx_len()
+    }
+
+    /// Queued host-observable events + a pending GPIO edge. Cheap check for
+    /// the web worker fast path: skip the `drain_events` Vec handoff (which
+    /// also runs the GPIO edge diff) when zero.
+    #[inline]
+    pub fn events_pending(&self) -> usize {
+        let gpio_edge = (self.gpio_output() != self.last_gpio_out) as usize;
+        self.events.len() + gpio_edge
+    }
+
+    /// Set the emulated-clock mode (web UI speed control; see `clock_mode`
+    /// field). Values >2 clamp to turbo. Battery/run_flash never call this,
+    /// so validated timing stays on mode 0.
+    pub fn set_clock_mode(&mut self, mode: u8) {
+        self.clock_mode = mode.min(2);
+    }
+
+    /// Current clock mode (0/1/2, see `clock_mode` field).
+    #[inline]
+    pub fn clock_mode(&self) -> u8 {
+        self.clock_mode
+    }
+
+    /// Ops between timer-tick batches for the current clock mode (2/8/8).
+    #[inline]
+    pub fn tick_stride(&self) -> u8 {
+        match self.clock_mode {
+            0 => 2,
+            _ => 8,
+        }
+    }
+
+    /// Timer cycles per tick batch for the current clock mode. Balanced keeps
+    /// the exact 1-per-2 ratio (4 per 8 ops); turbo doubles virtual time.
+    #[inline]
+    pub fn tick_cycles(&self) -> u64 {
+        match self.clock_mode {
+            0 => 1,
+            1 => 4,
+            _ => 8,
+        }
     }
 
     /// Block-cache index for a pc (both cores share the function, never the
@@ -1309,7 +1435,9 @@ impl Soc {
     /// Bytes written to the USB-Serial-JTAG TX FIFO (ROM console) since the
     /// last call.
     pub fn take_usb_serial_tx(&mut self) -> Vec<u8> {
-        self.usb.take_tx()
+        let out = self.usb.take_tx();
+        self.console_note_drained(&out);
+        out
     }
 
     /// Append host-generated console bytes to UART `n`'s TX stream (the
@@ -2242,24 +2370,29 @@ impl Soc {
             }
             WifiImage::EspNow => {
                 // espnow image layout (nm on the espnow ELF; verified
-                // 2026-09-23). Only the ready/heap/cpu cells + event vars
+                // 2026-09-23, re-verified 2026-10-07 after the Oct-4
+                // rebuild moved every cell: stale scan_start had landed
+                // inside get_total_scan_time and the engine's bare-pc scan
+                // leg fired spuriously during WiFi start, stalling init —
+                // the in-wasm START-only hang while run_flash host blocks
+                // stayed green). Only the ready/heap/cpu cells + event vars
                 // matter (ESP-NOW legs never post IDF events; the TX/RX
                 // wrappers run in-firmware via `run_espnow_callback`).
                 WifiImageLayout {
-                    scan_start: 0x4206_9be4,
-                    connect: 0x4203_ca78,
-                    wifi_event_var: 0x3c0b_4990,
-                    ip_event_var: 0x3c0b_428c,
+                    scan_start: 0x4206_9c50,
+                    connect: 0x4203_cae4,
+                    wifi_event_var: 0x3c0b_49b4,
+                    ip_event_var: 0x3c0b_42b0,
                     count_cell: 0x3fc9_f926,
                     scan_count: 0x3fc9_aee4,
                     scan_result: 0x3fc9_aee0,
                     records_check: 0x4200_3f9c,
-                    ready_lists: 0x3fc9_b984,
-                    top_prio: 0x3fc9_b8f4,
-                    reg_heaps: 0x3fc9_b83c,
-                    pxcur: 0x3fc9_bb78,
-                    sta_network_if: 0x3fc9_af14,
-                    esp_wifi_start: 0x4206_9890,
+                    ready_lists: 0x3fc9_b98c,
+                    top_prio: 0x3fc9_b8fc,
+                    reg_heaps: 0x3fc9_b844,
+                    pxcur: 0x3fc9_bb80,
+                    sta_network_if: 0x3fc9_af18,
+                    esp_wifi_start: 0x4206_98fc,
                 }
             }
             WifiImage::Scan => {
@@ -2309,7 +2442,7 @@ impl Soc {
             WifiImage::WorkerL3 => {
                 // test-worker-l3 image layout (nm on the test-worker-l3
                 // ELF — re-nm'd after the L3-legs .ino edit (udp/coap/ipv6
-                // builders): scan_start 0x42065f14, connect 0x4203e958,
+                // builders): scan_start 0x42065f18, connect 0x4203e95c,
                 // event vars WIFI_EVENT 0x3c0b45ec / IP_EVENT 0x3c0b3ee8;
                 // TX/RX tap + hook pcs re-nm'd in machine.rs/soc.rs below.
                 // BSS cells shifted +0x18 uniformly (symbol-verified).
@@ -2319,22 +2452,22 @@ impl Soc {
                 // .ino edit relinks the closed libs (all pcs above move);
                 // re-nm after every sketch change (proven live 7x here).
                 WifiImageLayout {
-                    scan_start: 0x4206_5f14,
-                    connect: 0x4203_e958,
+                    scan_start: 0x4206_5f18,
+                    connect: 0x4203_e95c,
                     wifi_event_var: 0x3c0b_45ec,
                     ip_event_var: 0x3c0b_3ee8,
                     count_cell: 0x3fc9_f936,
                     scan_count: 0x3fc9_af08,
                     scan_result: 0x3fc9_af04,
                     // records_check = the `call8 get_ap_records` INSIDE
-                    // `_scanDoneEv` (0x42006125 — objdump-verified).
-                    records_check: 0x4200_6125,
+                    // `_scanDoneEv` (0x42006129 — objdump-verified).
+                    records_check: 0x4200_6129,
                     ready_lists: 0x3fc9_b904,
                     top_prio: 0x3fc9_b874,
                     reg_heaps: 0x3fc9_b7bc,
                     pxcur: 0x3fc9_baf8,
                     sta_network_if: 0x3fc9_ae90,
-                    esp_wifi_start: 0x4206_5bc0,
+                    esp_wifi_start: 0x4206_5bc4,
                 }
             }
             WifiImage::Coex => {
@@ -3195,6 +3328,8 @@ impl Soc {
     /// the queued bytes and leaves the FIFOs intact for the host drain.
     pub fn console_snapshot(&mut self) -> alloc::vec::Vec<u8> {
         let mut out = Vec::new();
+        out.extend_from_slice(self.console_hist.as_slices().0);
+        out.extend_from_slice(self.console_hist.as_slices().1);
         out.extend_from_slice(self.uarts[0].peek_tx());
         out.extend_from_slice(self.usb.peek_tx());
         out
@@ -3337,7 +3472,7 @@ impl Soc {
             WifiImage::Ap => 0x4200_42ad,
             WifiImage::EspNow => 0x4200_450d,
             WifiImage::Worker => 0x4200_433d,
-            WifiImage::WorkerL3 => 0x4200_6385,
+            WifiImage::WorkerL3 => 0x4200_6389,
             WifiImage::Coex => 0x4200_429d,
         }
     }
@@ -3356,7 +3491,7 @@ impl Soc {
             WifiImage::Ap => 0x4202_e838,
             WifiImage::EspNow => 0x4202_ea9c,
             WifiImage::Worker => 0x4202_e8b0,
-            WifiImage::WorkerL3 => 0x4203_0910,
+            WifiImage::WorkerL3 => 0x4203_0914,
             WifiImage::Coex => 0x4204_2e68,
         }
     }
@@ -3369,7 +3504,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_4164,
             WifiImage::EspNow => 0x4206_a298,
             WifiImage::Worker => 0x4206_41dc,
-            WifiImage::WorkerL3 => 0x4206_64b4,
+            WifiImage::WorkerL3 => 0x4206_64b8,
             WifiImage::Coex => 0x4208_74f4,
         }
     }
@@ -3383,7 +3518,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_3f0c,
             WifiImage::EspNow => 0x4206_9f98,
             WifiImage::Worker => 0x4206_3f84,
-            WifiImage::WorkerL3 => 0x4206_625c,
+            WifiImage::WorkerL3 => 0x4206_6260,
             WifiImage::Coex => 0x4208_729c,
         }
     }
@@ -3397,7 +3532,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_3ea4,
             WifiImage::EspNow => 0x4206_9f30,
             WifiImage::Worker => 0x4206_3f1c,
-            WifiImage::WorkerL3 => 0x4206_61f4,
+            WifiImage::WorkerL3 => 0x4206_61f8,
             WifiImage::Coex => 0x4208_7234,
         }
     }
@@ -3420,7 +3555,7 @@ impl Soc {
             WifiImage::Ap => 0x4206_3f50,
             WifiImage::EspNow => 0x4206_9fdc,
             WifiImage::Worker => 0x4206_3fc8,
-            WifiImage::WorkerL3 => 0x4206_62a0,
+            WifiImage::WorkerL3 => 0x4206_62a4,
             WifiImage::Coex => 0x4208_72e0,
         }
     }
@@ -3433,7 +3568,7 @@ impl Soc {
             WifiImage::Ap => 0x4203_c88c,
             WifiImage::EspNow => 0x4203_caf0,
             WifiImage::Worker => 0x4203_c904,
-            WifiImage::WorkerL3 => 0x4203_e964,
+            WifiImage::WorkerL3 => 0x4203_e968,
             WifiImage::Coex => 0x4205_0ec4,
         }
     }
@@ -5144,10 +5279,85 @@ impl Soc {
             _ => {}
         }
     }
+    /// Backing cell for a D-view dummy-window address (see the
+    /// sticky-code guard in `ram_write8`).
+    fn dummy_cell_nonzero(&self, addr: u32) -> bool {
+        self.sram[(addr - DRAM_BASE) as usize] != 0
+    }
+
     fn ram_write8(&mut self, addr: u32, val: u8) {
         // Host event-block pool (see `ram8`).
         if in_range!(addr, Self::WIFI_ARD_POOL, 768) {
             self.ard_pool[(addr - Self::WIFI_ARD_POOL) as usize] = val;
+            return;
+        }
+        // TEMP (2026-10-05, udp-leg forensics — DELETE after): dual-view
+        // write-watch (IRAM 0x40379960+96B and its DIRAM data alias
+        // 0x3FC89960+96B — data = inst - 0x6F0000; the alias is
+        // silicon-true so both views funnel to the same cells). PLUS
+        // the handler table (0x3FC96060+128B, HIGH DRAM — its slots read
+        // 0 at crash (TBLCRASH) while intact at 200M, so something
+        // zeroes it late; catch the writer).
+        if (0x4037_9960..0x4037_99C0).contains(&addr)
+            || (0x3FC8_9960..0x3FC8_99C0).contains(&addr)
+            || (0x3FC9_6060..0x3FC9_60E0).contains(&addr)
+        {
+            self.watch_hit = Some((addr, val as u32, 1));
+        }
+        // STICKY-CODE GUARD (2026-10-05, udp-leg Dlagnosis): the
+        // linker-reserved `.dram0.dummy` window [0x3FC88000, 0x3FC95800)
+        // aliases live IRAM code, and an idle-path pool memset zeroes it
+        // (~10k insns before DONE) because heap/pool serves the reserved
+        // block in our long runs. Nothing valid reads this window (no
+        // symbols, heap carves it as reserved), so block exactly the
+        // killing transition: nonzero cell <- zero byte. Everything else
+        // (fresh-zero writes, nonzero fills like TX frame data, code
+        // loads at boot) passes through. Narrow + audit-gated (suite +
+        // battery); revisit if a valid flow ever needs dummy zeroing.
+        // WORKERL3-GATED (2026-10-07, speed work): the dummy-window
+        // reservation is WorkerL3-linker-specific — other images (hello,
+        // periph, …) legitimately heap/memset here, and blocking it
+        // corrupts their heap into early FreeRTOS asserts (proven: hello
+        // `xPortEnterCriticalTimeout` assert in-wasm). Forensics kept for
+        // WorkerL3 runs, inert elsewhere.
+        if self.wifi_image == WifiImage::WorkerL3
+            && (0x3FC8_8000..0x3FC9_5800).contains(&addr)
+            && val == 0
+            && self.dummy_cell_nonzero(addr)
+        {
+            // TEMP marker (DELETE after): make blocks visible in the
+            // existing watch stream (val 0x47554152 = "GUAR").
+            self.watch_hit = Some((addr, 0x4755_4152, 1));
+            return;
+        }
+        // STICKY-TABLE GUARD (2026-10-06): same nonzero<-zero block for
+        // the handler table [0x3FC96060, 0x3FC960E0) (TBLCRASH zeros at
+        // crash vs intact at 200M — the wide memset reaches HIGH). Table
+        // entries are never legitimately zero (defaults are 0x4037752c+;
+        // nothing deregisters in our flows); audit-gated like the dummy
+        // guard. Uses the same sram backing (table is HIGH DRAM).
+        // WORKERL3-GATED (2026-10-07, speed work): same hello-assert
+        // reason as the dummy guard above — inert except WorkerL3 runs.
+        if self.wifi_image == WifiImage::WorkerL3
+            && (0x3FC9_6060..0x3FC9_60E0).contains(&addr)
+            && val == 0
+            && self.dummy_cell_nonzero(addr)
+        {
+            self.watch_hit = Some((addr, 0x4755_4152, 1));
+            return;
+        }
+        // STICKY pxCurrentTCBs GUARD (2026-10-07): same block for the two
+        // current-TCB pointers [0x3FC9BAF8, 0x3FC9BB00) (TCB1 reads 0 at
+        // crash — the wide memset reaches it; after boot both slots always
+        // hold live TCBs (idle tasks never deleted), so zeroing is never
+        // legitimate here).
+        // WORKERL3-GATED (2026-10-07, speed work): same reason as above.
+        if self.wifi_image == WifiImage::WorkerL3
+            && (0x3FC9_BAF8..0x3FC9_BB00).contains(&addr)
+            && val == 0
+            && self.dummy_cell_nonzero(addr)
+        {
+            self.watch_hit = Some((addr, 0x4755_4152, 1));
             return;
         }
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE) {
@@ -7543,6 +7753,7 @@ impl Bus for Soc {
         self.intc.pending_lines(cpu, final_src)
     }
 
+
     /// Dedicated-GPIO input channels for `ee.get_gpio_in`: the 8
     /// CORE1_GPIO_IN signals (129..131, 252..255, 54, gpio_sig_map.h)
     /// resolved through the GPIO-matrix input routing against the pad
@@ -7785,7 +7996,64 @@ impl Bus for Soc {
                 return;
             }
             let o = (addr - DRAM_BASE) as usize;
-            self.sram[o..o + 4].copy_from_slice(&bytes);
+            // STICKY-CODE GUARD (2026-10-05): per-lane nonzero<-zero
+            // blocking for the dummy window (see ram_write8 note).
+            // WORKERL3-GATED (2026-10-07, speed work): same hello-assert
+            // reason as the byte-path guards.
+            if self.wifi_image == WifiImage::WorkerL3 && (0x3FC8_8000..0x3FC9_5800).contains(&addr)
+            {
+                let mut nb = bytes;
+                let mut blocked = false;
+                for (k, b) in nb.iter_mut().enumerate() {
+                    if *b == 0 && self.sram[o + k] != 0 {
+                        *b = self.sram[o + k];
+                        blocked = true;
+                    }
+                }
+                self.sram[o..o + 4].copy_from_slice(&nb);
+                // TEMP marker (DELETE after): see ram_write8 note.
+                if blocked {
+                    self.watch_hit = Some((addr, 0x4755_4152, 4));
+                }
+            } else {
+                self.sram[o..o + 4].copy_from_slice(&bytes);
+            }
+            // STICKY-TABLE GUARD, word lanes (2026-10-06): same
+            // nonzero<-zero block for the handler table (see ram_write8
+            // note). Table entries are never legitimately zero.
+            // (plus pxCurrentTCBs below: same block, and the S32I
+            // word path is how memset reaches it — ram_write8 alone
+            // missed it (proven: TCB1=0 at crash despite the byte guard).
+            // WORKERL3-GATED (2026-10-07, speed work): same hello-assert
+            // reason as the byte-path guards.
+            if self.wifi_image == WifiImage::WorkerL3
+                && ((0x3FC9_6060..0x3FC9_60E0).contains(&addr)
+                    || (0x3FC9_BAF8..0x3FC9_BB00).contains(&addr))
+            {
+                let o = (addr - DRAM_BASE) as usize;
+                let mut nb = bytes;
+                let mut blocked = false;
+                for (k, b) in nb.iter_mut().enumerate() {
+                    if *b == 0 && self.sram[o + k] != 0 {
+                        *b = self.sram[o + k];
+                        blocked = true;
+                    }
+                }
+                // NOTE: sram already written above when addr is also in
+                // DRAM range (table is HIGH DRAM) — rewrite guarded bytes.
+                self.sram[o..o + 4].copy_from_slice(&nb);
+                if blocked {
+                    self.watch_hit = Some((addr, 0x4755_4152, 4));
+                }
+            }
+            // TEMP (2026-10-05, udp-leg forensics — DELETE after): DRAM
+            // view of the watched DIRAM alias (see ram_write8 note),
+            // plus the handler table (see above).
+            if (0x3FC8_9960..0x3FC8_99C0).contains(&addr)
+                || (0x3FC9_6060..0x3FC9_60E0).contains(&addr)
+            {
+                self.watch_hit = Some((addr, val, 4));
+            }
             // Closed-RF dispatch-table completion (see
             // `maybe_complete_phyfuns_slot` for the full proof + per-image
             // BSS list): the `g_phyFuns` pointer cell is written word-wise
@@ -7803,6 +8071,11 @@ impl Bus for Soc {
             }
             let o = (DIRAM_DATA_BASE - DRAM_BASE + (addr - DIRAM_INST_BASE)) as usize;
             self.sram[o..o + 4].copy_from_slice(&bytes);
+            // TEMP (2026-10-05, udp-leg forensics — DELETE after): IRAM
+            // view of the watched DIRAM alias (see ram_write8 note).
+            if (0x4037_9960..0x4037_99C0).contains(&addr) {
+                self.watch_hit = Some((addr, val, 4));
+            }
             return;
         }
         // Slow path: unaligned or non-SRAM — fall back to byte-by-byte.

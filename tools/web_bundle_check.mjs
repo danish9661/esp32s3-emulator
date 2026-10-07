@@ -46,10 +46,13 @@ try {
   process.exit(1);
 }
 
-// --- 2. API-compat: every emu.* call in main.js exists in the fresh d.ts ---
-const main = readFileSync(join(root, 'web', 'main.js'), 'utf8');
+// --- 2. API-compat: every emu.* call in web JS (main + workers) exists in the fresh d.ts ---
+const webJs = readdirSync(join(root, 'web'))
+  .filter((f) => f.endsWith('.js'))
+  .map((f) => readFileSync(join(root, 'web', f), 'utf8'))
+  .join('\n');
 const dts = readFileSync(join(tmp, 'wasm_bridge.d.ts'), 'utf8');
-const calls = [...new Set([...main.matchAll(/emu\.(\w+)/g)].map((m) => m[1]))];
+const calls = [...new Set([...webJs.matchAll(/emu\.(\w+)/g)].map((m) => m[1]))];
 const missing = calls.filter((c) => !dts.includes(c));
 if (missing.length === 0) pass(`API-compat (${calls.length} emu.* calls resolve in d.ts)`);
 else fail(`API-compat missing from d.ts: ${missing.join(', ')}`);

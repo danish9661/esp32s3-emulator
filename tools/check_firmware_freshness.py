@@ -226,5 +226,42 @@ for e in man:
 # policy as noise.
 print(f"gallery entries: {len(mfiles)}, battery cases: {len(battery_cases())} (gallery is a curated subset; absence is policy, not rot)")
 
+# --- 3. gallery-copy freshness ---
+# web/firmware/*.merged.bin are gitignored local copies synced from
+# tools/sketches via tools/sync_gallery.py (only manifest.json is tracked).
+# A copy that drifts from its sketch bin breaks the browser demo exactly
+# like a stale battery bin (proven 2026-10-07: Sep-30 L3 gallery copy vs
+# Oct-5 relink with moved hook pcs -> in-wasm EXCCAUSE 0x22 crash while the
+# battery NODE harness on the sketch bin stayed green). Compare content
+# (md5), not mtime: copies are rewritten by sync (mtime always newer).
+# Warn-only like the rest (FAIL lines, exit 0 unless --strict).
+import hashlib as _hashlib
+
+
+def _md5(path):
+    h = _hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1048576), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+for e in man:
+    f = e.get("file")
+    if not f or e.get("micropython"):
+        continue
+    wp = os.path.join(WEB_FW, f)
+    if not os.path.exists(wp):
+        continue  # already FAILed in section 2
+    cands = glob.glob(os.path.join(SK, "*", f))
+    if not cands:
+        continue  # resolved outside sketches (variants covered in §1)
+    if _md5(wp) != _md5(cands[0]):
+        note(
+            f"FAIL stale gallery copy: web/firmware/{f} differs from "
+            f"{os.path.relpath(cands[0], ROOT)} "
+            f"(resync: python3 tools/sync_gallery.py)"
+        )
+
 print(f"== freshness+gallery guard: {len(fails)} FAILs ==")
 sys.exit(1 if (fails and STRICT) else 0)

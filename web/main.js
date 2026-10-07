@@ -1,6 +1,12 @@
-import init, { Emulator } from './pkg/wasm_bridge.js';
-import { PeripheralBridge } from './emu_api.js';
-import { VirtualI2CSensor, VirtualSpiAdc, VirtualCamera } from './virtual_devices.js';
+import { createRings, wrapRings, ringReadUart, supported as sabSupported, C } from './sab-rings.js';
+
+// NOTE: the emulator itself (wasm Emulator + PeripheralBridge + virtual
+// devices) lives in web/emu-worker.js, always off the main thread. This
+// module keeps DOM, gallery, sockets and rendering only — it posts commands
+// to the worker and paints the frames the worker publishes (postMessage
+// transferables, or SAB shared-rings when crossOriginIsolated).
+// Dual-engine: Engine=Dual moves virtual-device dispatch to web/io-worker.js
+// over a MessageChannel (1-frame inject latency, same class as before).
 
 const NUM_PINS = 40;
 
@@ -50,15 +56,20 @@ let consoleLines = [];
 let consoleText = '';
 let searchMatches = [];
 let searchIdx = -1;
+// Shared streaming decoder (one instance, stream:true — the old code built a
+// new TextDecoder per batch) + throttled paint (at most every 250ms; worker
+// frames arrive ~80/s while stepping).
+const serialDecoder = new TextDecoder();
+let serialPending = '';
+let serialPaintAt = 0;
 
-function setStatus(msg) {
-  els.status.textContent = msg;
-}
-
-// ── Serial console ──
-function appendSerial(bytes) {
-  if (!bytes || bytes.length === 0) return;
-  const text = new TextDecoder().decode(bytes);
+function flushSerial(force) {
+  const now = performance.now();
+  if (!force && now - serialPaintAt < 250) return;
+  serialPaintAt = now;
+  if (!serialPending) return;
+  const text = serialPending;
+  serialPending = '';
   consoleText += text;
   // Track lines for search
   const newLines = text.split('\n');
@@ -74,6 +85,17 @@ function appendSerial(bytes) {
   if (els.autoScroll.checked) {
     els.console.scrollTop = els.console.scrollHeight;
   }
+}
+
+function setStatus(msg) {
+  els.status.textContent = msg;
+}
+
+// ── Serial console ──
+function appendSerial(bytes) {
+  if (!bytes || bytes.length === 0) return;
+  serialPending += serialDecoder.decode(bytes, { stream: true });
+  flushSerial(false);
 }
 
 // ── Search ──
@@ -224,8 +246,11 @@ function updateGpioCell(i, mask) {
 }
 
 let gpioFrameSkip = 0;
-function renderGpio() {
-  const mask = emu.gpio_output();
+let lastGpioMask = 0;
+function renderGpio(mask) {
+  if (mask === undefined) mask = lastGpioMask;
+  mask = mask >>> 0;
+  lastGpioMask = mask;
   if (mask === gpioPrevMask) return;
   // The grid is 40 DOM cells: repaint at most every 3rd frame (~20 Hz).
   // Pin state still converges (mask diff is cumulative), but layout work
@@ -282,7 +307,7 @@ function netCounters() {
   netStatus(`gateway: ${gwSocket && gwSocket.readyState === 1 ? 'connected' : 'disconnected'} — TX ${netTxCount} frames, RX ${netRxCount} frames`);
 }
 function gwConnect() {
-  if (!emu || !bridge) { netStatus('gateway: load firmware first'); return; }
+  if (!workerReady) { netStatus('gateway: load firmware first'); return; }
   if (gwSocket && gwSocket.readyState === 1) { netStatus('gateway: already connected'); return; }
   const url = (els.gwUrl && els.gwUrl.value.trim()) || 'ws://127.0.0.1:5050/api/network-gateway?sessionId=browser';
   let ws;
@@ -303,7 +328,7 @@ function gwConnect() {
     if (!(ev.data instanceof ArrayBuffer)) return;
     const bytes = new Uint8Array(ev.data);
     if (!bytes.length || bytes.length > 1600) return;
-    emu.net_inject_rx(bytes);
+    emuWorker.postMessage({ cmd: 'netRx', bytes: bytes.buffer }, [bytes.buffer]);
     netRxCount++;
     const type = bytes.length >= 14 ? bytes[12].toString(16).padStart(2, '0') + bytes[13].toString(16).padStart(2, '0') : '??';
     appendNet(`RX ${bytes.length}B ethertype 0x${type}`);
@@ -317,24 +342,24 @@ function gwConnect() {
   ws.onerror = () => {
     netStatus('gateway: error — is the Go gateway running? (go run . in tools/gateway)');
   };
-  // (Re)arm the TX leg on every (re)connect so no capture is missed even
-  // if the socket opens after frames already flowed: onFrame callbacks
-  // accumulate on the bridge, so guard against double-arming.
-  if (!gwConnect._armed) {
-    bridge.net.onFrame((frame) => {
-      if (!frame || !frame.length) return;
-      netTxCount++;
-      const type = frame.length >= 14 ? frame[12].toString(16).padStart(2, '0') + frame[13].toString(16).padStart(2, '0') : '??';
-      appendNet(`TX ${frame.length}B ethertype 0x${type}`);
-      netCounters();
-      if (gwSocket && gwSocket.readyState === 1) {
-        try { gwSocket.send(frame); } catch (_) { /* drop, keep stepping */ }
-      }
-    });
-    gwConnect._armed = true;
-  }
+  // The emulation worker always collects board→host frames into its frame
+  // outbox (see emu-worker.js armBridges); this side only forwards them to
+  // the socket when connected, else they stay local (pcap only via run_flash).
+  // No per-connect arming needed (the old onFrame double-arm guard is gone).
   gwSocket = ws;
   netStatus(`gateway: connecting — ${url}`);
+}
+
+// Forward one worker-captured board→host frame to the gateway socket.
+function forwardNetFrame(frame) {
+  if (!frame || !frame.length) return;
+  netTxCount++;
+  const type = frame.length >= 14 ? frame[12].toString(16).padStart(2, '0') + frame[13].toString(16).padStart(2, '0') : '??';
+  appendNet(`TX ${frame.length}B ethertype 0x${type}`);
+  netCounters();
+  if (gwSocket && gwSocket.readyState === 1) {
+    try { gwSocket.send(frame); } catch (_) { /* drop, keep stepping */ }
+  }
 }
 function gwDisconnect() {
   if (gwSocket) { try { gwSocket.close(); } catch (_) { /* closed */ } gwSocket = null; }
@@ -373,7 +398,7 @@ function bleCounters() {
   bleStatus(`ble: ${bleSocket && bleSocket.readyState === 1 ? 'connected' : 'disconnected'} — TX ${bleTxCount} pkts, RX ${bleRxCount} pkts`);
 }
 function bleConnect() {
-  if (!emu || !bridge) { bleStatus('ble: load firmware first'); return; }
+  if (!workerReady) { bleStatus('ble: load firmware first'); return; }
   if (bleSocket && bleSocket.readyState === 1) { bleStatus('ble: already connected'); return; }
   const url = (els.bleUrl && els.bleUrl.value.trim()) || 'ws://127.0.0.1:5050/api/ble-gateway';
   let ws;
@@ -396,7 +421,7 @@ function bleConnect() {
     if (!(ev.data instanceof ArrayBuffer)) return;
     const bytes = new Uint8Array(ev.data);
     if (!bytes.length || bytes.length > 4096) return;
-    emu.bt_hci_inject_rx(bytes);
+    emuWorker.postMessage({ cmd: 'bleRx', bytes: bytes.buffer }, [bytes.buffer]);
     bleRxCount++;
     appendBle(`RX ${bytes.length}B h4=0x${bytes[0].toString(16).padStart(2, '0')}`);
     bleCounters();
@@ -409,23 +434,23 @@ function bleConnect() {
   ws.onerror = () => {
     bleStatus('ble: error — is the Go gateway + ble_bridge.py running? (go run . in tools/gateway, python3 tools/ble_bridge.py)');
   };
-  // (Re)arm the TX leg on every (re)connect so no capture is missed even
-  // if the socket opens after HCI already flowed: onPacket callbacks
-  // accumulate on the bridge, so guard against double-arming.
-  if (!bleConnect._armed) {
-    bridge.ble.onPacket((pkt) => {
-      if (!pkt || !pkt.length) return;
-      bleTxCount++;
-      appendBle(`TX ${pkt.length}B h4=0x${pkt[0].toString(16).padStart(2, '0')}`);
-      bleCounters();
-      if (bleSocket && bleSocket.readyState === 1) {
-        try { bleSocket.send(pkt); } catch (_) { /* drop, keep stepping */ }
-      }
-    });
-    bleConnect._armed = true;
-  }
+  // The emulation worker always collects firmware→controller HCI into its
+  // frame outbox (see emu-worker.js armBridges); this side only forwards to
+  // the socket when connected, else HCI stays local (ROM loopback still boots
+  // to DONE). No per-connect arming needed.
   bleSocket = ws;
   bleStatus(`ble: connecting — ${url}`);
+}
+
+// Forward one worker-captured firmware→controller HCI packet to the bridge.
+function forwardBlePacket(pkt) {
+  if (!pkt || !pkt.length) return;
+  bleTxCount++;
+  appendBle(`TX ${pkt.length}B h4=0x${pkt[0].toString(16).padStart(2, '0')}`);
+  bleCounters();
+  if (bleSocket && bleSocket.readyState === 1) {
+    try { bleSocket.send(pkt); } catch (_) { /* drop, keep stepping */ }
+  }
 }
 function bleDisconnect() {
   if (bleSocket) { try { bleSocket.close(); } catch (_) { /* closed */ } bleSocket = null; }
@@ -446,73 +471,138 @@ function appendVdev(text) {
   els.vdev.scrollTop = els.vdev.scrollHeight;
 }
 
-// ── Emulator loop ──
-let emu = null;
-let bridge = null;
-let vdevSensor = null;
-let vdevAdc = null;
-let vdevCam = null;
+// ── Emulator worker client ──
+// The machine runs in web/emu-worker.js (single) with optional
+// web/io-worker.js (dual). This thread only renders frames.
+let emuWorker = null;
+let ioWorker = null;
+let workerReady = false;
+let workerLoaded = false;
+let workerRunning = false;
 let flashBytes = null;
 let flashKeyHex = null;
-let timer = null;
-let totalSteps = 0;
-// ── MIPS meter state ──
-let mipsSteps = 0;
-let mipsLastT = performance.now();
-let mipsShown = 0;
+let sabRings = null;
+let sabPoll = null;
+let engineMode = 'single';
+let clockSel = 1;
+let transportSel = 'auto';
 
-// Frame budget: one rAF tick ≈ 16 ms. At ~10 MIPS in-wasm, 40k steps
-// would need only ~4 ms of emulation — but the per-call JS↔wasm boundary
-// cost dominates at small batches (measured: raising the batch 40k →
-// 250k/frame changes wall time per emulated second far less than 6x).
-// Run up to 4 consecutive batches per frame while time remains (< 12 ms),
-// so fast boots finish sooner without freezing the page on slow devices.
-let lastTickMs = 0;
-function tick() {
-  const t0 = performance.now();
-  // Deadline: leave ~4 ms of the 16 ms frame for paint/input.
-  const deadline = t0 + 12;
-  const n = parseInt(els.steps.value, 10);
-  let executed = 0;
-  for (let b = 0; b < 4; b++) {
-    if (bridge && vdevSensor && vdevAdc) {
-      emu.i2c_inject_rx(0, new Uint8Array([vdevSensor.reg]));
-      emu.spi_inject_miso(0, new Uint8Array([vdevAdc.value]));
+function postWorker(cmd, transfer) {
+  if (emuWorker) emuWorker.postMessage(cmd, transfer || []);
+}
+
+function applyTransportSelection() {
+  // SAB needs crossOriginIsolated (COOP/COEP, e.g. tools/serve.py). Auto:
+  // SAB when available, else postMessage. Manual override via the select.
+  const want =
+    transportSel === 'sab' ? true : transportSel === 'msg' ? false : sabSupported();
+  if (want && sabSupported()) {
+    sabRings = createRings();
+    postWorker({ cmd: 'transport', sab: sabRings.sab });
+  } else {
+    sabRings = null;
+    postWorker({ cmd: 'transport', sab: null });
+  }
+}
+
+function startSabPoll() {
+  if (sabPoll) return;
+  const poll = () => {
+    if (sabRings && workerRunning) {
+      const uart = ringReadUart(sabRings);
+      if (uart.length) appendSerial(uart);
+      const gpio = Atomics.load(sabRings.ctrl, C.GPIO);
+      renderGpio(gpio);
+      const lo = Atomics.load(sabRings.ctrl, C.STEPS_LO);
+      const hi = Atomics.load(sabRings.ctrl, C.STEPS_HI);
+      const steps = hi * 0x100000000 + (lo >>> 0);
+      const mips = Atomics.load(sabRings.ctrl, C.MIPS_X10) / 10;
+      const pc = Atomics.load(sabRings.ctrl, C.PC);
+      if (els.mips) els.mips.textContent = `${mips.toFixed(1)} MIPS`;
+      setStatus(`pc=0x${pc.toString(16)}  steps=${steps.toLocaleString()}`);
     }
-    executed += emu.step_batch(n);
-    // Drain + dispatch once per batch (cheap when empty: the Rust drain
-    // fast-path returns without touching merge state, and dispatch only
-    // walks queued events).
-    appendSerial(emu.uart_read());
-    if (bridge) bridge.dispatch();
-    if (performance.now() >= deadline) break;
+    flushSerial(false);
+    sabPoll = requestAnimationFrame(poll);
+  };
+  sabPoll = requestAnimationFrame(poll);
+}
+
+function onWorkerMessage(ev) {
+  const m = ev.data;
+  if (!m) return;
+  switch (m.type) {
+    case 'ready':
+      workerReady = true;
+      postWorker({ cmd: 'steps', n: parseInt(els.steps.value, 10) });
+      postWorker({ cmd: 'clock', mode: clockSel });
+      postWorker({ cmd: 'engine', which: engineMode });
+      applyTransportSelection();
+      setStatus('worker ready — pick an example or load a merged.bin');
+      tryAutoLoad();
+      break;
+    case 'loaded':
+      workerLoaded = true;
+      workerRunning = false;
+      setStatus(`loaded ${m.bytes.toLocaleString()} bytes`);
+      els.run.disabled = false;
+      els.stop.disabled = true;
+      els.reset.disabled = false;
+      if (els.mips) els.mips.textContent = '';
+      break;
+    case 'frame':
+      if (m.uart) appendSerial(new Uint8Array(m.uart));
+      flushSerial(false);
+      if (!sabRings) {
+        renderGpio(m.gpio);
+        if (els.mips) els.mips.textContent = `${m.mips.toFixed(1)} MIPS`;
+        setStatus(`pc=0x${m.pc.toString(16)}  steps=${m.steps.toLocaleString()}`);
+      }
+      for (const f of m.netTx || []) forwardNetFrame(new Uint8Array(f));
+      for (const p of m.bleTx || []) forwardBlePacket(new Uint8Array(p));
+      for (const t of m.logs || []) appendVdev(t);
+      break;
+    case 'running':
+      workerRunning = m.on;
+      flushSerial(true);
+      break;
+    case 'transport':
+      // Worker confirms the transport (false = fell back to postMessage).
+      if (!m.sab) sabRings = null;
+      break;
   }
-  lastTickMs = performance.now() - t0;
-  totalSteps += executed;
-  renderGpio();
-  // MIPS = emulated instructions per wall second, smoothed over ~0.5 s.
-  mipsSteps += executed;
-  const now = performance.now();
-  const elapsed = now - mipsLastT;
-  if (elapsed >= 500) {
-    mipsShown = (mipsSteps / (elapsed / 1000)) / 1e6;
-    mipsSteps = 0;
-    mipsLastT = now;
-    if (els.mips) els.mips.textContent = `${mipsShown.toFixed(1)} MIPS`;
+}
+
+function ensureWorkers() {
+  if (emuWorker) return;
+  emuWorker = new Worker('./emu-worker.js', { type: 'module' });
+  emuWorker.onmessage = onWorkerMessage;
+  emuWorker.onerror = (e) => setStatus(`worker error: ${e.message || e.type}`);
+  emuWorker.postMessage({ cmd: 'init' });
+  if (engineMode === 'dual' && !ioWorker) {
+    ioWorker = new Worker('./io-worker.js', { type: 'module' });
+    const chan = new MessageChannel();
+    emuWorker.postMessage({ cmd: 'ioPort', port: chan.port1 }, [chan.port1]);
+    ioWorker.postMessage({ cmd: 'emuPort', port: chan.port2 }, [chan.port2]);
   }
-  setStatus(`pc=0x${emu.pc().toString(16)}  steps=${totalSteps.toLocaleString()}`);
+  setStatus('worker starting…');
 }
 
 function startLoop() {
-  if (timer) return;
-  timer = setInterval(tick, 0);
+  if (workerRunning) return;
+  ensureWorkers();
+  postWorker({ cmd: 'run' });
+  workerRunning = true;
+  els.run.disabled = true;
+  els.stop.disabled = false;
+  startSabPoll();
 }
 
 function stopLoop() {
-  if (timer) {
-    clearInterval(timer);
-    timer = null;
-  }
+  workerRunning = false;
+  postWorker({ cmd: 'stop' });
+  flushSerial(true);
+  els.run.disabled = false;
+  els.stop.disabled = true;
 }
 
 function hexToBytes(hex) {
@@ -524,128 +614,33 @@ function hexToBytes(hex) {
 }
 
 async function loadFlash(bytes, keyHex) {
+  ensureWorkers();
   stopLoop();
-  emu = new Emulator();
-  // Gallery entries that arm the fail-closed secure-boot gate opt in via
-  // `"secure_boot": true` in manifest.json (mirrors run_flash
-  // SECURE_BOOT_EN=1: burns BLK0/REPEAT_DATA4 bit 20 through the real PGM
-  // path BEFORE load_flash, so boot_from_flash verifies the app region's
-  // signature sector; unsigned images park both CPUs with no output).
-  // The committed gallery secure_boot image is genuinely `espsecure.py
-  // sign-data`-signed (see tools/sketches/esp32s3_secure_boot/ +
-  // tools/build_secure_boot.sh), so it boots to Hello/boot OK.
-  if (currentGalleryItem && currentGalleryItem.secureBoot === true) {
-    emu.secure_boot_enable();
-  }
-  if (keyHex) {
-    emu.load_flash_encrypted(bytes, hexToBytes(keyHex));
-  } else {
-    emu.load_flash(bytes);
-  }
-  // Gallery entries that need an attached virtual SD card opt in via
-  // `"sdspi": true` in manifest.json (mirrors run_flash SPI_SDSPI=1:
-  // same FAT16 volume SDMMC formatted, over the GPSPI2 SDSPI path).
-  const needsSdspi = currentGalleryItem && currentGalleryItem.sdspi === true;
-  if (needsSdspi) {
-    emu.spi_sdspi_attach_sdmmc_image(0);
-  }
-  // Gallery entries that need a host fixture opt in via manifest fields
-  // (mirrors the run_flash env flows): `"touch": "<pad>:<val>"` injects
-  // the touch counter (TOUCH_INJECT); `"secure_boot": true` burns
-  // SECURE_BOOT_EN through the real PGM path BEFORE load_flash so the
-  // signed gallery image verifies (fail-closed: unsigned images park
-  // both CPUs with no output — the committed gallery secure_boot image
-  // is genuinely `espsecure.py sign-data`-signed, see
-  // tools/sketches/esp32s3_secure_boot/ + tools/build_secure_boot.sh).
-  if (currentGalleryItem && currentGalleryItem.touch) {
-    const [pad, val] = currentGalleryItem.touch.split(':').map(Number);
-    if (Number.isInteger(pad) && Number.isInteger(val)) {
-      emu.touch_inject(pad, val);
-    }
-  }
-  // Wi-Fi fixtures (mirror the run_flash WIFI_SCAN_APS flows): the engine
-  // lives in the machine (`Soc::wifi_fixture_poll`, driven per step_fast),
-  // so the bridge just arms it — no JS per-frame work needed.
-  if (currentGalleryItem && currentGalleryItem.wifiScan !== null) {
-    emu.wifi_scan_fixture(currentGalleryItem.wifiScan || '');
-  }
-  if (currentGalleryItem && currentGalleryItem.wifiSta !== null) {
-    emu.wifi_sta_fixture(currentGalleryItem.wifiSta || 'EmuNet,-50,6,02:11:22:33:44:55');
-  }
-  // SoftAP fixture (mirrors run_flash WIFI_AP_FIXTURE=1): the firmware
-  // posts AP_START itself; the engine stages the AP config + fixed LAN.
-  if (currentGalleryItem && currentGalleryItem.wifiAp !== null) {
-    const ap = currentGalleryItem.wifiAp || {};
-    emu.wifi_ap_fixture(ap.ssid || 'EmuAP', ap.passphrase || 'password', ap.channel || 6);
-  }
-  // ESP-NOW loopback (mirrors run_flash WIFI_ESPNOW_LOOPBACK=1): the
-  // engine invokes the TX/RX wrappers in-firmware once `send()` returned
-  // (UART `sent 1` marker, peeked from the host console stream).
-  if (currentGalleryItem && currentGalleryItem.espnow === true) {
-    emu.wifi_espnow_fixture();
-  }
-  // Live-IP worker (mirrors run_flash WIFI_STA_CONN=1 on the worker
-  // image): same AP list + fixed LAN as wifi-sta, own linked pcs under
-  // `WifiImage::Worker`. The TX tap fires on the worker's real
-  // `esp_netif_transmit` calls; forward captured frames via
-  // `bridge.net.onFrame` (gateway WebSocket, see emu_api.js).
-  if (currentGalleryItem && currentGalleryItem.wifiWorker !== null) {
-    emu.wifi_worker_fixture(currentGalleryItem.wifiWorker || 'EmuNet,-50,6,02:11:22:33:44:55');
-  }
-  // L3 worker (mirrors run_flash WIFI_STA_CONN=1 on the L3 image):
-  // same AP list + fixed LAN as wifi-sta, own linked pcs under
-  // `WifiImage::WorkerL3` (see wasm-bridge `wifi_worker_l3_fixture`).
-  // Like the net worker, TX frames route via `bridge.net.onFrame`
-  // (gateway WebSocket) and replies come back via `net_inject_rx` —
-  // the L3 legs (DNS/NTP/UDP-echo) answer from gateway-local services
-  // (tools/gateway/handleL7.go), so no live netif is needed.
-  if (currentGalleryItem && currentGalleryItem.wifiWorkerL3 !== null) {
-    emu.wifi_worker_l3_fixture(currentGalleryItem.wifiWorkerL3 || 'EmuNet,-50,6,02:11:22:33:44:55');
-  }
-
-  if (typeof PeripheralBridge !== 'undefined') {
-    bridge = new PeripheralBridge(emu);
-    // A fresh bridge means fresh onFrame subscribers: allow the gateway
-    // TX leg to re-arm on next connect (see gwConnect).
-    gwConnect._armed = false;
-    if (gwSocket) { try { gwSocket.close(); } catch (_) { /* closed */ } gwSocket = null; }
-    netTxCount = 0; netRxCount = 0;
-    netStatus('gateway: disconnected — TX frames stay local (pcap only via run_flash)');
-    if (els.netlog) els.netlog.textContent = '';
-    netLineCount = 0;
-    vdevSensor = new VirtualI2CSensor(0x42);
-    vdevAdc = new VirtualSpiAdc(0xaa);
-    vdevSensor.onActivity = (t) => appendVdev(t);
-    vdevAdc.onActivity = (t) => appendVdev(t);
-    bridge.i2c.onRead((chan) => vdevSensor.handleRead(chan));
-    bridge.i2c.onWrite((chan, byte) => vdevSensor.handleWrite(chan, byte));
-    bridge.spi.onTransfer((chan, tx) => vdevAdc.handleTransfer(chan, tx));
-    // Demo camera frame (two captures' worth, like the harness pre-primes).
-    vdevCam = new VirtualCamera([0x01020304, 0x11223344, 0xa5a5a5a5, 0xdeadbeef, 0x12345678, 0x00000000, 0xffffffff, 0x5a5a5a5a]);
-    vdevCam.onActivity = (t) => appendVdev(t);
-    emu.cam_inject_frame(vdevCam.takeFrame());
-    emu.cam_inject_frame(vdevCam.takeFrame());
-    if (els.vdev) els.vdev.textContent = '';
-    vdevLineCount = 0;
-    appendVdev('Virtual devices attached: I2C sensor @0x42, SPI ADC');
-  }
-
+  // The worker takes ownership of the image bytes (transferable); Reset is
+  // worker-side (it retains the image), so no main-thread copy is needed.
   flashBytes = bytes;
   flashKeyHex = keyHex || null;
-  totalSteps = 0;
+  if (gwSocket) { try { gwSocket.close(); } catch (_) { /* closed */ } gwSocket = null; }
+  netTxCount = 0; netRxCount = 0;
+  netStatus('gateway: disconnected — TX frames stay local (pcap only via run_flash)');
+  if (els.netlog) els.netlog.textContent = '';
+  netLineCount = 0;
+  if (els.vdev) els.vdev.textContent = '';
+  vdevLineCount = 0;
   consoleText = '';
   consoleLines = [];
+  serialPending = '';
   els.console.textContent = '';
   gpioPrevMask = 0;
-  renderGpio();
-  setStatus(`loaded ${bytes.length.toLocaleString()} bytes`);
-  els.run.disabled = false;
-  els.stop.disabled = true;
-  els.reset.disabled = false;
-  // Reset the MIPS meter for the fresh run.
-  mipsSteps = 0;
-  mipsLastT = performance.now();
-  if (els.mips) els.mips.textContent = '';
+  lastGpioMask = 0;
+  renderGpio(0);
+  setStatus(`loading ${bytes.length.toLocaleString()} bytes…`);
+  els.run.disabled = true;
+  const copy = new Uint8Array(bytes);
+  emuWorker.postMessage(
+    { cmd: 'load', bytes: copy.buffer, keyHex: flashKeyHex, gallery: currentGalleryItem },
+    [copy.buffer],
+  );
 }
 
 // ── File input ──
@@ -881,7 +876,7 @@ els.gallery.addEventListener('change', async (e) => {
 
 // ── Buttons ──
 els.run.addEventListener('click', () => {
-  if (!emu) return;
+  if (!workerLoaded) return;
   startLoop();
   els.run.disabled = true;
   els.stop.disabled = false;
@@ -894,12 +889,22 @@ els.stop.addEventListener('click', () => {
 });
 
 els.reset.addEventListener('click', () => {
-  if (!flashBytes) return;
-  loadFlash(flashBytes, flashKeyHex);
+  if (!workerLoaded) return;
+  // Worker-side reload (it retains the image bytes — the main-thread copy
+  // was transferred on load).
+  consoleText = '';
+  consoleLines = [];
+  serialPending = '';
+  els.console.textContent = '';
+  gpioPrevMask = 0;
+  lastGpioMask = 0;
+  renderGpio(0);
+  postWorker({ cmd: 'reset' });
 });
 
 els.steps.addEventListener('input', () => {
   els.stepsVal.textContent = els.steps.value;
+  postWorker({ cmd: 'steps', n: parseInt(els.steps.value, 10) });
 });
 
 // ── Serial input (host → firmware) ──
@@ -908,21 +913,14 @@ els.steps.addEventListener('input', () => {
 // Shift+Enter sends without it. The FIFO caps at the 128-byte hardware
 // depth (silicon drops overrun bytes), so long pastes are chunked.
 function sendSerial() {
-  if (!emu || !els.serialInput) return;
+  if (!workerLoaded || !els.serialInput) return;
   let text = els.serialInput.value;
   if (!text) return;
   if (!/\r|\n$/.test(text)) text += '\n';
   const bytes = new TextEncoder().encode(text);
   const port = els.serialPort ? els.serialPort.value : 'usb';
-  const CHUNK = 96; // stay under the 128-byte FIFO with margin
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    const slice = bytes.slice(i, i + CHUNK);
-    if (port === 'usb') {
-      emu.usb_inject_rx(slice);
-    } else {
-      emu.uart_inject_rx(parseInt(port, 10), slice);
-    }
-  }
+  const copy = new Uint8Array(bytes);
+  postWorker({ cmd: 'inject', port, bytes: copy.buffer }, [copy.buffer]);
   // Echo what we sent (terminal-style) so the user sees it even if the
   // firmware doesn't echo.
   appendSerial(new TextEncoder().encode(`» ${text}`));
@@ -950,16 +948,64 @@ function updateSerialPlaceholder() {
 if (els.serialPort) els.serialPort.addEventListener('change', updateSerialPlaceholder);
 updateSerialPlaceholder();
 
+// ── Engine / clock / transport selects (wired in index.html) ──
+function wireEngineControls() {
+  const eng = document.getElementById('engine');
+  const clk = document.getElementById('clockmode');
+  const tr = document.getElementById('transport');
+  if (eng) {
+    eng.value = engineMode;
+    eng.addEventListener('change', () => {
+      engineMode = eng.value === 'dual' ? 'dual' : 'single';
+      if (engineMode === 'dual' && ioWorker === null && emuWorker) {
+        ioWorker = new Worker('./io-worker.js', { type: 'module' });
+        const chan = new MessageChannel();
+        emuWorker.postMessage({ cmd: 'ioPort', port: chan.port1 }, [chan.port1]);
+        ioWorker.postMessage({ cmd: 'emuPort', port: chan.port2 }, [chan.port2]);
+      }
+      postWorker({ cmd: 'engine', which: engineMode });
+      setStatus(`engine: ${engineMode} — reloads firmware under the new topology`);
+    });
+  }
+  if (clk) {
+    clk.value = String(clockSel);
+    clk.addEventListener('change', () => {
+      clockSel = [0, 1, 2].includes(parseInt(clk.value, 10)) ? parseInt(clk.value, 10) : 1;
+      postWorker({ cmd: 'clock', mode: clockSel });
+    });
+  }
+  if (tr) {
+    const sabOK = sabSupported();
+    for (const opt of tr.options) {
+      if (opt.value === 'sab' && !sabOK) opt.disabled = true;
+    }
+    tr.value = transportSel;
+    if (!sabOK && transportSel === 'sab') {
+      tr.value = 'auto';
+      transportSel = 'auto';
+    }
+    tr.title = sabOK
+      ? 'Frame transport: auto picks SAB shared-rings (this page is crossOriginIsolated)'
+      : 'Frame transport: SAB needs COOP/COEP (serve via tools/serve.py); using postMessage';
+    tr.addEventListener('change', () => {
+      transportSel = tr.value;
+      applyTransportSelection();
+    });
+  }
+}
+
 // ── Init ──
 initGpio();
-await init();
-setStatus('wasm ready — pick an example or load a merged.bin');
-try {
-  const res = await fetch('./firmware/esp32s3_hello.merged.bin');
-  if (res.ok) {
-    const buf = await res.arrayBuffer();
-    loadFlash(new Uint8Array(buf));
+wireEngineControls();
+ensureWorkers();
+async function tryAutoLoad() {
+  try {
+    const res = await fetch('./firmware/esp32s3_hello.merged.bin');
+    if (res.ok) {
+      const buf = await res.arrayBuffer();
+      loadFlash(new Uint8Array(buf));
+    }
+  } catch (_) {
+    /* no bundled firmware */
   }
-} catch (_) {
-  /* no bundled firmware */
 }

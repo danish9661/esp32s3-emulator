@@ -743,7 +743,13 @@ void setup() {
   } else {
     n = ipv6_frame(f, gw_mac, s_ll, gw_ula, 17, u6_pay, 17);
     tx(f, n);
-    for (int w = 0; w < 1; w++) { delay(200); tx(f, n); }
+    // Three re-TX (4 TX total, mirror RA): UDPv6 missed at 3 TX + 6-pop
+    // across two deterministic runs (17/19 twice, 71B echo staged but the
+    // 6-pop scan never lands it in the broadcast-flooded RX FIFO) — same
+    // rendezvous flakiness RA showed at 3 TX, fixed at 4 TX. Extra TX stages
+    // another echo without extra pops (pop budget is the destabilization
+    // risk — 8-pop caused ILLEGAL at 856M; 6-pop stays). Echo stays 2 TX.
+    for (int w = 0; w < 3; w++) { delay(200); tx(f, n); }
     // 6-pop window (same broadcast flooding as the RA leg above).
     for (int k = 0; k < 6 && !u6_ok; k++) {
       memset(rxb, 0, sizeof(rxb));

@@ -113,6 +113,31 @@ impl Emulator {
         self.inner.take_uart_tx(0)
     }
 
+    /// Total undrained console bytes (UART0/1/2 + USB-CDC). Cheap check for
+    /// the worker fast path: skip the `uart_read` Vec handoff when zero.
+    pub fn uart_pending(&self) -> u32 {
+        self.inner.soc.uart_pending_total() as u32
+    }
+
+    /// Queued host-observable events + a pending GPIO edge. Cheap check for
+    /// the worker fast path: skip the `drain_events` Vec handoff when zero.
+    pub fn events_pending(&self) -> u32 {
+        self.inner.soc.events_pending() as u32
+    }
+
+    /// Set the emulated-clock mode (web UI speed control only):
+    /// 0 = accurate, 1 = balanced (same ratio, batched ticks), 2 = turbo
+    /// (2x virtual time — demo-boot use, timer accuracy not guaranteed).
+    /// Battery/run_flash never call this (mode stays 0 there).
+    pub fn set_clock_mode(&mut self, mode: u32) {
+        self.inner.soc.set_clock_mode(mode as u8);
+    }
+
+    /// Current clock mode (0/1/2).
+    pub fn clock_mode(&self) -> u32 {
+        self.inner.soc.clock_mode() as u32
+    }
+
     /// Push host-typed bytes into UART `n`'s RX FIFO (serial console input,
     /// `n` = 0/1/2). The firmware reads them like bytes from a serial
     /// terminal (e.g. the `uart_echo` sketch's `Serial1.read`, MicroPython's

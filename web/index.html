@@ -61,8 +61,31 @@
       </div>
       <label class="steps">
         Steps/frame
-        <input type="range" id="steps" min="1000" max="500000" step="1000" value="40000" />
+        <input type="range" id="steps" min="1000" max="1000000" step="1000" value="40000" />
         <span id="stepsVal">40000</span>
+      </label>
+      <label class="steps">
+        Clock
+        <select id="clockmode" title="Emulated-clock mode: Accurate = cycle-exact ticks; Balanced = same ratio, batched (default, faster); Turbo = 2x virtual time for fast demo boots (timing-sensitive demos may misread)">
+          <option value="0">Accurate</option>
+          <option value="1" selected>Balanced</option>
+          <option value="2">Turbo</option>
+        </select>
+      </label>
+      <label class="steps">
+        Engine
+        <select id="engine" title="Single = both cores serialized in one worker (stable). Dual = virtual-device dispatch in a second worker (experimental, same 1-frame inject latency)">
+          <option value="single" selected>Single</option>
+          <option value="dual">Dual (exp)</option>
+        </select>
+      </label>
+      <label class="steps">
+        Transport
+        <select id="transport" title="Frame transport worker→UI: auto picks SAB shared-rings when the page is crossOriginIsolated, else postMessage">
+          <option value="auto" selected>Auto</option>
+          <option value="msg">postMessage</option>
+          <option value="sab">SAB rings</option>
+        </select>
       </label>
     </div>
     <div class="setup-group meter-group">

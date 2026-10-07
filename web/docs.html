@@ -39,6 +39,7 @@
 
     <div class="toc">
       <a href="#run">Run firmware</a>
+      <a href="#speed">Speed controls</a>
       <a href="#micropython">MicroPython REPL</a>
       <a href="#serial">Serial in and out</a>
       <a href="#gpio">Pin header</a>
@@ -49,12 +50,28 @@
     <h2 id="run">Run firmware</h2>
     <p>Pick a gallery example or load your own <code>.merged.bin</code>
     (arduino-cli produces one per sketch). Press <strong>Run</strong> — the
-    emulator steps both cores, and output appears in the console as the
-    firmware prints. <strong>Stop</strong> halts stepping;
-    <strong>Reset</strong> reloads the same image from its first boot
-    instruction. The steps-per-frame slider trades emulation speed against
-    page responsiveness; the MIPS readout shows smoothed emulated
-    instructions per wall second.</p>
+    emulator steps both cores in a background worker (never on the UI
+    thread), and output appears in the console as the firmware prints.
+    <strong>Stop</strong> halts stepping; <strong>Reset</strong> reloads the
+    same image from its first boot instruction. The steps-per-frame slider
+    sets the base batch the worker scales adaptively each frame; the MIPS
+    readout shows smoothed emulated instructions per wall second.</p>
+
+    <h2 id="speed">Speed controls</h2>
+    <p><strong>Clock</strong> selects the emulated time rate:
+    <strong>Accurate</strong> ticks cycle-exactly,
+    <strong>Balanced</strong> (default) batches the same ratio with fewer
+    overheads, <strong>Turbo</strong> runs 2× virtual time so
+    delay-heavy boots finish sooner (timing-sensitive demos may misread —
+    switch back to Accurate if a demo looks off). <strong>Engine</strong>
+    selects <strong>Single</strong> (both cores serialized in one worker,
+    stable) or <strong>Dual</strong> (virtual-device dispatch offloaded to
+    a second worker, experimental). <strong>Transport</strong> selects how
+    frames reach the page: <strong>Auto</strong> uses zero-copy
+    SharedArrayBuffer rings when the page is cross-origin isolated,
+    else <code>postMessage</code>. Local SAB development needs COOP/COEP
+    headers — serve with <code>python3 tools/serve.py</code> instead of
+    plain <code>http.server</code>.</p>
 
     <h2 id="micropython">MicroPython REPL</h2>
     <p>The <strong>MicroPython</strong> preset in the firmware rail boots the
@@ -109,15 +126,18 @@ FLASHENC_KEY=...            boot the image through XTS flash encryption</pre>
     real hardware would answer.</p>
 
     <h2 id="validate">Validate</h2>
-    <p>The battery replays all 123 cases headlessly: build (or reuse) each
+    <p>The battery replays all 124 cases headlessly: build (or reuse) each
     merged image, boot it through <code>run_flash</code> or the Node bridge,
     and assert serial markers plus internal state. Run a slice locally with
     <code>./tools/run_battery.sh wifi_scan wifi_sta</code>, or the whole
     suite with <code>./tools/run_battery.sh</code>. The freshness guard
     (<code>tools/check_firmware_freshness.py</code>) keeps committed bins in
-    sync with their sketch sources, and <code>tools/webui_playwright.py</code>
-    drives the real page in Chromium — boot, MIPS, echo, UART round-trip,
-    SD mount, touch read, worker boot, gateway panel — failing loudly on any page error.</p>
+    sync with their sketch sources, gallery copies in sync with the bins
+    (<code>python3 tools/sync_gallery.py</code> refreshes them), and
+    <code>tools/webui_playwright.py</code>
+    drives the real page in Chromium — 32 checks covering boot, MIPS, echo,
+    UART round-trip, SD mount, touch read, worker boot, Wi-Fi/ESP-NOW/L3,
+    BLE, MicroPython, gateway panels — failing loudly on any page error.</p>
   </main>
 
   <footer class="foot">

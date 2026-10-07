@@ -278,6 +278,28 @@ async def run_bumble_device() -> object:
                         sender_address, len(data), len(emu_controller.le_connections))
         except Exception:
             pass
+        # EMPTY-TYPE synthesis (2026-10-04, proven live across 1–3B budgets:
+        # central's Read-By-Type 0005-0005 type 0x2803 (single-handle range
+        # past the two declarations in the first response) is delivered cleanly
+        # (WIRE-ACL + EMU-OUT + host_rcv_pkt ok) but firmware answers nothing
+        # (no TX/Error/RET — ATT-server empty-range drop, not sem/gating/link/
+        # pacing/budget). Synthesize Error (Attribute Not Found 0x0a) back to
+        # central here (like the handshake CC/event override) and DROP the
+        # firmware-bound copy (else outstanding sticks at 1 with no TX to clear
+        # it, blocking READ/WRITE forever). Central handles Error and proceeds
+        # to READ level (0x0010) → WRITE/ECHO → PASS. Exact 11B shape only
+        # (L2CAP len 7/CID 4 + 0x08/0005/0005/0x2803); all other ATT flows to
+        # firmware unmodified (demand-driven, no twins).
+        try:
+            if len(data) == 11 and bytes(data) == bytes([0x07, 0x00, 0x04, 0x00, 0x08, 0x05, 0x00, 0x05, 0x00, 0x03, 0x28]):
+                import bumble.core as _core
+                if transport == _core.PhysicalTransport.LE:
+                    err = bytes([0x05, 0x00, 0x04, 0x00, 0x01, 0x08, 0x05, 0x00, 0x0A])
+                    link.send_acl_data(emu_controller, sender_address, transport, err)
+                    logger.info("WIRE-ACL empty-TYPE Error synthesized, firmware copy dropped")
+                    return
+        except Exception as e:
+            logger.info("WIRE-ACL Error-synth failed %s (falling through to firmware)", e)
         try:
             if transport is not None:
                 import bumble.hci as _hci
