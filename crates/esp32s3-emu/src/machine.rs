@@ -174,7 +174,7 @@ pub struct Esp32S3 {
     /// +4 memset (core0 runs a ROM memset loop, postpcs cycling
     /// 0x40056fce/d5/dc/e4) — this names the memset caller, i.e. the
     /// allocator path (calloc? os_zalloc? manual?) behind it.
-    pub memset_hits: [(u32, u32, u32); 4],
+    pub memset_hits: [(u32, u32, u32); 16],
     pub memset_idx: usize,
     /// TEMP (2026-10-06 — DELETE after): NULL-target skip fire count.
     pub nullskip_fires: u32,
@@ -279,7 +279,7 @@ impl Esp32S3 {
             watch_op: [(0, 0, 0, 0); 16],
             watch_op_idx: 0,
             // TEMP (2026-10-05, udp-leg forensics — DELETE after).
-            memset_hits: [(0, 0, 0); 4],
+            memset_hits: [(0, 0, 0); 16],
             memset_idx: 0,
             // TEMP (2026-10-06 — DELETE after).
             nullskip_fires: 0,
@@ -573,6 +573,17 @@ impl Esp32S3 {
         }
         self.cpu[core].step_one(&mut self.soc);
         true
+    }
+
+    /// True when a ROM-memcpy span covers the never-zero islands
+    /// (handler table [0x3FC96060,0x3FC960E0), pxCurrentTCBs
+    /// [0x3FC9BAF8,0x3FC9BB00)). Pure u64 arithmetic (no wraparound
+    /// miscompare: end stays full-width). Unit-tested; the run_fast_core
+    /// hook below is a thin caller (pc match + fake-RETW mirror the TX tap).
+    pub(crate) fn memcpy_span_hits_islands(dst: u32, nbytes: u32) -> bool {
+        let end = dst as u64 + nbytes as u64;
+        (dst < 0x3FC9_60E0 && end > 0x3FC9_6060)
+            || (dst < 0x3FC9_BB00 && end > 0x3FC9_BAF8)
     }
 
     /// Run up to `len` instructions on `core` via `step_one` (no per-op
@@ -979,6 +990,15 @@ impl Esp32S3 {
             {
                 let dst = self.cpu[core].reg(10);
                 let mlen = self.cpu[core].reg(12);
+                // TEMP (2026-10-07 — DELETE after): record EVERY call
+                // here (dst+len) — the late sweep zeroes table+pxcur
+                // from this call chain with dst outside the dummy
+                // window, so the skip below never fires to record it.
+                {
+                    let j = self.memset_idx % 16;
+                    self.memset_hits[j] = (dst, mlen, self.cpu[core].reg(8));
+                    self.memset_idx += 1;
+                }
                 // NOTE: no small-len gate — the pool-growth memset is
                 // fragment-chunk sized (proven by the kill span covering
                 // multiple code pages); an absurd len still runs loud
@@ -993,6 +1013,40 @@ impl Esp32S3 {
                         let j = self.memset_idx % 4;
                         self.memset_hits[j] = (dst, mlen, ra);
                         self.memset_idx += 1;
+                        n += 1;
+                        continue;
+                    }
+                }
+            }
+            // ROM memcpy span guard (WorkerL3 + entry 0x40056F44):
+            // the ppTx path calls ROM memcpy INDIRECTLY (the assumed direct
+            // call site at 0x42074b45 never samples) with a wild span from
+            // the stalled RF queue: proven 23KB+ zero sweep 0x3FC96060 ->
+            // 0x3FC9BB00 wiping handler table + pxCurrentTCBs (+ stacks ->
+            // ALLOCA Guru on both cores). ROM entry (pre-rotation, caller
+            // window, newlib ABI): dst=reg(10), src=reg(11), n=reg(12).
+            // Skip (fake-RETW; memcpy returns dst, already staged) iff
+            // [dst,dst+n) intersects the never-zero islands (same audit as
+            // the sticky guards — no legitimate memcpy targets them).
+            // Narrow by design: exact entry pc + island intersection only;
+            // every other memcpy (including the stub byte-memset at
+            // 0x4000078C) runs normally.
+            if self.soc.wifi_image == esp32s3_soc::WifiImage::WorkerL3
+                && pc0 == 0x4005_6F44
+            {
+                let dst = self.cpu[core].reg(10);
+                let nbytes = self.cpu[core].reg(12);
+                if Self::memcpy_span_hits_islands(dst, nbytes) {
+                    // TEMP record (DELETE after): shares the memset ring
+                    // (end-dump prints it as MEMSET — read dst/len/ra).
+                    let j = self.memset_idx % 16;
+                    self.memset_hits[j] =
+                        (dst, nbytes, self.cpu[core].reg(8));
+                    self.memset_idx += 1;
+                    let ra = self.cpu[core].reg(8);
+                    let ret = (pc0 & 0xc000_0000) | (ra & 0x3fff_ffff);
+                    if (0x4000_0000..0x4400_0000).contains(&ret) {
+                        self.cpu[core].pc = ret;
                         n += 1;
                         continue;
                     }

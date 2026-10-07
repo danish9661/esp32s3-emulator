@@ -153,7 +153,7 @@ CASES=(
 "test_worker_net_inwasm|NODE:tools/wifi_harness.mjs|WIFI WORKER NET HARNESS PASS||esp32s3_test_worker_net/esp32s3_test_worker_net.merged.bin"
 "test_worker_l3_inwasm|NODE:tools/wifi_harness.mjs|WIFI WORKER L3 HARNESS PASS||esp32s3_test_worker_l3/esp32s3_test_worker_l3.merged.bin"
 "test_worker_l3|WIFI_STA_CONN=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55|WORKER L3 START;WORKER L3 status 3;WORKER L3 netif 1;WORKER L3 gw 0;WORKER L3 dns -21;WORKER L3 ntp -22;WORKER L3 udp -29;WORKER L3 coap -30;WORKER L3 coap_srv -34;WORKER L3 http_synack -23;WORKER L3 http -24;WORKER L3 mqtt_synack -25;WORKER L3 mqtt -28;WORKER L3 ip6 ra -31;WORKER L3 ip6 echo -32;WORKER L3 ip6 udp -33;WORKER L3 DONE|350000000"
-"test_worker_l3_live|SKIP:udp miss + early exit at 887M with RA 4xTX (RA fixed: 134 OK live; DSP-skip stale after relink so park word moved — manual 19/19 stands via l3dsp.log with coap_srv 1 + mqtt 1883 + echo; full DONE pending re-nm DSP word + robust udp (3xTX?) + indirect-call hook — same class as the retired lightsleep SKIP)"
+"test_worker_l3_live|WIFI_STA_CONN=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55 NET_GW=127.0.0.1:5051|WORKER L3 START;WORKER L3 status 3;WORKER L3 netif 1;WORKER L3 gw 1;WORKER L3 dns 34;WORKER L3 ntp 123;WORKER L3 udp 9;WORKER L3 coap 205;WORKER L3 coap_srv 1;WORKER L3 http_synack 1;WORKER L3 http 200;WORKER L3 mqtt_synack 1;WORKER L3 mqtt_connack 1;WORKER L3 mqtt_suback 1;WORKER L3 mqtt 1883;WORKER L3 ip6 ra 134;WORKER L3 ip6 echo 129;WORKER L3 ip6 udp 9;WORKER L3 DONE|1100000000|esp32s3_test_worker_l3/esp32s3_test_worker_l3.merged.bin"
 "net_pcap|WIFI_STA_CONN=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55 NET_GW=127.0.0.1:5051 NET_PCAP=tools/.gateway/battery.pcap|WORKER NET START;WORKER NET status 3;WORKER NET netif 1;WORKER NET DONE|350000000|esp32s3_test_worker_net/esp32s3_test_worker_net.merged.bin"
 "ble||BLE START;BLE init 1;BLE server 1;BLE service 1;BLE chars 2;BLE echo 4;BLE adv 1;BLE level 100;BLE DONE|"
 "wifi_ap|WIFI_AP_FIXTURE=1|WIFI AP softAP 1;WIFI AP IP 192.168.4.1;WIFI AP MAC 62:55:44:33:22:11;WIFI AP stations 0;WIFI AP clients 0;WIFI AP DONE|60000000"
@@ -336,6 +336,11 @@ for c in "${CASES[@]}"; do
   # 1B). Scale with budget: 900s for >=1B, else 300s.
   case_timeout=300
   if [[ $steps -ge 1000000000 ]]; then case_timeout=1000; fi
+  # Live L3 is the battery's longest entry (delay-heavy LwIP waits need
+  # ~950M+ insns; at contended-box pace that exceeds 1000s wall). The
+  # markers stay the real gate; this only stops the timeout from killing
+  # a healthy slow run (CI shards allow 300 min per step).
+  if [[ "$name" == test_worker_l3_live ]]; then case_timeout=1500; fi
   # shellcheck disable=SC2086 (envstr intentionally splits on spaces —
   # no value inside it contains spaces; NET_PCAP rides separately above).
   if [[ -n "$pcap_abs" ]]; then

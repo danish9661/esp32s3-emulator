@@ -780,6 +780,14 @@ fn main() {
     // faults (EPC1=0 tells nothing). Always-on (2 stores/step, negligible).
     let mut pc_ring = [(0u32, 0u32); 32];
     let mut pc_ring_i: usize = 0;
+    // TEMP (2026-10-07 — DELETE after): pxCurrentTCBs[1] zeroing tripwire.
+    // The slot (0x3FC9BAFC) is nonzero once the scheduler starts yet reads
+    // 0 at the core1 crash; the sticky guards block guarded-path zeroing,
+    // so the killer uses an unguarded path (or it is never set here).
+    // Poll every macro-step (one read32 — negligible vs a step_fast) and
+    // break AT the transition with full context (far better than
+    // post-crash forensics: pc_ring shows the killer's trajectory).
+    let mut pxcur_seen = false;
     // TEMP (2026-10-05, udp-leg park forensics — DELETE after): watchdog
     // for the post-`ip6edrain 3` stall (firmware stops printing after the
     // echo drains; first udp TX reaches the tap but the 6-pop scan never
@@ -819,6 +827,61 @@ fn main() {
         // TEMP (2026-10-05 — DELETE after): trailing ring (see decl).
         pc_ring[pc_ring_i % 32] = (m.cpu[0].pc, m.cpu[1].pc);
         pc_ring_i += 1;
+        // TEMP (2026-10-07 — DELETE after): pxcur tripwire (see decl).
+        {
+            let tcb1 = m.soc.read32(0x3FC9_BAFC);
+            if !pxcur_seen {
+                if tcb1 != 0 {
+                    pxcur_seen = true;
+                }
+            } else if tcb1 == 0 {
+                // Print-only: never break here — a WDT reset's fresh-boot
+                // zeros would false-positive (proven: post-reboot break at
+                // 0x40000400). The run outcome belongs to the firmware.
+                println!(
+                    "[host] PXCUR-ZERO at i={i} executed={executed} pc0={:#010x} pc1={:#010x}",
+                    m.cpu[0].pc, m.cpu[1].pc
+                );
+                for c in 0..2 {
+                    println!(
+                        "[host] PXCUR-ZERO core{c} a0={:#010x} a1(sp)={:#010x} a2={:#010x} a3={:#010x} wb={} ps={:#010x}",
+                        m.cpu[c].reg(0),
+                        m.cpu[c].reg(1),
+                        m.cpu[c].reg(2),
+                        m.cpu[c].reg(3),
+                        m.cpu[c].windowbase(),
+                        m.cpu[c].sreg(xtensa_core::cpu::SR_PS),
+                    );
+                }
+                for k in 0..32 {
+                    let e = pc_ring[(pc_ring_i + k) % 32];
+                    println!("[host] PXCUR-RING pc0={:#010x} pc1={:#010x}", e.0, e.1);
+                }
+                // Ground truth at detection: actual table/slot values
+                // (did the phase-1 sweep land or was it guard-blocked?)
+                // plus the image gate the guards check.
+                println!(
+                    "[host] PXCUR-STATE tbl60={:#010x} tbla8={:#010x} tcb0={:#010x} tcb1={:#010x} workerl3={}",
+                    m.soc.read32(0x3FC9_6060),
+                    m.soc.read32(0x3FC9_60A8),
+                    m.soc.read32(0x3FC9_BAF8),
+                    m.soc.read32(0x3FC9_BAFC),
+                    m.soc.wifi_image == esp32s3_soc::WifiImage::WorkerL3,
+                );
+                // Per-op watch ring: the pxcur observer arms record every
+                // write to the slot with post-op pc — the zeroing write
+                // (val 0x0 at 0x3fc9bafc) names its writer op directly.
+                for k in 0..16 {
+                    let e = m.watch_op[(m.watch_op_idx + k) % 16];
+                    if e.1 != 0 {
+                        println!(
+                            "[host] PXCUR-WATCH postpc={:#010x} addr={:#010x} val={:#010x} a0={:#010x}",
+                            e.0, e.1, e.2, e.3
+                        );
+                    }
+                }
+            }
+        }
         // TEMP (2026-10-07 — DELETE after): storm-loop trace (first
         // NULLSKIP fire + next 300 macro-steps, both pcs). Maps the
         // take→vector→prologue→dispatch→skip→rfi loop to find what
@@ -3820,7 +3883,7 @@ if wifi_espnow_loopback && (!wifi_espnow_tx_done || !wifi_espnow_rx_done) {
             m.nullskip_first.4
         );
         for k in 0..4 {
-            let e = m.memset_hits[(m.memset_idx + k) % 4];
+            let e = m.memset_hits[(m.memset_idx + k) % 16];
             if e.0 != 0 {
                 println!(
                     "[host] MEMSET dst={:#010x} len={} ra={:#010x} ret={:#010x}",

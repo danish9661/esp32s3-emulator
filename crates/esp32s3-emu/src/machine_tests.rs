@@ -5150,3 +5150,30 @@ fn dual_core_spinlock_contention_makes_progress() {
     }
     assert_eq!(m.soc.read32(LOCK), 0, "lock released at end");
 }
+
+/// ROM-memcpy span discriminator (WorkerL3 wild-sweep guard): pure
+/// interval logic, pinned here so the live-run evidence (23KB+ sweep
+/// 0x3FC96060 -> 0x3FC9BB00) stays encoded even though live runs only
+/// exercise it when the stalled RF queue actually goes wild.
+#[test]
+fn memcpy_span_hits_islands() {
+    use crate::machine::Esp32S3 as M;
+    // Wild sweep (proven live): covers both islands.
+    assert!(M::memcpy_span_hits_islands(0x3FC9_6060, 0x5A50));
+    // Touches table only / pxcur only.
+    assert!(M::memcpy_span_hits_islands(0x3FC9_6050, 0x20));
+    assert!(M::memcpy_span_hits_islands(0x3FC9_BAF0, 0x20));
+    // Ends exactly at an island start: no overlap.
+    assert!(!M::memcpy_span_hits_islands(0x3FC9_6000, 0x60));
+    // Starts exactly at an island end: no overlap.
+    assert!(!M::memcpy_span_hits_islands(0x3FC9_60E0, 0x100));
+    assert!(!M::memcpy_span_hits_islands(0x3FC9_BB00, 0x100));
+    // Sane pool-sized copy far from islands.
+    assert!(!M::memcpy_span_hits_islands(0x3FC8_9980, 0x800));
+    // Zero length never hits.
+    assert!(!M::memcpy_span_hits_islands(0x3FC9_6060, 0));
+    // Huge span from below (no wrap in u64, covers islands).
+    assert!(M::memcpy_span_hits_islands(0x3FC8_0000, 0x8000_0000));
+    // Top-wrapping span covers only extremes, not mid-range islands.
+    assert!(!M::memcpy_span_hits_islands(0xFFFF_FFF0, 0x20));
+}

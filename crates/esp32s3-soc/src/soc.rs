@@ -5285,6 +5285,21 @@ impl Soc {
         self.sram[(addr - DRAM_BASE) as usize] != 0
     }
 
+    // TEMP (2026-10-07 — DELETE after): D-side sram index for I-alias
+    // (instruction-view) addrs over the guarded ranges (handler table +
+    // pxCurrentTCBs). The D-side lanes (ram_write8/write32/cas32) are all
+    // guarded now; the I-side arms had no guards at all, and the late
+    // zeroing survived every D-side guard with the image gate verified
+    // active — so it comes through here (I-alias of 0x3FC9BAF8 is
+    // 0x4038BAF8, inside the DIRAM window).
+    fn ialias_guarded_cell(&self, addr: u32) -> Option<usize> {
+        if in_range!(addr, 0x4038_6060, 0x80) || in_range!(addr, 0x4038_BAF8, 8) {
+            Some((DIRAM_DATA_BASE - DRAM_BASE + (addr - DIRAM_INST_BASE)) as usize)
+        } else {
+            None
+        }
+    }
+
     fn ram_write8(&mut self, addr: u32, val: u8) {
         // Host event-block pool (see `ram8`).
         if in_range!(addr, Self::WIFI_ARD_POOL, 768) {
@@ -5302,6 +5317,12 @@ impl Soc {
             || (0x3FC8_9960..0x3FC8_99C0).contains(&addr)
             || (0x3FC9_6060..0x3FC9_60E0).contains(&addr)
         {
+            self.watch_hit = Some((addr, val as u32, 1));
+        }
+        // TEMP (2026-10-07 — DELETE after): pxCurrentTCBs observer (pure
+        // record, never blocks — unlike the sticky guards). The slot
+        // zeroes late via an unguarded path; this names the writer op.
+        if (0x3FC9_BAF8..0x3FC9_BB00).contains(&addr) {
             self.watch_hit = Some((addr, val as u32, 1));
         }
         // STICKY-CODE GUARD (2026-10-05, udp-leg Dlagnosis): the
@@ -5359,6 +5380,16 @@ impl Soc {
         {
             self.watch_hit = Some((addr, 0x4755_4152, 1));
             return;
+        }
+        // TEMP (2026-10-07 — DELETE after): I-alias guard, byte lane
+        // (see ialias_guarded_cell). Blocks nonzero->zero, WorkerL3-gated.
+        if self.wifi_image == WifiImage::WorkerL3 && val == 0 {
+            if let Some(o) = self.ialias_guarded_cell(addr) {
+                if self.sram[o] != 0 {
+                    self.watch_hit = Some((addr, 0x4755_4152, 1));
+                    return;
+                }
+            }
         }
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE) {
             if addr == 0x3FCEF750 || addr == 0x3FCEF748 {
@@ -7681,7 +7712,26 @@ impl Bus for Soc {
                 ]
             });
             if old == compare {
+                // TEMP (2026-10-07 — DELETE after): pxCurrentTCBs GUARD,
+                // CAS lane. cas32 bypasses every other guard (direct sram
+                // write); the slot zeroed late through an unguarded path
+                // while byte/word lanes were guarded, so this lane gets
+                // the same nonzero->zero block (WorkerL3-gated, audit:
+                // slots always hold live TCBs post-boot).
+                if self.wifi_image == WifiImage::WorkerL3
+                    && (0x3FC9_BAF8..0x3FC9_BB00).contains(&addr)
+                    && val == 0
+                    && old != 0
+                {
+                    self.watch_hit = Some((addr, 0x4755_4152, 4));
+                    return old;
+                }
                 self.sram[o..o + 4].copy_from_slice(&val.to_le_bytes());
+                // TEMP (2026-10-07 — DELETE after): pxCurrentTCBs observer,
+                // CAS lane (see ram_write8 note).
+                if (0x3FC9_BAF8..0x3FC9_BB00).contains(&addr) {
+                    self.watch_hit = Some((addr, val, 4));
+                }
             }
             return old;
         }
@@ -7710,6 +7760,23 @@ impl Bus for Soc {
                 self.sram[o + 3],
             ]);
             if old == compare {
+                // TEMP (2026-10-07 — DELETE after): I-alias guard, CAS
+                // lane (see ialias_guarded_cell).
+                if self.wifi_image == WifiImage::WorkerL3 {
+                    if let Some(go) = self.ialias_guarded_cell(addr) {
+                        let nb = val.to_le_bytes();
+                        let mut blocked = false;
+                        for (k, b) in nb.iter().enumerate() {
+                            if *b == 0 && self.sram[go + k] != 0 {
+                                blocked = true;
+                            }
+                        }
+                        if blocked {
+                            self.watch_hit = Some((addr, 0x4755_4152, 4));
+                            return old;
+                        }
+                    }
+                }
                 self.sram[o..o + 4].copy_from_slice(&val.to_le_bytes());
             }
             return old;
@@ -7996,56 +8063,6 @@ impl Bus for Soc {
                 return;
             }
             let o = (addr - DRAM_BASE) as usize;
-            // STICKY-CODE GUARD (2026-10-05): per-lane nonzero<-zero
-            // blocking for the dummy window (see ram_write8 note).
-            // WORKERL3-GATED (2026-10-07, speed work): same hello-assert
-            // reason as the byte-path guards.
-            if self.wifi_image == WifiImage::WorkerL3 && (0x3FC8_8000..0x3FC9_5800).contains(&addr)
-            {
-                let mut nb = bytes;
-                let mut blocked = false;
-                for (k, b) in nb.iter_mut().enumerate() {
-                    if *b == 0 && self.sram[o + k] != 0 {
-                        *b = self.sram[o + k];
-                        blocked = true;
-                    }
-                }
-                self.sram[o..o + 4].copy_from_slice(&nb);
-                // TEMP marker (DELETE after): see ram_write8 note.
-                if blocked {
-                    self.watch_hit = Some((addr, 0x4755_4152, 4));
-                }
-            } else {
-                self.sram[o..o + 4].copy_from_slice(&bytes);
-            }
-            // STICKY-TABLE GUARD, word lanes (2026-10-06): same
-            // nonzero<-zero block for the handler table (see ram_write8
-            // note). Table entries are never legitimately zero.
-            // (plus pxCurrentTCBs below: same block, and the S32I
-            // word path is how memset reaches it — ram_write8 alone
-            // missed it (proven: TCB1=0 at crash despite the byte guard).
-            // WORKERL3-GATED (2026-10-07, speed work): same hello-assert
-            // reason as the byte-path guards.
-            if self.wifi_image == WifiImage::WorkerL3
-                && ((0x3FC9_6060..0x3FC9_60E0).contains(&addr)
-                    || (0x3FC9_BAF8..0x3FC9_BB00).contains(&addr))
-            {
-                let o = (addr - DRAM_BASE) as usize;
-                let mut nb = bytes;
-                let mut blocked = false;
-                for (k, b) in nb.iter_mut().enumerate() {
-                    if *b == 0 && self.sram[o + k] != 0 {
-                        *b = self.sram[o + k];
-                        blocked = true;
-                    }
-                }
-                // NOTE: sram already written above when addr is also in
-                // DRAM range (table is HIGH DRAM) — rewrite guarded bytes.
-                self.sram[o..o + 4].copy_from_slice(&nb);
-                if blocked {
-                    self.watch_hit = Some((addr, 0x4755_4152, 4));
-                }
-            }
             // TEMP (2026-10-05, udp-leg forensics — DELETE after): DRAM
             // view of the watched DIRAM alias (see ram_write8 note),
             // plus the handler table (see above).
@@ -8053,6 +8070,46 @@ impl Bus for Soc {
                 || (0x3FC9_6060..0x3FC9_60E0).contains(&addr)
             {
                 self.watch_hit = Some((addr, val, 4));
+            }
+            // TEMP (2026-10-07 — DELETE after): pxCurrentTCBs observer,
+            // word lane (see ram_write8 note).
+            if (0x3FC9_BAF8..0x3FC9_BB00).contains(&addr) {
+                self.watch_hit = Some((addr, val, 4));
+            }
+            // Sticky guards, word lanes: dummy window [0x3FC88000,0x3FC95800)
+            // (2026-10-05: idle pool memset over the DIRAM alias kills IRAM;
+            // heap never serves it on silicon) + handler table
+            // [0x3FC96060,0x3FC960E0) (2026-10-06: entries never legitimately
+            // zero; TBLCRASH) + pxCurrentTCBs [0x3FC9BAF8,0x3FC9BB00)
+            // (2026-10-07: slots always hold live TCBs post-boot). Per-lane
+            // nonzero->zero block, WorkerL3-gated (2026-10-07 speed work:
+            // hello heaps here; blocking broke its boot). See ram_write8
+            // note. All lanes evaluate against the PRISTINE cell content
+            // with a SINGLE write at the end: the old split form wrote the
+            // dummy lane first, so a later lane read back already-zeroed
+            // bytes and passed the killing write through (proven by unit
+            // test: byte lane held while word lane zeroed). Ranges are
+            // disjoint, so at most one lane matches per write.
+            {
+                let guarded = self.wifi_image == WifiImage::WorkerL3
+                    && ((0x3FC8_8000..0x3FC9_5800).contains(&addr)
+                        || (0x3FC9_6060..0x3FC9_60E0).contains(&addr)
+                        || (0x3FC9_BAF8..0x3FC9_BB00).contains(&addr));
+                let mut nb = bytes;
+                let mut blocked = false;
+                if guarded {
+                    for (k, b) in nb.iter_mut().enumerate() {
+                        if *b == 0 && self.sram[o + k] != 0 {
+                            *b = self.sram[o + k];
+                            blocked = true;
+                        }
+                    }
+                }
+                self.sram[o..o + 4].copy_from_slice(&nb);
+                if blocked {
+                    // TEMP marker (DELETE after): see ram_write8 note.
+                    self.watch_hit = Some((addr, 0x4755_4152, 4));
+                }
             }
             // Closed-RF dispatch-table completion (see
             // `maybe_complete_phyfuns_slot` for the full proof + per-image
@@ -8070,6 +8127,29 @@ impl Bus for Soc {
                 return;
             }
             let o = (DIRAM_DATA_BASE - DRAM_BASE + (addr - DIRAM_INST_BASE)) as usize;
+            // TEMP (2026-10-07 — DELETE after): I-alias guard, word lane
+            // (see ialias_guarded_cell). Per-lane nonzero->zero block.
+            if self.wifi_image == WifiImage::WorkerL3 {
+                if let Some(go) = self.ialias_guarded_cell(addr) {
+                    let mut nb = bytes;
+                    let mut blocked = false;
+                    for (k, b) in nb.iter_mut().enumerate() {
+                        if *b == 0 && self.sram[go + k] != 0 {
+                            *b = self.sram[go + k];
+                            blocked = true;
+                        }
+                    }
+                    self.sram[o..o + 4].copy_from_slice(&nb);
+                    if blocked {
+                        self.watch_hit = Some((addr, 0x4755_4152, 4));
+                    }
+                    // TEMP watch (DELETE after): IRAM view record.
+                    if (0x4037_9960..0x4037_99C0).contains(&addr) {
+                        self.watch_hit = Some((addr, val, 4));
+                    }
+                    return;
+                }
+            }
             self.sram[o..o + 4].copy_from_slice(&bytes);
             // TEMP (2026-10-05, udp-leg forensics — DELETE after): IRAM
             // view of the watched DIRAM alias (see ram_write8 note).
