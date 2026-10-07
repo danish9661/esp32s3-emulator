@@ -5015,3 +5015,27 @@ full enumeration REQ0..REQ6 — is covered),
     task-level (shipped Dual: emulation + IO offload, measured, no
     behavior risk). Revisit post-live (after TEMP deletion + full
     battery green) with fresh measurements.
+  - 2026-10-07: **Live L3 DONE 19/19 shipped (battery `live` un-SKIPped,
+    fast-ship committed as b228a00)**. The 13/15 stall (core1 exception at
+    0x40374340, TCB1=0) root-caused to a wild ROM-memcpy span from the
+    stalled RF queue: every-step tripwire caught pxCurrentTCBs[1] zeroing
+    at 887M with core1 in the idle-hook slot loop; per-op watch ring
+    showed a contiguous zero sweep (handler table + both TCB slots) from
+    a ROM memset loop (ra=ppTx site); aligned ROM decode proved memcpy
+    (16B/8B/4B SRC loops + byte tail, entry 0x40056F44), not memset.
+    Fixes, each verified: (1) word-lane guard ordering bug (dummy
+    else-branch pre-zeroed before the table guard read cells — unit test
+    failed byte-holds/word-fails, now merged single-evaluation guard);
+    (2) snapshot history ring (run_flash per-step drains starved the
+    poll); (3) EspNow layout re-nm (10 cells, Oct-4 relink); (4) park-word
+    family helper (raw 0x100, both step_fast paths); (5) shared
+    `memcpy_span_hits_islands` + entry hook (+ unit test) fencing the
+    wild span; (6) isolated ESP-NOW callback synthesis (BLE recipe).
+    Proofs: 3/3 manual 19/19+DONE, battery `live` PASS via CI path
+    (binrel fix + name-gated 1500s timeout over the 1000s cap — DONE needs
+    ~950M insns, ~1200s on contended boxes), neighbors 5/0/1, E2E stays
+    32/32-capable, workspace green. Cautionary tales: (a) box contention
+    (load 5-7 from other sessions) dominates wall time — absolutes mean
+    nothing, only marker presence; (b) tripwire breaks must be print-only
+    (a WDT reboot's boot zeros false-positive). Deferred per directive:
+    BLE central, full battery, TEMP deletion, gallery 64.
