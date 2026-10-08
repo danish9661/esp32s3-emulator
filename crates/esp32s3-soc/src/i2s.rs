@@ -123,8 +123,6 @@ pub struct I2s {
     rx_count: usize,
     rx_in: [u32; FIFO_DEPTH],
     rx_in_count: usize,
-    /// TEMP I2S-driver probe (remove): recent (offset, value) writes.
-    pub dbg_writes: alloc::vec::Vec<(u32, u32)>,
     int_raw: u32,
     int_ena: u32,
     // TX serial-shift state.
@@ -193,7 +191,6 @@ impl I2s {
             rx_bck: 0,
             rx_ws: 0,
             rx_bck_div: 1,
-            dbg_writes: alloc::vec::Vec::new(), // TEMP (remove)
             tx_dma_pending: false,
         }
     }
@@ -370,12 +367,6 @@ impl I2s {
 
     pub fn write32(&mut self, offset: u32, value: u32) {
         let o = offset & 0xFFF;
-        if o == RX_CONF || o == TX_CONF {
-            // TEMP I2S-driver probe (remove)
-            if self.dbg_writes.len() < 60 {
-                self.dbg_writes.push((o, value));
-            }
-        }
         match o {
             FIFO => {
                 if self.tx_count < FIFO_DEPTH {

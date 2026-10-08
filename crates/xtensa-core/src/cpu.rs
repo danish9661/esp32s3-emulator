@@ -274,11 +274,6 @@ pub struct Cpu {
     /// Debug counters for interrupt-delivery diagnosis (run_flash probes).
     pub dbg_irq_taken: u64,
     pub dbg_irq_skipped_level0: u64,
-    /// TEMP (2026-10-06 — DELETE after): last-8 interrupt takes as
-    /// (line, level). Names the storming line for the NULL-dispatch
-    /// hunt (the take computes it; post-hoc sregs are clear).
-    pub take_ring: [(u32, u32); 8],
-    pub take_idx: usize,
     /// Decode cache for WASM/native speed: direct-mapped cache of
     /// `pc -> (raw, opc, opnds, len, wmask)` to avoid the `decode_inst` match
     /// AND the `opnds` match per step. Hot loops (boot copy, FreeRTOS) hit
@@ -325,8 +320,6 @@ impl Cpu {
             last_raw: 0,
             dbg_irq_taken: 0,
             dbg_irq_skipped_level0: 0,
-            take_ring: [(0, 0); 8],
-            take_idx: 0,
             decode_cache: {
                 let mut v = alloc::vec::Vec::with_capacity(8192);
                 v.resize_with(8192, || {
@@ -616,17 +609,6 @@ impl Cpu {
             return false;
         }
         self.dbg_irq_taken += 1;
-        // TEMP (2026-10-06 — DELETE after): latch (line, level). Line
-        // = highest set bit (NSAU-style, mirrors _xt_lowint1's pick).
-        {
-            let masked = INT_LEVEL_MASKS[level as usize] & intset & intenable;
-            if masked != 0 {
-                let line = 31 - masked.leading_zeros();
-                let j = self.take_idx % 8;
-                self.take_ring[j] = (line, level as u32);
-                self.take_idx += 1;
-            }
-        }
         let pc = self.pc;
         if level == 1 {
             self.sregs[SR_EXCCAUSE as usize] = LEVEL1_INTERRUPT_CAUSE;

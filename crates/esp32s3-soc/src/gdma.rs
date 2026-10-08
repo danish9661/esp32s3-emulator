@@ -30,8 +30,6 @@
 //! (bits 1/3) are asserted so the firmware GDMA ISR (and any registered
 //! `gdma` tx-event callback, e.g. the esp-idf RMT driver) can run.
 
-use alloc::vec::Vec;
-
 /// GDMA register-block base (APB): `DR_REG_GDMA_BASE = 0x6003_F000` per
 /// `esp32s3.peripherals.ld` (`PROVIDE ( GDMA = 0x6003F000 )`). One
 /// controller with 5 channel pairs shared by ALL peripherals — RMT, SPI,
@@ -115,9 +113,6 @@ pub struct Gdma {
     out_conf0: [u32; NCH],
     out_conf1: [u32; NCH],
     out_int_raw: [u32; NCH],
-    /// TEMP I2S-driver probe (remove): completed-walk counters.
-    pub dbg_walks_out: u64,
-    pub dbg_walks_in: u64,
     out_int_ena: [u32; NCH],
     out_link: [u32; NCH],
     out_state: [u32; NCH],
@@ -133,10 +128,6 @@ pub struct Gdma {
     in_int_ena: [u32; NCH],
     in_link: [u32; NCH],
     in_peri_sel: [u32; NCH],
-
-    // Temporary validation ring buffer: records recent raw GDMA writes.
-    dbg: [(u32, u32); 64],
-    dbg_i: usize,
 }
 
 impl Default for Gdma {
@@ -146,8 +137,6 @@ impl Default for Gdma {
             out_conf0: [0; NCH],
             out_conf1: [0; NCH],
             out_int_raw: [0; NCH],
-            dbg_walks_out: 0,
-            dbg_walks_in: 0,
             out_int_ena: [0; NCH],
             out_link: [0; NCH],
             out_state: [0; NCH],
@@ -160,8 +149,6 @@ impl Default for Gdma {
             in_int_ena: [0; NCH],
             in_link: [0; NCH],
             in_peri_sel: [0; NCH],
-            dbg: [(0u32, 0u32); 64],
-            dbg_i: 0,
         }
     }
 }
@@ -220,13 +207,11 @@ impl Gdma {
     /// Assert `out_done` + `out_eof` + `out_total_eof` for an OUT channel.
     pub fn raise_out_done(&mut self, ch: usize) {
         self.out_int_raw[ch] |= (1 << 0) | (1 << 1) | (1 << 3);
-        self.dbg_walks_out += 1; // TEMP I2S-driver probe (remove)
     }
 
     /// Assert `in_done` + `in_eof` + `in_total_eof` for an IN channel.
     pub fn raise_in_done(&mut self, ch: usize) {
         self.in_int_raw[ch] |= (1 << 0) | (1 << 1) | (1 << 3);
-        self.dbg_walks_in += 1; // TEMP I2S-driver probe (remove)
     }
 
     /// Enable all interrupt bits for an IN channel (so the firmware GDMA ISR
@@ -256,34 +241,6 @@ impl Gdma {
             }
         }
         false
-    }
-
-    /// Debug: per-channel (out_peri, out_raw, out_ena, in_peri, in_raw, in_ena).
-    pub fn debug_state(&self) -> Vec<(u32, u32, u32, u32, u32, u32)> {
-        let mut v = Vec::new();
-        for ch in 0..NCH {
-            v.push((
-                self.out_peri_sel[ch],
-                self.out_int_raw[ch],
-                self.out_int_ena[ch],
-                self.in_peri_sel[ch],
-                self.in_int_raw[ch],
-                self.in_int_ena[ch],
-            ));
-        }
-        v
-    }
-
-    /// Debug: recent raw GDMA writes (offset, value) as a Vec.
-    pub fn debug_log(&self) -> Vec<(u32, u32)> {
-        let mut v = Vec::with_capacity(64);
-        for k in 0..64 {
-            let i = (self.dbg_i + k) % 64;
-            if self.dbg[i].1 != 0 || self.dbg[i].0 != 0 {
-                v.push(self.dbg[i]);
-            }
-        }
-        v
     }
 
     /// Masked OUT interrupt status for a channel (matrix source 71+ch).
@@ -357,8 +314,6 @@ impl Gdma {
     /// copy. Returns `None` for non-start writes.
     pub fn write32(&mut self, offset: u32, value: u32) -> Option<(usize, bool)> {
         let off = offset & 0xFFF;
-        self.dbg[self.dbg_i] = (off, value);
-        self.dbg_i = (self.dbg_i + 1) % 64;
         let (is_out, ch, w) = Self::decode(off)?;
         if is_out {
             match w {

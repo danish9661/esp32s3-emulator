@@ -5039,3 +5039,20 @@ full enumeration REQ0..REQ6 — is covered),
     nothing, only marker presence; (b) tripwire breaks must be print-only
     (a WDT reboot's boot zeros false-positive). Deferred per directive:
     BLE central, full battery, TEMP deletion, gallery 64.
+  - 2026-10-08: **TEMP forensics deletion completed (was 215+ markers)**.
+    All `DELETE after` probes/dumps/rings removed across run_flash (119),
+    machine.rs (70), soc.rs (26), cpu.rs take_ring, gdma/i2s probe
+    clusters, plus the walkvec.rs forensic tool (unreferenced). Kept +
+    reworded every load-bearing mechanism (NULL-skip RFI-OUT + storm
+    brake, entry-line latch, wait-skip/DSP-skip/memcpy-guard/RF-skip
+    fake-returns, sticky + I-alias guards, RESTAGE-ON-ABORT now on a local
+    `aborted` flag, BLE whitelist/blacklist/handshake/pacing/HOLD gates,
+    canned stagers, ESP-NOW synthesis). Two real bugs caught en route: a
+    `blocked`-plumbing mixup across three guard lanes, and a span-ordering
+    bug in the deletion scripting (unsorted spans hit shifted lines —
+    recovered via checkout + deterministic replay). Proofs: 592/592 tests,
+    clippy `-D warnings` clean, fmt clean, wasm32 clean, hello `boot OK`
+    + BLE `BLE DONE`, 11/0/0 wifi/usb/ble/espnow slice. Full battery
+    killed twice by host restarts before completing — re-run it to certify
+    (per user: committed on smoke-green instead). Remaining per directive:
+    BLE central, full battery certification, per-core threads.

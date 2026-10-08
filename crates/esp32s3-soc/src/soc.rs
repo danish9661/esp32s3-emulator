@@ -761,19 +761,6 @@ pub struct Soc {
     /// objdump 0x420052e5 — so the tap address names recycled memory by
     /// arrival time; the helper stays parked for other images.)
     ble_link_up: bool,
-    /// TEMP (2026-10-03): event-dispatch tracer switch (DELETE after).
-    ble_trace_evt: bool,
-    /// TEMP (2026-10-03): event-dispatch trace ring (DELETE after).
-    ble_trace: [(u32, u32, u32, u32); 16],
-    /// TEMP (2026-10-03): trace ring cursor (DELETE after).
-    ble_trace_idx: usize,
-    /// TEMP (2026-10-05, udp-leg forensics — DELETE after): IRAM
-    /// write-watch for the zeroed `esp_cpu_wait_for_intr` region.
-    /// The DIRAM alias is silicon-true (data = inst - 0x6F0000), so both
-    /// views are watched: IRAM 0x40379960+96B and DRAM 0x3FC89960+96B.
-    /// Set on any RAM write into either range as (addr, val, size);
-    /// run_flash polls+takes it each macro-step to print the writer pcs.
-    pub watch_hit: Option<(u32, u32, u32)>,
 
     /// Block-boundary cache for block-at-a-time execution (machine
     /// `step_fast`): per core, `fast_tag[c][i]` is the block-start pc
@@ -912,11 +899,6 @@ impl Soc {
             ble_tx_seq: 0,
             ble_last_op: 0,
             ble_link_up: false,
-            ble_trace_evt: false,
-            ble_trace: [(0, 0, 0, 0); 16],
-            ble_trace_idx: 0,
-            // TEMP (2026-10-05, udp-leg forensics — DELETE after).
-            watch_hit: None,
             fast_tag: [
                 Box::new([FAST_TAG_INVALID; FAST_CACHE_SIZE]),
                 Box::new([FAST_TAG_INVALID; FAST_CACHE_SIZE]),
@@ -964,33 +946,13 @@ impl Soc {
         &self.flash[..]
     }
 
-    /// TEMP (2026-10-05, udp-leg forensics — DELETE after): sources
-    /// bitmap + mapped lines at crash (NULL-dispatch hunt: which
-    /// peripheral source fires on a line with no handler). Returns
-    /// (sources lo64, sources hi64, lines). Fresh scan (ignores the
-    /// per-step cache so post-mortem reads are current).
+    /// Sources bitmap + mapped lines (peripheral source -> line).
+    /// Returns (sources lo64, sources hi64, lines). Fresh scan (ignores
+    /// the per-step cache so reads are current).
     pub fn int_debug(&mut self, cpu: usize) -> (u64, u64, u32) {
         let src = self.scan_peripheral_sources();
         let lines = self.intc.pending_lines(cpu, src);
         (src as u64, (src >> 64) as u64, lines)
-    }
-
-    /// TEMP (2026-10-06 — DELETE after): non-default matrix routes as
-    /// packed (source, line) pairs for the NULL-dispatch hunt (which
-    /// source sits on unregistered lines 20/21/24?). Format: up to 8
-    /// pairs packed as u64s [(src<<32|line)], plus count. Only routes
-    /// with line != 6 (the default) are listed.
-    pub fn int_routes(&self, cpu: usize) -> ([u64; 32], usize) {
-        let mut out = [0u64; 32];
-        let mut n = 0usize;
-        for src in 0..96u32 {
-            let l = self.intc.map_entry(cpu, src as usize);
-            if l != 6 && n < 32 {
-                out[n] = ((src as u64) << 32) | (l as u64);
-                n += 1;
-            }
-        }
-        (out, n)
     }
 
     /// Owned plaintext view of the whole flash image (block-decrypted when
@@ -4054,37 +4016,6 @@ impl Soc {
         self.ble_link_up = true;
     }
 
-    /// TEMP (2026-10-03): event-dispatch tracer switch (DELETE after).
-    /// run_flash sets it in canned mode; the machine's per-op watch
-    /// prints entry regs at the evt-dispatch pcs to locate the CC drop.
-    pub fn ble_trace_evt(&self) -> bool {
-        self.ble_trace_evt
-    }
-
-    /// TEMP (2026-10-03): set the tracer switch (DELETE after).
-    pub fn set_ble_trace_evt(&mut self, on: bool) {
-        self.ble_trace_evt = on;
-    }
-
-    /// TEMP (2026-10-03): event-dispatch trace ring (DELETE after).
-    /// Last 16 (entry pc, x, y, z) quadruples recorded by the machine
-    /// watch (caller-window args; for the port_run ev_cb site x=handler
-    /// a8, y=ev a2, z=a3).
-    pub fn ble_trace_push3(&mut self, pc: u32, x: u32, y: u32, z: u32) {
-        self.ble_trace[self.ble_trace_idx % 16] = (pc, x, y, z);
-        self.ble_trace_idx += 1;
-    }
-
-    /// TEMP (2026-10-03): dump the trace ring (DELETE after). Oldest first.
-    pub fn ble_trace_dump(&self) -> alloc::vec::Vec<(u32, u32, u32, u32)> {
-        let mut v = alloc::vec::Vec::new();
-        let n = self.ble_trace_idx.min(16);
-        for k in 0..n {
-            v.push(self.ble_trace[(self.ble_trace_idx + k) % 16]);
-        }
-        v
-    }
-
     /// Stage one controller→firmware HCI packet for injection (Bumble
     /// bridge replies: Command Complete/Status events, ACL data, LE
     /// advertising reports). FIFO, bounded at 8 — excess drops increment
@@ -4553,13 +4484,6 @@ impl Soc {
         let blocks = self.read16(0x3fc9_df6c + 4);
         let free = self.read16(0x3fc9_df6c + 6);
         blocks != 0 && free != 0
-    }
-
-    /// TEMP (2026-10-03): ev-pool free count for the wake-up forensics
-    /// (DELETE after). Did the queued 22B event ever get consumed?
-    pub fn ble_evt_pool_free(&mut self) -> u32 {
-        use xtensa_core::Bus as _Bus;
-        self.read16(0x3fc9_df6c + 6)
     }
 
     /// Dropped-RX counter (host frontend for the NET_RX_DROPPED battery
@@ -5285,7 +5209,7 @@ impl Soc {
         self.sram[(addr - DRAM_BASE) as usize] != 0
     }
 
-    // TEMP (2026-10-07 — DELETE after): D-side sram index for I-alias
+    // D-side sram index for I-alias
     // (instruction-view) addrs over the guarded ranges (handler table +
     // pxCurrentTCBs). The D-side lanes (ram_write8/write32/cas32) are all
     // guarded now; the I-side arms had no guards at all, and the late
@@ -5305,25 +5229,6 @@ impl Soc {
         if in_range!(addr, Self::WIFI_ARD_POOL, 768) {
             self.ard_pool[(addr - Self::WIFI_ARD_POOL) as usize] = val;
             return;
-        }
-        // TEMP (2026-10-05, udp-leg forensics — DELETE after): dual-view
-        // write-watch (IRAM 0x40379960+96B and its DIRAM data alias
-        // 0x3FC89960+96B — data = inst - 0x6F0000; the alias is
-        // silicon-true so both views funnel to the same cells). PLUS
-        // the handler table (0x3FC96060+128B, HIGH DRAM — its slots read
-        // 0 at crash (TBLCRASH) while intact at 200M, so something
-        // zeroes it late; catch the writer).
-        if (0x4037_9960..0x4037_99C0).contains(&addr)
-            || (0x3FC8_9960..0x3FC8_99C0).contains(&addr)
-            || (0x3FC9_6060..0x3FC9_60E0).contains(&addr)
-        {
-            self.watch_hit = Some((addr, val as u32, 1));
-        }
-        // TEMP (2026-10-07 — DELETE after): pxCurrentTCBs observer (pure
-        // record, never blocks — unlike the sticky guards). The slot
-        // zeroes late via an unguarded path; this names the writer op.
-        if (0x3FC9_BAF8..0x3FC9_BB00).contains(&addr) {
-            self.watch_hit = Some((addr, val as u32, 1));
         }
         // STICKY-CODE GUARD (2026-10-05, udp-leg Dlagnosis): the
         // linker-reserved `.dram0.dummy` window [0x3FC88000, 0x3FC95800)
@@ -5346,9 +5251,6 @@ impl Soc {
             && val == 0
             && self.dummy_cell_nonzero(addr)
         {
-            // TEMP marker (DELETE after): make blocks visible in the
-            // existing watch stream (val 0x47554152 = "GUAR").
-            self.watch_hit = Some((addr, 0x4755_4152, 1));
             return;
         }
         // STICKY-TABLE GUARD (2026-10-06): same nonzero<-zero block for
@@ -5364,7 +5266,6 @@ impl Soc {
             && val == 0
             && self.dummy_cell_nonzero(addr)
         {
-            self.watch_hit = Some((addr, 0x4755_4152, 1));
             return;
         }
         // STICKY pxCurrentTCBs GUARD (2026-10-07): same block for the two
@@ -5378,18 +5279,16 @@ impl Soc {
             && val == 0
             && self.dummy_cell_nonzero(addr)
         {
-            self.watch_hit = Some((addr, 0x4755_4152, 1));
             return;
         }
-        // TEMP (2026-10-07 — DELETE after): I-alias guard, byte lane
+        // I-alias guard, byte lane
         // (see ialias_guarded_cell). Blocks nonzero->zero, WorkerL3-gated.
-        if self.wifi_image == WifiImage::WorkerL3 && val == 0 {
-            if let Some(o) = self.ialias_guarded_cell(addr) {
-                if self.sram[o] != 0 {
-                    self.watch_hit = Some((addr, 0x4755_4152, 1));
-                    return;
-                }
-            }
+        if self.wifi_image == WifiImage::WorkerL3
+            && val == 0
+            && let Some(o) = self.ialias_guarded_cell(addr)
+            && self.sram[o] != 0
+        {
+            return;
         }
         if in_range!(addr, DRAM_BASE, SRAM_BASE_RANGE) {
             if addr == 0x3FCEF750 || addr == 0x3FCEF748 {
@@ -7494,21 +7393,6 @@ impl Soc {
         self.gdma.int_pending()
     }
 
-    /// TEMP I2S-driver probe (remove): completed-walk counters.
-    pub fn gdma_dbg_walks(&self) -> (u64, u64) {
-        (self.gdma.dbg_walks_out, self.gdma.dbg_walks_in)
-    }
-
-    /// TEMP I2S-driver probe (remove): recent I2S CONF writes.
-    pub fn i2s_conf_writes(&self, idx: usize) -> alloc::vec::Vec<(u32, u32)> {
-        self.i2s[idx].dbg_writes.clone()
-    }
-
-    /// TEMP I2S-driver probe (remove): recent raw GDMA writes.
-    pub fn gdma_debug_log(&self) -> alloc::vec::Vec<(u32, u32)> {
-        self.gdma.debug_log()
-    }
-
     /// Debug accessor for the I2C interrupt status (INT_RAW & INT_ENA).
     pub fn i2c_int_st(&self, n: usize) -> u32 {
         self.i2c[n].int_st()
@@ -7532,16 +7416,6 @@ impl Soc {
         } else {
             0
         }
-    }
-
-    /// Debug: per-channel GDMA interrupt/peri state (validation harness).
-    pub fn gdma_debug(&self) -> Vec<(u32, u32, u32, u32, u32, u32)> {
-        self.gdma.debug_state()
-    }
-
-    /// Debug: recent raw GDMA writes (validation harness).
-    pub fn gdma_log(&self) -> Vec<(u32, u32)> {
-        self.gdma.debug_log()
     }
 
     /// Scan all peripheral interrupt status registers and build the source
@@ -7712,7 +7586,7 @@ impl Bus for Soc {
                 ]
             });
             if old == compare {
-                // TEMP (2026-10-07 — DELETE after): pxCurrentTCBs GUARD,
+                // pxCurrentTCBs GUARD,
                 // CAS lane. cas32 bypasses every other guard (direct sram
                 // write); the slot zeroed late through an unguarded path
                 // while byte/word lanes were guarded, so this lane gets
@@ -7723,15 +7597,9 @@ impl Bus for Soc {
                     && val == 0
                     && old != 0
                 {
-                    self.watch_hit = Some((addr, 0x4755_4152, 4));
                     return old;
                 }
                 self.sram[o..o + 4].copy_from_slice(&val.to_le_bytes());
-                // TEMP (2026-10-07 — DELETE after): pxCurrentTCBs observer,
-                // CAS lane (see ram_write8 note).
-                if (0x3FC9_BAF8..0x3FC9_BB00).contains(&addr) {
-                    self.watch_hit = Some((addr, val, 4));
-                }
             }
             return old;
         }
@@ -7760,21 +7628,20 @@ impl Bus for Soc {
                 self.sram[o + 3],
             ]);
             if old == compare {
-                // TEMP (2026-10-07 — DELETE after): I-alias guard, CAS
+                // I-alias guard, CAS
                 // lane (see ialias_guarded_cell).
-                if self.wifi_image == WifiImage::WorkerL3 {
-                    if let Some(go) = self.ialias_guarded_cell(addr) {
-                        let nb = val.to_le_bytes();
-                        let mut blocked = false;
-                        for (k, b) in nb.iter().enumerate() {
-                            if *b == 0 && self.sram[go + k] != 0 {
-                                blocked = true;
-                            }
+                if self.wifi_image == WifiImage::WorkerL3
+                    && let Some(go) = self.ialias_guarded_cell(addr)
+                {
+                    let nb = val.to_le_bytes();
+                    let mut blocked = false;
+                    for (k, b) in nb.iter().enumerate() {
+                        if *b == 0 && self.sram[go + k] != 0 {
+                            blocked = true;
                         }
-                        if blocked {
-                            self.watch_hit = Some((addr, 0x4755_4152, 4));
-                            return old;
-                        }
+                    }
+                    if blocked {
+                        return old;
                     }
                 }
                 self.sram[o..o + 4].copy_from_slice(&val.to_le_bytes());
@@ -7819,7 +7686,6 @@ impl Bus for Soc {
         }
         self.intc.pending_lines(cpu, final_src)
     }
-
 
     /// Dedicated-GPIO input channels for `ee.get_gpio_in`: the 8
     /// CORE1_GPIO_IN signals (129..131, 252..255, 54, gpio_sig_map.h)
@@ -8063,19 +7929,6 @@ impl Bus for Soc {
                 return;
             }
             let o = (addr - DRAM_BASE) as usize;
-            // TEMP (2026-10-05, udp-leg forensics — DELETE after): DRAM
-            // view of the watched DIRAM alias (see ram_write8 note),
-            // plus the handler table (see above).
-            if (0x3FC8_9960..0x3FC8_99C0).contains(&addr)
-                || (0x3FC9_6060..0x3FC9_60E0).contains(&addr)
-            {
-                self.watch_hit = Some((addr, val, 4));
-            }
-            // TEMP (2026-10-07 — DELETE after): pxCurrentTCBs observer,
-            // word lane (see ram_write8 note).
-            if (0x3FC9_BAF8..0x3FC9_BB00).contains(&addr) {
-                self.watch_hit = Some((addr, val, 4));
-            }
             // Sticky guards, word lanes: dummy window [0x3FC88000,0x3FC95800)
             // (2026-10-05: idle pool memset over the DIRAM alias kills IRAM;
             // heap never serves it on silicon) + handler table
@@ -8096,20 +7949,14 @@ impl Bus for Soc {
                         || (0x3FC9_6060..0x3FC9_60E0).contains(&addr)
                         || (0x3FC9_BAF8..0x3FC9_BB00).contains(&addr));
                 let mut nb = bytes;
-                let mut blocked = false;
                 if guarded {
                     for (k, b) in nb.iter_mut().enumerate() {
                         if *b == 0 && self.sram[o + k] != 0 {
                             *b = self.sram[o + k];
-                            blocked = true;
                         }
                     }
                 }
                 self.sram[o..o + 4].copy_from_slice(&nb);
-                if blocked {
-                    // TEMP marker (DELETE after): see ram_write8 note.
-                    self.watch_hit = Some((addr, 0x4755_4152, 4));
-                }
             }
             // Closed-RF dispatch-table completion (see
             // `maybe_complete_phyfuns_slot` for the full proof + per-image
@@ -8127,35 +7974,21 @@ impl Bus for Soc {
                 return;
             }
             let o = (DIRAM_DATA_BASE - DRAM_BASE + (addr - DIRAM_INST_BASE)) as usize;
-            // TEMP (2026-10-07 — DELETE after): I-alias guard, word lane
+            // I-alias guard, word lane
             // (see ialias_guarded_cell). Per-lane nonzero->zero block.
-            if self.wifi_image == WifiImage::WorkerL3 {
-                if let Some(go) = self.ialias_guarded_cell(addr) {
-                    let mut nb = bytes;
-                    let mut blocked = false;
-                    for (k, b) in nb.iter_mut().enumerate() {
-                        if *b == 0 && self.sram[go + k] != 0 {
-                            *b = self.sram[go + k];
-                            blocked = true;
-                        }
+            if self.wifi_image == WifiImage::WorkerL3
+                && let Some(go) = self.ialias_guarded_cell(addr)
+            {
+                let mut nb = bytes;
+                for (k, b) in nb.iter_mut().enumerate() {
+                    if *b == 0 && self.sram[go + k] != 0 {
+                        *b = self.sram[go + k];
                     }
-                    self.sram[o..o + 4].copy_from_slice(&nb);
-                    if blocked {
-                        self.watch_hit = Some((addr, 0x4755_4152, 4));
-                    }
-                    // TEMP watch (DELETE after): IRAM view record.
-                    if (0x4037_9960..0x4037_99C0).contains(&addr) {
-                        self.watch_hit = Some((addr, val, 4));
-                    }
-                    return;
                 }
+                self.sram[o..o + 4].copy_from_slice(&nb);
+                return;
             }
             self.sram[o..o + 4].copy_from_slice(&bytes);
-            // TEMP (2026-10-05, udp-leg forensics — DELETE after): IRAM
-            // view of the watched DIRAM alias (see ram_write8 note).
-            if (0x4037_9960..0x4037_99C0).contains(&addr) {
-                self.watch_hit = Some((addr, val, 4));
-            }
             return;
         }
         // Slow path: unaligned or non-SRAM — fall back to byte-by-byte.

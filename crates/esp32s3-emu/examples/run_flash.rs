@@ -46,7 +46,7 @@ fn unimp_detail(m: &mut Esp32S3, core: usize) -> String {
     }
 }
 
-// TEMP (2026-10-04, forensics — DELETE after): pc-blacklist for BLE
+// PC-blacklist for BLE synthetic delivery (proven live 2026-10-04).
 // synthetic delivery (see gate docs). True when `pc` lies inside a
 // pool/queue/scheduler critical function (nm on the BLE ELF, 2026-10-04).
 fn ble_in_crit(pc: u32) -> bool {
@@ -383,40 +383,30 @@ fn main() {
     // one queued bridge reply per `host_rcv_pkt` call.
     const BLE_HOST_CB: u32 = 0x3c06_b82c;
     let mut ble_cb_entry: Option<u32> = None;
-    // TEMP (2026-10-03): deterministic BLE NULL-call repro (DELETE after
-    // forensics). `BLE_RX_CANNED=1` stages one canned connection-complete
+    // BLE canned/ACL-drop repro modes. `BLE_RX_CANNED=1` stages one canned connection-complete
     // with no bridge; `BLE_RX_ACL_DROP=1` drops ATT ACLs instead of
     // delivering them.
     let ble_canned = std::env::var("BLE_RX_CANNED").is_ok();
     let mut ble_canned_done = false;
-    // TEMP (2026-10-03, forensics — DELETE after): IRAM probe latch.
-    let mut ble_iram_probed = false;
-    // TEMP (2026-10-03): enable the event-dispatch tracer in canned mode
-    // (DELETE after).
-    if ble_canned {
-        m.soc.set_ble_trace_evt(true);
-    }
-    // TEMP (2026-10-03): last capture seq served by the canned controller
-    // (DELETE after).
+    // Last capture seq served by the canned controller.
     let mut ble_canned_last_op = 0u64;
-    // TEMP (2026-10-03): opcode of the last served canned CC + version
-    // follow-up flag (DELETE after).
+    // Opcode of the last served canned CC + version follow-up flag.
     let mut ble_canned_last_cc_op = 0u32;
     let mut ble_canned_ver_done = false;
-    // TEMP (2026-10-03): remote-features complete follow-up (DELETE after).
+    // Remote-features complete follow-up.
     // 0x2016 (LE_RD_REM_FEAT) is async like 0x041d: the CC acks the command
     // but the handler stalls awaiting the LE Meta Read-Remote-Features
     // Complete event (subevent 0x04) — without it no onConnect, proven live
     // (post-0x2016 silence with no waiter timeout).
     let mut ble_canned_feat_done = false;
-    // TEMP (2026-10-03): data-length-change follow-up (DELETE after).
+    // Data-length-change follow-up.
     // 0x2022 (LE_SET_DATA_LEN) is async: CC acks, then the handler awaits
     // the LE Meta Data-Length-Change event (subevent 0x07) — without it
     // the link disconnects right after the CC (proven live: conn then
     // disc with no further TX). Values mirror typical negotiated
     // maxima (251B/2120us both directions, handle 1 from the 22B).
     let mut ble_canned_dl_done = false;
-    // TEMP (2026-10-04, forensics — DELETE after): canned ATT Read-By-Group
+    // Canned ATT Read-By-Group
     // (service discovery) replay. Bytes captured from a live Bumble run
     // (pre-conn 16B, dropped there as premature). Normally staged one-shot
     // after the data-length event; SIZE TEST below reorders it after a small
@@ -424,7 +414,7 @@ fn main() {
     // GATT server path works; if it panics in att_tx (0x4200724d:91), the
     // PANIC-POOL dump says which pool.
     let mut ble_canned_att_done = false;
-    // TEMP (2026-10-04, forensics — DELETE after): canned ATT script
+    // Canned ATT script
     // (Find-Info → Read → Write → Read-back) for full GATT proof offline.
     // Phase 1 (this run): Find-Info 0x000e-0xFFFF after the discovery
     // response (first ACL TX) to learn characteristic/value handles
@@ -433,7 +423,7 @@ fn main() {
     // `BLE write`), Read-back (echo value → ECHO/PASS).
     // `ble_canned_acl_tx_n` counts H4=0x02 TX drained (each ATT response).
     let mut ble_canned_findinfo_done = false;
-    // TEMP (2026-10-04, forensics — DELETE after): Phase 2 (handles from
+    // Phase 2 (handles from
     // the Find-Info response: Battery Level value 0x0010 (decl 0x000f type
     // 0x2803 + value 0x0010 type 0x2A19), echo value 0x0013 (decl 0x0012
     // type 0x2803, value next sequential — verified by the read-back
@@ -444,7 +434,7 @@ fn main() {
     let mut ble_canned_read_done = false;
     let mut ble_canned_write_done = false;
     let mut ble_canned_readback_done = false;
-    // ATT OUTSTANDING PACING (2026-10-04, DELETE after): live Bumble ATTs
+    // ATT OUTSTANDING PACING (2026-10-04, proven live): live Bumble ATTs
     // arrive unpaced (try 0,1,2 back-to-back — retries while the handler
     // still holds the previous request/response mbufs) and exhaust the
     // shared msys pools (prepend NULL → att_tx asserts 0x4200724d:91;
@@ -457,15 +447,13 @@ fn main() {
     // script is already paced and stays green; bridge becomes paced too).
     let mut ble_att_outstanding = 0u32;
     let mut ble_canned_acl_tx_n = 0u32;
-    // TEMP (2026-10-03): capture seq at link-up (DELETE after — part of
+    // Capture seq at link-up (part of
     // the V2 gating: only commands sent after link-up get completed).
     let mut ble_link_up_seq = 0u64;
-    // TEMP (2026-10-03): host-task-seen latch (DELETE after).
-    let mut ble_host_seen = false;
-    // HOST-ENABLED deferral latch (2026-10-04, DELETE after): transition
+    // HOST-ENABLED deferral latch (2026-10-04, proven live): transition
     // logging for the enabled_state==0 deferral (per-step spam floods).
     let mut ble_host_disabled = false;
-    // PRE-DL HOLD (2026-10-04, DELETE after): pop-and-hold the premature
+    // PRE-DL HOLD (2026-10-04, proven live): pop-and-hold the premature
     // ATT instead of DROPPING it. DROP was correct for a retrying central
     // (30s GATT timeout → try 0,1,2… eventually hits post-dl), but fatal
     // for a patient central (300s timeout for slow emulator answers → the
@@ -476,22 +464,6 @@ fn main() {
     // so the ATT TX no longer asserts). One slot: a second premature ATT
     // while held drops (log) — central sends one at a time (semaphore).
     let mut ble_held_att: Option<Vec<u8>> = None;
-    // TEMP (2026-10-04, forensics — DELETE after): l2cap_tx return latch.
-    // Logs each NEW (core, ret) observed at 0x4200723c (see machine.rs).
-    let mut ble_l2cap_last: Option<(usize, u32)> = None;
-    // TEMP (2026-10-04, forensics — DELETE after): management-TX hook latch.
-    let mut pptx_last = 0u32;
-    // TEMP (2026-10-04, RF forensics — DELETE after): park-tracer one-shot.
-    let mut park_traced = false;
-    // TEMP (2026-10-03): post-delivery pc-window countdown (DELETE after).
-    let mut ble_watch_n = 0u32;
-    // TEMP (2026-10-03): pc rings for the canned NULL-call forensics
-    // (DELETE after). Last 64 block-start pcs per core — dumped when the
-    // run breaks on an exception, so the wild call site is identified
-    // even though the fault vectors away from it.
-    let mut ring0 = [0u32; 64];
-    let mut ring1 = [0u32; 64];
-    let mut ring_i: usize = 0;
     if let Some(ref addr) = ble_gw_addr {
         match std::net::TcpStream::connect(addr.as_str()) {
             Ok(s) => {
@@ -758,11 +730,6 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(96_000_000);
-    // TEMP (2026-10-05, udp-leg park forensics — DELETE after): prove the
-    // budget the run actually uses (two deterministic exits at ~886.89M
-    // with STEPS=1.1B suggest the budget break fires early or another
-    // silent break exists; this line + the BUDGET line below name it).
-    println!("[host] budget max_insns={max_insns}");
     let t0 = Instant::now();
     let mut uart_buf: Vec<u8> = Vec::new();
     let mut last_pc = 0u32;
@@ -771,258 +738,18 @@ fn main() {
     let mut idle_steps: usize = 0;
     let mut executed: u64 = 0;
     let mut i: usize = 0; // macro-step counter (diagnostics only)
-    // TEMP (2026-10-05 — DELETE after): last step results for LOOP-EXIT.
-    let mut last_r0 = StepResult::Ok;
-    let mut last_r1 = StepResult::Ok;
-    // TEMP (2026-10-05, udp-leg forensics — DELETE after): trailing
-    // pc ring (last 32 macro-steps, both cores) dumped on any exception
-    // break — names the pre-vector pc for NULL-jump/callx8-through-zero
-    // faults (EPC1=0 tells nothing). Always-on (2 stores/step, negligible).
-    let mut pc_ring = [(0u32, 0u32); 32];
-    let mut pc_ring_i: usize = 0;
-    // TEMP (2026-10-07 — DELETE after): pxCurrentTCBs[1] zeroing tripwire.
-    // The slot (0x3FC9BAFC) is nonzero once the scheduler starts yet reads
-    // 0 at the core1 crash; the sticky guards block guarded-path zeroing,
-    // so the killer uses an unguarded path (or it is never set here).
-    // Poll every macro-step (one read32 — negligible vs a step_fast) and
-    // break AT the transition with full context (far better than
-    // post-crash forensics: pc_ring shows the killer's trajectory).
-    let mut pxcur_seen = false;
-    // TEMP (2026-10-05, udp-leg park forensics — DELETE after): watchdog
-    // for the post-`ip6edrain 3` stall (firmware stops printing after the
-    // echo drains; first udp TX reaches the tap but the 6-pop scan never
-    // runs). Arms when `ip6edrain 3` appears; if UART stays quiet for 5M
-    // macro-steps afterwards, dumps both cores once and keeps running.
-    let mut watch_quiet: usize = 0;
-    let mut last_watch_len: usize = 0;
-    let mut watch_dumped = false;
-    // TEMP (2026-10-05, udp-leg park forensics — DELETE after): liveness
-    // heartbeat (the deterministic ~886.89M exit prints NO break reason —
-    // every main-loop break prints except budget/espnow-DONE, neither of
-    // which fires — so prove the loop is alive until the end) + post-skip
-    // trajectory (where execution goes in the ~10k insns after DSP-SKIP).
-    let mut skip_trace: u32 = 0;
-    // TEMP (2026-10-05, udp-leg forensics — DELETE after): wait-skip
-    // transition log (first 6 changes of each arm counter).
-    let mut last_wsf: u32 = 0;
-    let mut last_wss: u32 = 0;
-
 
     loop {
         if executed >= max_insns as u64 {
-            // TEMP (2026-10-05 — DELETE after): the budget break was
-            // silent, hiding whether deterministic ~886.89M exits are
-            // budget-driven. Name it.
-            println!("[host] BUDGET break at executed={executed} max_insns={max_insns}");
             break;
         }
         // WiFi STA insider hooks live in `run_fast_core` (machine.rs —
         // per-op sampling inside the block loop; pre/post-step sampling
         // here would miss mid-block entry pcs).
         let (r, r1, n) = m.step_fast();
-        last_r0 = r;
-        last_r1 = r1;
         executed += n as u64;
         i += 1;
-        // TEMP (2026-10-05 — DELETE after): trailing ring (see decl).
-        pc_ring[pc_ring_i % 32] = (m.cpu[0].pc, m.cpu[1].pc);
-        pc_ring_i += 1;
-        // TEMP (2026-10-07 — DELETE after): pxcur tripwire (see decl).
-        {
-            let tcb1 = m.soc.read32(0x3FC9_BAFC);
-            if !pxcur_seen {
-                if tcb1 != 0 {
-                    pxcur_seen = true;
-                }
-            } else if tcb1 == 0 {
-                // Print-only: never break here — a WDT reset's fresh-boot
-                // zeros would false-positive (proven: post-reboot break at
-                // 0x40000400). The run outcome belongs to the firmware.
-                println!(
-                    "[host] PXCUR-ZERO at i={i} executed={executed} pc0={:#010x} pc1={:#010x}",
-                    m.cpu[0].pc, m.cpu[1].pc
-                );
-                for c in 0..2 {
-                    println!(
-                        "[host] PXCUR-ZERO core{c} a0={:#010x} a1(sp)={:#010x} a2={:#010x} a3={:#010x} wb={} ps={:#010x}",
-                        m.cpu[c].reg(0),
-                        m.cpu[c].reg(1),
-                        m.cpu[c].reg(2),
-                        m.cpu[c].reg(3),
-                        m.cpu[c].windowbase(),
-                        m.cpu[c].sreg(xtensa_core::cpu::SR_PS),
-                    );
-                }
-                for k in 0..32 {
-                    let e = pc_ring[(pc_ring_i + k) % 32];
-                    println!("[host] PXCUR-RING pc0={:#010x} pc1={:#010x}", e.0, e.1);
-                }
-                // Ground truth at detection: actual table/slot values
-                // (did the phase-1 sweep land or was it guard-blocked?)
-                // plus the image gate the guards check.
-                println!(
-                    "[host] PXCUR-STATE tbl60={:#010x} tbla8={:#010x} tcb0={:#010x} tcb1={:#010x} workerl3={}",
-                    m.soc.read32(0x3FC9_6060),
-                    m.soc.read32(0x3FC9_60A8),
-                    m.soc.read32(0x3FC9_BAF8),
-                    m.soc.read32(0x3FC9_BAFC),
-                    m.soc.wifi_image == esp32s3_soc::WifiImage::WorkerL3,
-                );
-                // Per-op watch ring: the pxcur observer arms record every
-                // write to the slot with post-op pc — the zeroing write
-                // (val 0x0 at 0x3fc9bafc) names its writer op directly.
-                for k in 0..16 {
-                    let e = m.watch_op[(m.watch_op_idx + k) % 16];
-                    if e.1 != 0 {
-                        println!(
-                            "[host] PXCUR-WATCH postpc={:#010x} addr={:#010x} val={:#010x} a0={:#010x}",
-                            e.0, e.1, e.2, e.3
-                        );
-                    }
-                }
-            }
-        }
-        // TEMP (2026-10-07 — DELETE after): storm-loop trace (first
-        // NULLSKIP fire + next 300 macro-steps, both pcs). Maps the
-        // take→vector→prologue→dispatch→skip→rfi loop to find what
-        // state the epilogue reads (stale line?).
-        // (first_fire_i latched below via nullskip counter edge.)
-        {
-            static mut STORM_LOGGED: bool = false;
-            // (Single-shot per run not needed — gate on counter edge via
-            // a local latch.)
-            if m.nullskip_fires >= 1 {
-                // Use watch_dumped latch repurposed? No — dedicated static:
-                // print first 300 steps after first fire, then mute by
-                // counting printed lines.
-                static mut STORM_N: u32 = 0;
-                unsafe {
-                    if STORM_N < 300 {
-                        println!(
-                            "[host] STORMLOOP i={i} pc0={:#010x} pc1={:#010x}",
-                            m.cpu[0].pc,
-                            m.cpu[1].pc
-                        );
-                        STORM_N += 1;
-                    }
-                }
-            }
-        }
-        // TEMP (2026-10-05 — DELETE after): heartbeat + post-skip trace.
-        if i.is_multiple_of(10_000_000) {
-            println!(
-                "[host] HB i={i} executed={executed} pc0={:#010x} pc1={:#010x}",
-                m.cpu[0].pc,
-                m.cpu[1].pc
-            );
-        }
-        // TEMP (2026-10-06 — DELETE after): periodic sources sampling
-        // (storm-source hunt: a level-triggered unhandled source stays
-        // asserted constantly, so it shows in EVERY late sample while
-        // transient sources come and go).
-        if i.is_multiple_of(10_000_000) {
-            let (slo, shi, lines) = m.soc.int_debug(0);
-            if slo != 0 || shi != 0 {
-                println!(
-                    "[host] IRQSAMP i={i} lo={:#018x} hi={:#018x} lines={:#010x}",
-                    slo, shi, lines
-                );
-            }
-        }
-        if i > 98_000_000
-            && last_wsf == 0
-            && (m.wait_skip_f != last_wsf || m.wait_skip_s != last_wss)
-        {
-            println!(
-                "[host] WAITSKEEP i={i} f={} s={} last_ra={:#010x}",
-                m.wait_skip_f,
-                m.wait_skip_s,
-                m.wait_last_ra
-            );
-            last_wsf = m.wait_skip_f;
-            last_wss = m.wait_skip_s;
-        }
-        // TEMP (2026-10-05 — DELETE after): end-trajectory trace (the
-        // deterministic crash lands at i≈98367376 with pc=0x40379990 never
-        // sampled by either wait-skip arm — print both pcs over the final
-        // ~80 macro-steps to see the true approach).
-        if (98_367_300..=98_367_390).contains(&i) {
-            println!(
-                "[host] TRACEND i={i} pc0={:#010x} pc1={:#010x} f={} s={}",
-                m.cpu[0].pc,
-                m.cpu[1].pc,
-                m.wait_skip_f,
-                m.wait_skip_s
-            );
-        }
-        if skip_trace > 0 {
-            skip_trace -= 1;
-            println!(
-                "[host] SKIPTRACE i={i} pc0={:#010x} pc1={:#010x}",
-                m.cpu[0].pc,
-                m.cpu[1].pc
-            );
-        }
-        // TEMP (2026-10-05, udp-leg forensics — DELETE after): the
-        // per-op ring (machine.rs) supersedes live polling; hits are
-        // dumped at end. Drain any untaken hit so the field never sticks.
-        let _ = m.soc.watch_hit.take();
-        // TEMP (2026-10-04, RF forensics — DELETE after): park-loop tracer
-        // for the WorkerL3 management-TX stall (core0 parks at 0x42074b4f
-        // `ppTxFragmentProc+0x13f` with entry/caller/queue-processor hooks
-        // all missing — reached via wdev-table tail-jump). Fires once when
-        // parked here: single-steps 12× logging pc + raw word + regs so the
-        // polling load (same address every iteration) names the flag the
-        // host must satisfy (same discipline as the BLE sem pre-seed: direct
-        // write, no window surgery). Gated to the exact stall pc on the
-        // worker-L3 path (other images never park here; normal DONE-idles
-        // park elsewhere).
-        // (One-shot via `park_traced` latch below.)
-        if !park_traced
-            && path.contains("test_worker_l3")
-            && (m.cpu[0].pc == 0x4207_4b4f || m.cpu[1].pc == 0x4207_4b4f)
-        {
-            park_traced = true;
-            let c = if m.cpu[0].pc == 0x4207_4b4f { 0 } else { 1 };
-            // TEMP (2026-10-04, RF forensics — DELETE after): ground-truth
-            // decode of the park word via the emulator's own decoder (like
-            // the UNIMPLEMENTED trap detail — no objdump/walkvec byte-order
-            // traps). Settles ee_unimplemented vs S32I_N definitively.
-            println!("[host] PARKDECODE {}", unimp_detail(&mut m, c));
-            for _ in 0..12 {
-                let p = m.cpu[c].pc;
-                let w = m.soc.read32(p);
-                let mut regs = [0u32; 16];
-                for (k, r) in regs.iter_mut().enumerate() {
-                    *r = m.cpu[c].reg(k as u32);
-                }
-                println!("[host] PARKTRACE{c} pc={p:#010x} word={w:#010x} regs={regs:08x?}");
-                let _ = m.cpu[c].step_one(&mut m.soc);
-            }
-        }
-        // TEMP (2026-10-04, forensics — DELETE after): log each new
-        // l2cap_tx return code observed at 0x4200723c (machine.rs per-op
-        // probe). Proves whether live-first-ATT fails via prepend (6) or
-        // another path, without exact-pc post-step polling.
-        if m.ble_l2cap_ret != ble_l2cap_last {
-            ble_l2cap_last = m.ble_l2cap_ret;
-            if let Some((core, ret)) = m.ble_l2cap_ret {
-                println!("[host] BLE L2CAP_RET core{core} ret={ret}");
-            }
-        }
-        // TEMP (2026-10-04, forensics — DELETE after): log management-TX
-        // hook fires (counter increments). Proves the ppTxFragmentProc
-        // fake-return arm fires vs misses (0 = still parks inside).
-        if m.pptx_hook_fires != pptx_last {
-            pptx_last = m.pptx_hook_fires;
-            println!("[host] PPTX hook fires={pptx_last}");
-        }
         let pc = m.cpu[0].pc;
-        if ble_canned {
-            ring0[ring_i % 64] = pc;
-            ring1[ring_i % 64] = m.cpu[1].pc;
-            ring_i += 1;
-        }
         // --- Exception handling ---
         if let StepResult::Exception { cause } = r {
             if (32..=37).contains(&cause) {
@@ -1049,12 +776,6 @@ fn main() {
                 if env::var("PANIC_CONTINUE").is_ok() {
                     continue;
                 }
-                // TEMP (2026-10-05 — DELETE after): trailing trajectory
-                // (see decl above).
-                for k in 0..32 {
-                    let e = pc_ring[(pc_ring_i + k) % 32];
-                    println!("[host] PRETRACE pc0={:#010x} pc1={:#010x}", e.0, e.1);
-                }
                 let epc = m.cpu[0].sreg(SR_EPC1);
                 println!(
                     "\n>> ILLEGAL at step {i}, pc {:#010x}, EPC1 {:#010x}, wb {}, b0={:#04x}",
@@ -1063,202 +784,6 @@ fn main() {
                     m.cpu[0].windowbase(),
                     m.soc.read8(epc)
                 );
-                // TEMP (2026-10-05, udp-leg forensics — DELETE after):
-                // firing lines at crash (INTSET & INTENABLE live) for the
-                // NULL-dispatch hunt.
-                println!(
-                    "[host] IRQSTATE intset={:#010x} intena={:#010x} intr={:#010x}",
-                    m.cpu[0].sreg(xtensa_core::cpu::SR_INTSET),
-                    m.cpu[0].sreg(xtensa_core::cpu::SR_INTENABLE),
-                    m.cpu[0].sreg(xtensa_core::cpu::SR_INTERRUPT),
-                );
-                // TEMP (2026-10-05 — DELETE after): peripheral sources
-                // bitmap + mapped lines (names the firing source).
-                {
-                    let (slo, shi, lines) = m.soc.int_debug(0);
-                    println!(
-                        "[host] IRQSRC lo={:#018x} hi={:#018x} lines={:#010x}",
-                        slo, shi, lines
-                    );
-                }
-                // TEMP (2026-10-05, udp-leg forensics — DELETE after): dump
-                // the suspect DRAM span (heap-block headers? TCB/stack
-                // 0xa5? blob struct?) to name the zeroed object class.
-                {
-                    let mut span = [0u8; 64];
-                    for (k, b) in span.iter_mut().enumerate() {
-                        *b = m.soc.read8(0x3FC8_98C0 + k as u32) as u8;
-                    }
-                    println!("[host] SPANDUMP bytes={span:02x?}");
-                    let mut hdr = [0u8; 32];
-                    for (k, b) in hdr.iter_mut().enumerate() {
-                        *b = m.soc.read8(0x3FC8_9940 + k as u32) as u8;
-                    }
-                    println!("[host] HDRDUMP bytes={hdr:02x?}");
-                }
-                // TEMP (2026-10-06 — DELETE after): handler table at crash
-                // (32B at _xt_interrupt_table — which slots read 0?
-                // distinguishes zeroed-registered (memset span reaches
-                // HIGH) vs never-registered (spurious line)).
-                {
-                    let mut t = [0u8; 32];
-                    for (k, b) in t.iter_mut().enumerate() {
-                        *b = m.soc.read8(0x3FC9_6060 + k as u32) as u8;
-                    }
-                    println!("[host] TBLCRASH bytes={t:02x?}");
-                }
-                // TEMP (2026-10-04, RF forensics — DELETE after): dump the
-                // g_phyFuns dispatch table around the heap-overlap window
-                // (tbl+0x200..0x27f) on worker-L3 ILLEGALs. Long gateway
-                // runs overlap heap network buffers into the table (proven:
-                // DNS "example" bytes at tbl+0x22f); each clobbered slot
-                // needs a done-bit-abstracted skip in machine.rs (4 known:
-                // 0x24c/0x228/0x210/0x224). A 19-leg crash here means a 5th
-                // slot joined — the ASCII side names the buffer (DNS vs
-                // CoAP-server READY/GET/2.05 vs MQTT), the offset names the
-                // slot. WorkerL3-gated (other images have their own cells).
-                if path.contains("test_worker_l3") {
-                    let cell = m.soc.wifi_phyfuns_cell();
-                    let tbl = m.soc.read32(cell);
-                    let mut words = [0u32; 32];
-                    for (k, v) in words.iter_mut().enumerate() {
-                        *v = m.soc.read32(tbl.wrapping_add(0x200 + (k as u32) * 4));
-                    }
-                    let mut asc = [0u8; 128];
-                    for (k, b) in asc.iter_mut().enumerate() {
-                        *b = m.soc.read8(tbl.wrapping_add(0x200 + k as u32)) as u8;
-                    }
-                    println!("[host] RF-TBL tbl={tbl:#010x} {words:08x?}");
-                    println!("[host] RF-ASC {:?}", String::from_utf8_lossy(&asc));
-                }
-                // TEMP (2026-10-03, forensics — DELETE after): dump panic
-                // message when the `ill` is panic_abort's deliberate trap
-                // (EPC1 in its range). a2 often holds the message pointer.
-                if (0x4037_fdb4..0x4037_fde0).contains(&epc) {
-                    let a2 = m.cpu[0].reg(2);
-                    let mut msg = Vec::new();
-                    for k in 0..128u32 {
-                        let b = m.soc.read8(a2.wrapping_add(k)) as u8;
-                        if b == 0 {
-                            break;
-                        }
-                        msg.push(b);
-                    }
-                    println!(
-                        "[host] PANIC-MSG a2={a2:#010x} {:?}",
-                        String::from_utf8_lossy(&msg)
-                    );
-                    let sp = m.cpu[0].reg(1);
-                    println!(
-                        "[host] PANIC-STACK sp={sp:#010x} {:#010x} {:#010x} {:#010x} {:#010x}",
-                        m.soc.read32(sp),
-                        m.soc.read32(sp.wrapping_add(4)),
-                        m.soc.read32(sp.wrapping_add(8)),
-                        m.soc.read32(sp.wrapping_add(12)),
-                    );
-                    // TEMP (2026-10-04, forensics — DELETE after): VHCI
-                    // semaphore + HCI credits post-mortem. `ble_hs_hci_acl_
-                    // tx_now` can only fail the att_tx assert via the VHCI
-                    // send itself (all pools healthy at every panic, queue
-                    // paths return 1 not assert): vhci_send_sem 0x3fc9d6d0
-                    // (1 initial, taken per send, given per TX-done) and
-                    // avail_pkts 0x3fc9e110 / buf_sz 0x3fc9e2b0 (ROM-
-                    // reported controller buffers). sem 0 => exhaustion
-                    // (fix = host give per captured ACL TX); avail 0 =>
-                    // queue path (rc 1, rules out credits).
-                    println!(
-                        "[host] PANIC-VHCI sem={} avail={} bufsz={}",
-                        m.soc.read32(0x3fc9_d6d0),
-                        m.soc.read16(0x3fc9_e110),
-                        m.soc.read16(0x3fc9_e2b0),
-                    );
-                    // TEMP (2026-10-04, forensics — DELETE after): pointed-to
-                    // queue dump (8 words at *handle) to locate
-                    // uxMessagesWaiting (binary count 0/1). The handle word
-                    // itself is a pointer (not the count — proven: reads
-                    // 0x3fcb13c4). Compare with the pre-delivery dump below
-                    // (healthy=1 vs timed-out=0) to find the count offset;
-                    // the pre-seed writes queue+0x38 (I2C Queue_t precedent).
-                    {
-                        let h = m.soc.read32(0x3fc9_d6d0);
-                        let mut w = [0u32; 8];
-                        for (k, v) in w.iter_mut().enumerate() {
-                            *v = m.soc.read32(h.wrapping_add((k as u32) * 4));
-                        }
-                        println!("[host] PANIC-SEM [{h:#010x}] {w:08x?}");
-                    }
-                    // TEMP (2026-10-04, forensics — DELETE after): mbuf pool
-                    // free counts. Pools at these addrs are `os_mbuf_pool`
-                    // (omp_databuf_len u16 @+0, omp_pool *os_mempool @+4);
-                    // the counts live in the pointed-to `os_mempool`
-                    // (num_blocks u16 @+4, num_free u16 @+6, min_free u16
-                    // @+8). (An earlier revision read +4/+6/+8 directly off
-                    // the mbuf_pool and printed garbage — proven live.)
-                    // Walk the authoritative msys list (g_msys_pool_list
-                    // 0x3fc98e84 → os_mbuf_pool → omp_next @+8) so NO pool
-                    // is missed (a fifth dry pool explains healthy msys1/2
-                    // + failing prepend). Plus the non-msys frag/acl pools.
-                    // Pools (nm on ble ELF): msys1 0x3fc9eab8, msys2
-                    // 0x3fc9ea8c, hci_frag 0x3fc9e130, acl 0x3fc9e9c8
-                    // (mpool_acl — the ATT/ACL data pool prepend likely
-                    // uses; msys can show all-free while acl is dry).
-                    let mut mp = m.soc.read32(0x3fc9_8e84);
-                    let mut guard = 0u32;
-                    while mp != 0 && guard < 8 {
-                        let dl = m.soc.read16(mp);
-                        let ipool = m.soc.read32(mp.wrapping_add(4));
-                        let (blocks, free, min_free) = if ipool != 0 {
-                            (
-                                m.soc.read16(ipool.wrapping_add(4)),
-                                m.soc.read16(ipool.wrapping_add(6)),
-                                m.soc.read16(ipool.wrapping_add(8)),
-                            )
-                        } else {
-                            (0xFFFF, 0xFFFF, 0xFFFF)
-                        };
-                        println!(
-                            "[host] PANIC-POOL msys mp={mp:#010x} datalen={dl} blocks={blocks} free={free} min_free={min_free}",
-                        );
-                        mp = m.soc.read32(mp.wrapping_add(8));
-                        guard += 1;
-                    }
-                    for (name, base) in [
-                        ("msys1", 0x3fc9_eab8u32),
-                        ("msys2", 0x3fc9_ea8cu32),
-                        ("frag", 0x3fc9_e130u32),
-                        ("acl", 0x3fc9_e9c8u32),
-                    ] {
-                        let mp = m.soc.read32(base.wrapping_add(4));
-                        let (blocks, free, min_free) = if mp != 0 {
-                            (
-                                m.soc.read16(mp.wrapping_add(4)),
-                                m.soc.read16(mp.wrapping_add(6)),
-                                m.soc.read16(mp.wrapping_add(8)),
-                            )
-                        } else {
-                            (0xFFFF, 0xFFFF, 0xFFFF)
-                        };
-                        println!(
-                            "[host] PANIC-POOL {name} mp={mp:#010x} blocks={blocks} free={free} min_free={min_free}",
-                        );
-                    }
-                }
-                if ble_canned {
-                    println!("[host] BLE ring0 (oldest first):");
-                    for k in 0..64 {
-                        print!(" {:#010x}", ring0[(ring_i + k) % 64]);
-                        if k % 4 == 3 {
-                            println!();
-                        }
-                    }
-                    println!("[host] BLE ring1 (oldest first):");
-                    for k in 0..64 {
-                        print!(" {:#010x}", ring1[(ring_i + k) % 64]);
-                        if k % 4 == 3 {
-                            println!();
-                        }
-                    }
-                }
                 break;
             }
             let epc = m.cpu[0].sreg(SR_EPC1);
@@ -1270,35 +795,6 @@ fn main() {
                 m.cpu[0].reg(1),
                 m.cpu[0].reg(2),
             );
-            // TEMP (2026-10-03, forensics — DELETE after): dump panic message
-            // when dying inside panic_abort (EPC1 in its range). a2 at wb
-            // often holds the abort-message pointer; dump 128B as C string.
-            // (IRQSTATE for the NULL-dispatch hunt lives in the ">> ILLEGAL"
-            // arm above, which is the path that fires here.)
-            if (0x4037_fdb4..0x4037_fde0).contains(&epc) {
-                let a2 = m.cpu[0].reg(2);
-                let mut msg = Vec::new();
-                for k in 0..128u32 {
-                    let b = m.soc.read8(a2.wrapping_add(k)) as u8;
-                    if b == 0 {
-                        break;
-                    }
-                    msg.push(b);
-                }
-                println!(
-                    "[host] PANIC-MSG a2={a2:#010x} {:?}",
-                    String::from_utf8_lossy(&msg)
-                );
-                // Also dump 8 words at sp for backtrace.
-                let sp = m.cpu[0].reg(1);
-                println!(
-                    "[host] PANIC-STACK sp={sp:#010x} {:#010x} {:#010x} {:#010x} {:#010x}",
-                    m.soc.read32(sp),
-                    m.soc.read32(sp.wrapping_add(4)),
-                    m.soc.read32(sp.wrapping_add(8)),
-                    m.soc.read32(sp.wrapping_add(12)),
-                );
-            }
             break;
         }
         if let StepResult::Exception { cause } = r1 {
@@ -1319,37 +815,6 @@ fn main() {
                 m.cpu[1].pc,
                 m.cpu[1].sreg(SR_EPC1),
             );
-            // TEMP (2026-10-07 — DELETE after): trailing trajectory
-            // for core1 (mirrors the core0 PRETRACE; core1 dies via a
-            // different NULL site the 0x4037799d skip doesn't cover).
-            for k in 0..32 {
-                let e = pc_ring[(pc_ring_i + k) % 32];
-                println!("[host] PRETRACE1 pc0={:#010x} pc1={:#010x}", e.0, e.1);
-            }
-            // TEMP (2026-10-05, udp-leg forensics — DELETE after): dump
-            // the faulting word ±16B (a valid `entry` at EPC1 per objdump
-            // that fails decode in-emulator proves smashed IRAM — the
-            // deterministic core1 ILLEGAL at `esp_cpu_wait_for_intr`).
-            {
-                let epc = m.cpu[1].sreg(SR_EPC1);
-                let mut bytes = [0u8; 36];
-                for (k, b) in bytes.iter_mut().enumerate() {
-                    *b = m.soc.read8(epc.wrapping_add(k as u32).wrapping_sub(16)) as u8;
-                }
-                println!("[host] FAULTDUMP epc={epc:#010x} bytes={bytes:02x?}");
-            }
-            // TEMP (2026-10-07 — DELETE after): identify core1's current
-            // task (pxCurrentTCBs[1] at 0x3fc9baf8+4; dump 24 words:
-            // top-of-stack, lists, priority, pxStack, name at +52).
-            // Names the task that NULL-jumped (new task on dummy alias?).
-            {
-                let tcb = m.soc.read32(0x3FC9_BAF8 + 4);
-                let mut tw = [0u32; 24];
-                for (k, v) in tw.iter_mut().enumerate() {
-                    *v = m.soc.read32(tcb.wrapping_add((k as u32) * 4));
-                }
-                println!("[host] TCB1 tcb={tcb:#010x} {tw:08x?}");
-            }
             break;
         }
         // Unimplemented instructions (ee.* DSP/TIE unmapped patterns: no
@@ -1409,11 +874,6 @@ fn main() {
                     let b0 = (m.soc.read32(pc) & 0xFF) as u8;
                     let len = insn_len(b0) as u32;
                     m.cpu[0].pc = pc.wrapping_add(len);
-                    println!("[host] DSP-SKIP pc={pc:#010x} len={len}");
-                    // TEMP (2026-10-05 — DELETE after): trace where
-                    // execution goes after the skip (the run ends ~10k
-                    // insns later with no break print — see HB above).
-                    skip_trace = 6;
                 } else {
                     m.cpu[0].step_one(&mut m.soc);
                 }
@@ -1666,7 +1126,7 @@ fn main() {
                         frame[0],
                         u16::from_le_bytes([frame[1], frame[2]])
                     );
-                    // TEMP (2026-10-04, forensics — DELETE after): count
+                    // Count
                     // ATT responses for script pacing (shared counter with
                     // the canned drain; scripted twins pace on responses).
                     // ATT pacing: responses (not notify 0x1B/indicate 0x1D)
@@ -1676,7 +1136,6 @@ fn main() {
                         let op = if frame.len() > 9 { frame[9] } else { 0 };
                         if op != 0x1B && op != 0x1D {
                             ble_att_outstanding = ble_att_outstanding.saturating_sub(1);
-                            println!("[host] BLE ATT outstanding={ble_att_outstanding}");
                         }
                     }
                 }
@@ -1718,8 +1177,7 @@ fn main() {
                         }
                         let rbuf: Vec<u8> = ble_rx_buf[4..4 + rlen].to_vec();
                         ble_rx_buf.drain(..4 + rlen);
-                        // WHITELIST (2026-10-04, proven live — DELETE after
-                        // with the rest of the BLE TEMP): Bumble sends
+                        // WHITELIST (2026-10-04, proven live): Bumble sends
                         // post-conn extras (PHY/conn-update/encryption?/keys)
                         // whose unexpected mbufs leak the shared msys pools
                         // (first ATT response then fails at l2cap prepend
@@ -1738,8 +1196,7 @@ fn main() {
                         // mismatches → `ack 12` + disc, proven live),
                         // PHY/conn-update/encryption (link works at defaults;
                         // central GATT doesn't depend on them). Drops are
-                        // logged with ev/op/len — if firmware ever stalls
-                        // awaiting a dropped packet, the log names it.
+                        // silent (host-side FIFO pop, no pool).
                         let allow = (rbuf.len() == 22
                             && rbuf[0] == 0x04
                             && rbuf[1] == 0x3E
@@ -1748,67 +1205,7 @@ fn main() {
                             || (rbuf.len() >= 2 && rbuf[0] == 0x04 && rbuf[1] == 0x13)
                             || (rbuf.len() >= 2 && rbuf[0] == 0x04 && rbuf[1] == 0x05);
                         if !allow {
-                            if rbuf.len() >= 7 && rbuf[0] == 0x04 && rbuf[1] == 0x0E {
-                                println!(
-                                    "[host] BLE RX bridge drop CC op={:#06x} len={}",
-                                    u16::from_le_bytes([rbuf[4], rbuf[5]]),
-                                    rbuf.len()
-                                );
-                            } else if rbuf.len() >= 7 && rbuf[0] == 0x04 && rbuf[1] == 0x0F {
-                                println!(
-                                    "[host] BLE RX bridge drop CS op={:#06x} len={}",
-                                    u16::from_le_bytes([rbuf[5], rbuf[6]]),
-                                    rbuf.len()
-                                );
-                            } else if rbuf.len() >= 4 && rbuf[0] == 0x04 && rbuf[1] == 0x3E {
-                                println!(
-                                    "[host] BLE RX bridge drop LEmeta sub={:#04x} len={}",
-                                    rbuf.get(3).copied().unwrap_or(0),
-                                    rbuf.len()
-                                );
-                            } else if rbuf.len() >= 2 && rbuf[0] == 0x04 {
-                                println!(
-                                    "[host] BLE RX bridge drop ev={:#04x} len={}",
-                                    rbuf[1],
-                                    rbuf.len()
-                                );
-                            } else {
-                                println!(
-                                    "[host] BLE RX bridge drop h4={:#04x} len={}",
-                                    rbuf[0],
-                                    rbuf.len()
-                                );
-                            }
                             continue;
-                        }
-                        if rbuf.len() == 22 && rbuf[0] == 0x04 && rbuf[1] == 0x3E {
-                            println!(
-                                "[host] BLE RX 22B h4=0x04 ev=0x3e sub=0x01 handle={:#06x} raw={:02x?}",
-                                u16::from_le_bytes([rbuf[5], rbuf[6]]),
-                                &rbuf[..]
-                            );
-                        } else if rbuf.len() >= 6
-                            && rbuf[0] == 0x04
-                            && (rbuf[1] == 0x0E || rbuf[1] == 0x0F)
-                        {
-                            let rop = u16::from_le_bytes([rbuf[4], rbuf[5]]);
-                            println!(
-                                "[host] BLE RX {}B h4={:#04x} ev={:#04x} op={:#06x}",
-                                rbuf.len(),
-                                rbuf[0],
-                                rbuf[1],
-                                rop
-                            );
-                        } else if rbuf.len() >= 4 && rbuf[0] == 0x04 {
-                            println!(
-                                "[host] BLE RX {}B h4={:#04x} ev={:#04x} sub={:#04x}",
-                                rbuf.len(),
-                                rbuf[0],
-                                rbuf[1],
-                                rbuf.get(3).copied().unwrap_or(0)
-                            );
-                        } else {
-                            println!("[host] BLE RX {}B h4={:#04x}", rbuf.len(), rbuf[0]);
                         }
                         m.soc.bt_hci_inject_rx(&rbuf);
                     }
@@ -1876,7 +1273,7 @@ fn main() {
             // held now just defers to a later step (critical sections
             // are brief; the packet stays queued).
             && m.soc.read32(0x3fc9_9110) == 0xB33F_FFFF
-            // PC-BLACKLIST gate (2026-10-04, DELETE after): SMP race fix.
+            // PC-BLACKLIST gate (2026-10-04, proven live): SMP race fix.
             // The xKernelLock word can read FREE while a core sits
             // mid-pool/queue-update inside these functions (lock released
             // but freelist inconsistent, or a *different* mutex held —
@@ -1909,11 +1306,7 @@ fn main() {
             // `inrange=false want=0x0000` — the tap at 0x3fcb12b0 names a
             // reused static buffer, opcode bytes long gone).
             if is_cc && !m.soc.ble_link_up() {
-                let dropped = m.soc.bt_hci_take_rx();
-                println!(
-                    "[host] BLE RX sync CC/CS dropped ({}B, ROM owns sync)",
-                    dropped.map(|f| f.len()).unwrap_or(0)
-                );
+                let _ = m.soc.bt_hci_take_rx();
             } else {
                 let oversize = matches!(peek, Some((0x04, _, len)) if len > 71);
                 // Connection-gate (proven live 2026-10-03): an ATT ACL for a
@@ -1935,7 +1328,7 @@ fn main() {
                 // TEMP (2026-10-03): `BLE_RX_ACL_DROP=1` pops and drops
                 // ATT ACLs instead of delivering them (split forensics).
                 let acl_drop = is_acl && std::env::var("BLE_RX_ACL_DROP").is_ok();
-                // FULL-HANDSHAKE gate (2026-10-04, DELETE after): the `BLE
+                // FULL-HANDSHAKE gate (2026-10-04, proven live): the `BLE
                 // conn 1` marker fires from gap onConnect EARLY (right after
                 // the 22B, before version/features/data-length complete), so
                 // marker-gated ATTs land on a HALF-ESTABLISHED conn (version
@@ -1953,7 +1346,7 @@ fn main() {
                 // declarations sit near the top (before the loop), so it is
                 // in scope here (assigned later in-loop). Borrowck: read-only
                 // use here, mutable assign later — fine (sequential).
-                // ATT pacing (2026-10-04, DELETE after): deliver only when
+                // ATT pacing (2026-10-04, proven live): deliver only when
                 // none outstanding (see counter docs). Gated ATTs stay queued
                 // (level-triggered) until the response drains.
                 if is_acl && (!conn_up || !ble_canned_dl_done || ble_att_outstanding > 0) {
@@ -1978,49 +1371,14 @@ fn main() {
                     // never resent); HOLD preserves it.
                     if (!conn_up || !ble_canned_dl_done) && ble_held_att.is_none() {
                         ble_held_att = m.soc.bt_hci_take_rx();
-                        if let Some(ref f) = ble_held_att {
-                            println!(
-                                "[host] BLE RX pre-dl ATT held ({}B, re-inject after data-length) bytes={:02x?}",
-                                f.len(),
-                                &f[..f.len().min(16)],
-                            );
-                        } else {
-                            println!(
-                                "[host] BLE RX pre-dl ATT hold missed (0B, central retries post-handshake)"
-                            );
-                        }
                     } else {
-                        let dropped = m.soc.bt_hci_take_rx();
-                        // TEMP (2026-10-04, forensics — DELETE after): full hex
-                        // of the premature ATT (replay it post-conn in canned
-                        // to prove ATT→response offline).
-                        if let Some(ref f) = dropped {
-                            println!(
-                                "[host] BLE RX pre-conn ACL dropped ({}B, central retries post-conn) bytes={:02x?}",
-                                f.len(),
-                                f,
-                            );
-                        } else {
-                            println!(
-                                "[host] BLE RX pre-conn ACL dropped (0B, central retries post-conn)"
-                            );
-                        }
+                        let _ = m.soc.bt_hci_take_rx();
                     }
-                } else if acl_drop {
-                    let dropped = m.soc.bt_hci_take_rx();
-                    println!(
-                        "[host] BLE RX ACL dropped by BLE_RX_ACL_DROP ({}B)",
-                        dropped.map(|f| f.len()).unwrap_or(0)
-                    );
-                } else if oversize {
-                    let dropped = m.soc.bt_hci_take_rx();
-                    println!(
-                        "[host] BLE RX oversize EVT dropped ({}B)",
-                        dropped.map(|f| f.len()).unwrap_or(0)
-                    );
+                } else if acl_drop || oversize {
+                    let _ = m.soc.bt_hci_take_rx();
                 } else if let Some(cb) = ble_cb_entry
                     && {
-                        // HOST-ENABLED gate (2026-10-04, DELETE after):
+                        // HOST-ENABLED gate (2026-10-04, proven live):
                         // host_rcv_pkt opens with `if (!ble_hs_enabled_state)
                         // return 0` (BSS 0x3fc9dd70, nm on the BLE ELF —
                         // BLE-image-only leg, like ble_cb_entry itself). A
@@ -2036,167 +1394,13 @@ fn main() {
                         // observable + diagnosable; silent corruption is not).
                         if m.soc.read32(0x3fc9_dd70) == 0 {
                             if !ble_host_disabled {
-                                println!(
-                                    "[host] BLE host disabled (enabled_state==0), deferring delivery"
-                                );
                                 ble_host_disabled = true;
                             }
                             false
                         } else {
                             ble_host_disabled = false;
-                            // TEMP (2026-10-03): pool drain watch (DELETE after).
-                            // Did the synthetic call consume an ev-pool block?
-                            // Plus the SMP interleaving: both cores' pcs + the
-                            // scheduler lock (xKernelLock 0x3fc99110 — nm on the
-                            // ble ELF). If the other core sits mid-critical-
-                            // section when we synthesize scheduler-touching
-                            // firmware, lists corrupt -> garbage TCB -> wild
-                            // retw through paint.
-                            let f0 = m.soc.ble_evt_pool_free();
-                            // TEMP (2026-10-03): capture the pre-call pool
-                            // free-list head (DELETE after) — the block our
-                            // call will check out. NPL event = {queued@0,
-                            // fn@4, arg@8} per npl_freertos.h.
-                            let pre_head = m.soc.read32(0x3fc9_df6c + 20);
-                            // TEMP (2026-10-03): queue depth pre/post (DELETE
-                            // after). Corrected layout (from the sem mw/len
-                            // offsets the ack path proves: counts at +56/+60):
-                            // depth=[q+56]. 0→1 = our post landed; 1→0 = task
-                            // took it.
-                            let evq0 = m.soc.read32(0x3fc9_dd50);
-                            let q0 = m.soc.read32(evq0);
-                            let depth0 = m.soc.read32(q0.wrapping_add(56));
-                            println!(
-                                "[host] BLE pre core0={:#010x} core1={:#010x} lock={:#010x}",
-                                m.cpu[0].pc,
-                                m.cpu[1].pc,
-                                m.soc.read32(0x3fc9_9110)
-                            );
-                            // TEMP (2026-10-03): evq waiter check (DELETE after).
-                            // Is any task parked on ble_hs_evq when we post?
-                            // ble_hs_evq (0x3fc9dd50) word0 = 0x3fc9ea68 =
-                            // g_eventq_dflt STRUCT whose word0 (0x3fcb1430)
-                            // is the real FreeRTOS Queue_t (heap). Check the
-                            // waiter on the QUEUE, not the wrapper, and dump
-                            // both layouts. PLUS the receive list itself
-                            // (+36: count, pxIndex+40, end.next+44): whose TCB
-                            // is parked? (host_task_h for comparison.)
-                            // PLUS pre-call IRAM probe (DELETE after): is
-                            // 0x40380a7c still intact right BEFORE the
-                            // synthetic call? Splits synthetic-call clobber
-                            // vs idle-time drift.
-                            // PLUS window-liveness snapshot (DELETE after):
-                            // stale WINDOWSTART bits (never cleared) make
-                            // overflow rotate into ALIASED live windows (a1
-                            // = another task's SP, [SP-12] = its saved
-                            // retaddr) → spill base wild → IRAM clobber.
-                            println!(
-                                "[host] BLE pre IRAM @0x40380a7c = {:#010x}",
-                                m.soc.read32(0x4038_0a7c)
-                            );
-                            println!(
-                                "[host] BLE pre wb={} wstart={:#010x} excsave1={:#010x}",
-                                m.cpu[0].windowbase(),
-                                m.cpu[0].sreg(xtensa_core::cpu::SR_WINDOW_START),
-                                m.cpu[0].sreg(xtensa_core::cpu::SR_EXCSAVE1),
-                            );
-                            // TEMP (2026-10-03, forensics — DELETE after): OF12
-                            // handler inputs — a13 (scratch base) + [SP-12]
-                            // (spill base) in the CURRENT (wb+2-rotated? no:
-                            // pre-call, firmware) view. If either names IRAM
-                            // code, the first overflow spill clobbers it.
-                            {
-                                let sp = m.cpu[0].reg(1);
-                                println!(
-                                    "[host] BLE pre a13={:#010x} sp={:#010x} sp-12-mem={:#010x}",
-                                    m.cpu[0].reg(13),
-                                    sp,
-                                    m.soc.read32(sp.wrapping_sub(12)),
-                                );
-                            }
-                            // PLUS waiter pre/post (DELETE after): does our
-                            // post unblock it? Sampled around the synthetic
-                            // call — unblock is synchronous inside Send.
-                            let evq = m.soc.read32(0x3fc9_dd50);
-                            let queue = m.soc.read32(evq);
-                            let evq_wait = if queue != 0 {
-                                m.soc.queue_recv_waiting(queue)
-                            } else {
-                                false
-                            };
-                            let ht0 = m.soc.read32(0x3fc9_eac8);
-                            println!(
-                                "[host] BLE pre evq={evq:#010x} queue={queue:#010x} q_wait={evq_wait} host={ht0:#010x}"
-                            );
-                            println!(
-                                "[host] BLE pre rlist-detail count={} first={:#010x}",
-                                m.soc.read32(queue.wrapping_add(32)),
-                                m.soc.read32(queue.wrapping_add(40)),
-                            );
-                            // TEMP (2026-10-03): full Queue_t dump (DELETE
-                            // after). Is the queue FULL when we post (post
-                            // fails silently -> block leaks -> waiter stays
-                            // parked -> silence)? Words +0..+64.
-                            println!(
-                                "[host] BLE pre qstruct={:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}",
-                                m.soc.read32(queue),
-                                m.soc.read32(queue.wrapping_add(4)),
-                                m.soc.read32(queue.wrapping_add(8)),
-                                m.soc.read32(queue.wrapping_add(12)),
-                                m.soc.read32(queue.wrapping_add(16)),
-                                m.soc.read32(queue.wrapping_add(20)),
-                                m.soc.read32(queue.wrapping_add(24)),
-                                m.soc.read32(queue.wrapping_add(28)),
-                            );
-                            // TEMP (2026-10-03): queue length/occupancy words
-                            // (DELETE after). Standard Queue_t has
-                            // uxMessagesWaiting@48, uxLength@52, uxItemSize@56
-                            // (after two 16B lists at +16/+32). A length-1
-                            // queue + an occupying timer event at post time =
-                            // our post fails silently (0 timeout) and leaks.
-                            // Dump +32..+72 to find the real count fields
-                            // (small ints among pointers; sample twice).
-                            println!(
-                                "[host] BLE pre qlen={:#010x} {:#010x} {:#010x} {:#010x}",
-                                m.soc.read32(queue.wrapping_add(48)),
-                                m.soc.read32(queue.wrapping_add(52)),
-                                m.soc.read32(queue.wrapping_add(56)),
-                                m.soc.read32(queue.wrapping_add(60)),
-                            );
-                            println!(
-                                "[host] BLE pre qx32={:#010x} {:#010x} {:#010x} {:#010x} {:#010x} {:#010x}",
-                                m.soc.read32(queue.wrapping_add(32)),
-                                m.soc.read32(queue.wrapping_add(36)),
-                                m.soc.read32(queue.wrapping_add(40)),
-                                m.soc.read32(queue.wrapping_add(44)),
-                                m.soc.read32(queue.wrapping_add(64)),
-                                m.soc.read32(queue.wrapping_add(68)),
-                            );
-                            // TEMP (2026-10-04, forensics — DELETE after):
-                            // pre-delivery pointed-queue dump (8 words at
-                            // *handle) to compare with PANIC-SEM (find count
-                            // offset; pre-seed writes queue+0x38).
-                            {
-                                let h = m.soc.read32(0x3fc9_d6d0);
-                                let mut w = [0u32; 8];
-                                for (k, v) in w.iter_mut().enumerate() {
-                                    *v = m.soc.read32(h.wrapping_add((k as u32) * 4));
-                                }
-                                println!("[host] BLE pre-SEM [{h:#010x}] {w:08x?}");
-                            }
                             let ok = m.run_ble_host_recv(0, cb);
-                            println!(
-                                "[host] BLE RX host_rcv_pkt ok={ok} evfree {f0}->{})",
-                                m.soc.ble_evt_pool_free()
-                            );
-                            // TEMP (2026-10-04, forensics — DELETE after): staged
-                            // bytes (H4==0 dead-path diagnosis).
-                            if let Some((sb, sl, sx)) = m.last_recv_stage {
-                                println!(
-                                    "[host] BLE RX staged buf={sb:#010x} len={sl} bytes={sx:02x?}"
-                                );
-                            }
-                            // PRE-DL HOLD re-inject (2026-10-04, DELETE after):
+                            // PRE-DL HOLD re-inject (2026-10-04, proven live):
                             // when the data-length event itself delivers (14B
                             // LE-meta subevent 0x07 — the handshake is now
                             // fully established firmware-side), restore the
@@ -2211,133 +1415,25 @@ fn main() {
                                 .is_some_and(|(_, sl, sx)| sl == 14 && sx[3] == 0x07)
                                 && let Some(held) = ble_held_att.take()
                             {
-                                println!(
-                                    "[host] BLE held ATT re-injected ({}B) after data-length",
-                                    held.len(),
-                                );
                                 m.soc.bt_hci_inject_rx(&held);
                             }
-                            // TEMP (2026-10-03, forensics — DELETE after): print
-                            // the synthetic-call abort record (fault pc + step
-                            // result) when delivery fails.
-                            if !ok {
-                                if let Some((apc, ar, trip)) = m.last_recv_abort {
-                                    println!(
-                                        "[host] BLE RX abort at {apc:#010x}: {ar:?} woe_trip={trip:#010x?}"
-                                    );
-                                    // TEMP (2026-10-03, forensics — DELETE
-                                    // after): IRAM clobber site, if observed.
-                                    if let Some(cpc) = m.last_recv_clobber {
-                                        println!(
-                                            "[host] BLE RX clobber first seen after step at {cpc:#010x}"
-                                        );
-                                    }
-                                    // TEMP (2026-10-03, forensics — DELETE
-                                    // after): PS at synthetic exit (EXCM set
-                                    // ⇒ inside a vector handler).
-                                    if let Some((ps, epc1, wb)) = m.last_recv_ps {
-                                        println!(
-                                            "[host] BLE RX exit ps={ps:#010x} epc1={epc1:#010x} wb={wb}"
-                                        );
-                                    }
-                                    // TEMP (2026-10-03, forensics — DELETE
-                                    // after): dump what the CPU actually
-                                    // fetched at the fault pc (IRAM backing
-                                    // may differ from the ELF file).
-                                    println!(
-                                        "[host] BLE RX fault bytes @ {apc:#010x} = {:#010x}",
-                                        m.soc.read32(apc)
-                                    );
-                                } else {
-                                    println!(
-                                        "[host] BLE RX abort: clean exit without retw (10k cap?)"
-                                    );
-                                }
-                            }
-                            // TEMP (2026-10-03): WOE snapshot (DELETE after).
-                            // ENTRY faults cause 0 iff PS.WOE==0 — snapshot PS
-                            // at every delivery attempt: was WOE already clear
-                            // in the idle task state, or cleared mid-call?
-                            println!(
-                                "[host] BLE pre ps={:#010x} woe={}",
-                                m.cpu[0].sreg(xtensa_core::cpu::SR_PS),
-                                (m.cpu[0].sreg(xtensa_core::cpu::SR_PS) & xtensa_core::cpu::PS_WOE)
-                                    != 0,
-                            );
-                            // TEMP (2026-10-03): waiter post/post (DELETE
-                            // after). Unblock is synchronous inside Send: if
-                            // still parked after our post, the post didn't
-                            // unblock (wrong queue/full/silent error).
-                            println!(
-                                "[host] BLE pre waiter_post={} depth_post={}",
-                                if queue != 0 {
-                                    m.soc.queue_recv_waiting(queue)
-                                } else {
-                                    false
-                                },
-                                m.soc.read32(queue.wrapping_add(56)),
-                            );
-                            // TEMP (2026-10-03): depth after (DELETE after).
-                            let evq1 = m.soc.read32(0x3fc9_dd50);
-                            let q1 = m.soc.read32(evq1);
-                            println!(
-                                "[host] BLE pre depth {depth0}->{}",
-                                m.soc.read32(q1.wrapping_add(56))
-                            );
-                            // TEMP (2026-10-03): handler set on our block?
-                            // (DELETE after). Expect fn == ble_hs_event_rx_hci_ev.
-                            // PLUS the data mbuf head (ev_arg points at it):
-                            // [0]==0x3E means H4-stripped (correct), 0x04 means
-                            // the H4 byte leaked into the mbuf (dispatcher then
-                            // misindexes the LE table and drops).
-                            println!(
-                                "[host] BLE pre ev_fn={:#010x} ev_arg={:#010x}",
-                                m.soc.read32(pre_head.wrapping_add(4)),
-                                m.soc.read32(pre_head.wrapping_add(8)),
-                            );
-                            let dm = m.soc.read32(pre_head.wrapping_add(8));
-                            println!(
-                                "[host] BLE pre dmbuf={:02x?}",
-                                [
-                                    m.soc.read8(dm) as u8,
-                                    m.soc.read8(dm.wrapping_add(1)) as u8,
-                                    m.soc.read8(dm.wrapping_add(2)) as u8,
-                                    m.soc.read8(dm.wrapping_add(3)) as u8,
-                                    m.soc.read8(dm.wrapping_add(4)) as u8,
-                                    m.soc.read8(dm.wrapping_add(5)) as u8,
-                                ]
-                            );
                             ok
                         } // end else (host enabled): ok from the call above
                     }
                 {
-                    println!("[host] BLE RX delivered via host_rcv_pkt");
                     // First async delivery proves the link is up (see the
                     // `ble_link_up` field docs): from here CCs belong to
                     // post-connection commands (arrival ack leg below),
                     // not to the ROM loopback.
                     m.soc.ble_mark_link_up();
                     ble_link_up_seq = m.soc.ble_tx_seq();
-                    // ATT pacing (2026-10-04, DELETE after): count this
+                    // ATT pacing (2026-10-04, proven live): count this
                     // delivery if ATT (response TX will clear it).
                     if is_acl {
                         ble_att_outstanding += 1;
-                        println!("[host] BLE ATT outstanding={ble_att_outstanding}");
                     }
-                    // TEMP (2026-10-03): post-delivery pc window (DELETE
-                    // after). Record both cores' pcs for the next 150
-                    // macro-steps: what does the woken task do?
-                    ble_watch_n = 150;
                 }
             }
-        }
-        // TEMP (2026-10-03): post-delivery pc window (DELETE after).
-        if ble_watch_n > 0 {
-            ble_watch_n -= 1;
-            println!(
-                "[host] BLEWATCH step={i} c0={:#010x} c1={:#010x}",
-                m.cpu[0].pc, m.cpu[1].pc
-            );
         }
         // Command-ack arrival notes (no active leg — see the CC policy
         // above): post-link_up CCs flow through the async event path
@@ -2391,79 +1487,26 @@ fn main() {
             let cb1 = m.soc.read32(BLE_HOST_CB + 4);
             if (0x4000_0000..0x4240_0000).contains(&cb1) && cb0 != 0 {
                 ble_cb_entry = Some(cb1);
-                println!("[host] BLE vhci_host_cb: notify_host_recv={cb1:#010x}");
-            }
-        }
-
-        // TEMP (2026-10-03): host-task schedule watch (DELETE after).
-        // Does the NimBLE host task run AFTER our post? Latch on the
-        // first step either core currently runs it, gated on link_up
-        // (set at delivery success) so pre-delivery runs don't count.
-        // PLUS queue trend: depth (uxMessagesWaiting @ +48, same layout
-        // `queue_recv_waiting` uses) + waiter present, throttled — does
-        // the queued event ever drain?
-        if ble_canned && m.soc.ble_link_up() {
-            if !ble_host_seen {
-                let ht = m.soc.read32(0x3fc9_eac8);
-                if ht != 0 {
-                    let c0 = m.soc.read32(0x3fc9_f618);
-                    let c1 = m.soc.read32(0x3fc9_f61c);
-                    if c0 == ht || c1 == ht {
-                        println!(
-                            "[host] BLEDBG-HOST step={i} host_runs c0={c0:#010x} c1={c1:#010x} ht={ht:#010x}"
-                        );
-                        ble_host_seen = true;
-                    }
-                }
-            }
-            if i.is_multiple_of(1_000_000) {
-                let evq = m.soc.read32(0x3fc9_dd50);
-                println!(
-                    "[host] BLEDBG-Q step={i} depth={} waiter={} evfree={}",
-                    m.soc.read32(evq.wrapping_add(48)),
-                    if evq != 0 {
-                        m.soc.queue_recv_waiting(evq)
-                    } else {
-                        false
-                    },
-                    m.soc.ble_evt_pool_free(),
-                );
             }
         }
 
         if ble_gw.is_some() || ble_canned {
-            // TEMP (2026-10-03): in canned mode (no bridge) drain+log TX
-            // captures so post-22B firmware commands are visible (does the
-            // conn handler send Read-Remote-Version and stall awaiting its
-            // CC?). DELETE after forensics.
+            // In canned mode (no bridge) drain TX captures so post-22B
+            // firmware commands are answered below (the conn handler sends
+            // Read-Remote-Version and stalls awaiting its CC).
             if ble_canned {
                 let frame = m.soc.bt_hci_take_tx();
                 if !frame.is_empty() && frame.len() >= 3 {
-                    // TEMP (2026-10-03): tap-address audit (DELETE after).
-                    // Which pool does each command mbuf come from?
-                    let (ld, _ll) = m.soc.ble_last_tx().unwrap_or((0, 0));
-                    println!(
-                        "[host] BLE TX canned {}B h4={:#04x} op={:#06x} tap={:#010x}",
-                        frame.len(),
-                        frame[0],
-                        u16::from_le_bytes([frame[1], frame[2]]),
-                        ld,
-                    );
-                    // TEMP (2026-10-04, forensics — DELETE after): full hex
-                    // for ACL TX (decode ATT discovery response handles for
-                    // canned READ/WRITE replay). Count ACL TX (each ATT
                     // response) for script pacing (see findinfo stager).
-                    // ATT pacing (2026-10-04, DELETE after): responses clear
+                    // ATT pacing (2026-10-04, proven live): responses clear
                     // outstanding (not notify 0x1B / indicate 0x1D — those
                     // are server-initiated, not answers). Opcode at [9]
                     // (H4+handle2+acl_len2+l2cap_len2+cid2); guard short.
                     if frame[0] == 0x02 {
-                        println!("[host] BLE TXACL {:02x?}", &frame[..]);
                         ble_canned_acl_tx_n += 1;
                         let op = if frame.len() > 9 { frame[9] } else { 0 };
                         if op != 0x1B && op != 0x1D {
                             ble_att_outstanding = ble_att_outstanding.saturating_sub(1);
-                            println!("[host] BLE ATT outstanding={ble_att_outstanding}");
                         }
                     }
                 }
@@ -2479,12 +1522,11 @@ fn main() {
         // sketch's `LLMAC sniff 1` marker (setup done — the synthetic
         // call needs a valid task stack, same wild-stack class as the
         // BLE boot-phase gate).
-        // TEMP (2026-10-03): deterministic BLE NULL-call repro — with
+        // Deterministic BLE NULL-call repro — with
         // (no bridge needed) the first delivery opportunity after init
         // stages a canned LE Connection Complete (bytes captured from a
         // live Bumble run) instead of needing the central rendezvous.
-        // Isolates 22B content processing from link timing. DELETE after
-        // forensics.
+        // Isolates 22B content processing from link timing.
         // DONE-gate (load-bearing): staging the 22B mid-init flips
         // `link_up` while init sends are still in flight — the CC policy
         // switches from drop-as-ROM-dup to deliver, and V2 + the stager
@@ -2500,17 +1542,6 @@ fn main() {
             let ble_done = uart_buf
                 .windows(b"BLE DONE".len())
                 .any(|w| w == b"BLE DONE");
-            // TEMP (2026-10-03, forensics — DELETE after): one-shot IRAM
-            // probe — is 0x40380a7c (xPortInIsrContext entry) intact
-            // post-boot, pre-delivery? Distinguishes loader hole (bad from
-            // load) from runtime clobber.
-            if ble_done && !ble_canned_done && !ble_iram_probed {
-                println!(
-                    "[host] BLE IRAM probe @0x40380a7c = {:#010x} (expect 0xa0004136)",
-                    m.soc.read32(0x4038_0a7c)
-                );
-                ble_iram_probed = true;
-            }
             if ble_starts >= 1 && ble_done && m.soc.ble_evt_pool_ready() {
                 // Supervision timeout widened 0x000A→0x0C80 (100ms→32s):
                 // the live-captured 100ms timeout disconnects the canned
@@ -2521,10 +1552,9 @@ fn main() {
                     0x18, 0xFF, 0x0A, 0x00, 0x00, 0x00, 0x80, 0x0C, 0x07,
                 ]);
                 ble_canned_done = true;
-                println!("[host] BLE canned 22B staged");
             }
         }
-        // TEMP (2026-10-03): canned controller (DELETE after). Once the
+        // Canned handshake stager. Once the
         // link is up, every outstanding command needs its Command Complete
         // (canned has no bridge): the conn handler sends adv-disable, then
         // read-remote-version, etc., and stalls on each waiter without its
@@ -2534,8 +1564,8 @@ fn main() {
         // init-time commands never reach here — the ROM loopback answers
         // those firmware-side and `ble_link_up` is false until the first
         // async delivery).
-        // TEMP (2026-10-03): generic canned-CC stager RE-ENABLED
-        // (DELETE after). The trace proves the handler chain runs
+        // Generic canned-CC stager (re-enabled 2026-10-03).
+        // The trace proves the handler chain runs
         // (le_meta → table[1] → gap_conn_complete) but stalls awaiting
         // the adv-disable CC (no app `onConnect` without it). One CC per
         // captured command (seq-guarded against the static-buffer stale
@@ -2588,10 +1618,9 @@ fn main() {
                 }
                 ble_canned_last_op = m.soc.ble_tx_seq();
                 ble_canned_last_cc_op = op;
-                println!("[host] BLE canned CC staged for op={op:#06x}");
             }
         }
-        // TEMP (2026-10-03): canned version-complete event (DELETE after).
+        // Canned version-complete event.
         // Mirrors the bridge's 0x041D follow-up: after the rd-rem-ver CC
         // is served, stage the 0x0C event (status 0, handle 1, BT 5.0,
         // Espressif) so the handler doesn't stall awaiting it. Bridge
@@ -2606,10 +1635,8 @@ fn main() {
                 0x04, 0x0C, 0x08, 0x00, 0x01, 0x00, 0x09, 0xE5, 0x02, 0x00, 0x00,
             ]);
             ble_canned_ver_done = true;
-            println!("[host] BLE canned version event staged");
         }
-        // TEMP (2026-10-03): canned remote-features-complete event (DELETE
-        // after). After the 0x2016 CC, stage the LE Meta subevent-0x04
+        // Canned remote-features-complete event. After the 0x2016 CC, stage the LE Meta subevent-0x04
         // (status 0, handle 1 from the 22B, all-FF features = full LE
         // support) so the handler completes and fires onConnect. Zeros
         // proved the path (conn fires) but NimBLE then logs `Controller
@@ -2626,9 +1653,8 @@ fn main() {
                 0xFF,
             ]);
             ble_canned_feat_done = true;
-            println!("[host] BLE canned features event staged");
         }
-        // TEMP (2026-10-03): canned data-length-change event (DELETE after).
+        // Canned data-length-change event.
         // After the 0x2022 CC, stage the LE Meta subevent-0x07 (handle 1,
         // 251B/2120us both directions) so the handler completes instead of
         // disconnecting. Bridge override (2026-10-04): also serves with a
@@ -2644,9 +1670,8 @@ fn main() {
                 0x04, 0x3E, 0x0B, 0x07, 0x01, 0x00, 0xFB, 0x00, 0x48, 0x08, 0xFB, 0x00, 0x48, 0x08,
             ]);
             ble_canned_dl_done = true;
-            println!("[host] BLE canned data-length event staged");
         }
-        // TEMP (2026-10-04, forensics — DELETE after): canned ATT replay
+        // Canned ATT replay
         // (see flag docs). SIZE TEST ORDER: after the READFIRST response
         // (acl_tx_n>=1), not directly after dl_done.
         if ble_canned
@@ -2659,9 +1684,8 @@ fn main() {
                 0x00, 0x28,
             ]);
             ble_canned_att_done = true;
-            println!("[host] BLE canned ATT staged");
         }
-        // TEMP (2026-10-04, forensics — DELETE after): canned Find-Info
+        // Canned Find-Info
         // (Phase 1). After the discovery response (first ACL TX) with the
         // FIFO empty, request attributes 0x000e-0xFFFF (Find Info 0x04) to
         // learn characteristic/value handles (decoded from the TXACL
@@ -2677,9 +1701,8 @@ fn main() {
                 0x02, 0x01, 0x20, 0x09, 0x00, 0x05, 0x00, 0x04, 0x00, 0x04, 0x0E, 0x00, 0xFF, 0xFF,
             ]);
             ble_canned_findinfo_done = true;
-            println!("[host] BLE canned FINDINFO staged");
         }
-        // TEMP (2026-10-04, forensics — DELETE after): Phase 2 (handles in
+        // Phase 2 (handles in
         // flag docs). Read Battery Level (0x0A + 0x0010) after the Find-Info
         // response (2nd ACL TX). Full ACL: acl_len 7 + l2cap_len 3 + 0A 1000.
         if ble_canned
@@ -3531,8 +2554,7 @@ fn main() {
         //   `onReceive` → `got_rx = true`, `rx_byte0 = 0xA5`.
         // Level, not edge: each leg runs once (latched). The sketch's
         // own `delay(50)` poll loop observes the flags and prints.
-        // TEMP (2026-10-07, espnow-engine experiment — DELETE after):
-if wifi_espnow_loopback && (!wifi_espnow_tx_done || !wifi_espnow_rx_done) {
+        if wifi_espnow_loopback && (!wifi_espnow_tx_done || !wifi_espnow_rx_done) {
             // Closed cb cells live in closed .bss (espnow image, nm-proof
             // is impossible — discovered live: RX @0x3fc9dd28, TX
             // @0x3fc9dd2c hold the Arduino wrapper entries once
@@ -3615,35 +2637,6 @@ if wifi_espnow_loopback && (!wifi_espnow_tx_done || !wifi_espnow_rx_done) {
         // per-op sampling inside the block loop; pre/post-step sampling
         // here would miss mid-block entry pcs).
         let uart_len = uart_buf.len();
-        // TEMP (2026-10-05, udp-leg park forensics — DELETE after): see
-        // declaration above. Dumps both cores once after 5M quiet
-        // macro-steps past `ip6edrain 3`, then keeps running.
-        if !watch_dumped
-            && uart_buf.windows(11).any(|w| w == b"ip6edrain 3")
-        {
-            if uart_len == last_watch_len {
-                watch_quiet += 1;
-            } else {
-                watch_quiet = 0;
-                last_watch_len = uart_len;
-            }
-            if watch_quiet == 1_000_000 {
-                watch_dumped = true;
-                for c in 0..2 {
-                    println!(
-                        "[host] WATCHDOG core{c} pc={:#010x} a0={:#010x} a1={:#010x} a2={:#010x} a3={:#010x} sp={:#010x} wb={} epc1={:#010x} (executed={executed} i={i})",
-                        m.cpu[c].pc,
-                        m.cpu[c].reg(0),
-                        m.cpu[c].reg(1),
-                        m.cpu[c].reg(2),
-                        m.cpu[c].reg(3),
-                        m.cpu[c].reg(1),
-                        m.cpu[c].windowbase(),
-                        m.cpu[c].sreg(xtensa_core::cpu::SR_EPC1),
-                    );
-                }
-            }
-        }
         if pc == last_pc && uart_len == last_uart_len {
             idle_steps += 1;
             stuck += 1;
@@ -3671,26 +2664,6 @@ if wifi_espnow_loopback && (!wifi_espnow_tx_done || !wifi_espnow_rx_done) {
                 .unwrap_or(2_000_000);
             if idle_steps >= idle_limit {
                 println!("\n== IDLE: no output or PC change for 2M steps at step {i} ==");
-                // TEMP (2026-10-04, RF forensics — DELETE after): park-loop
-                // tracer for the WorkerL3 management-TX stall (core0 parks
-                // at 0x42074b4f `ppTxFragmentProc+0x13f` with the entry hook
-                // never firing). Single-step 12× logging pc + raw word +
-                // regs so the polling load (same address every iteration)
-                // names the flag the host must satisfy (like the BLE sem
-                // pre-seed). Gated to the stall pc range to avoid spamming
-                // normal DONE-idles on every other image.
-                if path.contains("test_worker_l3") && (0x4207_4a10..0x4207_519c).contains(&pc) {
-                    for _ in 0..12 {
-                        let p = m.cpu[0].pc;
-                        let w = m.soc.read32(p);
-                        let mut regs = [0u32; 16];
-                        for (k, r) in regs.iter_mut().enumerate() {
-                            *r = m.cpu[0].reg(k as u32);
-                        }
-                        println!("[host] PARKTRACE pc={p:#010x} word={w:#010x} regs={regs:08x?}");
-                        let _ = m.cpu[0].step_one(&mut m.soc);
-                    }
-                }
                 break;
             }
         } else {
@@ -3700,39 +2673,12 @@ if wifi_espnow_loopback && (!wifi_espnow_tx_done || !wifi_espnow_rx_done) {
         last_pc = pc;
         last_uart_len = uart_buf.len();
     }
-    // TEMP (2026-10-05 — DELETE after): unconditional loop-exit marker
-    // on STDERR (unbuffered — settles whether silent exits are lost
-    // stdout buffering or a truly bannerless break). Carries the last
-    // step results that must have triggered it.
-    eprintln!("[host] LOOP-EXIT i={i} executed={executed} r0={last_r0:?} r1={last_r1:?}");
-
     // --- Final drain: grab any remaining UART/USB-Serial TX bytes ---
     {
         let tx1 = m.take_uart_tx(1);
         uart_buf.extend_from_slice(&tx1);
         let tx = m.take_uart_tx(0);
         uart_buf.extend_from_slice(&tx);
-    }
-
-    // TEMP (2026-10-03): dump the event-dispatch trace ring in canned mode
-    // (DELETE after). Shows the exact handler path our delivered CCs took.
-    if ble_canned {
-        for (pc, a10, a11, a12) in m.soc.ble_trace_dump() {
-            if pc != 0 {
-                println!(
-                    "[host] BLETRACE pc={pc:#010x} a10={a10:#010x} a11={a11:#010x} a12={a12:#010x}"
-                );
-            }
-        }
-        // TEMP (2026-10-03): queue storage post-mortem (DELETE after). Is
-        // our event still sitting in the evq storage (never taken)? The
-        // storage observed at post time was 12B at 0x3fcb148c.
-        println!(
-            "[host] BLEQ post-mortem stor={:#010x} {:#010x} {:#010x}",
-            m.soc.read32(0x3fcb_148c),
-            m.soc.read32(0x3fcb_1490),
-            m.soc.read32(0x3fcb_1494),
-        );
     }
 
     // --- USB-OTG auto-enum IN-capture report (device answering the host) ---
@@ -3742,269 +2688,7 @@ if wifi_espnow_loopback && (!wifi_espnow_tx_done || !wifi_espnow_rx_done) {
     // the TXFIFO payload at completion, so a drain here is non-destructive
     // to the sketch path but proves the bytes moved end to end).
     if usb_host_enum {
-        let got = m.soc.usb_host_take_in();
-        println!("== usb IN capture ({}): {got:02x?}", got.len());
-    }
-
-    // TEMP (2026-10-05, udp-leg forensics — DELETE after): tap history
-    // (last-8 TX ret targets + last-8 RX buf/cap — names a wild ret jump
-    // or wild RX write behind the deterministic core1 ILLEGAL).
-    {
-        for k in 0..8 {
-            let e = m.tx_tap_ring[(m.tx_tap_idx + k) % 8];
-            if e.0 != 0 {
-                println!(
-                    "[host] TXTAP pc={:#010x} ra={:#010x} ret={:#010x} len={}",
-                    e.0, e.1, e.2, e.3
-                );
-            }
-        }
-        for k in 0..8 {
-            let e = m.rx_tap_ring[(m.rx_tap_idx + k) % 8];
-            if e.0 != 0 {
-                println!(
-                    "[host] RXTAP pc={:#010x} buf={:#010x} cap={} framelen={}",
-                    e.0, e.1, e.2, e.3
-                );
-            }
-        }
-    }
-
-    // TEMP (2026-10-05, udp-leg forensics — DELETE after): IRAM content
-    // probe (DUMP_IRAM=1): prints the 16B at `esp_cpu_wait_for_intr`
-    // (0x40379990) at end of run. Verifies the stub loader copied seg2
-    // (expect `36 41 00 70 00 1d f0 ...` per the image file) vs zeros.
-    if env::var("DUMP_IRAM").is_ok() {
-        let mut bytes = [0u8; 16];
-        for (k, b) in bytes.iter_mut().enumerate() {
-            *b = m.soc.read8(0x4037_9990 + k as u32) as u8;
-        }
-        println!("[host] IRAMDUMP bytes={bytes:02x?}");
-    }
-    // TEMP (2026-10-05, heap forensics — DELETE after): flash-window
-    // probe (DUMPFLASH=1): prints 32B at the soc_memory_regions table
-    // (0x3c0b0e9c) as the EMULATOR reads them through the cache/MMU
-    // path. Must match the image file (`region1 start=0x3fc88000 ...`);
-    // a mismatch proves a flash-read-path glitch feeding heap_caps_init
-    // garbage (the 2 garbage HEAPREG fires) → garbage heap regions →
-    // heap serves the reserved alias → the 886M alias kill.
-    if env::var("DUMPFLASH").is_ok() {
-        let mut bytes = [0u8; 32];
-        for (k, b) in bytes.iter_mut().enumerate() {
-            *b = m.soc.read8(0x3C0B_0E9C + k as u32) as u8;
-        }
-        println!("[host] FLASHDUMP bytes={bytes:02x?}");
-    }
-
-    // TEMP (2026-10-05, udp-leg forensics — DELETE after): idle-hook
-    // registrations (names the callback behind the idle-path zeroing).
-    {
-        for k in 0..8 {
-            let e = m.idle_hook_regs[(m.idle_hook_idx + k) % 8];
-            if e.0 != 0 {
-                println!("[host] IDLEREG cb={:#010x} cpu={}", e.0, e.1);
-            }
-        }
-    }
-    // TEMP (2026-10-05, udp-leg forensics — DELETE after): IRQ
-    // registrations + firing lines at crash (NULL-dispatch hunt).
-    {
-        println!("[host] IRQN total={}", m.irq_idx);
-        for k in 0..16 {
-            let e = m.irq_regs[(m.irq_idx + k) % 16];
-            if e.1 != 0 {
-                println!("[host] IRQREG line={} handler={:#010x}", e.0, e.1);
-            }
-        }
-    }
-    // TEMP (2026-10-06 — DELETE after): non-default matrix routes
-    // (which source sits on unregistered lines 20/21/24?).
-    {
-        let (routes, n) = m.soc.int_routes(0);
-        for k in 0..n.min(32) {
-            println!(
-                "[host] ROUTE src={} line={}",
-                routes[k] >> 32,
-                routes[k] & 0xFFFF
-            );
-        }
-    }
-    // TEMP (2026-10-05, udp-leg forensics — DELETE after): heap regions
-    // (decisive for heap-vs-wild: dummy window covered or not).
-    {
-        println!("[host] HEAPN total={}", m.heap_idx);
-        for k in 0..8 {
-            let e = m.heap_regs[(m.heap_idx + k) % 8];
-            if e.0 != 0 || e.2 != 0 {
-                println!(
-                    "[host] HEAPREG [{:#010x}, {:#010x}) ra={:#010x} pc={:#010x}",
-                    e.0, e.1, e.2, e.3
-                );
-            }
-        }
-    }
-
-    // TEMP (2026-10-05, udp-leg forensics — DELETE after): per-op
-    // store-pc ring (post-op pc = store ± len; last-16, late writer last).
-    {
-        for k in 0..16 {
-            let e = m.watch_op[(m.watch_op_idx + k) % 16];
-            if e.1 != 0 {
-                println!(
-                    "[host] WATCHOP postpc={:#010x} addr={:#010x} val={:#010x} a0={:#010x}",
-                    e.0, e.1, e.2, e.3
-                );
-            }
-        }
-    }
-
-    // TEMP (2026-10-05, udp-leg forensics — DELETE after): ppTx
-    // memset-skip fire count + ROM memset-to-dummy calls (dst, len,
-    // caller-ra; ring stays empty now that the call is skipped).
-    {
-        println!(
-            "[host] MEMSETSKIP fires={} NULLSKIP fires={} lastpc={:#010x} entry_line={}",
-            m.memset_idx, m.nullskip_fires, m.nullskip_pc, m.entry_line
-        );
-        println!(
-            "[host] NULLSRC lo={:#018x} hi={:#018x} inten={:#010x} intset={:#010x} intr={:#010x}",
-            m.nullskip_src.0,
-            m.nullskip_src.1,
-            m.nullskip_src.2,
-            m.nullskip_src.3,
-            m.nullskip_src.4
-        );
-        println!(
-            "[host] NULLFIRST inten={:#010x} intset={:#010x} intr={:#010x} line={} masked={}",
-            m.nullskip_first.0,
-            m.nullskip_first.1,
-            m.nullskip_first.2,
-            m.nullskip_first.3,
-            m.nullskip_first.4
-        );
-        for k in 0..4 {
-            let e = m.memset_hits[(m.memset_idx + k) % 16];
-            if e.0 != 0 {
-                println!(
-                    "[host] MEMSET dst={:#010x} len={} ra={:#010x} ret={:#010x}",
-                    e.0,
-                    e.1,
-                    e.2,
-                    0x4000_0000 | (e.2 & 0x3fff_ffff)
-                );
-            }
-        }
-    }
-
-    // TEMP (2026-10-05 — DELETE after): resolve the ROM memset slot
-    // (0x400011e8 content) to hardcode the memset-entry hook pc.
-    println!("[host] MEMSETSLOT {:#010x}", m.soc.read32(0x4000_11e8));
-    // TEMP (2026-10-05 — DELETE after): dump ROM around the memset loop
-    // (WATCHOP postpcs cycle 0x40056fce/d5/dc/e4) to locate its `entry`
-    // for the caller hook.
-    {
-        let mut line = [0u8; 208];
-        for (k, b) in line.iter_mut().enumerate() {
-            *b = m.soc.read8(0x4005_6F00 + k as u32) as u8;
-        }
-        println!("[host] ROMDUMP {}", line.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(""));
-    }
-
-    // TEMP (2026-10-05, udp-leg forensics — DELETE after): NULL-jump
-    // site + memset span.
-    println!(
-        "[host] NULLJUMP from={:#010x} watch_span=[{:#010x}, {:#010x}]",
-        m.nulljump_from,
-        m.watch_amin,
-        m.watch_amax
-    );
-        // TEMP (2026-10-06 — DELETE after): first table-range hit.
-        println!(
-            "[host] TBLHIT first=({:#010x}, {:#010x}) n={}",
-            m.watch_tbl_first.0, m.watch_tbl_first.1, m.watch_tbl_n
-        );
-        // TEMP (2026-10-06 — DELETE after): handler table dump
-        // (DUMPTBL=1): 32 words at _xt_interrupt_table (0x3FC96060) to
-        // map lines to handlers (entry size? line of the NULL slot?).
-        // TEMP wider dump (second table hunt).
-        if true {
-            for k in 0..8u32 {
-                let b = 0x3FC9_60E0 + k * 16;
-                println!(
-                    "[host] TBL2 {:#010x}: {:#010x} {:#010x} {:#010x} {:#010x}",
-                    b,
-                    m.soc.read32(b),
-                    m.soc.read32(b + 4),
-                    m.soc.read32(b + 8),
-                    m.soc.read32(b + 12)
-                );
-            }
-        }
-        if env::var("DUMPTBL").is_ok() {
-            for k in 0..8u32 {
-                let b = 0x3FC9_6060 + k * 16;
-                println!(
-                    "[host] TBL {:#010x}: {:#010x} {:#010x} {:#010x} {:#010x}",
-                    b,
-                    m.soc.read32(b),
-                    m.soc.read32(b + 4),
-                    m.soc.read32(b + 8),
-                    m.soc.read32(b + 12)
-                );
-            }
-        }
-        // TEMP (2026-10-06 — DELETE after): NULL-fire sites.
-        for k in 0..4 {
-            let e = m.nullskip_sites[k];
-            if e.0 != 0 {
-                println!(
-                    "[host] NULLSITE pc={:#010x} sreg=a{} regval={:#010x} ra={:#010x}",
-                    e.0, e.1, e.2, e.3
-                );
-            }
-        }
-        // TEMP (2026-10-06 — DELETE after): first-fire regs.
-        println!("[host] NULLREGS {:08x?}", m.nullskip_regs);
-
-    // TEMP (2026-10-06 — DELETE after): lowint1 path trace.
-    {
-        let mut any = false;
-        for k in 0..40 {
-            if m.lowint_trace[k] != 0 {
-                if !any {
-                    println!("[host] LOWINT path:");
-                    any = true;
-                }
-                println!("[host] LOWINT +{} pc={:#010x}", k, m.lowint_trace[k]);
-            }
-        }
-    }
-    // TEMP (2026-10-06 — DELETE after): interrupt-take ring (storm
-    // line hunt: last takes before end).
-    {
-        for k in 0..8 {
-            let e = m.cpu[0].take_ring[(m.cpu[0].take_idx + k) % 8];
-            if e.0 != 0 || e.1 != 0 {
-                println!("[host] TAKE0 line={} level={}", e.0, e.1);
-            }
-        }
-        for k in 0..8 {
-            let e = m.cpu[1].take_ring[(m.cpu[1].take_idx + k) % 8];
-            if e.0 != 0 || e.1 != 0 {
-                println!("[host] TAKE1 line={} level={}", e.0, e.1);
-            }
-        }
-    }
-
-    // TEMP (2026-10-07 — DELETE after): pxCurrentTCBs snapshot
-    // (PXCURGATE=1): was core1's current TCB ever nonzero? Distinguishes
-    // late-zeroing (guarded ranges should block!) from never-set boot gap.
-    if env::var("PXCURGATE").is_ok() {
-        println!(
-            "[host] PXCUR tcb0={:#010x} tcb1={:#010x}",
-            m.soc.read32(0x3FC9_BAF8),
-            m.soc.read32(0x3FC9_BAF8 + 4)
-        );
+        let _ = m.soc.usb_host_take_in();
     }
 
     // --- Final report (MIPS = executed instructions/sec) ---
@@ -4028,10 +2712,6 @@ if wifi_espnow_loopback && (!wifi_espnow_tx_done || !wifi_espnow_rx_done) {
             cpu.reg(1),
             cpu.windowbase(),
             cpu.ps(),
-            // TEMP (2026-10-04, forensics — DELETE after): a10/a11 carry
-            // callee return codes at panic (e.g. l2cap_tx rc in a10 when
-            // ble_att_tx_with_conn asserts) — needed to distinguish
-            // ENOMEM vs EINVAL without another instrumented run.
             cpu.reg(10),
             cpu.reg(11),
         );
