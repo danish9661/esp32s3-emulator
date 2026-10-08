@@ -5056,3 +5056,41 @@ full enumeration REQ0..REQ6 — is covered),
     killed twice by host restarts before completing — re-run it to certify
     (per user: committed on smoke-green instead). Remaining per directive:
     BLE central, full battery certification, per-core threads.
+  - 2026-10-09: **BLE central GATT CLOSED live end-to-end (was open):
+    CENTRAL_PASS**. Bumble central (0.0.231) against the emulated NimBLE
+    firmware: scan → conn → full discovery (1800/1801/180F) → READ level
+    `0x64` → WRITE `hi!` → read-back `686921` echo → `CENTRAL_PASS`,
+    with firmware markers `BLE read 1`/`BLE write 3`/`level 100`/`echo 4`
+    (battery `ble` still passes bridgeless via ROM loopback). Three
+    stacked root causes, each live-proven in order over ~20 instrumented
+    runs (all TEMP probes since removed; 0 markers remain):
+    (1) **Completed-packets park (the wedge)**: the Number-of-Completed-
+    Packets event handler parks nimble_host on a finite-timeout queue
+    whose waiter never releases under tickless idle (no ticks expire it)
+    — every 2nd ATT queued fine but never picked up until post-disc
+    teardown (proven via rxq dumps + TCB wait-list forensics:
+    state=xDelayedTaskList1, sole waiter on a length-128 queue, scheduler
+    NOT suspended, sem count 1). Fix: drop ev13 in run_flash (pop +
+    discard; flow credits evidently don't gate TX — every answer
+    transmits without it). Series 1-ATT-then-silence → 5+ ATTs answered.
+    (2) **Bridge UUID string match**: Bumble 0.0.231 `str(UUID)` is
+    `'UUID-16:2A19 (Battery Level)'`, so `== "2A19"`/`== "180F"` never
+    matched → eternal NOSVC despite correct discovery. Fixed with a hex-
+    part normalizer (verified both formats). NOSVC → READ/WRITE.
+    (3) **Write-Command pacing**: ATT opcode 0x52 gets no response, so
+    counting it stuck `outstanding` at 1 and pacing-blocked the
+    read-back. Exempted via staged[9] opcode check. READ/WRITE → PASS.
+    Supporting (kept, PASS-proven as a set): TX-FIFO capture (single slot
+    silently overwrote back-to-back sends — now bounded FIFO 8), ATT
+    spacing gap (2M), IDLE-hijack gate (waiti under tickless sleeps
+    through software-pended yields), INTSET-yield preservation + write-
+    if-0 sem top-up across synthesis. Cautionary tales: (a) objdump
+    linear sweep desyncs on dense Xtensa (again — our decoder is ground
+    truth); (b) the live 1801 service is Generic Attribute, not 8011 as
+    the canned twins assumed (canned never checks uuids — still green);
+    (c) firmware outrunning the bridge idle-exits before scans start —
+    start the bridge first, confirm scanning, then boot firmware.
+    Proofs: CENTRAL_PASS on the final cleaned tree (bridge41+fw52),
+    workspace all-green, clippy `-D warnings`/fmt/wasm32 clean, battery
+    `ble` PASS. Remaining per directive: full battery certification,
+    per-core threads.

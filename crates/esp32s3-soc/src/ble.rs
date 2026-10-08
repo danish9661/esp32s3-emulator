@@ -79,8 +79,10 @@ pub struct Ble {
     /// `BLE assert lld.c:324` when it reads 0; with the seed it proceeds
     /// past init into VHCI traffic).
     bt_mac: [u32; 0x1000 / 4],
-    /// Captured host→controller HCI frame (drained by `bt_hci_take_tx`).
-    pending_tx: Vec<u8>,
+    /// Captured host→controller HCI frames (drained by `take_tx`).
+    pending_tx: VecDeque<Vec<u8>>,
+    /// Dropped-TX counter (FIFO full on capture).
+    tx_dropped: u32,
     /// Staged controller→host HCI frames (bounded FIFO, like net RX).
     pending_rx: VecDeque<Vec<u8>>,
     /// Dropped-RX counter (FIFO full while staging).
@@ -108,7 +110,8 @@ impl Ble {
         Self {
             regs: [0; 0x1000 / 4],
             bt_mac,
-            pending_tx: Vec::new(),
+            pending_tx: VecDeque::new(),
+            tx_dropped: 0,
             pending_rx: VecDeque::new(),
             rx_dropped: 0,
             int_raw: 0,
@@ -252,27 +255,37 @@ impl Ble {
 
     /// Capture one host→controller HCI frame (firmware VHCI send path).
     /// Empty frames are ignored (a zero-length VHCI send is a no-op).
+    /// FIFO (bounded 8 like RX): back-to-back firmware sends (an ATT
+    /// response immediately followed by a command) must BOTH reach the
+    /// host — the old single slot silently overwrote the first, losing
+    /// responses and sticking the harness ATT pacing (proven live:
+    /// central stalls after 2 answers, nondeterministic across runs).
+    /// Excess drops increment the TX drop counter.
     pub fn capture_tx(&mut self, frame: &[u8]) {
         if frame.is_empty() {
             return;
         }
-        self.pending_tx.clear();
-        self.pending_tx.extend_from_slice(frame);
+        if self.pending_tx.len() >= 8 {
+            self.tx_dropped += 1;
+            return;
+        }
+        self.pending_tx.push_back(frame.to_vec());
         self.int_raw |= INT_TX_DONE;
     }
 
-    /// Drain the captured host→controller HCI frame (host frontend —
-    /// forwards length-prefixed to the Bumble bridge).
+    /// Drain the oldest captured host→controller HCI frame (host
+    /// frontend — forwards length-prefixed to the Bumble bridge).
+    /// Empty when the FIFO is dry.
     pub fn take_tx(&mut self) -> Vec<u8> {
-        core::mem::take(&mut self.pending_tx)
+        self.pending_tx.pop_front().unwrap_or_default()
     }
 
-    /// Non-draining snapshot of the last captured TX (the ACK-path block
+    /// Non-draining snapshot of the oldest queued TX (the ACK-path block
     /// matcher in `Soc::ble_ack_deliver` needs the H4 echo while the
     /// host may also drain it for the bridge — both observe the same
     /// bytes).
     pub fn pending_tx_snapshot(&self) -> Vec<u8> {
-        self.pending_tx.clone()
+        self.pending_tx.front().cloned().unwrap_or_default()
     }
 
     /// Stage one controller→host HCI frame (bridge reply path). FIFO,
@@ -331,6 +344,11 @@ impl Ble {
     }
 
     /// Dropped-RX counter (frames lost while the RX FIFO was full).
+    /// Dropped-TX count (see `capture_tx`).
+    pub fn tx_dropped(&self) -> u32 {
+        self.tx_dropped
+    }
+
     pub fn rx_dropped(&self) -> u32 {
         self.rx_dropped
     }

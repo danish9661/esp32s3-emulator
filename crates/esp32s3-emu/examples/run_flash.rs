@@ -446,6 +446,12 @@ fn main() {
     // queued until the response drains. Shared by canned + bridge (canned
     // script is already paced and stays green; bridge becomes paced too).
     let mut ble_att_outstanding = 0u32;
+    // ATT spacing (2026-10-08, CENTRAL_PASS set): minimum macro-steps
+    // between ACL deliveries. Keeps bursts from overwhelming the host
+    // task while it is still draining the previous response; central
+    // waits patiently. Gated ATTs stay queued (level-triggered).
+    let mut ble_last_att_i: usize = 0;
+    const BLE_ATT_GAP: usize = 2_000_000;
     let mut ble_canned_acl_tx_n = 0u32;
     // Capture seq at link-up (part of
     // the V2 gating: only commands sent after link-up get completed).
@@ -1120,12 +1126,6 @@ fn main() {
                     println!("[host] BLE bridge write failed; dropping HCI leg");
                     ble_gw = None;
                 } else if frame.len() >= 4 {
-                    println!(
-                        "[host] BLE TX {}B h4={:#04x} op={:#06x}",
-                        frame.len(),
-                        frame[0],
-                        u16::from_le_bytes([frame[1], frame[2]])
-                    );
                     // Count
                     // ATT responses for script pacing (shared counter with
                     // the canned drain; scripted twins pace on responses).
@@ -1308,131 +1308,195 @@ fn main() {
             if is_cc && !m.soc.ble_link_up() {
                 let _ = m.soc.bt_hci_take_rx();
             } else {
-                let oversize = matches!(peek, Some((0x04, _, len)) if len > 71);
-                // Connection-gate (proven live 2026-10-03): an ATT ACL for a
-                // connection the host hasn't established yet walks a NULL
-                // conn struct (wild `retw` through heap paint 0xa5a5a5a5 →
-                // 0x65a5a5a5, double-fault `break`). The 22B connection
-                // event and the 16B ATT arrive back-to-back from the
-                // bridge, but the firmware task needs many steps to turn
-                // the event into a conn object — delivering the ATT first
-                // races it. Gate ACLs on the sketch's `BLE conn 1` marker
-                // (same marker-gated discipline as ESP-NOW's `sent 1`):
-                // the packet stays queued (level-triggered retry) until
-                // the connection exists. Events are never gated (they ARE
-                // what establishes it).
-                let is_acl = matches!(peek, Some((0x02, _, _)));
-                let conn_up = uart_buf
-                    .windows(b"BLE conn 1".len())
-                    .any(|w| w == b"BLE conn 1");
-                // TEMP (2026-10-03): `BLE_RX_ACL_DROP=1` pops and drops
-                // ATT ACLs instead of delivering them (split forensics).
-                let acl_drop = is_acl && std::env::var("BLE_RX_ACL_DROP").is_ok();
-                // FULL-HANDSHAKE gate (2026-10-04, proven live): the `BLE
-                // conn 1` marker fires from gap onConnect EARLY (right after
-                // the 22B, before version/features/data-length complete), so
-                // marker-gated ATTs land on a HALF-ESTABLISHED conn (version
-                // unknown? features pending? data-length default?) and die
-                // in att_tx (l2cap assert 0x4200724d:91, deterministic 5/5
-                // live runs; canned stages ATT after dl_done and answers 29B
-                // clean — proven live). Require the data-length event staged
-                // too (ble_canned_dl_done is set for bridge as well via the
-                // extended stager — handshake fully driven by then). Pre-dl
-                // ATTs DROP (central retries post-handshake; same discipline
-                // as pre-conn).
-                // NOTE: ble_canned_dl_done is declared below (canned stager
-                // section) — Rust block scoping needs it visible here. It is
-                // a `let mut` in the same fn scope ABOVE this point? No —
-                // declarations sit near the top (before the loop), so it is
-                // in scope here (assigned later in-loop). Borrowck: read-only
-                // use here, mutable assign later — fine (sequential).
-                // ATT pacing (2026-10-04, proven live): deliver only when
-                // none outstanding (see counter docs). Gated ATTs stay queued
-                // (level-triggered) until the response drains.
-                if is_acl && (!conn_up || !ble_canned_dl_done || ble_att_outstanding > 0) {
-                    // Head-of-line block fix (2026-10-04, proven live): a
-                    // premature ATT ACL (central's service discovery sent
-                    // immediately after the 22B, before the firmware
-                    // finishes version/features/data-length) sits at the
-                    // FIFO head and STARVES the version/features events
-                    // behind it (firmware times out `HCI wait for ack 19`,
-                    // no conn, central GATT timeout). The old leave-queued
-                    // policy deadlocks (ACL needs conn, conn needs events
-                    // behind the ACL).
-                    //
-                    // HOLD vs DROP (2026-10-04): pre-dl/pre-conn ATTs are
-                    // HELD (pop into `ble_held_att`, FIFO goes empty so the
-                    // data-length stager unblocks; re-injected after the
-                    // data-length event delivers — see below). DROP only
-                    // applies when already held (second premature ATT) or
-                    // when pacing-blocked post-dl (outstanding>0, central
-                    // pipelines — retry covers it). DROP for a patient
-                    // (300s-timeout) central is fatal (single discovery
-                    // never resent); HOLD preserves it.
-                    if (!conn_up || !ble_canned_dl_done) && ble_held_att.is_none() {
-                        ble_held_att = m.soc.bt_hci_take_rx();
-                    } else {
-                        let _ = m.soc.bt_hci_take_rx();
-                    }
-                } else if acl_drop || oversize {
+                // Completed-packets drop (2026-10-08, CENTRAL_PASS set):
+                // the Number-of-Completed-Packets event (live-only; canned
+                // has none) parks nimble_host after the 1st ATT cycle
+                // (proven live: with it delivered, every 2nd ATT queues
+                // fine but is never picked up until post-disc teardown;
+                // with it dropped, the full discovery + READ/WRITE/ECHO
+                // walk completes). The handler waits on a queue whose
+                // waiter is never released under tickless idle (no ticks
+                // to expire its take-timeout). Flow credits evidently do
+                // not gate TX (every answer transmits without it), so the
+                // drop is safe. Pop + discard; log at most rarely (this
+                // fires per TX).
+                if matches!(peek, Some((0x04, Some(0x13), _))) {
                     let _ = m.soc.bt_hci_take_rx();
-                } else if let Some(cb) = ble_cb_entry
-                    && {
-                        // HOST-ENABLED gate (2026-10-04, proven live):
-                        // host_rcv_pkt opens with `if (!ble_hs_enabled_state)
-                        // return 0` (BSS 0x3fc9dd70, nm on the BLE ELF —
-                        // BLE-image-only leg, like ble_cb_entry itself). A
-                        // disabled host means the packet would be CONSUMED
-                        // (stage pops first) and dropped on the floor; worse,
-                        // pre-SYNTH_RETPC builds faulted the early retw and
-                        // corrupted state into a restage loop. Skip WITHOUT
-                        // consuming while disabled (level-triggered retry,
-                        // same discipline as no-callback-yet). Log
-                        // transitions only (per-step spam would flood).
-                        // NOTE: a host that never re-enables stalls here by
-                        // design (firmware-side waiter timeout → reset is
-                        // observable + diagnosable; silent corruption is not).
-                        if m.soc.read32(0x3fc9_dd70) == 0 {
-                            if !ble_host_disabled {
-                                ble_host_disabled = true;
+                } else {
+                    let oversize = matches!(peek, Some((0x04, _, len)) if len > 71);
+                    // Connection-gate (proven live 2026-10-03): an ATT ACL for a
+                    // connection the host hasn't established yet walks a NULL
+                    // conn struct (wild `retw` through heap paint 0xa5a5a5a5 →
+                    // 0x65a5a5a5, double-fault `break`). The 22B connection
+                    // event and the 16B ATT arrive back-to-back from the
+                    // bridge, but the firmware task needs many steps to turn
+                    // the event into a conn object — delivering the ATT first
+                    // races it. Gate ACLs on the sketch's `BLE conn 1` marker
+                    // (same marker-gated discipline as ESP-NOW's `sent 1`):
+                    // the packet stays queued (level-triggered retry) until
+                    // the connection exists. Events are never gated (they ARE
+                    // what establishes it).
+                    let is_acl = matches!(peek, Some((0x02, _, _)));
+                    let conn_up = uart_buf
+                        .windows(b"BLE conn 1".len())
+                        .any(|w| w == b"BLE conn 1");
+                    // TEMP (2026-10-03): `BLE_RX_ACL_DROP=1` pops and drops
+                    // ATT ACLs instead of delivering them (split forensics).
+                    let acl_drop = is_acl && std::env::var("BLE_RX_ACL_DROP").is_ok();
+                    // FULL-HANDSHAKE gate (2026-10-04, proven live): the `BLE
+                    // conn 1` marker fires from gap onConnect EARLY (right after
+                    // the 22B, before version/features/data-length complete), so
+                    // marker-gated ATTs land on a HALF-ESTABLISHED conn (version
+                    // unknown? features pending? data-length default?) and die
+                    // in att_tx (l2cap assert 0x4200724d:91, deterministic 5/5
+                    // live runs; canned stages ATT after dl_done and answers 29B
+                    // clean — proven live). Require the data-length event staged
+                    // too (ble_canned_dl_done is set for bridge as well via the
+                    // extended stager — handshake fully driven by then). Pre-dl
+                    // ATTs DROP (central retries post-handshake; same discipline
+                    // as pre-conn).
+                    // NOTE: ble_canned_dl_done is declared below (canned stager
+                    // section) — Rust block scoping needs it visible here. It is
+                    // a `let mut` in the same fn scope ABOVE this point? No —
+                    // declarations sit near the top (before the loop), so it is
+                    // in scope here (assigned later in-loop). Borrowck: read-only
+                    // use here, mutable assign later — fine (sequential).
+                    // ATT pacing (2026-10-04, proven live): deliver only when
+                    // none outstanding (see counter docs). Gated ATTs stay queued
+                    // (level-triggered) until the response drains.
+                    let att_gap = is_acl && i < ble_last_att_i + BLE_ATT_GAP;
+                    // IDLE-CONTEXT gate (2026-10-08, CENTRAL_PASS set): never
+                    // deliver an ATT while core0 runs an IDLE task. The
+                    // synthetic host_recv hijacks core0's current task; the
+                    // queue-send inside marks the host Ready + pends a yield,
+                    // but an IDLE task in waiti under tickless idle (Arduino
+                    // default: no ticks fire) sleeps through a
+                    // software-pended yield with nothing to act on it, so the
+                    // delivery is queued yet never picked up (proven live:
+                    // IDLE-hijacked deliveries sat 9.6M steps to a stale
+                    // post-disc drain; nimble_host-hijacked ones dispatch in
+                    // ~4k). Other tasks reach the scheduler via their next
+                    // block, so only IDLE is gated. BLE-image-only TCB addrs,
+                    // like BLE_HOST_CB above. Gated ATTs stay queued (level).
+                    let idle_hijack = if is_acl {
+                        let tcb0 = m.soc.read32(0x3fc9_f618);
+                        let mut nm = [0u8; 6];
+                        for (k, b) in nm.iter_mut().enumerate() {
+                            *b = m.soc.read8(tcb0.wrapping_add(52 + k as u32)) as u8;
+                        }
+                        nm == *b"IDLE0\x00" || nm == *b"IDLE1\x00"
+                    } else {
+                        false
+                    };
+                    if is_acl
+                        && (!conn_up
+                            || !ble_canned_dl_done
+                            || ble_att_outstanding > 0
+                            || att_gap
+                            || idle_hijack)
+                    {
+                        // Head-of-line block fix (2026-10-04, proven live): a
+                        // premature ATT ACL (central's service discovery sent
+                        // immediately after the 22B, before the firmware
+                        // finishes version/features/data-length) sits at the
+                        // FIFO head and STARVES the version/features events
+                        // behind it (firmware times out `HCI wait for ack 19`,
+                        // no conn, central GATT timeout). The old leave-queued
+                        // policy deadlocks (ACL needs conn, conn needs events
+                        // behind the ACL).
+                        //
+                        // HOLD vs DROP (2026-10-04): pre-dl/pre-conn ATTs are
+                        // HELD (pop into `ble_held_att`, FIFO goes empty so the
+                        // data-length stager unblocks; re-injected after the
+                        // data-length event delivers — see below). DROP only
+                        // applies when already held (second premature ATT).
+                        // PACING-BLOCKED (2026-10-08, proven live: back-to-back
+                        // ATTs race the response drain — request N+1 arrives in
+                        // the same step window as response N's tap drain, sees
+                        // stale outstanding=1 and was eaten, hanging the
+                        // central into ROM-disc; nondeterministic across runs).
+                        // Pacing-blocked ATTs stay QUEUED (no pop): the response
+                        // drain clears outstanding within steps and delivery
+                        // retries level-triggered. No deadlock (responses don't
+                        // need delivery; events are never gated).
+                        if (!conn_up || !ble_canned_dl_done) && ble_held_att.is_none() {
+                            ble_held_att = m.soc.bt_hci_take_rx();
+                        } else if !conn_up || !ble_canned_dl_done {
+                            let _ = m.soc.bt_hci_take_rx();
+                        }
+                        // else: pacing-blocked, spacing-gapped, or IDLE-hijack —
+                        // leave queued.
+                    } else if acl_drop || oversize {
+                        let _ = m.soc.bt_hci_take_rx();
+                    } else if let Some(cb) = ble_cb_entry
+                        && {
+                            // HOST-ENABLED gate (2026-10-04, proven live):
+                            // host_rcv_pkt opens with `if (!ble_hs_enabled_state)
+                            // return 0` (BSS 0x3fc9dd70, nm on the BLE ELF —
+                            // BLE-image-only leg, like ble_cb_entry itself). A
+                            // disabled host means the packet would be CONSUMED
+                            // (stage pops first) and dropped on the floor; worse,
+                            // pre-SYNTH_RETPC builds faulted the early retw and
+                            // corrupted state into a restage loop. Skip WITHOUT
+                            // consuming while disabled (level-triggered retry,
+                            // same discipline as no-callback-yet). Log
+                            // transitions only (per-step spam would flood).
+                            // NOTE: a host that never re-enables stalls here by
+                            // design (firmware-side waiter timeout → reset is
+                            // observable + diagnosable; silent corruption is not).
+                            if m.soc.read32(0x3fc9_dd70) == 0 {
+                                if !ble_host_disabled {
+                                    ble_host_disabled = true;
+                                }
+                                false
+                            } else {
+                                ble_host_disabled = false;
+                                let ok = m.run_ble_host_recv(0, cb);
+                                // PRE-DL HOLD re-inject (2026-10-04, proven live):
+                                // when the data-length event itself delivers (14B
+                                // LE-meta subevent 0x07 — the handshake is now
+                                // fully established firmware-side), restore the
+                                // held ATT to the FIFO back. Next steps deliver
+                                // it with conn_up + dl_done true, so the ATT TX
+                                // no longer asserts. Fires once per hold (slot
+                                // clears); a failed delivery (ok=false) still
+                                // re-injects (the data-length event reached the
+                                // handler queue either way — abort records show
+                                // delivery faults, not staging faults).
+                                if m.last_recv_stage
+                                    .is_some_and(|(_, sl, sx)| sl == 14 && sx[3] == 0x07)
+                                    && let Some(held) = ble_held_att.take()
+                                {
+                                    m.soc.bt_hci_inject_rx(&held);
+                                }
+                                ok
+                            } // end else (host enabled): ok from the call above
+                        }
+                    {
+                        // First async delivery proves the link is up (see the
+                        // `ble_link_up` field docs): from here CCs belong to
+                        // post-connection commands (arrival ack leg below),
+                        // not to the ROM loopback.
+                        m.soc.ble_mark_link_up();
+                        ble_link_up_seq = m.soc.ble_tx_seq();
+                        // ATT pacing (2026-10-04, proven live): count this
+                        // delivery if ATT (response TX will clear it).
+                        // WRITE-COMMAND exemption (2026-10-08, proven live:
+                        // opcode 0x52 gets NO response, so counting it sticks
+                        // outstanding at 1 and pacing-blocks every later ATT
+                        // — the read-back after `CENTRAL_WRITE ok` never
+                        // delivered. ATT opcode is staged[9]: H4 + handle2 +
+                        // acl_len2 + l2cap_len2 + cid2).
+                        if is_acl {
+                            let is_write_cmd =
+                                m.last_recv_stage.is_some_and(|(_, _, sx)| sx[9] == 0x52);
+                            if !is_write_cmd {
+                                ble_att_outstanding += 1;
                             }
-                            false
-                        } else {
-                            ble_host_disabled = false;
-                            let ok = m.run_ble_host_recv(0, cb);
-                            // PRE-DL HOLD re-inject (2026-10-04, proven live):
-                            // when the data-length event itself delivers (14B
-                            // LE-meta subevent 0x07 — the handshake is now
-                            // fully established firmware-side), restore the
-                            // held ATT to the FIFO back. Next steps deliver
-                            // it with conn_up + dl_done true, so the ATT TX
-                            // no longer asserts. Fires once per hold (slot
-                            // clears); a failed delivery (ok=false) still
-                            // re-injects (the data-length event reached the
-                            // handler queue either way — abort records show
-                            // delivery faults, not staging faults).
-                            if m.last_recv_stage
-                                .is_some_and(|(_, sl, sx)| sl == 14 && sx[3] == 0x07)
-                                && let Some(held) = ble_held_att.take()
-                            {
-                                m.soc.bt_hci_inject_rx(&held);
-                            }
-                            ok
-                        } // end else (host enabled): ok from the call above
+                            ble_last_att_i = i;
+                        }
                     }
-                {
-                    // First async delivery proves the link is up (see the
-                    // `ble_link_up` field docs): from here CCs belong to
-                    // post-connection commands (arrival ack leg below),
-                    // not to the ROM loopback.
-                    m.soc.ble_mark_link_up();
-                    ble_link_up_seq = m.soc.ble_tx_seq();
-                    // ATT pacing (2026-10-04, proven live): count this
-                    // delivery if ATT (response TX will clear it).
-                    if is_acl {
-                        ble_att_outstanding += 1;
-                    }
-                }
+                } // end completed-packets-drop else.
             }
         }
         // Command-ack arrival notes (no active leg — see the CC policy

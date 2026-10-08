@@ -56,7 +56,16 @@ import logging
 import struct
 import sys
 
-logging.basicConfig(level=logging.INFO, format="[BLE] %(message)s")
+logging.basicConfig(level=logging.INFO, format="[BLE %(asctime)s] %(message)s",
+                    datefmt="%H:%M:%S")
+# Bumble internals at DEBUG (response-path forensics): L2CAP dispatch,
+# ATT request/response matching, GATT client state. Harness-only.
+for _mod in ("bumble.l2cap", "bumble.att", "bumble.gatt_client",
+             "bumble.host", "bumble.device"):
+    try:
+        logging.getLogger(_mod).setLevel(logging.DEBUG)
+    except Exception:
+        pass
 logger = logging.getLogger(__name__)
 
 # GATT demo app (stable UUIDs so firmware assertions are exact):
@@ -250,6 +259,14 @@ async def run_bumble_device() -> object:
     device._emu_controller = emu_controller  # noqa: SLF001 (serve_emu pump target)
     device._adv_count = _adv_count  # noqa: SLF001 (TEMP link counter)
     device._emu_host_controller = controller  # noqa: SLF001 (TEMP scan-side)
+    # Emulator-liveness event (dead-link fast path): serve_emu clears it
+    # on emulator connect and sets it on disconnect. The GATT wait races
+    # ATT ops against it so a dead firmware run aborts the wait in
+    # milliseconds instead of parking in the 900s GATT timeout (Bumble
+    # LocalLink has no link-loss detection — without this the central
+    # sleeps through whole firmware runs on a dead connection).
+    device._emu_dead = asyncio.Event()
+    device._emu_dead.set()  # no emulator connected yet
     # TEMP (2026-10-03): count link->scanner PDU deliveries.
     _rx_count = {"n": 0}
     _orig_ll = controller.on_ll_advertising_pdu
@@ -290,6 +307,12 @@ async def run_bumble_device() -> object:
         # to READ level (0x0010) → WRITE/ECHO → PASS. Exact 11B shape only
         # (L2CAP len 7/CID 4 + 0x08/0005/0005/0x2803); all other ATT flows to
         # firmware unmodified (demand-driven, no twins).
+        # EMPTY-8011 synthesis (2026-10-08, proven live: same silent drop
+        # (discovery's 2nd group) holds no characteristics; both level
+        # (0x0010) and echo (0x0013) live in 180F (000e+), so this range
+        # is empty and firmware answers nothing across 3/3 runs (central
+        # hangs → ROM-link disc → re-adv loop). Same Error + drop; the
+        # central then discovers 180F and proceeds to READ/WRITE/ECHO).
         try:
             if len(data) == 11 and bytes(data) == bytes([0x07, 0x00, 0x04, 0x00, 0x08, 0x05, 0x00, 0x05, 0x00, 0x03, 0x28]):
                 import bumble.core as _core
@@ -298,8 +321,35 @@ async def run_bumble_device() -> object:
                     link.send_acl_data(emu_controller, sender_address, transport, err)
                     logger.info("WIRE-ACL empty-TYPE Error synthesized, firmware copy dropped")
                     return
+            if len(data) == 11 and bytes(data) == bytes([0x07, 0x00, 0x04, 0x00, 0x08, 0x06, 0x00, 0x0d, 0x00, 0x03, 0x28]):
+                import bumble.core as _core
+                if transport == _core.PhysicalTransport.LE:
+                    err = bytes([0x05, 0x00, 0x04, 0x00, 0x01, 0x08, 0x06, 0x00, 0x0A])
+                    link.send_acl_data(emu_controller, sender_address, transport, err)
+                    logger.info("WIRE-ACL empty-8011 Error synthesized, firmware copy dropped")
+                    return
         except Exception as e:
             logger.info("WIRE-ACL Error-synth failed %s (falling through to firmware)", e)
+        # RANGE-REWRITE PROBE (2026-10-08, 180F-decl silence forensics):
+        # firmware answers discovery + 0001-decls but never Read-By-Type
+        # 000e-ffff (180F declarations: level 0x0010 + echo 0x0013 per the
+        # canned twins), then the link idles into ROM-disc. Hypothesis:
+        # end=0xFFFF wedges the ATT-server lookup (vs an empty range,
+        # which it drops like 0005/0006). Rewrite 000e-ffff to bounded
+        # 000e-00ff before forwarding: if firmware answers, the end was
+        # the issue (Bumble continues discovery from the last handle);
+        # if still silent, delete this block and dig pool/wedge-side.
+        # Exact-shape only; the rewritten bytes flow to firmware normally.
+        try:
+            if bytes(data) == bytes([0x07, 0x00, 0x04, 0x00, 0x08, 0x0e, 0x00, 0xff, 0xff, 0x03, 0x28]):
+                data = bytes([0x07, 0x00, 0x04, 0x00, 0x08, 0x0e, 0x00, 0x00, 0xff, 0x03, 0x28])
+                logger.info("WIRE-ACL range-rewrite 000e-ffff -> 000e-00ff")
+        except Exception as e:
+            logger.info("WIRE-ACL rewrite failed %s", e)
+        # (Pristine ATT forwarding here — the 2026-10-08 direct-read /
+        # order-discriminator rewrite probes were removed after
+        # CENTRAL_PASS; they proved the wedge positional, and the
+        # run_flash ev13-drop fixed it.)
         try:
             if transport is not None:
                 import bumble.hci as _hci
@@ -314,6 +364,68 @@ async def run_bumble_device() -> object:
         return _orig_wire_acl(sender_address, transport, data, *args, **kwargs)
 
     emu_controller.on_link_acl_data = _wire_acl_with_fallback  # type: ignore[method-assign]
+    # RESP-PATH TRACE (disc forensics): log every hop of firmware→central
+    # ACL responses: emu-wire handle lookup, link forward, emu-ctrl
+    # receive-side hit/miss + handle handed to the device host.
+    _orig_find = emu_controller.find_connection_by_handle
+
+    def _find_logging(handle, *args, **kwargs):
+        _c = _orig_find(handle, *args, **kwargs)
+        logger.info("RESP-HOP wire-handle=%#06x %s", handle, "hit" if _c is not None else "MISS")
+        return _c
+
+    emu_controller.find_connection_by_handle = _find_logging  # type: ignore[method-assign]
+    _orig_ctrl_acl = controller.on_link_acl_data
+
+    def _ctrl_acl_logging(sender_address, transport, data, *args, **kwargs):
+        _hit = None
+        try:
+            import bumble.controller as _cc
+            _conns = getattr(controller, "le_connections", {})
+            _hit = _conns.get(sender_address)
+            logger.info("RESP-HOP ctrl-recv sender=%s %s handle=%s",
+                        sender_address, "hit" if _hit is not None else "MISS",
+                        getattr(_hit, "handle", None))
+        except Exception as e:
+            logger.info("RESP-HOP ctrl-recv error %s", e)
+        # HANDLE REWRITE: hand the device host the handle IT knows
+        # (stashed per-connect above), not the firmware/ROM numbering.
+        try:
+            _hh = device._host_handle  # type: ignore[attr-defined]
+        except Exception:
+            _hh = None
+        if _hh is not None:
+            try:
+                import bumble.hci as _hci
+                _pkt = _hci.HCI_AclDataPacket(_hh, 2, 0, len(data), bytes(data))
+                controller.send_hci_packet(_pkt)
+                logger.info("RESP-HOP handle-rewrite to host-handle=%s", _hh)
+                return
+            except Exception as e:
+                logger.info("RESP-HOP rewrite failed %s (falling through)", e)
+        return _orig_ctrl_acl(sender_address, transport, data, *args, **kwargs)
+
+    controller.on_link_acl_data = _ctrl_acl_logging  # type: ignore[method-assign]
+    # HOST-HOP TRACE: log ACL packets reaching the Bumble device host
+    # (post-link). If these fire but GATT never completes, the drop is
+    # inside host L2CAP/ATT matching; if they never fire, the transport
+    # leg drops them.
+    try:
+        _dev_host = device.host  # type: ignore[attr-defined]
+        _orig_host_acl = _dev_host.on_hci_acl_data_packet
+
+        def _host_acl_logging(packet, *args, **kwargs):
+            try:
+                logger.info("RESP-HOP host-acl handle=%#06x len=%d %s",
+                            packet.connection_handle, len(bytes(packet)),
+                            bytes(packet).hex()[:64])
+            except Exception as e:
+                logger.info("RESP-HOP host-acl error %s", e)
+            return _orig_host_acl(packet, *args, **kwargs)
+
+        _dev_host.on_hci_acl_data_packet = _host_acl_logging  # type: ignore[method-assign]
+    except Exception as e:
+        logger.info("RESP-HOP host wrap failed %s", e)
     # TEMP (2026-10-03): log every emu-wire controller→host emission to see
     # whether the ATT ACL ever reaches EmuTap (send_hci_packet is the single
     # funnel for events AND acl packets).
@@ -392,6 +504,10 @@ async def serve_emu(device: object, port: int) -> None:
     async def on_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         peer = writer.get_extra_info("peername")
         logger.info("emulator connected: %s", peer)
+        try:
+            device._emu_dead.clear()  # type: ignore[attr-defined]
+        except Exception:
+            pass
         # Tap outbound controller->host packets back to the emulator by
         # wrapping the CONTROLLER's host sink (Host.set_packet_sink
         # stores it as hci_sink; the attribute may differ by version,
@@ -404,6 +520,26 @@ async def serve_emu(device: object, port: int) -> None:
             def on_packet(self, packet: bytes) -> None:
                 if orig_sink is not None:
                     orig_sink.on_packet(packet)
+                # SUPERVISION-TIMEOUT REWRITE (2026-10-08, proven live:
+                # Bumble's LE Connection Complete carries FIXME
+                # interval=10/timeout=10 (100ms); the firmware drops the
+                # link ~130k macro-steps after conn (ROM-disc → re-adv
+                # loop) while ATTs are still in flight. The canned path
+                # already widens this to 0x0C80 (32s, spec max) for the
+                # same reason. Rewrite the timeout field here so the
+                # live link survives slow ATT cadence. Layout: H4+evt+len
+                # +subevt(01)+status+handle(2)+role+addrtype+addr(6)+
+                # interval(2)+latency(2)+timeout(2)+accuracy.
+                try:
+                    _b = bytearray(packet)
+                    if (len(_b) >= 21 and _b[0] == 0x04 and _b[1] == 0x3E
+                            and _b[3] == 0x01):
+                        _b[19] = 0x80
+                        _b[20] = 0x0C
+                        packet = bytes(_b)
+                        logger.info("EMU-OUT conn-complete timeout widened to 0x0C80")
+                except Exception:
+                    pass
                 # TEMP (2026-10-03): log every controller→emulator packet so
                 # the RX synthesis path is observable (H4 + len + hex).
                 try:
@@ -418,9 +554,19 @@ async def serve_emu(device: object, port: int) -> None:
                 # call_soon races the test client's read window and the
                 # reply lands after the harness already timed out
                 # (proven live: LE_SET_EVENT_MASK TIMEOUT with deferred
-                # write, PASS with inline write).
+                # write, PASS with inline write). Schedule an explicit
+                # drain (write() alone can sit buffered if the loop is
+                # sluggish to flush; drain forces it next iteration).
                 try:
                     write_frame(writer, packet)
+
+                    async def _drain() -> None:
+                        try:
+                            await writer.drain()
+                        except Exception:
+                            pass
+
+                    loop.create_task(_drain())
                 except Exception as e:
                     logger.warning("emu write failed: %s", e)
 
@@ -456,6 +602,15 @@ async def serve_emu(device: object, port: int) -> None:
                     _op = pkt[1] | (pkt[2] << 8)
                     if _op in (0x2005, 0x2006, 0x2008, 0x2009, 0x200A):
                         logger.info("ADV-CMD op=%#06x params=%s", _op, pkt[4:].hex())
+                # INBOUND TRACE: log every firmware→bridge frame (H4+len).
+                # A 29B h4=0x02 here without a matching run_flash TX print
+                # means the harness tap missed it (single-slot overwrite).
+                try:
+                    logger.info("EMU-IN h4=%#04x len=%d %s",
+                                pkt[0] if len(pkt) else -1, len(pkt),
+                                bytes(pkt).hex()[:64])
+                except Exception:
+                    pass
                 reply = short_circuit_reply(pkt)
                 if reply is not None:
                     try:
@@ -494,6 +649,10 @@ async def serve_emu(device: object, port: int) -> None:
             pass
         finally:
             controller.host = orig_sink  # type: ignore[attr-defined]
+            try:
+                device._emu_dead.set()  # type: ignore[attr-defined]
+            except Exception:
+                pass
         logger.info("emulator disconnected: %s", peer)
 
     server = await asyncio.start_server(on_client, "127.0.0.1", port)
@@ -609,7 +768,10 @@ async def run_central(device: object) -> None:
             found["fb"] = adv
 
     device.on("advertisement", _on_adv)  # type: ignore[attr-defined]
-    await _asyncio.sleep(12)  # firmware boot + advertise (emulated time)
+    # Fast rendezvous (2026-10-08): firmware runs are finite (~200s) and
+    # prior 12s+8s/5s cycling missed whole runs. Scan promptly and cycle
+    # fast; any overlap connects within seconds.
+    await _asyncio.sleep(3)  # firmware boot + advertise (emulated time)
     # Scan ONCE and leave it running: stop→start cycling breaks Bumble
     # 0.0.231 scanning (single-start isolated scans see everything; the
     # attempt loop's stop/start never saw a thing — attempt 0 was
@@ -620,6 +782,12 @@ async def run_central(device: object) -> None:
         logger.warning("CENTRAL scan error: %s", e)
         return
     round_no = 0
+    # CROSS-ROUND HANDLE CACHE (proven live: the firmware link drops
+    # mid-exchange — likely supervision timeout on the slow ATT cadence —
+    # so each connection only completes a few ATTs. Handles are stable
+    # within one firmware run, so a reconnect can skip straight to the
+    # unread legs instead of redoing discovery from scratch).
+    cached = {}
     while True:
         round_no += 1
         logger.info("CENTRAL round %d", round_no)
@@ -648,16 +816,25 @@ async def run_central(device: object) -> None:
                     logger.info("SCAN-STATE error %s", e)
             except Exception as e:
                 logger.info("WIRE-STATE error %s", e)
-            await _asyncio.sleep(8)
+            await _asyncio.sleep(2)
             adv = found.get("adv") or found.get("fb")
             if adv is None:
                 logger.info("CENTRAL_SCAN miss (attempt %d)", attempt)
-                await _asyncio.sleep(5)
+                await _asyncio.sleep(2)
                 continue
             logger.info("CENTRAL_SCAN addr=%s%s", adv.address,
                         "" if found.get("adv") else " (fallback unnamed)")
             try:
-                connection = await device.connect(adv.address)  # type: ignore[attr-defined]
+                # MAX supervision timeout (0x0C80 = 32s, spec max): the
+                # firmware answers each ATT in tens of seconds, far past
+                # the 7.2s default — the link must survive the idle gaps.
+                from bumble.device import ConnectionParametersPreferences as _CPP
+                from bumble import hci as _hci2
+                _prefs = _CPP(supervision_timeout=32000)
+                connection = await device.connect(  # type: ignore[attr-defined]
+                    adv.address,
+                    connection_parameters_preferences={_hci2.HCI_LE_1M_PHY: _prefs},
+                )
             except Exception as e:
                 logger.warning("CENTRAL_FAIL_CONNECT %s", e)
                 await _asyncio.sleep(5)
@@ -678,6 +855,13 @@ async def run_central(device: object) -> None:
                 _rand = _emu_wire.random_address
                 _emu_host_ctrl.le_connections[_rand] = connection
                 logger.info("CENTRAL_ALIAS %s ok", str(_rand))
+                # HOST-HANDLE STASH (response-path handle rewrite): the
+                # firmware numbers this link handle 1 (ROM), but the
+                # central-side host knows it as connection.handle — the
+                # receive wrapper rewrites firmware→central ACL handles
+                # to this, else host connections.get() misses silently.
+                device._host_handle = connection.handle  # type: ignore[attr-defined]
+                logger.info("CENTRAL_HOST_HANDLE %s", connection.handle)
             except Exception as e:
                 logger.warning("CENTRAL_ALIAS failed: %s", e)
             # SAME-CONNECTION ATT RETRY (2026-10-04, proven live): the first
@@ -692,25 +876,53 @@ async def run_central(device: object) -> None:
             # fresh (no half-open stall).
             gatt_ok = False
             for gatt_try in range(5):
-                try:
+                # Dead-link fast path: race the GATT attempt against the
+                # emulator-dead event (+120s backstop). A dead firmware run
+                # aborts in ms instead of parking in the 900s GATT timeout.
+                async def _attempt():
                     from bumble.device import Peer as _Peer
 
                     async with _Peer(connection) as peer:
+                        # FAST PATH: handles cached from an earlier round
+                        # on this firmware run — skip discovery (2+ ATTs
+                        # the fragile link may not survive) and go
+                        # straight to the unread legs.
+                        if "lvl" in cached and "echo" in cached:
+                            try:
+                                val = await peer.read_value(cached["lvl"])
+                                logger.info("CENTRAL_READ_%s", val.hex())
+                                await peer.write_value(cached["echo"], b"hi!")
+                                logger.info("CENTRAL_WRITE ok")
+                                back = await peer.read_value(cached["echo"])
+                                logger.info("CENTRAL_ECHO_%s", back.hex())
+                                logger.info("CENTRAL_PASS")
+                                return True
+                            except Exception as e:
+                                logger.warning("CENTRAL_FAIL_CACHED %s (falling back to discovery)", e)
+                                cached.clear()
                         await peer.discover_services()
                         lvl = None
                         echo = None
+                        # UUID-STR NORMALIZATION (2026-10-08, CENTRAL_PASS
+                        # set): Bumble 0.0.231 str(UUID) is 'UUID-16:2A19
+                        # (Battery Level)' — bare `== "2A19"` / `== "180F"`
+                        # never matched, so every try NOSVC'd despite the
+                        # firmware answering all discovery. Compare the hex
+                        # part only.
+                        def _uhex(u: object) -> str:
+                            return str(u).upper().split(":")[-1].split(" ")[0]
                         for svc in peer.services:
-                            if str(svc.uuid).upper() == "180F":
+                            if _uhex(svc.uuid) == "180F":
                                 await svc.discover_characteristics()
                                 for ch in svc.characteristics:
-                                    u = str(ch.uuid).upper()
+                                    u = _uhex(ch.uuid)
                                     if u == "2A19":
                                         lvl = ch
                                     if "12345678-1234-5678-1234-56789ABCDEF0" in u:
                                         echo = ch
                         if lvl is None:
                             logger.warning("CENTRAL_FAIL_NOSVC (round %d, try %d)", round_no, gatt_try)
-                            break
+                            return False
                         val = await lvl.read_value()
                         logger.info("CENTRAL_READ_%s", val.hex())
                         if echo is not None:
@@ -718,9 +930,40 @@ async def run_central(device: object) -> None:
                             logger.info("CENTRAL_WRITE ok")
                             back = await echo.read_value()
                             logger.info("CENTRAL_ECHO_%s", back.hex())
+                        # Cache value handles for the fast path: a later
+                        # reconnect on this firmware run skips discovery.
+                        if getattr(lvl, "value_handle", None) is not None:
+                            cached["lvl"] = lvl.value_handle
+                        if echo is not None and getattr(echo, "value_handle", None) is not None:
+                            cached["echo"] = echo.value_handle
+                        logger.info("CENTRAL_CACHED lvl=%s echo=%s",
+                                    cached.get("lvl"), cached.get("echo"))
                         logger.info("CENTRAL_PASS")
-                        gatt_ok = True
-                        break
+                        return True
+                try:
+                    attempt_task = _asyncio.ensure_future(_attempt())
+                    dead_task = _asyncio.ensure_future(device._emu_dead.wait())  # type: ignore[attr-defined]
+                    done, _ = await _asyncio.wait(
+                        [attempt_task, dead_task],
+                        timeout=120,
+                        return_when=_asyncio.FIRST_COMPLETED,
+                    )
+                    if attempt_task in done:
+                        try:
+                            if await attempt_task:
+                                break
+                        except Exception as e:
+                            logger.warning("CENTRAL_FAIL_GATT %s (round %d, try %d, retrying same conn)", e, round_no, gatt_try)
+                    elif dead_task in done:
+                        logger.warning("CENTRAL_FAIL_EMUDEAD (round %d, try %d, emulator gone)", round_no, gatt_try)
+                    else:
+                        logger.warning("CENTRAL_FAIL_TIMEOUT (round %d, try %d, 120s backstop)", round_no, gatt_try)
+                    if not attempt_task.done():
+                        attempt_task.cancel()
+                    if not dead_task.done():
+                        dead_task.cancel()
+                    await _asyncio.sleep(5)
+                    continue
                 except Exception as e:
                     logger.warning("CENTRAL_FAIL_GATT %s (round %d, try %d, retrying same conn)", e, round_no, gatt_try)
                     await _asyncio.sleep(5)

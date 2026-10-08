@@ -93,7 +93,9 @@ pub struct Esp32S3 {
     fast_tick_ctr: u8,
     /// Staged (buf, len, first 6 bytes) for the last `run_ble_host_recv`
     /// call (read by the harness PRE-DL HOLD re-inject check).
-    pub last_recv_stage: Option<(u32, u32, [u8; 6])>,
+    /// 16 snapshot bytes (not 6): the WRITE-COMMAND pacing exemption
+    /// reads the ATT opcode at index 9.
+    pub last_recv_stage: Option<(u32, u32, [u8; 16])>,
     /// NULL-target skip fire count (gates the first-fire storm brake).
     pub nullskip_fires: u32,
     /// Entry line latch (first
@@ -1288,6 +1290,15 @@ impl Esp32S3 {
             }
         }
         let ok = (self.cpu[core].pc & 0x3fff_ffff) == (SYNTH_RETPC & 0x3fff_ffff);
+        // INTSET-YIELD preservation (2026-10-08, CENTRAL_PASS set): a
+        // same-core FreeRTOS yield pends a software-interrupt bit via
+        // WSR.INTSET (sticky sreg 226); the full-sregs restore below
+        // would wipe it, leaving a Readied host unscheduled under
+        // tickless idle (no ticks to act on it). Re-apply bits SET
+        // during the call after the restore (nothing INTCLEARs on this
+        // path, so clears need no handling).
+        let intset_added = self.cpu[core].sreg(xtensa_core::cpu::SR_INTSET)
+            & !saved_sregs[xtensa_core::cpu::SR_INTSET as usize];
         let cpu = &mut self.cpu[core];
         cpu.pc = saved_pc;
         *cpu.phys_regs_mut() = saved_phys;
@@ -1295,6 +1306,10 @@ impl Esp32S3 {
             cpu.set_sreg(k as u32, *w);
         }
         cpu.set_sreg(xtensa_core::cpu::SR_INTENABLE, saved_ie);
+        cpu.set_sreg(
+            xtensa_core::cpu::SR_INTSET,
+            cpu.sreg(xtensa_core::cpu::SR_INTSET) | intset_added,
+        );
         cpu.set_windowbase(saved_wb);
         ok
     }
@@ -1345,10 +1360,10 @@ impl Esp32S3 {
         let Some((buf, len)) = self.soc.bt_hci_stage_rx() else {
             return false;
         };
-        // Snapshot staged
-        // bytes for the harness (H4==0 dead-path diagnosis).
+        // Snapshot staged bytes for the harness (H4==0 dead-path
+        // diagnosis + WRITE-COMMAND opcode check at index 9).
         {
-            let mut b = [0u8; 6];
+            let mut b = [0u8; 16];
             for (k, v) in b.iter_mut().enumerate() {
                 *v = self.soc.read8(buf.wrapping_add(k as u32)) as u8;
             }
@@ -1382,8 +1397,11 @@ impl Esp32S3 {
             let h = self.soc.read32(0x3fc9_d6d0);
             // Guard the null/uninit handle (boot phase): only write when
             // the pointer names DRAM (else skip — take will queue/fail as
-            // before, no wild write).
-            if (0x3fc8_0000..0x3fd0_0000).contains(&h) {
+            // before, no wild write). Top-up only from 0 (never clobber a
+            // live count — the offset was derived empirically and a blind
+            // overwrite risks waiter accounting).
+            if (0x3fc8_0000..0x3fd0_0000).contains(&h) && self.soc.read32(h.wrapping_add(0x38)) == 0
+            {
                 self.soc.write32(h.wrapping_add(0x38), 1);
             }
         }
