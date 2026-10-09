@@ -199,7 +199,12 @@ CASES=(
 "gdma_m2m||GDMA M2M PASS|"
 "full_load||FULL_LOAD PASS|150000000"
 "ota_slot||OTA SLOT TEST PASS|"
-"ota_update||OTA BEGIN 0;OTA WROTE 285792;OTA END 0;OTA SETBOOT 0;OTA SLOT1 ALIVE;OTA SLOT1 DONE|350000000"
+  // ota_update asserts the WROTE prefix, not the exact byte count: the
+  // image size varies by build environment (absolute paths leak into
+  // build artifacts), so a fixed count is environmentally brittle
+  // (proven: CI wrote a different count than local). Booting the
+  // written image (SLOT1 ALIVE/DONE below) is the real proof.
+"ota_update||OTA BEGIN 0;OTA WROTE;OTA END 0;OTA SETBOOT 0;OTA SLOT1 ALIVE;OTA SLOT1 DONE|350000000"
 "psram_qspi||PSRAM total=2097152;PSRAM RW OK;PSRAM PROBE PASS|"
 "psram_opi||PSRAM total=8388608;PSRAM RW OK;PSRAM PROBE PASS|"
 "psram_16m|PSRAM_MR2=5|PSRAM total=16777216;PSRAM HIGH OK;PSRAM PROBE PASS|"
@@ -274,7 +279,7 @@ for c in "${CASES[@]}"; do
         echo "$log" | grep -aqF -- "$m" || { ok=0; why="missing [$m]"; }
       done
       echo "$log" | grep -aq "HARNESS FAIL" && { ok=0; why="harness reported FAIL"; }
-      if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); note_fail "$name($why)"; fi
+      if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); note_fail "$name($why|logtail:$(echo "$log" | tail -4 | tr '\n' '~' | head -c 320))"; fi
       continue
     fi
     if [[ ! -f "$bin" ]]; then echo "FAIL $name (no binary $bin)"; fail=$((fail+1)); note_fail "$name(no-binary)"; continue; fi
@@ -285,7 +290,7 @@ for c in "${CASES[@]}"; do
       echo "$log" | grep -aqF -- "$m" || { ok=0; why="missing [$m]"; }
     done
     echo "$log" | grep -aq "HARNESS FAIL" && { ok=0; why="harness reported FAIL"; }
-    if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); note_fail "$name($why)"; fi
+    if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); note_fail "$name($why|logtail:$(echo "$log" | tail -4 | tr '\n' '~' | head -c 320))"; fi
     continue
   fi
   # Variant sketches share one source dir but need different arduino-cli
@@ -407,7 +412,7 @@ EOF
       ok=0; why="pcap artifact invalid"
     fi
   fi
-  if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); note_fail "$name($why)"; fi
+  if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); note_fail "$name($why|logtail:$(echo "$log" | tail -4 | tr '\n' '~' | head -c 320))"; fi
 done
 echo "== battery: $pass pass, $fail fail, $skipped skipped =="
 # Surface failures as CI annotations (see note at FAILED_CASES decl).

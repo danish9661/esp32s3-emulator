@@ -78,6 +78,15 @@ jobs:
           arduino-cli config init --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json || true
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@3.3.10
+      - name: Install sketch dependencies (pinned, like local dev)
+        # NimBLE-Arduino (ble + coex sketches) and esptool (espsecure for
+        # the secure_boot signing step) are NOT in the esp32 core and must
+        # be installed explicitly — fresh runners lack them (proven: ble +
+        # coex compile FAILs, secure_boot signing FAIL). Versions pinned
+        # to the validated local ones.
+        run: |
+          arduino-cli lib install "NimBLE-Arduino@2.5.1"
+          python3 -m pip install esptool
       - name: Install wasm-pack
         # Pinned to the repo-standard 0.14.0 (see AGENTS.md env table):
         # the unpinned installer floats to latest (0.15+) whose output
