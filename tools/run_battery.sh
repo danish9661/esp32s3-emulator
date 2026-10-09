@@ -311,6 +311,12 @@ for c in "${CASES[@]}"; do
     if [[ ! -f "$bin" ]]; then
       bin=$(find "$dir/build" -name "*.merged.bin" 2>/dev/null | head -1)
     fi
+    # Fresh checkout (no committed bin, no prior build): default to the
+    # committed path so --build's cp below has a destination. Without
+    # this, cp SRC "" fails and every cache-less case no-binary FAILs
+    # (proven in CI across all shards; locally masked by stale
+    # gitignored bins). The built file also seeds the local cache.
+    [[ -n "$bin" ]] || bin="$dir/esp32s3_$name.merged.bin"
   fi
   # --build compiles sketch sources, except derived images (binrel:
   # built by their base cases, e.g. test_worker_l3_live/net_pcap) and
