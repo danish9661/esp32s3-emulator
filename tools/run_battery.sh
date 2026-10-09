@@ -53,7 +53,7 @@ fi
 # logs need repo auth to download; annotations are API-readable). Cap
 # at 10 lines (command quota) with an overflow note.
 FAILED_CASES=""
-note_fail() { FAILED_CASES="$FAILED_CASES $1"; }
+note_fail() { FAILED_CASES="$FAILED_CASES|$1"; }
 
 # Live-gateway fixture (test_worker_l3_live, net_pcap): entries whose env
 # mentions NET_GW= need the Go L3–L7 gateway on 127.0.0.1:5051 (TCP ingest
@@ -258,7 +258,7 @@ for c in "${CASES[@]}"; do
     # have nothing to compile — same guard as the run_flash path below.
     if [[ $BUILD == 1 && -z "$binrel" && "$name" != "micropython" ]]; then
       if ! arduino-cli compile --fqbn esp32:esp32:esp32s3 --build-path "$dir/build" "$dir" >/tmp/battery_build.log 2>&1; then
-        echo "FAIL $name (compile)"; tail -3 /tmp/battery_build.log; fail=$((fail+1)); note_fail "$name"; continue
+        why="compile: $(tail -3 /tmp/battery_build.log | tr '\n' ';' | head -c 160)"; echo "FAIL $name ($why)"; fail=$((fail+1)); note_fail "$name($why)"; continue
       fi
       cp "$dir/build/esp32s3_$name.ino.merged.bin" "$dir/esp32s3_$name.merged.bin"
       bin="$dir/esp32s3_$name.merged.bin"
@@ -277,7 +277,7 @@ for c in "${CASES[@]}"; do
       if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); note_fail "$name($why)"; fi
       continue
     fi
-    if [[ ! -f "$bin" ]]; then echo "FAIL $name (no binary $bin)"; fail=$((fail+1)); note_fail "$name"; continue; fi
+    if [[ ! -f "$bin" ]]; then echo "FAIL $name (no binary $bin)"; fail=$((fail+1)); note_fail "$name(no-binary)"; continue; fi
     if ! command -v node >/dev/null 2>&1; then echo "FAIL $name (node missing)"; fail=$((fail+1)); note_fail "$name"; continue; fi
     log=$(timeout 600 node "$ROOT/${envstr#NODE:}" "$bin" 2>&1 | tr -d '\0')
     ok=1; why=""
@@ -322,20 +322,20 @@ for c in "${CASES[@]}"; do
     if [[ "$name" == "ota_update" ]]; then
       # Two-pass build (slot-1 image embedded into the updater).
       if ! "$ROOT/tools/build_ota.sh" >/tmp/battery_build.log 2>&1; then
-        echo "FAIL $name (compile)"; tail -3 /tmp/battery_build.log; fail=$((fail+1)); note_fail "$name"; continue
+        why="compile: $(tail -3 /tmp/battery_build.log | tr '\n' ';' | head -c 160)"; echo "FAIL $name ($why)"; fail=$((fail+1)); note_fail "$name($why)"; continue
       fi
     elif [[ "$name" == "secure_boot" ]]; then
       # Sign-then-reassemble build (signed hello app + merged flash image).
       if ! "$ROOT/tools/build_secure_boot.sh" >/tmp/battery_build.log 2>&1; then
-        echo "FAIL $name (compile)"; tail -3 /tmp/battery_build.log; fail=$((fail+1)); note_fail "$name"; continue
+        why="compile: $(tail -3 /tmp/battery_build.log | tr '\n' ';' | head -c 160)"; echo "FAIL $name ($why)"; fail=$((fail+1)); note_fail "$name($why)"; continue
       fi
     elif ! arduino-cli compile --fqbn "$fqbn" --build-path "$srcdir/build" "$srcdir" >/tmp/battery_build.log 2>&1; then
-      echo "FAIL $name (compile)"; tail -3 /tmp/battery_build.log; fail=$((fail+1)); note_fail "$name"; continue
+      why="compile: $(tail -3 /tmp/battery_build.log | tr '\n' ';' | head -c 160)"; echo "FAIL $name ($why)"; fail=$((fail+1)); note_fail "$name($why)"; continue
     else
       cp "$srcdir/build/$inobin" "$bin"
     fi
   fi
-  if [[ ! -f "$bin" ]]; then echo "FAIL $name (no binary $bin)"; fail=$((fail+1)); note_fail "$name"; continue; fi
+  if [[ ! -f "$bin" ]]; then echo "FAIL $name (no binary $bin)"; fail=$((fail+1)); note_fail "$name(no-binary)"; continue; fi
   # NET_PCAP paths in entries are repo-relative; resolve against ROOT so the
   # run is CWD-independent (bins/EMU above are already absolute). NOTE:
   # ROOT contains spaces, so the absolute pcap path CANNOT ride inside the
@@ -406,9 +406,10 @@ done
 echo "== battery: $pass pass, $fail fail, $skipped skipped =="
 # Surface failures as CI annotations (see note at FAILED_CASES decl).
 n=0
-for c in $FAILED_CASES; do
+while IFS= read -r c; do
+  [[ -z "$c" ]] && continue
   n=$((n+1))
-  if [[ $n -le 10 ]]; then echo "::error::battery case FAILED: $c"; fi
-done
-if [[ $n -gt 10 ]]; then echo "::error::battery ... plus $((n-10)) more failed cases (see log)"; fi
+  if [[ $n -le 12 ]]; then echo "::error::battery case FAILED: $c"; fi
+done < <(tr '|' '\n' <<<"$FAILED_CASES")
+if [[ $n -gt 12 ]]; then echo "::error::battery ... plus $((n-12)) more failed cases (see log)"; fi
 [[ $fail == 0 ]]
