@@ -5094,3 +5094,34 @@ full enumeration REQ0..REQ6 — is covered),
     workspace all-green, clippy `-D warnings`/fmt/wasm32 clean, battery
     `ble` PASS. Remaining per directive: full battery certification,
     per-core threads.
+  - 2026-10-09: **Full battery certified 124/0/0 (--build) + per-core
+    verdict reaffirmed: DEFER**.
+    - **Battery**: full `--build` run finished 121 pass / 3 fail / 0
+      skipped; all 3 fails were one pre-existing harness bug, not model
+      rot: the run_flash `--build` path compiled `$srcdir`
+      unconditionally, so binrel-derived entries (`test_worker_l3_live`,
+      `net_pcap`) and the sourceless entry (`micropython`) failed with
+      "Can't open sketch: no such file" (the NODE path already had the
+      `-z binrel` guard; the run_flash path never got one). Fixed with
+      the same guard + a micropython exemption (11 lines, script-only);
+      trio re-run 3/3 green (`live` 19/19+DONE, pcap 17 packets,
+      micropython harness). **Certified total 124/0/0.** Lesson (process):
+      never edit run_battery.sh mid-run (bash reads it incrementally).
+    - **Per-core threads (revisit of the Oct-07 DEFER, with fresh
+      numbers)**: verdict stands — DO NOT attempt. Sync audit re-clean
+      (one `Cell`, no RefCell/UnsafeCell/statics; `Bus` all-`&mut`);
+      sharing audit: one 21MB+ `Soc` (SRAM+flash+PSRAM+RTC+45 devices)
+      behind the exclusive bus, both cores alternating `run_fast_core`
+      per macro-step on a single global time base. Fresh measurement:
+      barrier rendezvous **~3.7us** vs macro-step work **~0.24us**
+      (~6 insns @ PGO-native ~25 MIPS) = **~15x overhead per sync**.
+      Coarse barriers are cheap but unsound (shared time + cross-core
+      IPC need <=16-op coupling — Sep-03 bulk-tick broke MCPWM, and
+      RMT/UART/I2S sampling proved the same sensitivity); fine barriers
+      are sound but cost 15x; mutex-without-barrier double-times the
+      shared clock and goes nondeterministic; sharding is impossible
+      (SMP shares everything, FreeRTOS cross-core traffic constant);
+      Soc-duplication merge is costlier than the step and unsound.
+      Correct parallelism stays task-level (Dual engine, shipped) +
+      process-level (battery shards/CI matrix). Revisit only if the
+      execution model changes (e.g., JIT with built-in sync points).

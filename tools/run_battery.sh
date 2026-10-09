@@ -242,7 +242,10 @@ for c in "${CASES[@]}"; do
     if [[ ! -f "$bin" ]]; then
       bin=$(find "$dir/build" -name "*.merged.bin" 2>/dev/null | head -1)
     fi
-    if [[ $BUILD == 1 && -z "$binrel" ]]; then
+    # BINLESS entries (micropython: external image, no sketch sources)
+    # and binrel entries (derived images built by their base cases)
+    # have nothing to compile — same guard as the run_flash path below.
+    if [[ $BUILD == 1 && -z "$binrel" && "$name" != "micropython" ]]; then
       if ! arduino-cli compile --fqbn esp32:esp32:esp32s3 --build-path "$dir/build" "$dir" >/tmp/battery_build.log 2>&1; then
         echo "FAIL $name (compile)"; tail -3 /tmp/battery_build.log; fail=$((fail+1)); continue
       fi
@@ -298,7 +301,13 @@ for c in "${CASES[@]}"; do
       bin=$(find "$dir/build" -name "*.merged.bin" 2>/dev/null | head -1)
     fi
   fi
-  if [[ $BUILD == 1 ]]; then
+  # --build compiles sketch sources, except derived images (binrel:
+  # built by their base cases, e.g. test_worker_l3_live/net_pcap) and
+  # sourceless entries (micropython: external image) — same guard as the
+  # NODE path above (2026-10-09: these FAILed --build with "no such file"
+  # since the binrel mechanism landed; the bins were never stale, only
+  # the guard was missing).
+  if [[ $BUILD == 1 && -z "$binrel" && "$name" != "micropython" ]]; then
     if [[ "$name" == "ota_update" ]]; then
       # Two-pass build (slot-1 image embedded into the updater).
       if ! "$ROOT/tools/build_ota.sh" >/tmp/battery_build.log 2>&1; then
