@@ -213,7 +213,7 @@ pub(crate) fn aes256_cbc_decrypt(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> 
     let w = key_expansion(key, 8);
     let mut out = Vec::with_capacity(data.len());
     let mut prev = *iv;
-    for chunk in data.chunks_exact(16) {
+    for chunk in data.as_chunks::<16>().0 {
         let mut block = [0u8; 16];
         block.copy_from_slice(chunk);
         let dec = aes_decrypt_block(&block, &w, 14);
@@ -710,7 +710,7 @@ mod tests {
         let (k1w, k2w) = xts_key(&key32);
         let mut t = xts_tweak(&k2w, &[0u8; 16]);
         let mut out = Vec::new();
-        for blk in pt.chunks_exact(16) {
+        for blk in pt.as_chunks::<16>().0 {
             let mut b = [0u8; 16];
             b.copy_from_slice(blk);
             out.extend_from_slice(&xts_block(&k1w, &t, &b, true));
@@ -720,7 +720,7 @@ mod tests {
         // Round-trip back through decrypt.
         let mut t = xts_tweak(&k2w, &[0u8; 16]);
         let mut back = Vec::new();
-        for blk in out.chunks_exact(16) {
+        for blk in out.as_chunks::<16>().0 {
             let mut b = [0u8; 16];
             b.copy_from_slice(blk);
             back.extend_from_slice(&xts_block(&k1w, &t, &b, false));

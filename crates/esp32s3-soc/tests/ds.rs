@@ -175,7 +175,7 @@ use esp32s3_soc::ds::Ds;
 use esp32s3_soc::efuse::Efuse;
 
 fn put_words(ds: &mut Ds, efuse: &Efuse, base: u32, data: &[u8]) {
-    for (i, chunk) in data.chunks_exact(4).enumerate() {
+    for (i, chunk) in data.as_chunks::<4>().0.iter().enumerate() {
         let v = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         ds.write32(base + (i as u32) * 4, v, efuse);
     }

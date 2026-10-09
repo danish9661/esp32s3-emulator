@@ -630,7 +630,7 @@ mod tests {
         a.beqz(5, 0x4000_0120);
         a.bnez(6, 0x4000_00F0);
         a.j(0x4000_0200);
-        for w in a.bytes.chunks_exact(3) {
+        for w in a.bytes.as_chunks::<3>().0 {
             let word = u32::from_le_bytes([w[0], w[1], w[2], 0]);
             let op = decode_inst(word).expect("should decode");
             let _ = opnds(op, word, 0);
@@ -652,7 +652,7 @@ mod tests {
         a.rsil(4, 0);
         a.rfi(3);
         a.rsr(5, 226);
-        for w in a.bytes.chunks_exact(3) {
+        for w in a.bytes.as_chunks::<3>().0 {
             let word = u32::from_le_bytes([w[0], w[1], w[2], 0]);
             assert!(decode_inst(word).is_some(), "word {word:#010x} decodes");
             let op = decode_inst(word).unwrap();

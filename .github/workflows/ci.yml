@@ -79,9 +79,15 @@ jobs:
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@3.3.10
       - name: Install wasm-pack
+        # Pinned to the repo-standard 0.14.0 (see AGENTS.md env table):
+        # the unpinned installer floats to latest (0.15+) whose output
+        # layout the bundle check does not track. Versioned release
+        # tarball (musl static — runs on any x86_64 runner).
         run: |
-          curl -sSf https://raw.githubusercontent.com/drager/wasm-pack/master/installer/init.sh | sh
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          curl -sSfL https://github.com/rustwasm/wasm-pack/releases/download/v0.14.0/wasm-pack-v0.14.0-x86_64-unknown-linux-musl.tar.gz -o /tmp/wasm-pack.tgz
+          tar xzf /tmp/wasm-pack.tgz -C /tmp
+          echo "/tmp/wasm-pack-v0.14.0-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+          /tmp/wasm-pack-v0.14.0-x86_64-unknown-linux-musl/wasm-pack --version
       - name: Go gateway framing tests (TCP-ingest wire contract)
         # The emulator's NET_GW leg speaks length-prefixed raw Ethernet;
         # these pin the framing both sides implement (split-segment

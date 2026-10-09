@@ -965,7 +965,7 @@ impl Soc {
         }
         let key = self.flash_xts_key();
         let mut out = vec![0u8; self.flash.len()];
-        for (b, dst) in out.chunks_exact_mut(16).enumerate() {
+        for (b, dst) in out.as_chunks_mut::<16>().0.iter_mut().enumerate() {
             let off = (b * 16) as u32;
             let mut blk = [0u8; 16];
             blk.copy_from_slice(&self.flash[b * 16..b * 16 + 16]);

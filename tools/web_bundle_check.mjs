@@ -58,9 +58,13 @@ if (missing.length === 0) pass(`API-compat (${calls.length} emu.* calls resolve 
 else fail(`API-compat missing from d.ts: ${missing.join(', ')}`);
 
 // --- 3. freshness: local web/pkg must not predate any crate source ---
+// On a clean checkout (CI) web/pkg/ is absent (gitignored) — there is no
+// local bundle to go stale, so the check is N/A there (the fresh build
+// above + API-compat + boot below are the CI assertions). Only FAIL when
+// a bundle exists AND is stale.
 const pkgWasm = join(root, 'web', 'pkg', 'wasm_bridge_bg.wasm');
 if (!existsSync(pkgWasm)) {
-  fail('web/pkg/wasm_bridge_bg.wasm missing (run: wasm-pack build crates/wasm-bridge --target web --out-dir ../../web/pkg)');
+  pass('web/pkg absent (clean checkout — freshness N/A)');
 } else {
   const built = statSync(pkgWasm).mtimeMs;
   let out = '';
