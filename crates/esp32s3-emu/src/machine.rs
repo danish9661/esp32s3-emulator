@@ -330,28 +330,34 @@ impl Esp32S3 {
         // the records-check a10 = ESP_OK force itself (the Soc cannot see
         // CPU regs): when the engine staged records this poll, force the
         // trapping core's return value.
-        let pc0 = self.cpu[0].pc;
-        let pc1 = self.cpu[1].pc;
-        let records_pc = self.soc.wifi_fixture_records_pc();
-        let staged_before = self.soc.wifi_fixture_records_staged();
-        // The engine's ESP-NOW legs need the UART `sent 1` marker, which
-        // lives in host-side console state the SoC cannot see: pass a
-        // cheap snapshot (the merged UART0+USB stream, same bytes
-        // run_flash greps). Snapshot BEFORE the drain below so the poll
-        // sees the same bytes the host just observed.
-        let uart_snap = self.soc.console_snapshot();
-        self.soc.wifi_fixture_poll(pc0, pc1, &uart_snap);
-        if self.soc.wifi_fixture_records_staged() && !staged_before {
-            for c in 0..2 {
-                if (c == 0 && pc0 == records_pc) || (c == 1 && pc1 == records_pc) {
-                    self.cpu[c].set_reg(10, 0); // a10 = ESP_OK
+        // Fixture legs run only while armed (fast path: `console_snapshot`
+        // is a Vec alloc + ~1KB of copies per block — pure overhead for
+        // the 100+ non-WiFi sketches; the polls themselves early-out on
+        // None but the snapshot has no such gate).
+        if self.soc.wifi_fixture_active() {
+            let pc0 = self.cpu[0].pc;
+            let pc1 = self.cpu[1].pc;
+            let records_pc = self.soc.wifi_fixture_records_pc();
+            let staged_before = self.soc.wifi_fixture_records_staged();
+            // The engine's ESP-NOW legs need the UART `sent 1` marker, which
+            // lives in host-side console state the SoC cannot see: pass a
+            // cheap snapshot (the merged UART0+USB stream, same bytes
+            // run_flash greps). Snapshot BEFORE the drain below so the poll
+            // sees the same bytes the host just observed.
+            let uart_snap = self.soc.console_snapshot();
+            self.soc.wifi_fixture_poll(pc0, pc1, &uart_snap);
+            if self.soc.wifi_fixture_records_staged() && !staged_before {
+                for c in 0..2 {
+                    if (c == 0 && pc0 == records_pc) || (c == 1 && pc1 == records_pc) {
+                        self.cpu[c].set_reg(10, 0); // a10 = ESP_OK
+                    }
                 }
             }
-        }
-        // Run any ESP-NOW callback the poll staged, in-firmware on core 1
-        // (parks in IDLE — always safe; same core run_flash uses).
-        while self.soc.wifi_espnow_call_pending() {
-            self.run_espnow_callback(1);
+            // Run any ESP-NOW callback the poll staged, in-firmware on core 1
+            // (parks in IDLE — always safe; same core run_flash uses).
+            while self.soc.wifi_espnow_call_pending() {
+                self.run_espnow_callback(1);
+            }
         }
         if self.soc.rom_boot_mode()
             && !(self.cpu[0].pc >= rom_stub::ROM_BASE && self.cpu[0].pc < rom_stub::ROM_END)

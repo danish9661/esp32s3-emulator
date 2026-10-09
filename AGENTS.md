@@ -5125,3 +5125,32 @@ full enumeration REQ0..REQ6 — is covered),
       Correct parallelism stays task-level (Dual engine, shipped) +
       process-level (battery shards/CI matrix). Revisit only if the
       execution model changes (e.g., JIT with built-in sync points).
+  - 2026-10-09: **Speed: PGO retrained + fixture-gating, +61-64% combined
+    (user: "mips is slow")**.
+    - **PGO retrain (stale since Oct-05)**: `merged.profdata` regenerated
+      over hello+periph; interleaved pinned-core A/B (100M-step window):
+      plain 6.6-6.7 vs PGO 10.6 MIPS, 3/3 stable = **+58%**. `verify OK`.
+    - **Fixture gating (+9-10%, 3/3)**: `step_fast` built a `console_`
+      `snapshot` (Vec alloc + ~1KB copies) + ran the fixture poll every
+      macro-step even with no fixture armed. New `Soc::wifi_fixture_
+      active()` gate (all four arming APIs set the flag; ESP-NOW incl.).
+      A per-op wrap of the ~730-line leg region measured **+0%** and was
+      REVERTED per the no-noise-gain rule (revert briefly ate the region
+      via a mis-anchored script — recovered from HEAD and re-applied only
+      the proven gate; lesson: verify `wifi_hook_` count after
+      scripted reversions).
+    - **Combined**: gated+PGO 10.8 vs plain 6.7 = **+61-64%, 3/3 stable**.
+      PGO retrained AGAIN after the gate (hot path changed), verify OK.
+    - Validation: unit green, clippy `-D warnings`/fmt/wasm32 clean,
+      WiFi subset 12/13 (sole FAIL = filter artifact pulling live without
+      its gateway), live L3 19/19+DONE on the gated tree, web bundle ALL
+      PASS (pkg rebuilt), gallery 63/63 synced, freshness 0 FAILs,
+      Playwright E2E ALL PASS (exercises dozens of images through the
+      gated engine — plus unit tests, this covers the gate; no full
+      battery re-run: the only delta since the 124 certification is the
+      disarmed-path skip). Bins: kept all `--build` outputs (periph's
+      committed 390KB differs at byte 65713 = stale sources, not
+      padding — old bin still boots, new bin is truth).
+    - Remaining levers (assessed, not taken): longer blocks (interrupt-
+      latency risk), waiti fast-forward (wall-time, not MIPS), wasm-opt
+      (~10%, no binaryen offline), JIT (months). Threads stay DEFER.

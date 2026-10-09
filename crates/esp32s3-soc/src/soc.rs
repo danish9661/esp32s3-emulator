@@ -2651,6 +2651,14 @@ impl Soc {
     /// (arm-once latch inside); no-op while no fixture is armed. ONLY arms
     /// — completions stay in the post-step poll (they need queue/heap
     /// borrows + UART bytes the pre-op point cannot provide).
+    /// Whether any WiFi fixture is armed (fast-path gate for the
+    /// machine's per-macro-step snapshot + poll: both are pure overhead
+    /// when disarmed — `console_snapshot` alone is a Vec alloc plus
+    /// ~1KB of copies per block).
+    pub fn wifi_fixture_active(&self) -> bool {
+        self.wifi_fixture.is_some()
+    }
+
     pub fn wifi_fixture_poll_pre(&mut self, pc: u32) {
         let Some(fx) = self.wifi_fixture.clone() else {
             return;
