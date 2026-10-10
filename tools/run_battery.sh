@@ -52,8 +52,8 @@ fi
 # Failed-case accumulator: surfaced as CI annotations at the end (job
 # logs need repo auth to download; annotations are API-readable). Cap
 # at 10 lines (command quota) with an overflow note.
-FAILED_CASES=""
-note_fail() { FAILED_CASES="$FAILED_CASES|$1"; }
+FAILED_CASES=()
+note_fail() { FAILED_CASES+=("$1"); }
 
 # Live-gateway fixture (test_worker_l3_live, net_pcap): entries whose env
 # mentions NET_GW= need the Go L3–L7 gateway on 127.0.0.1:5051 (TCP ingest
@@ -279,7 +279,7 @@ for c in "${CASES[@]}"; do
         echo "$log" | grep -aqF -- "$m" || { ok=0; why="missing [$m]"; }
       done
       echo "$log" | grep -aq "HARNESS FAIL" && { ok=0; why="harness reported FAIL"; }
-      if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); note_fail "$name($why|logtail:$(echo "$log" | tail -4 | tr '\n' '~' | head -c 320))"; fi
+      if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); note_fail "$name($why|end:$(echo "$log" | grep -a '== end' | tail -1 | head -c 160)|fault:$(echo "$log" | grep -a -E 'ILLEGAL|PANIC|Guru|assert failed|StoreProhibited|LoadProhibited' | head -2 | tr '\n' '~' | head -c 160))"; fi
       continue
     fi
     if [[ ! -f "$bin" ]]; then echo "FAIL $name (no binary $bin)"; fail=$((fail+1)); note_fail "$name(no-binary)"; continue; fi
@@ -290,7 +290,7 @@ for c in "${CASES[@]}"; do
       echo "$log" | grep -aqF -- "$m" || { ok=0; why="missing [$m]"; }
     done
     echo "$log" | grep -aq "HARNESS FAIL" && { ok=0; why="harness reported FAIL"; }
-    if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); note_fail "$name($why|logtail:$(echo "$log" | tail -4 | tr '\n' '~' | head -c 320))"; fi
+    if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); note_fail "$name($why|end:$(echo "$log" | grep -a '== end' | tail -1 | head -c 160)|fault:$(echo "$log" | grep -a -E 'ILLEGAL|PANIC|Guru|assert failed|StoreProhibited|LoadProhibited' | head -2 | tr '\n' '~' | head -c 160))"; fi
     continue
   fi
   # Variant sketches share one source dir but need different arduino-cli
@@ -412,15 +412,14 @@ EOF
       ok=0; why="pcap artifact invalid"
     fi
   fi
-  if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); note_fail "$name($why|logtail:$(echo "$log" | tail -4 | tr '\n' '~' | head -c 320))"; fi
+  if [[ $ok == 1 ]]; then echo "PASS $name"; pass=$((pass+1)); else echo "FAIL $name ($why)"; fail=$((fail+1)); note_fail "$name($why|end:$(echo "$log" | grep -a '== end' | tail -1 | head -c 160)|fault:$(echo "$log" | grep -a -E 'ILLEGAL|PANIC|Guru|assert failed|StoreProhibited|LoadProhibited' | head -2 | tr '\n' '~' | head -c 160))"; fi
 done
 echo "== battery: $pass pass, $fail fail, $skipped skipped =="
 # Surface failures as CI annotations (see note at FAILED_CASES decl).
 n=0
-while IFS= read -r c; do
-  [[ -z "$c" ]] && continue
+for c in "${FAILED_CASES[@]}"; do
   n=$((n+1))
   if [[ $n -le 12 ]]; then echo "::error::battery case FAILED: $c"; fi
-done < <(tr '|' '\n' <<<"$FAILED_CASES")
+done
 if [[ $n -gt 12 ]]; then echo "::error::battery ... plus $((n-12)) more failed cases (see log)"; fi
 [[ $fail == 0 ]]
