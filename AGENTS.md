@@ -5154,3 +5154,28 @@ full enumeration REQ0..REQ6 — is covered),
     - Remaining levers (assessed, not taken): longer blocks (interrupt-
       latency risk), waiti fast-forward (wall-time, not MIPS), wasm-opt
       (~10%, no binaryen offline), JIT (months). Threads stay DEFER.
+  - 2026-10-10: **Speed +61-64% (PGO retrain + fixture gating); word-read
+    investigated and REVERTED; JIT-for-wasm verdict: impossible**.
+    - PGO `merged.profdata` retrained (stale since Oct-05): plain 6.7 vs
+      PGO 10.6 MIPS interleaved pinned-core 3/3 (+58%); retrained AGAIN
+      post-gate, final gated+PGO 10.8 (+61-64% vs plain).
+    - Fixture gate (+9-10% 3/3): `step_fast` built `console_snapshot`
+      (Vec + ~1KB copies) + fixture poll per block while disarmed; new
+      `Soc::wifi_fixture_active()` gate (all four arming APIs set it).
+      Per-op wrap of the 730-line leg region measured +0% → reverted.
+    - Word-wide flash-window read: profiler split showed 48M flashwin
+      word reads / 100M insns (each 4x translate+match+gate). Built
+      `cache_read32` (one translate/gate per word) — measured +0-1%
+      native, NEGATIVE 2/3 in-wasm (nodejs A/B: 6.91/6.50/6.40 vs
+      6.42/6.03/6.51) → reverted per the no-noise-gain rule. Lesson: the
+      O3 byte path was already cheap; count != cost.
+    - **JIT**: user asked for JIT-in-browser. Verdict, researched: a
+      classic JIT needs executable memory (mmap RWX), which the wasm
+      sandbox forbids — impossible in-browser by platform design, not
+      effort. Cranelift/dynasm paths are native-only, months of work
+      (750 opcode templates + windows/spills + TB cache), zero browser
+      benefit. Our decoder stays in every option (JITs reuse decoders).
+      Realistic browser ceiling ~15-20 MIPS fully tuned (wasm 1.45-2.3x
+      penalty is published; ours measures 1.6x). 30 MIPS stands as a
+      NATIVE target (TLB/dispatch work continues); do not promise it
+      for the browser.
