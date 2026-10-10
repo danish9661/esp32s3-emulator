@@ -4916,14 +4916,14 @@ impl Soc {
             // when active, batch the remaining cycles to avoid per-step
             // function-call overhead on the hot path. Clocks: I2C_EXT0
             // bit 7, I2C_EXT1 bit 18 (EN0).
-            if !self.i2c[0].is_idle() && self.clk_on(false, 7) {
+            if self.clk_on(false, 7) && !self.i2c[0].is_idle() {
                 let n = self.i2c[0].remaining_cycles().max(1);
                 self.i2c[0].tick(n);
                 if self.i2c[0].has_events() {
                     self.events.extend(self.i2c[0].drain_events());
                 }
             }
-            if !self.i2c[1].is_idle() && self.clk_on(false, 18) {
+            if self.clk_on(false, 18) && !self.i2c[1].is_idle() {
                 let n = self.i2c[1].remaining_cycles().max(1);
                 self.i2c[1].tick(n);
                 if self.i2c[1].has_events() {
@@ -4942,7 +4942,7 @@ impl Soc {
             // stopped MCPWM timers / non-busy LCD / non-busy I2S), so a
             // skipped tick would have no-opped identically. Clock gates:
             // RMT bit 9, MCPWM0/1 bits 17/20 (EN0).
-            if self.rmt.is_active() && self.clk_on(false, 9) {
+            if self.clk_on(false, 9) && self.rmt.is_active() {
                 self.rmt.tick();
             }
             // RMT RX sampling: skipped unless a capture is armed/running.
@@ -4951,7 +4951,7 @@ impl Soc {
             // unrouted inputs read pull-up high. Pins 32+ are out of the
             // u32 readback word and also read high (same limit as the GPIO
             // edge sampler).
-            if self.rmt.rx_pending() && self.clk_on(false, 9) {
+            if self.clk_on(false, 9) && self.rmt.rx_pending() {
                 let rb = self.gpio_in_readback();
                 let rmt_rx = |sig: u32| -> u32 {
                     match self.gpio.in_sel(sig) {
@@ -4963,10 +4963,10 @@ impl Soc {
                 };
                 self.rmt.tick_rx(&rmt_rx);
             }
-            if self.mcpwm.is_active() && self.clk_on(false, 17) {
+            if self.clk_on(false, 17) && self.mcpwm.is_active() {
                 self.mcpwm.tick();
             }
-            if self.mcpwm1.is_active() && self.clk_on(false, 20) {
+            if self.clk_on(false, 20) && self.mcpwm1.is_active() {
                 self.mcpwm1.tick();
             }
             // MCPWM capture samples its channel inputs via the GPIO-matrix
@@ -4976,7 +4976,7 @@ impl Soc {
             // come from the pad readback (not pin_level: an output-enabled
             // peripheral-driven pin reads GPIO_OUT there, not the driven
             // signal).
-            if self.mcpwm.cap_timer_enabled() && self.clk_on(false, 17) {
+            if self.clk_on(false, 17) && self.mcpwm.cap_timer_enabled() {
                 let rb = self.gpio_in_readback();
                 let cap_in = |sig: u32| -> u32 {
                     match self.gpio.in_sel(sig) {
@@ -4987,7 +4987,7 @@ impl Soc {
                 };
                 self.mcpwm.tick_capture(166, 160, &cap_in);
             }
-            if self.mcpwm1.cap_timer_enabled() && self.clk_on(false, 20) {
+            if self.clk_on(false, 20) && self.mcpwm1.cap_timer_enabled() {
                 let rb = self.gpio_in_readback();
                 let cap_in = |sig: u32| -> u32 {
                     match self.gpio.in_sel(sig) {
@@ -5002,7 +5002,7 @@ impl Soc {
             // 163..165, group 1 = 172..174, gpio_sig_map.h PWMx_Fn_IN_IDX),
             // sampled even with every timer stopped. Unrouted inputs read
             // low so an enabled-but-unconnected detector never trips.
-            if self.mcpwm.fault_active() && self.clk_on(false, 17) {
+            if self.clk_on(false, 17) && self.mcpwm.fault_active() {
                 let rb = self.gpio_in_readback();
                 let fault_in = |sig: u32| -> u32 {
                     match self.gpio.in_sel(sig) {
@@ -5013,7 +5013,7 @@ impl Soc {
                 };
                 self.mcpwm.tick_fault(163, &fault_in);
             }
-            if self.mcpwm1.fault_active() && self.clk_on(false, 20) {
+            if self.clk_on(false, 20) && self.mcpwm1.fault_active() {
                 let rb = self.gpio_in_readback();
                 let fault_in = |sig: u32| -> u32 {
                     match self.gpio.in_sel(sig) {
@@ -5027,7 +5027,7 @@ impl Soc {
             // MCPWM timer sync: SYNC0..2 external inputs (group 0 =
             // 160..162, group 1 = 169..171) reload PHASE on rising edges
             // when SYNCI_EN is set. Sampled even with timers stopped.
-            if self.mcpwm.sync_armed() && self.clk_on(false, 17) {
+            if self.clk_on(false, 17) && self.mcpwm.sync_armed() {
                 let rb = self.gpio_in_readback();
                 let sync_in = |sig: u32| -> u32 {
                     match self.gpio.in_sel(sig) {
@@ -5038,7 +5038,7 @@ impl Soc {
                 };
                 self.mcpwm.tick_sync(160, &sync_in);
             }
-            if self.mcpwm1.sync_armed() && self.clk_on(false, 20) {
+            if self.clk_on(false, 20) && self.mcpwm1.sync_armed() {
                 let rb = self.gpio_in_readback();
                 let sync_in = |sig: u32| -> u32 {
                     match self.gpio.in_sel(sig) {
@@ -5052,13 +5052,13 @@ impl Soc {
             if self.sdm.is_active() {
                 self.sdm.tick();
             }
-            if self.lcd_cam.is_active() && self.clk_on(true, 8) {
+            if self.clk_on(true, 8) && self.lcd_cam.is_active() {
                 self.lcd_cam.tick();
             }
-            if self.i2s[0].is_active() && self.clk_on(false, 4) {
+            if self.clk_on(false, 4) && self.i2s[0].is_active() {
                 self.i2s[0].tick();
             }
-            if self.i2s[1].is_active() && self.clk_on(false, 21) {
+            if self.clk_on(false, 21) && self.i2s[1].is_active() {
                 self.i2s[1].tick();
             }
             // I2S GDMA streaming pump: trickle words between owned DMA
@@ -5068,9 +5068,9 @@ impl Soc {
             // any armed link (cold otherwise) plus the GDMA DMA clock
             // (EN1 bit 6): with the DMA clock off the walks below never
             // run, so the pump must idle too.
-            if (self.i2s_dma_out.iter().any(|d| d.active)
-                || self.i2s_dma_in.iter().any(|d| d.active))
-                && self.clk_on(true, 6)
+            if self.clk_on(true, 6)
+                && (self.i2s_dma_out.iter().any(|d| d.active)
+                    || self.i2s_dma_in.iter().any(|d| d.active))
             {
                 self.poll_i2s_dma();
             }
@@ -5091,7 +5091,7 @@ impl Soc {
             // input routing (FUNC_IN_SEL_CFG); resolve each signal index to the
             // GPIO pin's current level. Skipped while no unit is counting
             // (and after the one-time prev-level sampling) — the common case.
-            if (!self.pcnt.is_init() || self.pcnt.is_counting()) && self.clk_on(false, 10) {
+            if self.clk_on(false, 10) && (!self.pcnt.is_init() || self.pcnt.is_counting()) {
                 let pcnt_input = |sig: u32| -> u32 {
                     match self.gpio.in_sel(sig) {
                         Some((pin, inv)) => self.gpio.pin_level(pin) ^ (inv as u32),

@@ -5,9 +5,12 @@
 # A/B medians, pinned P-cores) on hello-boot trained over hello + periph.
 #
 # Profiles are TARGET-SPECIFIC: native x86_64 only. Do NOT apply to wasm
-# builds (different backend). Requires `llvm-profdata` in PATH. Retrain
-# after changing hot paths (xtensa-core decode/exec, soc tick dispatch);
-# a stale profile still builds and runs correctly, just less optimally.
+# builds (different backend). Requires the llvm-tools rustup component
+# (`rustup component add --toolchain stable llvm-tools`); the merge step
+# prefers the toolchain's own llvm-profdata and falls back to PATH.
+# Retrain after changing hot paths (xtensa-core decode/exec, soc tick
+# dispatch); a stale profile still builds and runs correctly, just less
+# optimally.
 #
 # Usage: ./tools/pgo.sh   (leaves an optimized target/ + tools/pgo/merged.profdata)
 set -eu
@@ -38,7 +41,13 @@ ADC_INJECT_MV=825 LLVM_PROFILE_FILE="$PROFSTAGE/raw/periph-%m.profraw" \
   > /tmp/pgo_train_periph.log 2>&1
 
 echo "[pgo] merging profiles..."
-llvm-profdata merge -o "$PROFDIR/merged.profdata" "$PROFSTAGE"/raw/*.profraw
+# Prefer the toolchain's own llvm-profdata (matches the rustc that
+# generated the profiles; system llvm-profdata drifts — 2026-10-10:
+# rustc 1.99 emits a newer profraw than system LLVM 21.1.8 reads).
+# Requires the llvm-tools rustup component (one-time).
+_LLVM_PROFDATA="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's|^host: ||p')/bin/llvm-profdata"
+if [[ ! -x "$_LLVM_PROFDATA" ]]; then _LLVM_PROFDATA="llvm-profdata"; fi
+"$_LLVM_PROFDATA" merge -o "$PROFDIR/merged.profdata" "$PROFSTAGE"/raw/*.profraw
 cp "$PROFDIR/merged.profdata" "$PROFSTAGE/merged.profdata"
 
 echo "[pgo] optimized build..."
