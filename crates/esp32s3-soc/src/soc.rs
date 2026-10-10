@@ -2775,8 +2775,7 @@ impl Soc {
             // block ends, and the entering block provably ends within
             // entry..entry+64; scan_start bodies are hundreds of bytes).
             if !st.scan_armed
-                && (pc0.wrapping_sub(l.scan_start) < 64
-                    || pc1.wrapping_sub(l.scan_start) < 64)
+                && (pc0.wrapping_sub(l.scan_start) < 64 || pc1.wrapping_sub(l.scan_start) < 64)
             {
                 self.wifi_scan_begin();
                 st.scan_armed = true;
