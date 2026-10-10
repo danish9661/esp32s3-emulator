@@ -199,11 +199,11 @@ CASES=(
 "gdma_m2m||GDMA M2M PASS|"
 "full_load||FULL_LOAD PASS|150000000"
 "ota_slot||OTA SLOT TEST PASS|"
-  // ota_update asserts the WROTE prefix, not the exact byte count: the
-  // image size varies by build environment (absolute paths leak into
-  // build artifacts), so a fixed count is environmentally brittle
-  // (proven: CI wrote a different count than local). Booting the
-  // written image (SLOT1 ALIVE/DONE below) is the real proof.
+  # ota_update asserts the WROTE prefix, not the exact byte count: the
+  # image size varies by build environment (absolute paths leak into
+  # build artifacts), so a fixed count is environmentally brittle
+  # (proven: CI wrote a different count than local). Booting the
+  # written image (SLOT1 ALIVE/DONE below) is the real proof.
 "ota_update||OTA BEGIN 0;OTA WROTE;OTA END 0;OTA SETBOOT 0;OTA SLOT1 ALIVE;OTA SLOT1 DONE|350000000"
 "psram_qspi||PSRAM total=2097152;PSRAM RW OK;PSRAM PROBE PASS|"
 "psram_opi||PSRAM total=8388608;PSRAM RW OK;PSRAM PROBE PASS|"
