@@ -66,6 +66,7 @@ I32SHL, I32SHRS, I32SHRU, I32EQZ, I32NE, I32EQ = 0x74, 0x75, 0x76, 0x45, 0x47, 0
 I32LTU, I32LOAD8U = 0x49, 0x2C  # lt unsigned, load8_u
 I32LTS = 0x48  # lt signed (loop-closing)
 I32GEU = 0x4F  # ge unsigned (loop-closing)
+I32GES = 0x4E  # ge signed (branch family: bge/bgez/bgei)
 I32STORE8 = 0x3A  # store8
 GLG, GLS, UNREACH = 0x23, 0x24, 0x00  # global.get/set, unreachable
 I64OR, I64SHL, I64EXU = 0x84, 0x86, 0xAD

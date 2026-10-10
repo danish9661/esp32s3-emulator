@@ -67,8 +67,8 @@ class Sim:
             elif b in (0x41, 0x42):
                 self.skip_uleb()  # signed LEB: same skip shape
             elif b in (0x00, 0x0F, 0x1A, 0x1B, 0x45, 0x46, 0x47, 0x48, 0x49,
-                       0x4F, 0x6A, 0x6B, 0x6C, 0x71, 0x72, 0x73, 0x74, 0x75,
-                       0x76, 0x84, 0x86, 0xAD):
+                       0x4E, 0x4F, 0x6A, 0x6B, 0x6C, 0x71, 0x72, 0x73, 0x74,
+                       0x75, 0x76, 0x84, 0x86, 0xAD):
                 pass
             else:
                 raise AssertionError(f"skip: unknown op {b:#x} at +{self.pos - 1}")
@@ -201,7 +201,7 @@ class Sim:
                 if ok:
                     self.pop(I32)
                     self.st.append(I32)  # eqz
-            elif op in (0x46, 0x47, 0x48, 0x49, 0x4F):
+            elif op in (0x46, 0x47, 0x48, 0x49, 0x4E, 0x4F):
                 if ok:
                     self.pop(I32)
                     self.pop(I32)
@@ -233,6 +233,7 @@ CALLSIGS = {
     "spike_mmio.wasm": {0: (2, []), 1: (1, ["i32"])},
     "spike_poll.wasm": {0: (0, ["i32"]), 1: (1, [])},
     "spike_auto.wasm": {0: (1, []), 1: (1, ["i32"]), 2: (2, [])},
+    "dmem_kat.wasm": {0: (1, []), 1: (1, ["i32"]), 2: (2, [])},
     "spike_s4bridge.wasm": {0: (1, []), 1: (1, ["i32"]), 2: (2, []), 3: (0, ["i32"])},
 }
 
@@ -305,7 +306,7 @@ def check(path, funcs):
                     nloc += cnt
                 bodies.append((fbody[r:], nloc))
     if isinstance(funcs, tuple):
-        if name == "spike_auto.wasm":
+        if name in ("spike_auto.wasm", "spike_static.wasm"):
             # run() returns []; seg funcs return [i32] (next table slot).
             funcs = [(4, [])] + [(4, [I32])] * (len(bodies) - 1)
         else:
@@ -335,6 +336,9 @@ if __name__ == "__main__":
         "spike_poll.wasm": [(0, [I64])],
         "spike_windiff.wasm": [(3, [])],
         "spike_auto.wasm": (4, []),
+        "spike_static.wasm": (4, []),
+        "wcond_kat.wasm": (1, []),
+        "dmem_kat.wasm": (1, []),
         "spike_s4bridge.wasm": [(0, [I64])],
         "spike_diff.wasm": [(0, [])],
     }

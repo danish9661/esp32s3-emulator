@@ -14,18 +14,29 @@ import sys
 sys.path.insert(0, "/home/danish1075/Documents/esp32 s3 emu/tools/transpile_spike")
 from xwasm import (uleb, sleb, section, funcbody, I32C, I32ADD, I32SUB, I32LD, I32ST,
                    I32AND, I32OR, I32XOR, I32SHL, I32SHRU, I32SHRS,
-                   I32LOAD8U, I32EQ, I32NE, I32EQZ, GLG, GLS, UNREACH, END)
+                   I32LOAD8U, I32STORE8, I32EQ, I32NE, I32EQZ,
+                   I32LTS, I32LTU, I32GES, I32GEU,
+                   GLG, GLS, UNREACH, END)
+CALL = 0x10
 
 LG, LS, MUL, SELECT, IF = 0x20, 0x21, 0x6C, 0x1B, 0x04
 EMPTY = 0x40
 WOE_BIT, CI_SHIFT = 0x40000, 16
 FMIRR = 0x90000
 DRAM_BASE, DRAM_SIZE = 0x3FC80000, 0x80000
+IRAM_BASE, IRAM_SIZE = 0x40370000, 0x80000
+ROM_BASE, ROM_SIZE = 0x40000000, 0x60000
+# Static direct-memory module layout (static_func.py): AR phys [0,256),
+# then identity snapshots. Everything else -> soc imports (correct, slower).
+M_DRAM_OFF, M_IRAM_OFF, M_ROM_OFF = 0x10000, 0x90000, 0x110000
+M_PAGES = 0x21  # 0x210000: snapshots end 0x170000, shadow at 0x200000 + slack
 
 COVERED = {"movi", "movi_n", "mov_n", "addi", "addi_n", "addmi", "add", "add_n",
            "sub", "and", "or", "xor", "slli", "srli", "srai", "extui",
            "l8ui", "l32i", "l32i_n", "l32r", "s32i", "s32i_n", "s8i",
-           "bne", "beq", "beqz", "beqz_n", "bnez", "bltu", "bgeu",
+           "bne", "beq", "beqz", "beqz_n", "bnez", "bnez_n", "bltu", "bgeu",
+           "beqi", "bnei", "blt", "bge", "bltz", "bgez", "bgei", "bltui", "bgeui",
+           "ball", "bnall", "bany", "bnone", "bbc", "bbs", "bbci", "bbsi",
            "call4", "call8", "call12", "callx8", "entry", "retw", "retw_n",
            "jx", "j", "addx4", "blti", "wsr_ps", "rsr_ps", "rsr_prid", "rsil",
            "rsync", "memw", "isync", "esync", "dsync"}
@@ -100,30 +111,135 @@ def walu(opc, o, out):
         raise AssertionError(f"unwired alu {opc}")
 
 
+def _s32(v):
+    v &= 0xFFFFFFFF
+    return v - 0x100000000 if v & 0x80000000 else v
+
+
+# (regs, regs/imm) branch family: target operand index, mirroring exec.rs
+# exactly (order verified against trace JSON: o[0]=s reg, o[1]=t reg-or-imm,
+# o[2]=target; 2-op forms use o[1] as target). bt/bf need BR state (FPU
+# compares unwired) -> loud trap.
+BRANCH2 = ("beqz", "beqz_n", "bnez", "bnez_n", "bltz", "bgez", "bt", "bf")
+BRANCH3 = ("bne", "beq", "blt", "bge", "bltu", "bgeu", "beqi", "bnei",
+           "blti", "bgei", "bltui", "bgeui", "ball", "bnall", "bany",
+           "bnone", "bbc", "bbs", "bbci", "bbsi")
+
+
+def branch_taken_py(opc, o, R):
+    """Python-side taken-condition (trace verify + static analysis).
+    Returns (taken: bool, tgt: int). Mirrors exec.rs; regs are u32."""
+    if opc in BRANCH3:
+        b, tgt = o[1]["v"], o[2]["v"]
+        if opc == "bne":
+            return R[o[0]["v"]] != R[o[1]["v"]], tgt
+        if opc == "beq":
+            return R[o[0]["v"]] == R[o[1]["v"]], tgt
+        if opc == "blt":
+            return _s32(R[o[0]["v"]]) < _s32(R[o[1]["v"]]), tgt
+        if opc == "bge":
+            return _s32(R[o[0]["v"]]) >= _s32(R[o[1]["v"]]), tgt
+        if opc == "bltu":
+            return (R[o[0]["v"]] & 0xFFFFFFFF) < (R[o[1]["v"]] & 0xFFFFFFFF), tgt
+        if opc == "bgeu":
+            return (R[o[0]["v"]] & 0xFFFFFFFF) >= (R[o[1]["v"]] & 0xFFFFFFFF), tgt
+        if opc == "beqi":
+            return R[o[0]["v"]] == (b & 0xFFFFFFFF), tgt
+        if opc == "bnei":
+            return R[o[0]["v"]] != (b & 0xFFFFFFFF), tgt
+        if opc == "blti":
+            return _s32(R[o[0]["v"]]) < _s32(b), tgt
+        if opc == "bgei":
+            return _s32(R[o[0]["v"]]) >= _s32(b), tgt
+        if opc == "bltui":
+            return (R[o[0]["v"]] & 0xFFFFFFFF) < (b & 0xFFFFFFFF), tgt
+        if opc == "bgeui":
+            return (R[o[0]["v"]] & 0xFFFFFFFF) >= (b & 0xFFFFFFFF), tgt
+        if opc == "ball":
+            return (R[o[0]["v"]] & R[o[1]["v"]]) == (R[o[1]["v"]] & 0xFFFFFFFF), tgt
+        if opc == "bnall":
+            return (R[o[0]["v"]] & R[o[1]["v"]]) != (R[o[1]["v"]] & 0xFFFFFFFF), tgt
+        if opc == "bany":
+            return ((R[o[0]["v"]] & R[o[1]["v"]]) & 0xFFFFFFFF) != 0, tgt
+        if opc == "bnone":
+            return ((R[o[0]["v"]] & R[o[1]["v"]]) & 0xFFFFFFFF) == 0, tgt
+        if opc == "bbc":
+            return ((R[o[0]["v"]] >> (R[o[1]["v"]] & 31)) & 1) == 0, tgt
+        if opc == "bbs":
+            return ((R[o[0]["v"]] >> (R[o[1]["v"]] & 31)) & 1) == 1, tgt
+        if opc == "bbci":
+            return ((R[o[0]["v"]] >> (b & 31)) & 1) == 0, tgt
+        if opc == "bbsi":
+            return ((R[o[0]["v"]] >> (b & 31)) & 1) == 1, tgt
+    if opc in BRANCH2:
+        a, tgt = R[o[0]["v"]], o[1]["v"]
+        if opc in ("beqz", "beqz_n"):
+            return a == 0, tgt
+        if opc in ("bnez", "bnez_n"):
+            return a != 0, tgt
+        if opc == "bltz":
+            return _s32(a) < 0, tgt
+        if opc == "bgez":
+            return _s32(a) >= 0, tgt
+        raise AssertionError(f"{opc} needs BR state (unwired)")
+    raise AssertionError(f"not a branch: {opc}")
+
+
 def emit_branch_verify(opc, o, R, nxt, pc):
     """Trace-directed branch/jump check (no state change, no emission)."""
     assert nxt is not None, "span ends on control op"
-    if opc in ("bne", "beq", "beqz", "beqz_n", "bnez", "bltu", "bgeu"):
-        if opc in ("bne", "beq", "bltu", "bgeu"):
-            a, b, tgt = R[o[0]["v"]], R[o[1]["v"]], o[2]["v"]
-        else:
-            a, b, tgt = R[o[0]["v"]], 0, o[1]["v"]
-        taken = {"bne": a != b, "beq": a == b, "beqz": a == 0,
-                 "beqz_n": a == 0, "bnez": a != 0,
-                 "bltu": (a & 0xFFFFFFFF) < (b & 0xFFFFFFFF),
-                 "bgeu": (a & 0xFFFFFFFF) >= (b & 0xFFFFFFFF)}[opc]
+    if opc in BRANCH2 or opc in BRANCH3:
+        taken, tgt = branch_taken_py(opc, o, R)
         assert (nxt == tgt) == taken, f"branch {opc} diverged at {pc:#x}"
-    elif opc == "blti":
-        a, b, tgt = R[o[0]["v"]], o[1]["v"], o[2]["v"]
-        sa = a - 0x100000000 if a & 0x80000000 else a
-        sb = b - 0x100000000 if b & 0x80000000 else b
-        assert (nxt == tgt) == (sa < sb), f"blti diverged at {pc:#x}"
     elif opc == "jx":
         assert nxt == R[o[0]["v"]], f"jx diverged at {pc:#x}"
     elif opc == "j":
         assert nxt == o[0]["v"], f"j diverged at {pc:#x}"
     else:
         raise AssertionError(f"not a branch: {opc}")
+
+
+def wcond(opc, o):
+    """Runtime branch taken-condition from live regs; leaves i32 nonzero
+    iff the branch WOULD take (loop-closing + static both-ways). Mirrors
+    branch_taken_py arm-for-arm (exec.rs ground truth)."""
+    if opc in ("bne", "beq", "blt", "bge", "bltu", "bgeu"):
+        a, b = wld(o[0]["v"]), wld(o[1]["v"])
+        op = {"bne": I32NE, "beq": I32EQ, "blt": I32LTS, "bge": I32GES,
+              "bltu": I32LTU, "bgeu": I32GEU}[opc]
+        return a + b + bytearray([op])
+    if opc in ("beqi", "bnei", "blti", "bgei", "bltui", "bgeui"):
+        op = {"beqi": I32EQ, "bnei": I32NE, "blti": I32LTS, "bgei": I32GES,
+              "bltui": I32LTU, "bgeui": I32GEU}[opc]
+        return wld(o[0]["v"]) + C(o[1]["v"]) + bytearray([op])
+    if opc in ("ball", "bnall"):
+        # (s&t)==t / !=t: recompute t (loads are pure, no temps needed).
+        base = wld(o[0]["v"]) + wld(o[1]["v"]) + bytearray([I32AND])
+        op = I32EQ if opc == "ball" else I32NE
+        return base + wld(o[1]["v"]) + bytearray([op])
+    if opc == "bany":
+        return wld(o[0]["v"]) + wld(o[1]["v"]) + bytearray([I32AND])
+    if opc == "bnone":
+        return wld(o[0]["v"]) + wld(o[1]["v"]) + bytearray([I32AND, I32EQZ])
+    if opc in ("bbc", "bbs"):
+        base = (wld(o[0]["v"]) + wld(o[1]["v"]) + C(31) + bytearray([I32AND])
+                + bytearray([I32SHRU]) + C(1) + bytearray([I32AND]))
+        return base if opc == "bbs" else base + bytearray([I32EQZ])
+    if opc in ("bbci", "bbsi"):
+        base = (wld(o[0]["v"]) + C(o[1]["v"]) + C(31) + bytearray([I32AND])
+                + bytearray([I32SHRU]) + C(1) + bytearray([I32AND]))
+        return base if opc == "bbsi" else base + bytearray([I32EQZ])
+    if opc == "bltz":
+        return wld(o[0]["v"]) + C(0) + bytearray([I32LTS])
+    if opc == "bgez":
+        return wld(o[0]["v"]) + C(0) + bytearray([I32GES])
+    if opc in ("bnez", "bnez_n"):
+        # Taken iff a != 0 (!!x; single EQZ inverts the loop).
+        return wld(o[0]["v"]) + bytearray([I32EQZ, I32EQZ])
+    if opc in ("beqz", "beqz_n"):
+        return wld(o[0]["v"]) + bytearray([I32EQZ])
+    raise AssertionError(f"wcond unwired (needs BR state): {opc}")
+
 
 
 def emit_call(out, opc, o, R, nxt, pc, length):
@@ -156,7 +272,7 @@ def emit_entry(out, o):
     out += bytearray([I32SHL, I32OR, GLS, 1, LG, 1, GLS, 0])
 
 
-def emit_retw(out, nxt, R):
+def emit_retw(out, nxt, R, skip_tail=False):
     out += woe_check()
     out += wld(0) + bytearray([LS, 0])
     out += bytes([LG, 0]) + C(30) + bytearray([I32SHRU, LS, 1])
@@ -178,6 +294,11 @@ def emit_retw(out, nxt, R):
             + bytearray([I32SHL]) + C(-1) + bytearray([I32XOR, I32AND, GLS, 1]))
     out += (bytearray(bytes([GLG, 0])) + bytes([LG, 1]) + bytearray([I32SUB])
             + C(15) + bytearray([I32AND, GLS, 0]))
+    # Static tail-call/leaf use (static_func.py): the return ADDRESS is
+    # dynamic (a0) and the run ends at HALT, so only the unrotation above
+    # matters; skip the reconstructed-target store + assert.
+    if skip_tail:
+        return
     assert nxt is not None, "span ends on control op"
     top = (nxt & 0xC0000000) & 0xFFFFFFFF
     out += C(1024) + C(top) + bytes([LG, 0]) + C(0x3FFFFFFF)
@@ -377,3 +498,68 @@ def slot_store(eff, val, width, fwd, span):
 
 if __name__ == "__main__":
     main()
+
+
+# Static direct-memory access (static_func.py): runtime eff -> region
+# dispatch. In [eff] (dload) or [val, eff]?? Convention: caller leaves [eff]
+# (dload) or computes [val] then [eff] (dstore pushes val first, stashed to
+# t0). Scratch locals t2 (eff) + t0 (val); seg funcs have 3 locals, none
+# used by straight-line shapes. DRAM/IRAM/ROM snapshots preloaded at the
+# M_*_OFF layout; everything else (MMIO, PSRAM window, RTC, flash windows)
+# goes through the soc imports (correct, slower). ROM stores route to the
+# import too (soc drops them; the snapshot stays pristine = silicon-true).
+TRAP_I, RD_I, WR_I = 0x00, 0x01, 0x02
+ELSE = 0x05
+
+
+def _region_arms(make_body):
+    """Nested IF/ELSE dispatch over (DRAM, IRAM, ROM, import-else).
+    make_body(base, off, is_rom) -> bytearray for one direct arm.
+    Stack discipline: each arm leaves [] (stores results to t0 itself)."""
+    out = bytearray()
+    for i, (base, size, off, is_rom) in enumerate((
+            (DRAM_BASE, DRAM_SIZE, M_DRAM_OFF, False),
+            (IRAM_BASE, IRAM_SIZE, M_IRAM_OFF, False),
+            (ROM_BASE, ROM_SIZE, M_ROM_OFF, True))):
+        out += bytes([LG, 2]) + C(base) + bytearray([I32SUB])
+        out += C(size) + bytearray([I32LTU, IF, EMPTY])
+        out += make_body(base, off, is_rom)
+        out += bytes([ELSE])
+    out += bytes([LG, 2])  # import-else leg (also triggered for ROM stores)
+    return out
+
+
+def dload(width):
+    """Emit direct-memory load. In: [eff]. Out: [val]."""
+    ld = bytes([I32LD]) + uleb(2) + uleb(0) if width == 4 else bytes([I32LOAD8U]) + uleb(0) + uleb(0)
+
+    def arm(base, off, is_rom):
+        return (bytes([LG, 2]) + C(base) + bytearray([I32SUB])
+                + C(off) + bytearray([I32ADD]) + bytearray(ld)
+                + bytes([LS, 0]))
+    out = bytearray(bytes([LS, 2]))  # t2 = eff
+    out += _region_arms(arm)
+    # import-else: val = soc_read32(eff).
+    out += bytes([CALL, RD_I, LS, 0])
+    out += bytes([END, END, END])
+    out += bytes([LG, 0])
+    return out
+
+
+def dstore(width):
+    """Emit direct-memory store. In: [val, eff]. Out: []."""
+    st = bytes([I32ST]) + uleb(2) + uleb(0) if width == 4 else bytes([I32STORE8]) + uleb(0) + uleb(0)
+
+    def arm(base, off, is_rom):
+        if is_rom:
+            # Silicon drops ROM writes: route through the import (faithful),
+            # keeping the snapshot pristine for later direct reads.
+            return bytes([LG, 2, LG, 0, CALL, WR_I])
+        return (bytes([LG, 2]) + C(base) + bytearray([I32SUB])
+                + C(off) + bytearray([I32ADD]) + bytes([LG, 0]) + bytearray(st))
+    out = bytearray(bytes([LS, 2, LS, 0]))  # t2 = eff, t0 = val; []
+    out += _region_arms(arm)
+    # import-else: soc_write32(eff, val) ([eff] already stacked by the tail).
+    out += bytes([LG, 0, CALL, WR_I])
+    out += bytes([END, END, END])
+    return out

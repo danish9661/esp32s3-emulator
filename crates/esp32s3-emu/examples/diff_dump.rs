@@ -90,7 +90,7 @@ fn main() {
         return;
     }
     let steps: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(60);
-    let skip: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let skip_arg = args.get(3).cloned().unwrap_or_default();
     let flash = std::fs::read(&path).expect("read flash image");
     let watch: u32 = args
         .get(4)
@@ -98,6 +98,30 @@ fn main() {
         .unwrap_or(0);
     let mut m = Esp32S3::new();
     m.boot_from_flash(&flash);
+    // Skip phase: count, func:<entry> (scan to entry, S4 static pairing),
+    // or watch-break. TEMP-DIFF scaffolding.
+    let func_entry: Option<u32> = skip_arg
+        .strip_prefix("func:")
+        .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+    let skip: usize = if func_entry.is_none() {
+        skip_arg.parse().unwrap_or(0)
+    } else {
+        0
+    };
+    if let Some(entry) = func_entry {
+        // Scan (cap 200M) until core0 pc == entry; the trace below then
+        // captures that dynamic execution for static-vs-dynamic pairing.
+        // Loud fail if never reached (wrong entry for this image).
+        let mut found = false;
+        for _ in 0..200_000_000 {
+            if m.cpu[0].pc == entry {
+                found = true;
+                break;
+            }
+            let _ = m.step();
+        }
+        assert!(found, "TEMP-DIFF: func entry {:#x} never reached", entry);
+    }
     // Dynamic function discovery: histogram of executed ENTRY pcs.
     use std::collections::HashMap;
     let mut funcs: HashMap<u32, usize> = HashMap::new();
@@ -138,6 +162,10 @@ fn main() {
         regs0[r as usize] = m.cpu[0].reg(r);
     }
     let wb0 = m.cpu[0].windowbase();
+    // Entry PS/WINDOWSTART for static ENTRY (MUST be pre-trace: post-trace
+    // reads reflect span-end windows, proven by the 0x15-vs-0x55 incident).
+    let ps0 = m.cpu[0].sreg(230);
+    let ws0 = m.cpu[0].sreg(73);
     // Full phys file BEFORE the span (execution reads outside the start
     // window: saved ras/spills. Cloned pre-loop: the stepping loop needs
     // &mut m, so the borrow cannot be held).
@@ -244,6 +272,8 @@ fn main() {
     let wb1 = m.cpu[0].windowbase();
     println!("\"regs0\": {:?},", regs0);
     println!("\"phys0\": {:?},", phys0.as_slice());
+    // Entry PS/WINDOWSTART (static ENTRY needs the caller's CALLINC).
+    println!("\"ps0\": {}, \"ws0\": {},", ps0, ws0);
     // Entry-pc histogram (dynamic function discovery).
     let mut hist: Vec<(u32, usize)> = funcs.into_iter().collect();
     hist.sort_by_key(|(_, c)| core::cmp::Reverse(*c));
@@ -313,6 +343,32 @@ fn main() {
             pfirst = false;
             print!("[{}, {}, {}]", 4 * i, b, a);
         }
+    }
+    // TEMP-SFUNC static preload: full DRAM + IRAM + ROM snapshots (the
+    // static emitter identity-loads them into module memory; only func:
+    // mode needs them, but printing unconditionally keeps one code path —
+    // traces stay small because most words print once here, not per step).
+    // Sizes: DRAM/IRAM 512KB, IROM 384KB (wordwise via the Bus).
+    print!("], \"fulldram\": [");
+    for i in 0..0x80000 / 4 {
+        if i > 0 {
+            print!(",");
+        }
+        print!("{}", m.soc.read32(0x3FC8_0000 + i as u32 * 4));
+    }
+    print!("], \"fulliram\": [");
+    for i in 0..0x80000 / 4 {
+        if i > 0 {
+            print!(",");
+        }
+        print!("{}", m.soc.read32(0x4037_0000 + i as u32 * 4));
+    }
+    print!("], \"fullrom\": [");
+    for i in 0..0x60000 / 4 {
+        if i > 0 {
+            print!(",");
+        }
+        print!("{}", m.soc.read32(0x4000_0000 + i as u32 * 4));
     }
     println!("]}}");
 }

@@ -17,7 +17,8 @@ from xwasm import (uleb, sleb, section, exports, funcbody, I32C, I32ADD,
                    I32GEU, I32LTS, GLG, GLS, UNREACH, END)
 from windiff import (C, wld, wst, wphys, woe_check, walu, slot_load, slot_store,
                      emit_branch_verify, emit_call, emit_entry, emit_retw,
-                     emit_special, COVERED, DRAM_BASE, DRAM_SIZE, FMIRR,
+                     emit_special, branch_taken_py, wcond, BRANCH2, BRANCH3,
+                     COVERED, DRAM_BASE, DRAM_SIZE, FMIRR,
                      LG, LS, MUL, SELECT, IF, EMPTY, WOE_BIT, CI_SHIFT)
 from autodiff import is_mmio, TRAP_I, RD_I, WR_I  # noqa: F401 (contract below)
 
@@ -25,23 +26,6 @@ CALL, RET, CALL_IND, BRIF = 0x10, 0x0F, 0x11, 0x0D
 BLOCK, LOOP = 0x02, 0x03
 HALT = 0xFFFFFFFF
 SHADOW_BASE = 0x200000
-
-
-def wcond(opc, o):
-    """Runtime branch condition from live regs (loop-closing); leaves i32."""
-    if opc in ("bne", "beq", "bltu", "bgeu"):
-        a, b = wld(o[0]["v"]), wld(o[1]["v"])
-        op = {"bne": I32NE, "beq": I32EQ, "bltu": I32LTU, "bgeu": I32GEU}[opc]
-        return a + b + bytearray([op])
-    if opc == "blti":
-        return wld(o[0]["v"]) + C(o[1]["v"]) + bytearray([I32LTS])
-    if opc in ("bnez",):
-        # Taken iff a != 0 (continue-iff-taken): double-eqz (!!x).
-        # A single EQZ inverts the loop (proven by spanLoop exiting after
-        # 1 iteration with a7=0x11503 instead of running 71k to zero).
-        return wld(o[0]["v"]) + bytearray([I32EQZ, I32EQZ])
-    # beqz/beqz_n.
-    return wld(o[0]["v"]) + bytearray([I32EQZ])
 
 
 def ssp_push(idval):
@@ -74,8 +58,8 @@ def main():
         if s["opc"] in ("call4", "call8", "call12", "callx8") and i + 1 < len(steps):
             starts.add(i + 1)
     for i, s in enumerate(steps):
-        if s["opc"] in ("bne", "beq", "beqz", "beqz_n", "bnez", "bltu", "bgeu",
-                         "blti", "jx", "j") and i + 1 < len(steps):
+        if (s["opc"] in BRANCH2 or s["opc"] in BRANCH3
+                or s["opc"] in ("jx", "j")) and i + 1 < len(steps):
             starts.add(i + 1)
     for i, s in enumerate(steps):
         if s["opc"] in ("retw", "retw_n") and i + 1 < len(steps):
@@ -96,8 +80,8 @@ def main():
     # All hits of one site must share the target (else irreducible: loud).
     br_hits = {}
     for i, s_ in enumerate(steps):
-        if s_["opc"] in ("bne", "beq", "beqz", "beqz_n", "bnez", "bltu", "bgeu",
-                          "blti", "jx", "j"):
+        if (s_["opc"] in BRANCH2 or s_["opc"] in BRANCH3
+                or s_["opc"] in ("jx", "j")):
             br_hits.setdefault(s_["pc"], []).append(i)
     # Pairing pre-pass: match each call with its in-trace retw (by return
     # pc) and vice versa. Dangling calls (no return in trace) push nothing;
@@ -138,18 +122,15 @@ def main():
             R = s_["regs"]
             if opc in COVERED and opc not in ("l8ui", "l32i", "l32i_n", "l32r",
                                               "s32i", "s32i_n", "s8i"):
-                if opc in ("bne", "beq", "beqz", "beqz_n", "bnez", "bltu", "bgeu",
-                           "blti", "jx", "j"):
+                if opc in BRANCH2 or opc in BRANCH3 or opc in ("jx", "j"):
                     # Trace-directed: taken-ness known statically (verified);
                     # return the executed target's seg.
-                    if opc in ("bne", "beq", "bltu", "bgeu"):
-                        a, b, tgt = R[o[0]["v"]], R[o[1]["v"]], o[2]["v"]
-                    elif opc == "blti":
-                        a, b, tgt = R[o[0]["v"]], o[1]["v"], o[2]["v"]
-                    elif opc == "jx":
+                    if opc == "jx":
                         tgt = R[o[0]["v"]]
+                    elif opc == "j":
+                        tgt = o[0]["v"]
                     else:
-                        tgt = o[0]["v"] if opc == "j" else o[1]["v"]
+                        _, tgt = branch_taken_py(opc, o, R)
                     emit_branch_verify(opc, o, R, nxt, s_["pc"])
                     assert (si + 1) in seg_id_of_pos, "fall-through must start a seg"
                     ft_seg = seg_id_of_pos[si + 1]
@@ -172,17 +153,12 @@ def main():
                         if len(hits) > 1:
                             for h in hits:
                                 ht = steps[h]
-                                if ht["opc"] in ("bne", "beq", "bltu", "bgeu"):
-                                    ha, hb = ht["regs"][ht["opnds"][0]["v"]], ht["regs"][ht["opnds"][1]["v"]]
-                                    htg = ht["opnds"][2]["v"]
-                                elif ht["opc"] == "blti":
-                                    ha, hb, htg = ht["regs"][ht["opnds"][0]["v"]], ht["opnds"][1]["v"], ht["opnds"][2]["v"]
-                                elif ht["opc"] in ("jx",):
+                                if ht["opc"] in ("jx",):
                                     htg = ht["regs"][ht["opnds"][0]["v"]]
                                 elif ht["opc"] == "j":
                                     htg = ht["opnds"][0]["v"]
                                 else:
-                                    ha, hb, htg = ht["regs"][ht["opnds"][0]["v"]], 0, ht["opnds"][1]["v"]
+                                    _, htg = branch_taken_py(ht["opc"], ht["opnds"], ht["regs"])
                                 assert htg == tgt, f"phase-ordered loop at {s_['pc']:#x}"
                             assert last + 1 < len(steps), "loop at trace end"
                             ft_seg = seg_id_of_pos[last + 1]
