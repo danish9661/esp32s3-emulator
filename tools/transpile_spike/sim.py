@@ -339,6 +339,7 @@ if __name__ == "__main__":
         "spike_static.wasm": (4, []),
         "wcond_kat.wasm": (1, []),
         "dmem_kat.wasm": (1, []),
+        "movcc_kat.wasm": (1, []),
         "spike_s4bridge.wasm": [(0, [I64])],
         "spike_diff.wasm": [(0, [])],
     }

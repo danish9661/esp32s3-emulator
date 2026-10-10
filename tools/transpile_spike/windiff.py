@@ -35,6 +35,7 @@ COVERED = {"movi", "movi_n", "mov_n", "addi", "addi_n", "addmi", "add", "add_n",
            "sub", "and", "or", "xor", "slli", "srli", "srai", "extui",
            "l8ui", "l32i", "l32i_n", "l32r", "s32i", "s32i_n", "s8i",
            "bne", "beq", "beqz", "beqz_n", "bnez", "bnez_n", "bltu", "bgeu",
+           "moveqz", "movnez", "movltz", "movgez",
            "beqi", "bnei", "blt", "bge", "bltz", "bgez", "bgei", "bltui", "bgeui",
            "ball", "bnall", "bany", "bnone", "bbc", "bbs", "bbci", "bbsi",
            "call4", "call8", "call12", "callx8", "entry", "retw", "retw_n",
@@ -94,6 +95,18 @@ def walu(opc, o, out):
         out += wst(d, wld(o[1]["v"]) + wld(o[2]["v"]) + bytes([I32AND]))
     elif opc == "or":
         out += wst(d, wld(o[1]["v"]) + wld(o[2]["v"]) + bytes([I32OR]))
+    elif opc in ("moveqz", "movnez", "movltz", "movgez"):
+        # Conditional AR move (exec.rs: if t-cond then d = s). SELECT with
+        # the old dest as false-arm (loads are pure, no temps needed).
+        cond = {"moveqz": I32EQZ, "movnez": None, "movltz": I32LTS,
+                "movgez": I32GES}[opc]
+        if opc == "movnez":
+            tst = wld(o[2]["v"]) + bytearray([I32EQZ, I32EQZ])
+        elif opc in ("movltz", "movgez"):
+            tst = wld(o[2]["v"]) + C(0) + bytearray([cond])
+        else:
+            tst = wld(o[2]["v"]) + bytearray([cond])
+        out += wst(d, wld(o[1]["v"]) + wld(d) + tst + bytearray([SELECT]))
     elif opc == "xor":
         out += wst(d, wld(o[1]["v"]) + wld(o[2]["v"]) + bytes([I32XOR]))
     elif opc == "slli":
