@@ -158,7 +158,7 @@ CASES=(
 "emmc||EMMC RPMB PASS;EMMC PASS;EMMC DONE|"
 "emmc_driver||EMMC DRIVER BEGIN OK;EMMC DRIVER FAT READ PASS;EMMC DRIVER FAT WRITE PASS;EMMC DRIVER DONE|60000000"
 "usb_host||USB HOST PORT OK;USB HOST DESC OK;USB HOST CFG OK;USB HOST STR OK;USB HOST SOF OK;USB HOST ENUM PASS;USB HOST DONE|"
-"wifi_scan|WIFI_SCAN_FIXTURE=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55|WIFI SCAN found 1;WIFI NET 0 EmuNet;WIFI SCAN DONE|60000000"
+"wifi_scan|WIFI_SCAN_FIXTURE=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55|WIFI SCAN START;WiFi scan dwell armed;SCAN_DONE posted;WIFI SCAN DONE|60000000"
 "wifi_sta|WIFI_STA_CONN=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55|WIFI STA status 3;WIFI STA IP 192.168.4.2;WIFI STA SSID EmuNet;WIFI STA after-disconnect 6;WIFI STA DONE|150000000"
 "test_worker_net|WIFI_STA_CONN=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55|WORKER NET START;WORKER NET status 3;WORKER NET netif 1;WORKER NET tx1 -11;WORKER NET tx2 -12;WORKER NET keep 14;WORKER NET rx1 1 -13;WORKER NET rx2 1 -14;WORKER NET DONE|350000000"
 "test_worker_net_inwasm|NODE:tools/wifi_harness.mjs|WIFI WORKER NET HARNESS PASS||esp32s3_test_worker_net/esp32s3_test_worker_net.merged.bin"
@@ -220,6 +220,12 @@ CASES=(
 "gdb|NODE:tools/gdb_harness.mjs|GDB HARNESS PASS||esp32s3_hello/esp32s3_hello.merged.bin"
 "micropython|NODE:tools/micropython_harness.mjs|MICROPYTHON HARNESS PASS|"
 "coex|WIFI_STA_CONN=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55|COEX START;COEX wifi status 3;COEX wifi ip 192.168.4.2;COEX ble adv 1;COEX wifi 1 ble 1;COEX PASS;COEX DONE|250000000"
+# TEMP-DIAG entries (2026-10-10, DELETE after CI-only wifi_scan stall is
+# root-caused — see the wifi_scan_s* variant mapping above). Appended
+# last so existing shard indices never shift.
+"wifi_scan_s1|WIFI_SCAN_FIXTURE=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55|WIFI SCAN START;WiFi scan dwell armed|60000000"
+"wifi_scan_s2|WIFI_SCAN_FIXTURE=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55|SCAN_DONE posted|60000000"
+"wifi_scan_s3|WIFI_SCAN_FIXTURE=1 WIFI_SCAN_APS=EmuNet,-50,6,02:11:22:33:44:55|WIFI SCAN DONE|60000000"
 )
 
 pass=0; fail=0; skipped=0
@@ -303,6 +309,12 @@ for c in "${CASES[@]}"; do
     psram_16m) srcdir="$SK/esp32s3_psram"; fqbn="$fqbn:PSRAM=opi"; bin="$srcdir/esp32s3_psram_16m.merged.bin"; inobin="esp32s3_psram.ino.merged.bin";;
     hello_opi) srcdir="$SK/esp32s3_hello"; fqbn="$fqbn:FlashMode=opi,PSRAM=opi"; bin="$srcdir/esp32s3_hello_opi.merged.bin"; inobin="esp32s3_hello.ino.merged.bin";;
     touch_denoise) srcdir="$SK/esp32s3_touch"; bin="$srcdir/esp32s3_touch.merged.bin"; inobin="esp32s3_touch.ino.merged.bin";;
+    # TEMP-DIAG wifi_scan pipeline stages (2026-10-10, DELETE after the
+    # CI-only wifi_scan stall is root-caused): each entry asserts ONE
+    # stage so its PASS/FAIL pinpoints the miss (arming / dwell-fire /
+    # setup-complete). Self-building variants of the wifi_scan sketch
+    # (own srcdir mapping so any shard VM builds them).
+    wifi_scan_s1|wifi_scan_s2|wifi_scan_s3) srcdir="$SK/esp32s3_wifi_scan"; bin="$srcdir/esp32s3_wifi_scan.merged.bin"; inobin="esp32s3_wifi_scan.ino.merged.bin";;
     flashenc) srcdir="$SK/esp32s3_hello"; bin="$srcdir/esp32s3_hello.merged.bin"; inobin="esp32s3_hello.ino.merged.bin";;
     rsa) srcdir="$SK/esp32s3_rsa/esp32s3_rsa_poke"; bin="$srcdir/esp32s3_rsa_poke.merged.bin"; inobin="esp32s3_rsa_poke.ino.merged.bin";;
   esac
