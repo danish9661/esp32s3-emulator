@@ -316,6 +316,11 @@ def main():
     print(f"windiff: {len(mod)} bytes, {len(steps)} ops, {len(baked)} baked")
 
 
+# Per-(slot, byte) oracle knowledge (merge model: bake what's known, assert
+# what's needed; unobserved bytes are never read by construction).
+_KNOWN = set()
+
+
 def slot_load(t, eff, width, reads, fwd, baked, slot_next):
     effw = eff & ~3
     if effw in fwd and fwd[effw] < FMIRR:
@@ -324,18 +329,23 @@ def slot_load(t, eff, width, reads, fwd, baked, slot_next):
         if effw not in fwd:
             sl = slot_next[0]
             slot_next[0] += 4
-            w = 0
-            for b in range(4):
-                k1, k4 = (effw + b, 1), (effw, 4)
-                if k1 in reads:
-                    w |= (reads[k1] & 0xFF) << (8 * b)
-                elif k4 in reads:
-                    w |= ((reads[k4] >> (8 * b)) & 0xFF) << (8 * b)
-                else:
-                    raise AssertionError(f"no oracle byte for {effw + b:#x}")
             fwd[effw] = sl
-            baked[sl] = w & 0xFFFFFFFF
-        base = C(fwd[effw])
+            baked[sl] = 0
+        sl = fwd[effw]
+        w = baked[sl]
+        for b in range(4):
+            k1, k4 = (effw + b, 1), (effw, 4)
+            if k1 in reads:
+                w = (w & ~(0xFF << (8 * b))) | ((reads[k1] & 0xFF) << (8 * b))
+                _KNOWN.add((sl, b))
+            elif k4 in reads:
+                w = (w & ~(0xFF << (8 * b))) | (((reads[k4] >> (8 * b)) & 0xFF) << (8 * b))
+                _KNOWN.add((sl, b))
+        baked[sl] = w & 0xFFFFFFFF
+        need = range(4) if width == 4 else [(eff & 3)]
+        missing = [b for b in need if (sl, b) not in _KNOWN]
+        assert not missing, f"no oracle byte for {eff:#x} (missing {missing})"
+        base = C(sl)
     if width == 4:
         assert (eff & 3) == 0
         return wst(t, base + bytearray(bytes([I32LD]) + uleb(2) + uleb(0)))
