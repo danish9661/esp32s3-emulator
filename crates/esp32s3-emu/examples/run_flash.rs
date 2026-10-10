@@ -2139,8 +2139,17 @@ fn main() {
             } else {
                 &SCAN_LAYOUT
             };
+            // Range match, not exact-pc (2026-10-10, CI hardening): the
+            // post-step poll observes block-END pcs, and branch-inclusive
+            // blocks run THROUGH calls, so an exact entry pc is observed
+            // only on 16-op-cap alignment luck. The entering block
+            // provably ends within entry..entry+64 (16 ops x 4B max
+            // width), and scan_start's body is 364B (nm), so the window
+            // is airtight with zero bleed into neighbors. Idempotent via
+            // the armed latch below.
             if !wifi_scan_armed
-                && (m.cpu[0].pc == layout.scan_start || m.cpu[1].pc == layout.scan_start)
+                && (m.cpu[0].pc.wrapping_sub(layout.scan_start) < 64
+                    || m.cpu[1].pc.wrapping_sub(layout.scan_start) < 64)
             {
                 m.soc.wifi_scan_begin();
                 wifi_scan_armed = true;

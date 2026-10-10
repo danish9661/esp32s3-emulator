@@ -2770,7 +2770,14 @@ impl Soc {
         // — Scan leg: arm the dwell at `esp_wifi_scan_start`; on elapse,
         // stage the count cell + post the REAL SCAN_DONE esp_event. —
         if !st.scan_done {
-            if !st.scan_armed && (pc0 == l.scan_start || pc1 == l.scan_start) {
+            // Range match, not exact-pc (2026-10-10, CI hardening — same
+            // rationale as the run_flash host-side leg: post-step observes
+            // block ends, and the entering block provably ends within
+            // entry..entry+64; scan_start bodies are hundreds of bytes).
+            if !st.scan_armed
+                && (pc0.wrapping_sub(l.scan_start) < 64
+                    || pc1.wrapping_sub(l.scan_start) < 64)
+            {
                 self.wifi_scan_begin();
                 st.scan_armed = true;
                 dirty = true;
