@@ -652,6 +652,19 @@ pub struct Soc {
     cached_rb: u32,
     /// Whether `cached_rb` is current (same invalidation as `src_valid`).
     rb_valid: bool,
+    /// Fetch TLB (speed): 64-entry direct-mapped page cache for instruction
+    /// fetch (`Bus::fetch32`). Entry = (page tag, gen, backing, base):
+    /// backing 1 = sram, 2 = iram0, 3 = irom, 4 = flash (raw offset).
+    /// Only run-static translations (SRAM/IROM) and MMU-stable flash pages
+    /// are filled; PSRAM/RTC/MMIO/unmapped never fill (slow path). Flash
+    /// fills are skipped while flash encryption is on (decrypt state).
+    /// `fetch_gen` invalidates everything at once; bumped on every MMU
+    /// write, MEMSPI flash write, rom-boot-mode flip, flashenc-mirror
+    /// refresh, and boot (loader writes). SRAM code pages are NOT flushed
+    /// on RAM writes — same documented no-SMC contract as the fast_len
+    /// block cache (no in-tree firmware self-modifies executed code).
+    fetch_tlb: [(u32, u32, u8, u32); 64],
+    fetch_gen: u32,
 
     /// Emulated-clock mode for the web UI speed control (browser only;
     /// native battery/run_flash keep the default 0):
@@ -878,6 +891,9 @@ impl Soc {
             loader_scratch_len: 0x6_0000,
             cached_src: 0,
             src_valid: false,
+            fetch_tlb: [(0, 0, 0, 0); 64],
+            // Nonzero so zeroed entries (gen 0) can never match.
+            fetch_gen: 1,
             cached_rb: 0,
             rb_valid: false,
             clock_mode: 0,
@@ -1019,6 +1035,7 @@ impl Soc {
     /// mirror can never go stale (firmware provisions HMAC keys at
     /// runtime through the same registers).
     fn refresh_flashenc_mirror(&mut self) {
+        self.bump_fetch_gen();
         let key = self.flash_enc_enabled().then(|| self.flash_xts_key());
         for m in self.memspi.iter_mut() {
             m.set_flashenc(key);
@@ -4823,6 +4840,7 @@ impl Soc {
     /// Set/clear the ROM-boot phase flag (machine boot/stub handoff).
     pub fn set_rom_boot_mode(&mut self, on: bool) {
         self.rom_boot_mode = on;
+        self.bump_fetch_gen();
     }
 
     /// Advance timer groups by `cycles` (frontend time source).
@@ -5181,6 +5199,95 @@ impl Soc {
 
     /// Byte read through a cache window (data or instruction), translated by
     /// the cache MMU to flash (read-only) or PSRAM (read-write) backing.
+    /// Fetch-TLB generation bump: invalidates every cached fetch page at
+    /// once. Called on MMU writes, MEMSPI flash writes, rom-boot-mode
+    /// flips, flashenc-mirror refreshes, and boot (loader writes).
+    pub fn bump_fetch_gen(&mut self) {
+        self.fetch_gen = self.fetch_gen.wrapping_add(1);
+    }
+
+    /// Classify a 4KB-aligned fetch page for the TLB. Returns
+    /// (backing, base) with backing 1 = sram, 2 = iram0, 3 = irom,
+    /// 4 = flash, or None (slow path: PSRAM/RTC/MMIO/unmapped, encrypted
+    /// flash, or a page straddling a mapping seam). Mirrors `read32`'s
+    /// slow-path routing exactly, page-granular: every byte of a filled
+    /// page reads the same backing it would through `cache_read8`/`ram8`.
+    fn fetch_classify(&self, page: u32) -> Option<(u8, u32)> {
+        // Page must sit fully inside one region (all region sizes are 4KB
+        // multiples, so start-inside implies full containment — verified
+        // explicitly below anyway).
+        let end = page.wrapping_add(0x1000);
+        if page >= IROM_BASE && end <= IROM_BASE + IROM_SIZE {
+            return Some((3, page - IROM_BASE));
+        }
+        if page >= DRAM_BASE && end <= DRAM_BASE + SRAM_BASE_RANGE {
+            return Some((1, page - DRAM_BASE));
+        }
+        if page >= IRAM_BASE && end <= IRAM_BASE + IRAM_WINDOW_SIZE {
+            let o = page - IRAM_BASE;
+            if o + 0x1000 <= SRAM0_SIZE {
+                return Some((2, o));
+            }
+            if o >= SRAM0_SIZE {
+                // DIRAM part (same mapping as `ram8`'s else arm and the
+                // aligned `read32` path).
+                let b = DIRAM_DATA_BASE - DRAM_BASE + (page - DIRAM_INST_BASE);
+                if b + 0x1000 <= SRAM_BYTES as u32 {
+                    return Some((1, b));
+                }
+            }
+            // Straddles the iram0/DIRAM seam: per-byte routing differs.
+            return None;
+        }
+        if (page >= FLASH_DATA_BASE && end <= FLASH_DATA_BASE + FLASH_WINDOW_SIZE)
+            || (page >= FLASH_INST_BASE && end <= FLASH_INST_BASE + FLASH_WINDOW_SIZE)
+        {
+            // Encrypted devices: decrypt state lives outside the TLB.
+            if self.flash_enc_enabled() {
+                return None;
+            }
+            let off = page & (FLASH_WINDOW_SIZE - 1);
+            if self.rom_boot_mode {
+                // Loader scratch is MMU-routed even in ROM-boot mode; a
+                // page straddling the scratch edge routes per byte.
+                let scratch_end = LOADER_SCRATCH_OFF + self.loader_scratch_len;
+                let in_scratch = off >= LOADER_SCRATCH_OFF && off + 0x1000 <= scratch_end;
+                let out_scratch = off + 0x1000 <= LOADER_SCRATCH_OFF || off >= scratch_end;
+                if !in_scratch && !out_scratch {
+                    return None;
+                }
+                if out_scratch {
+                    // Raw 1:1 flash alias (same as `cache_read8` ROM-boot arm).
+                    if off + 0x1000 <= FLASH_SIZE {
+                        return Some((4, off));
+                    }
+                    return None;
+                }
+            }
+            match self.cache.translate(page) {
+                // One 4KB CPU page never straddles 64KB MMU entries, so the
+                // translated run is contiguous; PSRAM stays uncached (written
+                // through `cache_write8`, which has no TLB invalidation).
+                Some(CacheTarget::Flash(fo)) if fo + 0x1000 <= FLASH_SIZE => Some((4, fo)),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Slow-path fetch with TLB fill: returns the word through `read32`
+    /// (always correct) and caches the page when classifiable.
+    fn fetch_fill(&mut self, addr: u32) -> u32 {
+        let w = self.read32(addr);
+        let page = addr & !0xFFF;
+        if let Some((backing, base)) = self.fetch_classify(page) {
+            let idx = ((page >> 12) & 63) as usize;
+            self.fetch_tlb[idx] = (page, self.fetch_gen, backing, base);
+        }
+        w
+    }
+
     fn cache_read8(&self, addr: u32) -> u8 {
         if self.rom_boot_mode {
             // ROM-boot phase: raw flash at the window offset (see field docs).
@@ -5705,6 +5812,7 @@ impl Soc {
                     // A programmed transaction may have rewritten backing
                     // under the XIP decrypt cache (encrypted devices).
                     self.flashenc_last.set((u32::MAX, [0; 16]));
+                    self.bump_fetch_gen();
                     0
                 } else {
                     self.memspi[n].read32(off)
@@ -6417,6 +6525,7 @@ impl Soc {
             MMU_TABLE_BASE => {
                 if is_write {
                     self.cache.mmu_write32(off, value);
+                    self.bump_fetch_gen();
                     0
                 } else {
                     self.cache.mmu_read32(off)
@@ -7722,6 +7831,52 @@ impl Bus for Soc {
     }
 
     #[inline(always)]
+    /// Instruction-fetch fast path: 64-entry direct-mapped page TLB over
+    /// run-static (SRAM/IROM) and MMU-stable flash pages. Hit cost is one
+    /// tag+gen compare and four byte loads; anything else (PSRAM, RTC,
+    /// MMIO, encrypted flash, seam-straddling pages, page-crossing words)
+    /// takes the slow path via `fetch_fill`, which returns the `read32`
+    /// word (always correct) and fills the page when classifiable.
+    fn fetch32(&mut self, addr: u32) -> u32 {
+        let page = addr & !0xFFF;
+        let idx = ((addr >> 12) & 63) as usize;
+        let (tag, egn, backing, base) = self.fetch_tlb[idx];
+        if tag == page && egn == self.fetch_gen && backing != 0 && (addr & 0xFFF) <= 0xFFC {
+            let o = (base + (addr & 0xFFF)) as usize;
+            // SAFETY: fill guarantees base+0x1000 <= backing length and the
+            // 0xFFC guard keeps all four bytes inside the cached page.
+            unsafe {
+                return u32::from_le_bytes(match backing {
+                    1 => [
+                        *self.sram.get_unchecked(o),
+                        *self.sram.get_unchecked(o + 1),
+                        *self.sram.get_unchecked(o + 2),
+                        *self.sram.get_unchecked(o + 3),
+                    ],
+                    2 => [
+                        *self.iram0.get_unchecked(o),
+                        *self.iram0.get_unchecked(o + 1),
+                        *self.iram0.get_unchecked(o + 2),
+                        *self.iram0.get_unchecked(o + 3),
+                    ],
+                    3 => [
+                        *self.irom.get_unchecked(o),
+                        *self.irom.get_unchecked(o + 1),
+                        *self.irom.get_unchecked(o + 2),
+                        *self.irom.get_unchecked(o + 3),
+                    ],
+                    _ => [
+                        *self.flash.get_unchecked(o),
+                        *self.flash.get_unchecked(o + 1),
+                        *self.flash.get_unchecked(o + 2),
+                        *self.flash.get_unchecked(o + 3),
+                    ],
+                });
+            }
+        }
+        self.fetch_fill(addr)
+    }
+
     fn read8(&mut self, addr: u32) -> u32 {
         let addr = ioblock_remap(addr);
         // Host event-block pool (NOT DRAM — outside every heap's bounds by

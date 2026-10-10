@@ -11,6 +11,15 @@ pub trait Bus {
     fn write16(&mut self, addr: u32, val: u32);
     fn write32(&mut self, addr: u32, val: u32);
 
+    /// Instruction-fetch word read. Defaults to `read32` (identical bytes);
+    /// the SoC overrides it with a fetch-TLB fast path that skips the
+    /// data-side range dispatch for run-static and MMU-stable pages.
+    /// Test buses keep the default.
+    #[inline(always)]
+    fn fetch32(&mut self, addr: u32) -> u32 {
+        self.read32(addr)
+    }
+
     /// Atomic 32-bit compare-and-swap for `s32c1i` (ISA RM "Conditional
     /// Store"): if `*addr == compare`, set `*addr = val`. Returns the OLD
     /// word. The whole read-compare-write is ONE bus transaction — no

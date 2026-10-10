@@ -665,8 +665,8 @@ impl Cpu {
         // bltu`) spin on it and would loop forever with a frozen counter.
         self.sregs[SR_CCOUNT as usize] = self.sregs[SR_CCOUNT as usize].wrapping_add(1);
         let pc = self.pc;
-        // Single read32 for fetch, extract b0 and len — faster than read8+read16/32
-        let raw_full = bus.read32(pc);
+        // Single fetch32 for fetch, extract b0 and len — faster than read8+read16/32
+        let raw_full = bus.fetch32(pc);
         let b0 = (raw_full & 0xFF) as u8;
         let len = insn_len(b0);
         let raw = if len == 2 {

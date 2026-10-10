@@ -1947,6 +1947,10 @@ impl Esp32S3 {
         // The stub's own flash reads must NOT go through that MMU (it reads
         // the image the way the real ROM reads flash — via SPI, MMU-free).
         self.soc.set_rom_boot_mode(true);
+        // New image on a possibly-reused Soc (browser reload): the loader
+        // writes below bypass the Bus, so invalidate fetch pages explicitly
+        // (the mode flip above already bumped, this documents the contract).
+        self.soc.bump_fetch_gen();
         let rom = rom_stub::rom_image();
         self.load_image(rom_stub::ROM_BASE, &rom);
         self.load_rom_data();

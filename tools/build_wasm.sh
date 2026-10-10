@@ -12,9 +12,12 @@
 #   default for wasm32-unknown-unknown; passing it explicitly pins the
 #   contract if the default ever changes.
 #   wasm-opt -O3 (binaryen, if installed): post-link peephole pass.
+#   Measured 2026-10-10: +0% (nodejs A/B 12.07-12.83 orig vs
+#   12.17-12.83 opt, fully-warm pair -0.2%) — V8 already optimizes the
+#   hot dispatch loop; kept as a no-harm step when binaryen is present.
 #   Absent here (no wasm-opt on PATH) the build still proceeds — wasm-pack
 #   + --release (opt-level=3, lto, codegen-units=1 per workspace Cargo.toml)
-#   is already ~all of the gain; wasm-opt adds the last ~10%.
+#   is already ~all of the gain.
 #
 # PGO stays native-only (profiles don't carry to wasm — browser keeps this
 # default build); see tools/pgo.sh.
