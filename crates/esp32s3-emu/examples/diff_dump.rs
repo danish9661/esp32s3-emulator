@@ -41,10 +41,39 @@ fn main() {
             let _ = m.step();
         }
         println!("{{\"sfunc\": {{\"entry\":{}, \"insns\": [", entry);
-        let mut pc = entry;
+        // Worklist CFG walk from the entry (NOT linear sweep): linear
+        // decode desyncs in dense 16/24-bit mix (proven: ad18's beqz@ad20
+        // targets adf8, inside the byte window but never emitted — lengths
+        // drifted). Decoding each pc exactly once from real transfer
+        // predecessors keeps alignment by construction. Direct branches/j
+        // follow both arms; calls fall through (callees transcribe
+        // separately); ret/jx/indirect/ill end paths. Data pools are only
+        // reached if branched to (never in practice).
         let end = entry.wrapping_add(nbytes);
-        let mut first = true;
-        while pc < end {
+        // (pc -> (len, raw, name, ops-json)). BTreeMap emits sorted by pc.
+        let mut seen: std::collections::BTreeMap<u32, (u32, u32, String, String)> =
+            std::collections::BTreeMap::new();
+        let mut truncated: Vec<u32> = Vec::new();
+        let mut queue = vec![entry];
+        // 2-op branch forms (target = opnds[1]) vs 3-op (target = opnds[2]).
+        let is_branch2 = |n: &str| {
+            matches!(
+                n,
+                "beqz" | "beqz_n" | "bnez" | "bnez_n" | "bltz" | "bgez" | "bt" | "bf"
+            )
+        };
+        let is_branch3 = |n: &str| {
+            matches!(
+                n,
+                "bne" | "beq" | "blt" | "bge" | "bltu" | "bgeu" | "beqi" | "bnei"
+                    | "blti" | "bgei" | "bltui" | "bgeui" | "ball" | "bnall"
+                    | "bany" | "bnone" | "bbc" | "bbs" | "bbci" | "bbsi"
+            )
+        };
+        while let Some(pc) = queue.pop() {
+            if pc < entry || pc >= end || seen.contains_key(&pc) {
+                continue;
+            }
             let raw_full = m.soc.read32(pc);
             let b0 = (raw_full & 0xFF) as u8;
             let len = insn_len(b0);
@@ -54,7 +83,7 @@ fn main() {
                 2 => decode_inst16b(raw),
                 _ => decode_inst(raw),
             };
-            let (name, ops) = match opc {
+            let (name, ops, opv) = match opc {
                 Some(o) => {
                     let os = opnds(o, raw, pc);
                     let s: Vec<String> = os
@@ -66,25 +95,76 @@ fn main() {
                             )
                         })
                         .collect();
-                    (o.name().to_string(), s.join(","))
+                    let v: Vec<(u32, bool, bool)> =
+                        os.iter().map(|x| (x.value, x.is_reg, x.visible)).collect();
+                    (o.name().to_string(), s.join(","), v)
                 }
-                None => ("<ill>".to_string(), String::new()),
+                None => ("<ill>".to_string(), String::new(), Vec::new()),
             };
+            seen.insert(pc, (len, raw, name.clone(), ops.clone()));
+            let next = pc.wrapping_add(len as u32);
+            // Path following: direct branches/j both arms (in-bound only;
+            // out-of-bound targets are reported as truncated for sizing);
+            // calls fall through (callees transcribe separately); everything
+            // else straight-line; ret/jx/indirect/ill end paths.
+            let tgt_opt: Option<u32> = if name == "j" {
+                opv.first().map(|x| x.0)
+            } else if is_branch2(&name) {
+                opv.get(1).map(|x| x.0)
+            } else if is_branch3(&name) {
+                opv.get(2).map(|x| x.0)
+            } else {
+                None
+            };
+            if name == "j" {
+                if let Some(t) = tgt_opt {
+                    if t >= entry && t < end {
+                        queue.push(t);
+                    } else {
+                        truncated.push(t);
+                    }
+                }
+            } else {
+                if let Some(t) = tgt_opt {
+                    if t >= entry && t < end {
+                        queue.push(t);
+                    } else {
+                        truncated.push(t);
+                    }
+                }
+                if next >= entry
+                    && next < end
+                    && !matches!(
+                        name.as_str(),
+                        "retw" | "retw_n" | "ret" | "ret_n" | "jx" | "ill"
+                    )
+                {
+                    queue.push(next);
+                }
+            }
+        }
+        // Emit in pc order + truncation report (size the window until empty
+        // for the functions you transcribe; fallback covers the rest).
+        let mut first = true;
+        for (pc, (len, raw, name, ops)) in seen.iter() {
             print!(
                 "{}{{\"pc\":{},\"len\":{},\"raw\":{},\"opc\":\"{}\",\"opnds\":[{}]}}",
                 if first { "" } else { "," },
                 pc,
                 len,
                 raw,
-                esc(&name),
+                esc(name),
                 ops
             );
             first = false;
             println!();
-            if matches!(name.as_str(), "retw" | "retw_n" | "ret" | "j") {
-                break;
+        }
+        print!("], \"truncated\": [");
+        for (i, t) in truncated.iter().enumerate() {
+            if i > 0 {
+                print!(",");
             }
-            pc = pc.wrapping_add(len as u32);
+            print!("{}", t);
         }
         println!("]}}}}");
         return;

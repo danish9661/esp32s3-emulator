@@ -68,8 +68,12 @@ I32LTS = 0x48  # lt signed (loop-closing)
 I32GEU = 0x4F  # ge unsigned (loop-closing)
 I32GES = 0x4E  # ge signed (branch family: bge/bgez/bgei)
 I32STORE8 = 0x3A  # store8
+I32CLZ = 0x67  # clz (nsau)
+I32DIVS, I32DIVU, I32REMS, I32REMU = 0x6D, 0x6E, 0x6F, 0x70  # div family (quou...)
+I64SHRU, I64SHRS, I32WRAPI64 = 0x87, 0x88, 0xA7  # 64-bit shift/wrap (sll/srl/sra/src)
 GLG, GLS, UNREACH = 0x23, 0x24, 0x00  # global.get/set, unreachable
 I64OR, I64SHL, I64EXU = 0x84, 0x86, 0xAD
+I64EXS = 0xAC  # extend_i32_s (sra)
 END = 0x0B
 
 body = bytearray()

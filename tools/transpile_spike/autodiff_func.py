@@ -16,10 +16,12 @@ from xwasm import (uleb, sleb, section, exports, funcbody, I32C, I32ADD,
                    I32SHRU, I32SHRS, I32LOAD8U, I32EQ, I32NE, I32EQZ,
                    I32GEU, I32LTS, GLG, GLS, UNREACH, END)
 from windiff import (C, wld, wst, wphys, woe_check, walu, slot_load, slot_store,
+                     emit_dispatch_run,
                      emit_branch_verify, emit_call, emit_entry, emit_retw,
                      emit_special, branch_taken_py, wcond, BRANCH2, BRANCH3,
                      COVERED, DRAM_BASE, DRAM_SIZE, FMIRR,
-                     LG, LS, MUL, SELECT, IF, EMPTY, WOE_BIT, CI_SHIFT)
+                     LG, LS, MUL, SELECT, IF, EMPTY, WOE_BIT, CI_SHIFT,
+                     SCOMP_P, CAS_I)
 from autodiff import is_mmio, TRAP_I, RD_I, WR_I  # noqa: F401 (contract below)
 
 CALL, RET, CALL_IND, BRIF = 0x10, 0x0F, 0x11, 0x0D
@@ -36,9 +38,10 @@ def ssp_push(idval):
             + bytearray(bytes([GLG, 3])) + C(4) + bytearray([I32ADD, GLS, 3]))
 
 
-def ssp_pop():
-    """Pop into stack (trap on empty): ssp -= 4; mem[SHADOW+ssp]."""
-    return (bytearray(bytes([GLG, 3])) + bytearray([I32EQZ, IF, EMPTY, UNREACH, END])
+def ssp_pop(pc):
+    """Pop into stack (trap to fallback on empty): ssp -= 4; mem[SHADOW+ssp]."""
+    return (bytearray(bytes([GLG, 3])) + bytearray([I32EQZ, IF, EMPTY])
+            + C(pc) + bytes([CALL, TRAP_I]) + C(HALT) + bytes([RET, END])
             + bytearray(bytes([GLG, 3])) + C(4) + bytearray([I32SUB, GLS, 3])
             + C(SHADOW_BASE) + bytearray(bytes([GLG, 3]))
             + bytearray([I32ADD]) + bytearray(bytes([I32LD]) + uleb(2) + uleb(0)))
@@ -102,7 +105,7 @@ def main():
                     match_ret[i] = ci
                     break
     # funcidx: trap(0)/read(1)/write(2) imports, run(3), seg_k -> 4+k.
-    segfunc = lambda k: 4 + k  # noqa: E731
+    segfunc = lambda k: 6 + k  # noqa: E731 (imports 0-3, run 4, resume 5)
 
     reads = {(a, w): v for a, v, w in span["reads"]}
     fwd, baked, slot_next = {}, {}, [FMIRR]
@@ -200,13 +203,13 @@ def main():
                     stats["linked"] += 1
                     break
                 elif opc == "entry":
-                    emit_entry(out, o)
+                    emit_entry(out, o, s_["pc"])
                 elif opc in ("retw", "retw_n"):
-                    emit_retw(out, nxt, R)
+                    emit_retw(out, nxt, R, s_["pc"])
                     if si in match_ret:
                         # Paired: pop the continuation the matching call
                         # pushed; the dispatcher routes to it.
-                        out += ssp_pop() + bytes([RET])
+                        out += ssp_pop(s_["pc"]) + bytes([RET])
                     else:
                         # Boundary (frame predates trace): static return to
                         # the next-trace seg (post-retw split guarantees it
@@ -215,15 +218,17 @@ def main():
                         stats["boundary"] = stats.get("boundary", 0) + 1
                         out += C(seg_id_of_pos[si + 1]) + bytes([RET])
                     break
-                elif opc in ("wsr_ps", "rsr_ps", "rsr_prid", "rsil"):
+                elif opc in ("wsr_ps", "rsr_ps", "rsr_prid", "rsil", "wsr_scompare1",
+                   "rsr_scompare1"):
                     emit_special(out, opc, o)
-                elif opc in ("rsync", "memw", "isync", "esync", "dsync"):
-                    pass
+                elif opc in ("rsync", "memw", "isync", "esync", "dsync",
+                           "waiti"):
+                    pass  # waiti: power-down hint, nop (exec.rs)
                 else:
                     walu(opc, o, out)
                 stats["covered"] += 1
                 continue
-            if opc in ("l8ui", "l32i", "l32i_n", "l32r"):
+            if opc in ("l8ui", "l32i", "l32i_n", "l32r", "l32e"):
                 eff = o[1]["v"] if opc == "l32r" else (R[o[1]["v"]] + o[2]["v"]) & 0xFFFFFFFF
                 width = 1 if opc == "l8ui" else 4
                 if is_mmio(eff):
@@ -241,7 +246,19 @@ def main():
                 out += slot_load(o[0]["v"], eff, width, reads, fwd, baked, slot_next)
                 stats["covered"] += 1
                 continue
-            if opc in ("s32i", "s32i_n", "s8i"):
+            if opc == "s32c1i":
+                # Atomic CAS via import (single-threaded inline would tear
+                # against core1's bus.cas32; host owns atomicity).
+                eff = (R[o[1]["v"]] + o[2]["v"]) & 0xFFFFFFFF
+                out += wphys(C(o[0]["v"])) + wld(o[0]["v"]) + C(eff)
+                out += bytes([LS, 2, LS, 0])
+                out += (bytes([LG, 2]) + C(SCOMP_P)
+                        + bytearray(bytes([I32LD]) + uleb(2) + uleb(0))
+                        + bytes([LG, 0, CALL, CAS_I]))
+                out += bytearray(bytes([I32ST]) + uleb(2) + uleb(0))
+                stats["covered"] += 1
+                continue
+            if opc in ("s32i", "s32i_n", "s8i", "s32e"):
                 eff = (R[o[1]["v"]] + o[2]["v"]) & 0xFFFFFFFF
                 width = 1 if opc == "s8i" else 4
                 if is_mmio(eff):
@@ -268,38 +285,34 @@ def main():
         bodies.append(bytes(out))
 
     # run(): preset globals + AR phys + ssp, dispatch loop to HALT.
-    run = bytearray()
-    run += C(steps[0]["wb"]) + bytearray([GLS, 0])
-    run += C(steps[0]["ws"]) + bytearray([GLS, 1])
-    run += C(steps[0]["ps"]) + bytearray([GLS, 2])
-    run += C(0) + bytearray([GLS, 3])  # ssp = 0
+    pre = bytearray()
+    pre += C(steps[0]["wb"]) + bytearray([GLS, 0])
+    pre += C(steps[0]["ws"]) + bytearray([GLS, 1])
+    pre += C(steps[0]["ps"]) + bytearray([GLS, 2])
+    pre += C(0) + bytearray([GLS, 3])  # ssp = 0
+    pre += C(0) + bytearray([GLS, 4])  # start seg
     for pp, vv in enumerate(span["phys0"]):
-        run += C(pp * 4) + C(vv) + bytearray(bytes([I32ST]) + uleb(2) + uleb(0))
-    # Dispatcher: id = 0 (table slot of seg 0); loop until HALT.
-    # Per iteration stack is empty at loop top; each op below annotated.
-    run += C(0) + bytearray([LS, 0])  # t0 = 0, []
-    run += bytes([LOOP, EMPTY])  # []
-    run += bytes([LG, 0])  # [id]
-    run += bytes([CALL_IND, 0x04, 0x00])  # [nid]
-    run += bytes([0x22, 0x00])  # tee t0=nid (nets zero): [nid]
-    run += C(HALT) + bytes([I32NE, BRIF, 0x00])  # [cond] -> []
-    run += bytes([END, END])
-    allbodies = [bytes(run)] + bodies
+        pre += C(pp * 4) + C(vv) + bytearray(bytes([I32ST]) + uleb(2) + uleb(0))
+    run, resume = emit_dispatch_run(pre)
+    # funcidx: imports 0-3, run 4, resume 5, seg_k -> 6+k.
+    allbodies = [bytes(run), bytes(resume)] + bodies
     code = uleb(len(allbodies))
     for b in allbodies:
         code += funcbody(b, 3)
     need = max([0x80040, SHADOW_BASE + 0x1000, 1028]
                 + ([slot_next[0] + 4] if baked else []))  # +TEMP-VISRING ring
     memsec = uleb(1) + bytes([0x00]) + uleb((need + 0xFFFF) // 0x10000)
-    glob = (uleb(4)
+    glob = (uleb(5)
             + bytes([0x7F, 0x01]) + bytes([I32C]) + sleb(0) + bytes([END])
             + bytes([0x7F, 0x01]) + bytes([I32C]) + sleb(1) + bytes([END])
             + bytes([0x7F, 0x01]) + bytes([I32C]) + sleb(0x40000) + bytes([END])
+            + bytes([0x7F, 0x01]) + bytes([I32C]) + sleb(0) + bytes([END])
             + bytes([0x7F, 0x01]) + bytes([I32C]) + sleb(0) + bytes([END]))
-    imps = (uleb(3)
+    imps = (uleb(4)
             + bytes([0x03]) + b"env" + bytes([0x04]) + b"trap" + bytes([0x00, 0x01])
             + bytes([0x03]) + b"env" + bytes([0x0A]) + b"soc_read32" + bytes([0x00, 0x02])
-            + bytes([0x03]) + b"env" + bytes([0x0B]) + b"soc_write32" + bytes([0x00, 0x03]))
+            + bytes([0x03]) + b"env" + bytes([0x0B]) + b"soc_write32" + bytes([0x00, 0x03])
+            + bytes([0x03]) + b"env" + bytes([0x09]) + b"soc_cas32" + bytes([0x00, 0x05]))
     # func table for call_indirect: seg funcs (funcidx 4+k).
     tabsec = uleb(1) + bytes([0x70, 0x00]) + uleb(nsegs)
     # element segment: active table 0 @ 0, seg funcidx vec.
@@ -308,7 +321,8 @@ def main():
     for k in range(nsegs):
         elem += uleb(segfunc(k))
     # Types: 0 []->[] (run), 1 [i32]->[] (trap), 2 [i32]->[i32] (read),
-    # 3 [i32,i32]->[] (write), 4 []->[i32] (segs + indirect target).
+    # 3 [i32,i32]->[] (write), 4 []->[i32] (segs + indirect target),
+    # 5 [i32,i32,i32]->[i32] (cas).
     segs = bytearray()
     if baked:
         words = sorted(baked.items())
@@ -327,17 +341,18 @@ def main():
             segs += uleb(len(data)) + data
     mod = (
         b"\x00asm\x01\x00\x00\x00"
-        + section(1, uleb(5) + bytes([0x60, 0x00, 0x00])
+        + section(1, uleb(6) + bytes([0x60, 0x00, 0x00])
                   + bytes([0x60, 0x01, 0x7F, 0x00])
                   + bytes([0x60, 0x01, 0x7F, 0x01, 0x7F])
                   + bytes([0x60, 0x02, 0x7F, 0x7F, 0x00])
-                  + bytes([0x60, 0x00, 0x01, 0x7F]))
+                  + bytes([0x60, 0x00, 0x01, 0x7F])
+                  + bytes([0x60, 0x03, 0x7F, 0x7F, 0x7F, 0x01, 0x7F]))
         + section(2, imps)
-        + section(3, uleb(len(allbodies)) + bytes([0x00]) + bytes([0x04]) * (len(allbodies) - 1))
+        + section(3, uleb(len(allbodies)) + bytes([0x00, 0x00]) + bytes([0x04]) * (len(allbodies) - 2))
         + section(4, tabsec)
         + section(5, memsec)
         + section(6, glob)
-        + section(7, exports([(b"run", 0x00, 0x03), (b"mem", 0x02, 0x00),
+        + section(7, exports([(b"run", 0x00, 0x04), (b"resume", 0x00, 0x05), (b"start", 0x03, 0x04), (b"mem", 0x02, 0x00),
                               (b"wb", 0x03, 0x00), (b"ws", 0x03, 0x01),
                               (b"ps", 0x03, 0x02)]))
         + section(9, elem)

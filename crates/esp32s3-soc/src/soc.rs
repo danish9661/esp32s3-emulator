@@ -1844,6 +1844,33 @@ impl Soc {
         self.psram.clone()
     }
 
+    /// Bulk SRAM access for the hybrid transpiled engine (transpile_run):
+    /// the whole 512 KB DRAM backing. The DIRAM instruction window
+    /// ([DIRAM_INST_BASE..+DIRAM_SIZE]) aliases sram at
+    /// DIRAM_DATA_BASE-DRAM_BASE; see `ram8`/memmap for the exact map.
+    /// No behavior change (pure accessor for host memcpy sync).
+    pub fn sram_bytes(&self) -> &[u8] {
+        &self.sram[..]
+    }
+
+    /// Mutable bulk SRAM access (hybrid sync target).
+    pub fn sram_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.sram[..]
+    }
+
+    /// Bulk SRAM0 (instruction-only 32 KB at IRAM_BASE) access for hybrid
+    /// sync. The module's direct-IRAM region covers [IRAM_BASE..+0x70000)
+    /// (SRAM0 + DIRAM); the top 64 KB of the IRAM window is unmapped and
+    /// stays on the soc import path (see dload/dstore region gating).
+    pub fn iram0_bytes(&self) -> &[u8] {
+        &self.iram0[..]
+    }
+
+    /// Mutable bulk SRAM0 access (hybrid sync target).
+    pub fn iram0_bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.iram0[..]
+    }
+
     /// Restore PSRAM across a non-deep reset (see `psram_wipe`).
     pub fn restore_psram(&mut self, snap: alloc::boxed::Box<[u8]>) {
         if snap.len() == self.psram.len() {

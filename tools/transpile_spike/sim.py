@@ -17,6 +17,15 @@ class Sim:
         self.st = []
         self.ctrl = ['func']  # function body is an implicit frame
         self.ctrl_reach = [True]
+        # Per-frame (stack snapshot, diverged): an arm that returns/branches
+        # out must not corrupt fall-through accounting (the budget-IF's
+        # DROP+BR left sim validating fall-through with a popped stack —
+        # proven by the spanLoop dispatcher failure). On ELSE restore the
+        # snapshot (both arms start from pre-IF stack); on END of a diverged
+        # non-func frame restore it too. Sound for our subset: every block
+        # is EMPTY-typed with []-leaving arms.
+        self.ctrl_snap = [[]]
+        self.ctrl_div = [False]
         self.nlocals = nlocals
         self.nglobals = nglobals
         self.ret = ret
@@ -67,15 +76,21 @@ class Sim:
             elif b in (0x41, 0x42):
                 self.skip_uleb()  # signed LEB: same skip shape
             elif b in (0x00, 0x0F, 0x1A, 0x1B, 0x45, 0x46, 0x47, 0x48, 0x49,
-                       0x4E, 0x4F, 0x6A, 0x6B, 0x6C, 0x71, 0x72, 0x73, 0x74,
-                       0x75, 0x76, 0x84, 0x86, 0xAD):
+                       0x4E, 0x4F, 0x67, 0x6A, 0x6B, 0x6C, 0x71, 0x72, 0x73,
+                       0x74, 0x75, 0x76, 0x84, 0x86, 0x87, 0x88, 0xA7, 0xAC, 0xAD,
+                       0x6D, 0x6E, 0x6F, 0x70):
                 pass
             else:
                 raise AssertionError(f"skip: unknown op {b:#x} at +{self.pos - 1}")
 
+    def push(self, typ):
+        self.st.append((typ, len(self.ctrl) - 1))
+
     def pop(self, want=None):
         assert self.st, f"stack underflow at +{self.pos}"
-        got = self.st.pop()
+        got, born = self.st.pop()
+        assert born == len(self.ctrl) - 1, (
+            f"cross-frame use at +{self.pos} (born in frame {born}, now {len(self.ctrl) - 1})")
         if want is not None:
             assert got == want, f"type: want {want} got {got} at +{self.pos}"
         return got
@@ -95,11 +110,15 @@ class Sim:
                 # Legal instruction (traps at runtime); code after it in
                 # the same block is unreachable until the next boundary.
                 reachable[-1] = False
+                if self.ctrl:
+                    self.ctrl_div[-1] = True
             elif op in (0x02, 0x03):
                 assert self.c[self.pos] == 0x40, f"non-empty blocktype at +{self.pos}"
                 self.pos += 1
                 self.ctrl.append(op)
                 self.ctrl_reach.append(reachable[-1])
+                self.ctrl_snap.append(list(self.st) if ok else [])
+                self.ctrl_div.append(False)
                 reachable.append(reachable[-1])
             elif op == 0x0B:
                 assert self.ctrl, f"stray end at +{self.pos}"
@@ -108,11 +127,22 @@ class Sim:
                     # Function end: if unreachable (all paths returned),
                     # stack check is vacuous (returns already validated).
                     self.end_reachable = reachable[-1]
+                elif self.ctrl_div[-1]:
+                    # Diverged frame (return/br out): fall-through resumes
+                    # with the pre-frame stack, not the dead arm's.
+                    self.st = self.ctrl_snap[-1]
                 self.ctrl.pop()
                 self.ctrl_reach.pop()
+                self.ctrl_snap.pop()
+                self.ctrl_div.pop()
                 reachable.pop()
             elif op == 0x0C:
                 self.uleb()  # br depth (no type change in our shapes)
+                # Unconditional branch: following ops unreachable until the
+                # enclosing END (budget-exit br lives right before its END).
+                reachable[-1] = False
+                if self.ctrl:
+                    self.ctrl_div[-1] = True
             elif op == 0x0D:
                 self.uleb()
                 if ok:
@@ -124,24 +154,33 @@ class Sim:
                     self.pop(I32)
                 self.ctrl.append(op)
                 self.ctrl_reach.append(reachable[-1])
+                self.ctrl_snap.append(list(self.st) if ok else [])
+                self.ctrl_div.append(False)
                 reachable.append(reachable[-1])
             elif op == 0x05:
-                # else: reachable iff the if-frame was (our shapes skip
-                # else entirely, but stay sound if one appears).
                 assert self.ctrl and self.ctrl[-1] == 0x04
+                # Else-arm starts from the pre-IF stack (taken-arm effects,
+                # including divergence, do not leak across).
+                self.st = list(self.ctrl_snap[-1])
+                self.ctrl_div[-1] = False
                 reachable[-1] = self.ctrl_reach[-1]
             elif op == 0x0F:
                 if ok:
                     for t in self.ret:
                         self.pop(t)
                 reachable[-1] = False
+                if self.ctrl:
+                    self.ctrl_div[-1] = True
             elif op == 0x1B:
                 if ok:
                     c = self.pop(I32)
                     v2 = self.pop()
                     v1 = self.pop()
                     assert v1 == v2, f"select arms {v1}/{v2} at +{self.pos}"
-                    self.st.append(v1)
+                    self.push(v1)
+            elif op == 0x1A:
+                if ok:
+                    self.pop()
             elif op == 0x10:
                 idx = self.uleb()
                 npar, nres = self.calls.get(idx, (0, []))
@@ -149,22 +188,22 @@ class Sim:
                     for _ in range(npar):
                         self.pop()
                     for t in nres:
-                        self.st.append(t)
+                        self.push(t)
             elif op == 0x11:
                 self.uleb()  # typeidx
                 self.uleb()  # tableidx
                 if ok:
                     self.pop(I32)  # funcidx; our segs are [] -> [i32]
-                    self.st.append(I32)
+                    self.push(I32)
             elif op in (0x20, 0x22):
                 i = self.uleb()
                 assert i < self.nlocals, f"local {i} at +{self.pos}"
                 if op == 0x20:
                     if ok:
-                        self.st.append(I32)
+                        self.push(I32)
                 else:
                     if ok:
-                        assert self.st and self.st[-1] == I32
+                        assert self.st and self.st[-1][0] == I32
                         # tee nets zero (pop value, push value, set local).
             elif op == 0x21:
                 i = self.uleb()
@@ -175,7 +214,7 @@ class Sim:
                 i = self.uleb()
                 assert i < self.nglobals, f"global {i} at +{self.pos}"
                 if ok:
-                    self.st.append(I32)
+                    self.push(I32)
             elif op == 0x24:
                 i = self.uleb()
                 assert i < self.nglobals
@@ -186,7 +225,7 @@ class Sim:
                 self.uleb()
                 if ok:
                     self.pop(I32)
-                    self.st.append(I32)
+                    self.push(I32)
             elif op in (0x36, 0x3A):
                 self.uleb()
                 self.uleb()
@@ -196,35 +235,43 @@ class Sim:
             elif op in (0x41, 0x42):
                 self.sleb()
                 if ok:
-                    self.st.append(I32 if op == 0x41 else I64)
+                    self.push(I32 if op == 0x41 else I64)
             elif op in (0x45,):
                 if ok:
                     self.pop(I32)
-                    self.st.append(I32)  # eqz
-            elif op in (0x46, 0x47, 0x48, 0x49, 0x4E, 0x4F):
+                    self.push(I32)  # eqz
+            elif op == 0x67:
+                if ok:
+                    self.pop(I32)  # clz: single operand (nsau)
+                    self.push(I32)
+            elif op in (0x46, 0x47, 0x48, 0x49, 0x4E, 0x4F, 0x6D, 0x6E, 0x6F, 0x70):
                 if ok:
                     self.pop(I32)
                     self.pop(I32)
-                    self.st.append(I32)
+                    self.push(I32)
             elif op in (0x6A, 0x6B, 0x6C, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76):
                 if ok:
                     self.pop(I32)
                     self.pop(I32)
-                    self.st.append(I32)
-            elif op in (0x84, 0x86):
+                    self.push(I32)
+            elif op in (0x84, 0x86, 0x87, 0x88):
                 if ok:
                     self.pop(I64)
                     self.pop(I64)
-                    self.st.append(I64)
-            elif op == 0xAD:
+                    self.push(I64)
+            elif op in (0xAC, 0xAD):
                 if ok:
                     self.pop(I32)
-                    self.st.append(I64)
+                    self.push(I64)
+            elif op == 0xA7:
+                if ok:
+                    self.pop(I64)
+                    self.push(I32)
             else:
                 raise AssertionError(f"unknown op {op:#x} at +{self.pos - 1}")
         assert not self.ctrl, "unclosed block"
         if getattr(self, 'end_reachable', True):
-            assert self.st == self.ret, f"end stack {self.st} != ret {self.ret}"
+            assert [t for t, _ in self.st] == self.ret, f"end stack {self.st} != ret {self.ret}"
 
 
 CALLSIGS = {
@@ -232,14 +279,17 @@ CALLSIGS = {
     "spike_call.wasm": {1: (0, [])},
     "spike_mmio.wasm": {0: (2, []), 1: (1, ["i32"])},
     "spike_poll.wasm": {0: (0, ["i32"]), 1: (1, [])},
-    "spike_auto.wasm": {0: (1, []), 1: (1, ["i32"]), 2: (2, [])},
+    "spike_auto.wasm": {0: (1, []), 1: (1, ["i32"]), 2: (2, []), 3: (3, ["i32"])},
+    "spike_static.wasm": {0: (1, []), 1: (1, ["i32"]), 2: (2, []), 3: (3, ["i32"])},
     "dmem_kat.wasm": {0: (1, []), 1: (1, ["i32"]), 2: (2, [])},
+    "scas_kat.wasm": {0: (1, []), 1: (1, ["i32"]), 2: (2, []), 3: (3, ["i32"])},
     "spike_s4bridge.wasm": {0: (1, []), 1: (1, ["i32"]), 2: (2, []), 3: (0, ["i32"])},
 }
 
 
 def check(path, funcs):
     """funcs: list of (code_bytes, nlocals, nglobals, ret_types)."""
+    name = path.rsplit("/", 1)[-1]
     data = open(path, "rb").read()
     assert data[:4] == b"\x00asm"
     # Minimal section walk: find code section (id 10).
@@ -307,8 +357,8 @@ def check(path, funcs):
                 bodies.append((fbody[r:], nloc))
     if isinstance(funcs, tuple):
         if name in ("spike_auto.wasm", "spike_static.wasm"):
-            # run() returns []; seg funcs return [i32] (next table slot).
-            funcs = [(4, [])] + [(4, [I32])] * (len(bodies) - 1)
+            # run/resume return []; seg funcs return [i32] (next slot).
+            funcs = [(5, []), (5, [])] + [(5, [I32])] * (len(bodies) - 2)
         else:
             # Broadcast single spec to every body (multi-func modules).
             funcs = [funcs] * len(bodies)
@@ -340,6 +390,8 @@ if __name__ == "__main__":
         "wcond_kat.wasm": (1, []),
         "dmem_kat.wasm": (1, []),
         "movcc_kat.wasm": (1, []),
+        "tail_kat.wasm": (1, []),
+        "scas_kat.wasm": (1, []),
         "spike_s4bridge.wasm": [(0, [I64])],
         "spike_diff.wasm": [(0, [])],
     }

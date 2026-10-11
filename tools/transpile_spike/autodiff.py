@@ -22,6 +22,7 @@ from windiff import (C, wld, wst, wphys, woe_check, walu, slot_load, slot_store,
 
 CALL = 0x10
 TRAP_I, RD_I, WR_I = 0, 1, 2  # import func indices: trap, soc_read32, soc_write32
+CAS_I = 3  # import func index: soc_cas32 (s32c1i; static + vehicle)
 MMIO_LO, MMIO_HI = 0x60000000, 0x60100000
 
 

@@ -15,9 +15,17 @@ sys.path.insert(0, "/home/danish1075/Documents/esp32 s3 emu/tools/transpile_spik
 from xwasm import (uleb, sleb, section, funcbody, I32C, I32ADD, I32SUB, I32LD, I32ST,
                    I32AND, I32OR, I32XOR, I32SHL, I32SHRU, I32SHRS,
                    I32LOAD8U, I32STORE8, I32EQ, I32NE, I32EQZ,
-                   I32LTS, I32LTU, I32GES, I32GEU,
+                   I32LTS, I32LTU, I32GES, I32GEU, I32CLZ,
+                   I32DIVS, I32DIVU, I32REMS, I32REMU,
+                   I64OR, I64SHL, I64EXU, I64EXS, I64SHRU, I64SHRS, I32WRAPI64,
+                   I64C,
                    GLG, GLS, UNREACH, END)
-CALL = 0x10
+# Special-reg cells in module memory (zero-init relied upon: firmware sets
+# SAR/SCOMPARE before use per ABI; EPC1 is only read by rfwo, which traps
+# to fallback that syncs it — documented approximation).
+SAR_P, SCOMP_P, EPC1_P = 0x300, 0x304, 0x308
+CALL, CALL_IND, BRIF, LOOP, RET = 0x10, 0x11, 0x0D, 0x03, 0x0F
+HALT = 0xFFFFFFFF
 
 LG, LS, MUL, SELECT, IF = 0x20, 0x21, 0x6C, 0x1B, 0x04
 EMPTY = 0x40
@@ -25,7 +33,19 @@ WOE_BIT, CI_SHIFT = 0x40000, 16
 FMIRR = 0x90000
 DRAM_BASE, DRAM_SIZE = 0x3FC80000, 0x80000
 IRAM_BASE, IRAM_SIZE = 0x40370000, 0x80000
+# Direct-cacheable IRAM: SRAM0 (32K) + DIRAM (416K). The top 64K of the
+# window is unmapped silicon-side; direct legs must exclude it (the soc
+# import path handles unmapped consistently). Snapshots still cover full.
+IRAM_DIRECT_SIZE = 0x70000
 ROM_BASE, ROM_SIZE = 0x40000000, 0x60000
+# Hybrid mailbox/counters in module memory (transpile_run.rs host protocol):
+# MB_REASON (0=transcribed-end, 1=trap-to-interp, 2=budget) + MB_PC (resume
+# pc for the interpreter) + MB_NEXT (table slot to resume transpiled) +
+# DISP_CTR (dispatches this run, for host time accounting). run() takes no
+# params; resume starts at the start_seg global (#4). Budget K bounds core1
+# starvation (WDT) inside hot transpiled loops.
+MB_REASON, MB_PC, MB_NEXT, DISP_CTR = 0x310, 0x318, 0x31C, 0x320
+START_GLOB, BUDGET_K = 4, 4096
 # Static direct-memory module layout (static_func.py): AR phys [0,256),
 # then identity snapshots. Everything else -> soc imports (correct, slower).
 M_DRAM_OFF, M_IRAM_OFF, M_ROM_OFF = 0x10000, 0x90000, 0x110000
@@ -34,12 +54,17 @@ M_PAGES = 0x21  # 0x210000: snapshots end 0x170000, shadow at 0x200000 + slack
 COVERED = {"movi", "movi_n", "mov_n", "addi", "addi_n", "addmi", "add", "add_n",
            "sub", "and", "or", "xor", "slli", "srli", "srai", "extui",
            "l8ui", "l32i", "l32i_n", "l32r", "s32i", "s32i_n", "s8i",
+           "l32e", "s32e", "s32c1i", "waiti",
            "bne", "beq", "beqz", "beqz_n", "bnez", "bnez_n", "bltu", "bgeu",
            "moveqz", "movnez", "movltz", "movgez",
            "beqi", "bnei", "blt", "bge", "bltz", "bgez", "bgei", "bltui", "bgeui",
            "ball", "bnall", "bany", "bnone", "bbc", "bbs", "bbci", "bbsi",
            "call4", "call8", "call12", "callx8", "entry", "retw", "retw_n",
            "jx", "j", "addx4", "blti", "wsr_ps", "rsr_ps", "rsr_prid", "rsil",
+           "wsr_scompare1", "rsr_scompare1",
+           "nsau", "sll", "srl", "sra", "src",
+           "ssr", "ssl", "ssai", "ssa8b", "ssa8l",
+           "quou", "quos", "rems", "remu",
            "rsync", "memw", "isync", "esync", "dsync"}
 
 
@@ -62,9 +87,13 @@ def wst(reg, val):
     return wphys(C(reg)) + val + bytearray(bytes([I32ST]) + uleb(2) + uleb(0))
 
 
-def woe_check():
+def woe_check(pc):
+    # Window-overflow guard: on fire, trap to fallback (which re-executes
+    # this pc interpretively with full spill/underflow semantics) — NEVER
+    # raw unreachable (that aborts the slice with an unrecoverable pc).
     return (bytearray(bytes([GLG, 2])) + C(WOE_BIT) + bytearray([I32AND])
-            + bytearray([I32EQZ, IF, EMPTY, UNREACH, END]))
+            + bytearray([I32EQZ, IF, EMPTY]) + C(pc) + bytes([CALL, TRAP_I])
+            + C(HALT) + bytes([RET, END]))
 
 
 def walu(opc, o, out):
@@ -95,6 +124,78 @@ def walu(opc, o, out):
         out += wst(d, wld(o[1]["v"]) + wld(o[2]["v"]) + bytes([I32AND]))
     elif opc == "or":
         out += wst(d, wld(o[1]["v"]) + wld(o[2]["v"]) + bytes([I32OR]))
+    elif opc == "nsau":
+        out += wst(d, wld(o[1]["v"]) + bytearray([I32CLZ]))
+    elif opc in ("ssr", "ssl", "ssai", "ssa8b", "ssa8l"):
+        # SAR cell (exec.rs: ssr=as&31, ssl=32-(as&31), ssai=imm&31,
+        # ssa8b=32-((as<<3)&31), ssa8l=(as<<3)&31).
+        if opc == "ssr":
+            v = wld(o[0]["v"]) + C(31) + bytearray([I32AND])
+        elif opc == "ssl":
+            v = C(32) + wld(o[0]["v"]) + C(31) + bytearray([I32AND, I32SUB])
+        elif opc == "ssai":
+            v = C(o[0]["v"] & 31)
+        elif opc == "ssa8b":
+            v = (C(32) + wld(o[0]["v"]) + C(3) + bytearray([I32SHL])
+                 + C(31) + bytearray([I32AND, I32SUB]))
+        else:
+            v = (wld(o[0]["v"]) + C(3) + bytearray([I32SHL])
+                 + C(31) + bytearray([I32AND]))
+        out += C(SAR_P) + v + bytearray(bytes([I32ST]) + uleb(2) + uleb(0))
+    elif opc in ("sll", "srl", "sra", "src"):
+        # SAR-based shifts via i64 (exec.rs: sh=(32-SAR)&63 / SAR&63;
+        # sra sign-extends, src shifts the {s,t} pair).
+        sh32 = (C(SAR_P) + bytearray(bytes([I32LD]) + uleb(2) + uleb(0))
+                + C(63) + bytearray([I32AND]))
+        if opc == "sll":
+            amt = C(32) + sh32 + bytearray([I32SUB]) + C(63) + bytearray([I32AND])
+            v = (wld(o[1]["v"]) + bytearray([I64EXU]) + amt
+                 + bytearray([I64EXU, I64SHL, I32WRAPI64]))
+        elif opc == "srl":
+            v = (wld(o[1]["v"]) + bytearray([I64EXU]) + sh32
+                 + bytearray([I64EXU, I64SHRU, I32WRAPI64]))
+        elif opc == "sra":
+            v = (wld(o[1]["v"]) + bytearray([I64EXS]) + sh32
+                 + bytearray([I64EXU, I64SHRS, I32WRAPI64]))
+        else:
+            v = (wld(o[1]["v"]) + bytearray([I64EXU, I64C]) + sleb(32)
+                 + bytearray([I64SHL]) + wld(o[2]["v"])
+                 + bytearray([I64EXU, I64OR]) + sh32
+                 + bytearray([I64EXU, I64SHRU, I32WRAPI64]))
+        out += wst(d, v)
+    elif opc in ("quou", "quos", "rems", "remu"):
+        # Saturating division (exec.rs edge rules; wasm div traps on
+        # zero/MIN/-1, so branch around it; result via t2, empty-type ifs).
+        # In: wld(s)+wld(t). t1=t, t0=s.
+        # NOTE: every arm below is a full IF/ELSE/END (empty-type, result
+        # via t2). An IF without ELSE executes the divisor path
+        # unconditionally and traps on zero (proven by div0 live).
+        pre = wld(o[1]["v"]) + wld(o[2]["v"]) + bytes([LS, 1, LS, 0])
+        get01 = lambda: bytes([LG, 0, LG, 1])
+        get0 = lambda: bytes([LG, 0])
+        get1 = lambda: bytes([LG, 1])
+        if opc == "quou":
+            body = (bytes([LG, 1, I32EQZ, IF, EMPTY]) + C(0xFFFFFFFF)
+                    + bytes([LS, 2, ELSE]) + get01() + bytes([I32DIVU, LS, 2, END]))
+        elif opc == "quos":
+            body = (bytes([LG, 1, I32EQZ, IF, EMPTY]) + C(0x7FFFFFFF)
+                    + bytes([LS, 2, ELSE])
+                    + get0() + C(0x80000000) + bytes([I32EQ])
+                    + get1() + C(-1) + bytes([I32EQ, I32AND, IF, EMPTY])
+                    + C(0x80000000) + bytes([LS, 2, ELSE])
+                    + get01() + bytes([I32DIVS, LS, 2, END, END]))
+        elif opc == "rems":
+            body = (bytes([LG, 1, I32EQZ, IF, EMPTY]) + get01()[:2]
+                    + bytes([LS, 2, ELSE])
+                    + get0() + C(0x80000000) + bytes([I32EQ])
+                    + get1() + C(-1) + bytes([I32EQ, I32AND, IF, EMPTY])
+                    + C(0) + bytes([LS, 2, ELSE])
+                    + get01() + bytes([I32REMS, LS, 2, END, END]))
+        else:
+            body = (bytes([LG, 1, I32EQZ, IF, EMPTY]) + get01()[:2]
+                    + bytes([LS, 2, ELSE])
+                    + get01() + bytes([I32REMU, LS, 2, END]))
+        out += wst(d, pre + body + bytes([LG, 2]))
     elif opc in ("moveqz", "movnez", "movltz", "movgez"):
         # Conditional AR move (exec.rs: if t-cond then d = s). SELECT with
         # the old dest as false-arm (loads are pure, no temps needed).
@@ -269,9 +370,9 @@ def emit_call(out, opc, o, R, nxt, pc, length):
             + bytearray([I32SHL, I32OR, GLS, 2]))
 
 
-def emit_entry(out, o):
+def emit_entry(out, o, pc):
     s, imm = o[0]["v"], o[2]["v"]
-    out += woe_check()
+    out += woe_check(pc)
     out += bytearray(bytes([GLG, 2])) + C(CI_SHIFT) + bytearray([I32SHRU])
     out += C(3) + bytearray([I32AND, LS, 0])
     out += bytes([GLG, 0]) + C(4) + bytearray([MUL])
@@ -285,8 +386,8 @@ def emit_entry(out, o):
     out += bytearray([I32SHL, I32OR, GLS, 1, LG, 1, GLS, 0])
 
 
-def emit_retw(out, nxt, R, skip_tail=False):
-    out += woe_check()
+def emit_retw(out, nxt, R, pc=None, skip_tail=False):
+    out += woe_check(pc if pc is not None else 0)
     out += wld(0) + bytearray([LS, 0])
     out += bytes([LG, 0]) + C(30) + bytearray([I32SHRU, LS, 1])
     out += C(1) + C(2) + C(3) + C(0)
@@ -296,13 +397,13 @@ def emit_retw(out, nxt, R, skip_tail=False):
         out += bytearray(bytes([GLG, 1])) + pos + bytearray([I32SHRU])
         out += C(1) + bytearray([I32AND, SELECT])
     out += bytearray([LS, 2])
-    out += bytes([LG, 1, I32EQZ, IF, EMPTY, UNREACH, END])
+    out += bytes([LG, 1, I32EQZ, IF, EMPTY]) + C(pc if pc is not None else 0) + bytes([CALL, TRAP_I]) + C(HALT) + bytes([RET, END])
     out += bytes([LG, 2, I32EQZ, I32EQZ, LG, 2, LG, 1, I32NE])
-    out += bytes([I32AND, IF, EMPTY, UNREACH, END])
+    out += bytes([I32AND, IF, EMPTY]) + C(pc if pc is not None else 0) + bytes([CALL, TRAP_I]) + C(HALT) + bytes([RET, END])
     upos = (bytearray(bytes([GLG, 0])) + C(16) + bytearray([I32ADD])
             + bytes([LG, 1]) + bytearray([I32SUB]) + C(15) + bytearray([I32AND]))
     out += bytearray(bytes([GLG, 1])) + upos + bytearray([I32SHRU])
-    out += C(1) + bytearray([I32AND, I32EQZ, IF, EMPTY, UNREACH, END])
+    out += C(1) + bytearray([I32AND, I32EQZ, IF, EMPTY]) + C(pc if pc is not None else 0) + bytes([CALL, TRAP_I]) + C(HALT) + bytes([RET, END])
     out += (bytearray(bytes([GLG, 1])) + C(1) + bytearray(bytes([GLG, 0]))
             + bytearray([I32SHL]) + C(-1) + bytearray([I32XOR, I32AND, GLS, 1]))
     out += (bytearray(bytes([GLG, 0])) + bytes([LG, 1]) + bytearray([I32SUB])
@@ -331,6 +432,10 @@ def emit_special(out, opc, o):
         out += wst(o[0]["v"], bytearray(bytes([GLG, 2])))
         out += (bytearray(bytes([GLG, 2])) + C(0xFFFFFFF0) + bytearray([I32AND])
                 + C(o[1]["v"] & 0xF) + bytearray([I32OR, GLS, 2]))
+    elif opc == "wsr_scompare1":
+        out += C(SCOMP_P) + wld(o[0]["v"]) + bytearray(bytes([I32ST]) + uleb(2) + uleb(0))
+    elif opc == "rsr_scompare1":
+        out += wst(o[0]["v"], C(SCOMP_P) + bytearray(bytes([I32LD]) + uleb(2) + uleb(0)))
     else:
         raise AssertionError(f"not special: {opc}")
 
@@ -373,10 +478,10 @@ def main():
             emit_call(out, opc, o, R, nxt, s_["pc"], s_["len"])
             continue
         if opc == "entry":
-            emit_entry(out, o)
+            emit_entry(out, o, s_["pc"])
             continue
         if opc in ("retw", "retw_n"):
-            emit_retw(out, nxt, R)
+            emit_retw(out, nxt, R, s_["pc"])
             continue
         if opc in ("wsr_ps", "rsr_ps", "rsr_prid", "rsil"):
             emit_special(out, opc, o)
@@ -521,7 +626,7 @@ if __name__ == "__main__":
 # M_*_OFF layout; everything else (MMIO, PSRAM window, RTC, flash windows)
 # goes through the soc imports (correct, slower). ROM stores route to the
 # import too (soc drops them; the snapshot stays pristine = silicon-true).
-TRAP_I, RD_I, WR_I = 0x00, 0x01, 0x02
+TRAP_I, RD_I, WR_I, CAS_I = 0x00, 0x01, 0x02, 0x03
 ELSE = 0x05
 
 
@@ -532,7 +637,7 @@ def _region_arms(make_body):
     out = bytearray()
     for i, (base, size, off, is_rom) in enumerate((
             (DRAM_BASE, DRAM_SIZE, M_DRAM_OFF, False),
-            (IRAM_BASE, IRAM_SIZE, M_IRAM_OFF, False),
+            (IRAM_BASE, IRAM_DIRECT_SIZE, M_IRAM_OFF, False),
             (ROM_BASE, ROM_SIZE, M_ROM_OFF, True))):
         out += bytes([LG, 2]) + C(base) + bytearray([I32SUB])
         out += C(size) + bytearray([I32LTU, IF, EMPTY])
@@ -576,3 +681,59 @@ def dstore(width):
     out += bytes([LG, 0, CALL, WR_I])
     out += bytes([END, END, END])
     return out
+
+
+def emit_dispatch_run(preset_ops):
+    """Shared hybrid dispatcher body (run + resume share it; presets differ).
+    preset_ops: bytearray of preset stores (globals/AR/ssp-push-HALT).
+    Globals: wb(0)/ws(1)/ps(2)/ssp(3)/start(4). Locals t0=id, t1=budget ctr.
+    Returns (run_body, resume_body): run presets then dispatches from seg 0
+    (start global ignored... actually run uses seg 0: t0=0); resume starts at
+    the start global. Both loop call_indirect to HALT / trap-mailbox (set by
+    the trap import on the host) / budget (reason 2 + MB_NEXT)."""
+    # Loop shape (all paths reachable for the checker; locals-only across
+    # every frame boundary — V8 rejects stack values crossing block entries,
+    # proven by nano_N5 vs nano_N6):
+    #   loop { nid=call(t0); t0=nid;
+    #          if nid==HALT { br 1 /* exit loop, reason 0 */ }
+    #          else { CTR++; drop-nothing; t1++;
+    #                 if t1>=K { MB_NEXT=t0; reason=2; br 2 /* exit loop */ };
+    #                 br 0 /* continue */ } }
+    # Depths: HALT-taken br 2 exits FUNC (IF=0,LOOP=1,FUNC=2; br-to-loop
+    # would RESTART — proven by the HALT-resume table-OOB); budget br 2
+    # exits LOOP from [BIF=0,OUTER=1,LOOP=2] (lands after loop-END);
+    # cont br 1 restarts LOOP from [OUTER=0,LOOP=1]. Loop/IFs are EMPTY;
+    # every arm ends [] (results travel via locals/globals/memory).
+    loop = bytearray()
+    loop += bytes([LOOP, EMPTY])
+    loop += bytes([LG, 0]) + bytes([CALL_IND, 0x04, 0x00])
+    loop += bytes([0x22, 0x00])  # tee t0=nid (nets zero): [nid]
+    loop += C(HALT) + bytes([I32EQ, IF, EMPTY])
+    loop += bytes([0x0C, 0x02, ELSE])  # done (EQ consumed nid): br 2 exits FUNC (br-to-loop would restart!)
+    loop += C(DISP_CTR) + bytearray(bytes([I32LD]) + uleb(2) + uleb(0))
+    loop += C(1) + bytearray([I32ADD, LS, 2])
+    loop += C(DISP_CTR) + bytes([LG, 2]) + bytearray(bytes([I32ST]) + uleb(2) + uleb(0))
+    # Stack [] here (nid died in EQ; t0 keeps it). t1++ next.
+    loop += bytes([LG, 1]) + C(1) + bytearray([I32ADD, LS, 1])
+    loop += bytes([LG, 1]) + C(BUDGET_K) + bytearray([I32GEU, IF, EMPTY])
+    loop += C(MB_NEXT) + bytes([LG, 0]) + bytearray(bytes([I32ST]) + uleb(2) + uleb(0))
+    loop += C(MB_REASON) + C(2) + bytearray(bytes([I32ST]) + uleb(2) + uleb(0))
+    loop += bytes([0x0C, 0x03, END])  # budget: br 3 exits FUNC (br-to-loop would restart!); end inner if
+    loop += bytes([0x0C, 0x01, END, END])  # cont: br 1 restarts LOOP; end outer if; end loop
+    run = bytearray(preset_ops)
+    run += C(0) + bytearray([LS, 0])
+    run += C(0) + bytearray([LS, 1])
+    run += C(MB_REASON) + C(0) + bytearray(bytes([I32ST]) + uleb(2) + uleb(0))
+    run += C(MB_PC) + C(HALT) + bytearray(bytes([I32ST]) + uleb(2) + uleb(0))
+    run += C(MB_NEXT) + C(HALT) + bytearray(bytes([I32ST]) + uleb(2) + uleb(0))
+    run += bytes(loop)
+    run += bytes([END])
+    resume = bytearray()
+    resume += bytearray(bytes([GLG, START_GLOB, LS, 0]))
+    resume += C(0) + bytearray([LS, 1])
+    resume += C(MB_REASON) + C(0) + bytearray(bytes([I32ST]) + uleb(2) + uleb(0))
+    resume += C(MB_PC) + C(HALT) + bytearray(bytes([I32ST]) + uleb(2) + uleb(0))
+    resume += C(MB_NEXT) + C(HALT) + bytearray(bytes([I32ST]) + uleb(2) + uleb(0))
+    resume += bytes(loop)
+    resume += bytes([END])
+    return bytes(run), bytes(resume)

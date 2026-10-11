@@ -8,9 +8,26 @@ const { instance } = await WebAssembly.instantiate(bytes, {
     trap: (pc) => { traps.push(pc >>> 0); },
     soc_read32: () => 0,
     soc_write32: () => {},
+    soc_cas32: () => 0,
   },
 });
-instance.exports.run();
+{
+  // Budget looping: run() presets + dispatches; on budget exit (mailbox
+  // reason 2) resume at MB_NEXT until HALT-done (0) or trap (1). This also
+  // exercises the resume path on every long run (spanLoop hits it ~17x).
+  const mem32 = () => new Uint32Array(instance.exports.mem.buffer);
+  instance.exports.run();
+  let guard = 0;
+  while (mem32()[0x310 / 4] === 2 && traps.length === 0 && guard++ < 100000) {
+    const nxt = mem32()[0x31C / 4];
+    // Never resume into HALT (stale mailbox after a done-iteration tripped
+    // budget bookkeeping — proven by spanLoop dispatch 70920 table-OOB).
+    if (nxt === 0xFFFFFFFF) { console.log('STALE MAILBOX (resume into HALT)'); process.exit(1); }
+    instance.exports.start.value = nxt;
+    instance.exports.resume();
+  }
+  if (guard >= 100000) { console.log('RESUME LOOP GUARD (divergent?)'); process.exit(1); }
+}
 console.log(`AUTO covered=${rep.covered} mmio=${rep.mmio} runtime-traps=${traps.length}`);
 if (rep.traps.length) console.log('build-traps:', rep.traps.slice(0, 12).map(x => x).join(' '));
 if (traps.length) { console.log('RUNTIME TRAP (unexpected)'); process.exit(1); }
