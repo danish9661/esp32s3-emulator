@@ -356,7 +356,8 @@ def check(path, funcs):
                     nloc += cnt
                 bodies.append((fbody[r:], nloc))
     if isinstance(funcs, tuple):
-        if name in ("spike_auto.wasm", "spike_static.wasm"):
+        if name in ("spike_auto.wasm", "spike_static.wasm", "hy1.wasm", "s4_boot.wasm",
+                    "s4_mini.wasm", "s4_batchA.wasm", "s4_559cc.wasm", "single559cc.wasm"):
             # run/resume return []; seg funcs return [i32] (next slot).
             funcs = [(5, []), (5, [])] + [(5, [I32])] * (len(bodies) - 2)
         else:
@@ -372,7 +373,9 @@ def check(path, funcs):
 
 
 if __name__ == "__main__":
+    import os
     path = sys.argv[1]
+    # Keyed by basename so copies (hy1.wasm, s4_boot.wasm) check identically.
     # (nglobals, ret-stack) per function, in order.
     specs = {
         "spike_win.wasm": [(3, [I64]), (3, [])],
@@ -387,6 +390,13 @@ if __name__ == "__main__":
         "spike_windiff.wasm": [(3, [])],
         "spike_auto.wasm": (4, []),
         "spike_static.wasm": (4, []),
+        # Pinned hybrid copies (same dispatcher shape; check() expands by name).
+        "hy1.wasm": (5, []),
+        "single559cc.wasm": (5, []),
+        "s4_boot.wasm": (5, []),
+        "s4_mini.wasm": (5, []),
+        "s4_batchA.wasm": (5, []),
+        "s4_559cc.wasm": (5, []),
         "wcond_kat.wasm": (1, []),
         "dmem_kat.wasm": (1, []),
         "movcc_kat.wasm": (1, []),

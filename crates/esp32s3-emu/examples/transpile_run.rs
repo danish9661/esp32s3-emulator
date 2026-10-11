@@ -46,20 +46,21 @@ const DIRAM_SIZE: usize = 0x68000;
 const MB_REASON: usize = 0x310;
 const MB_PC: usize = 0x318;
 const MB_NEXT: usize = 0x31C;
-const DISP_CTR: usize = 0x320;
+// MB_RET (0x30C): interpreter-exact retw RA stored by the module (see windiff).
+const MB_RET: usize = 0x30C;
 const SHADOW_BASE: usize = 0x200000;
 const SAR_P: usize = 0x300;
 const SCOMP_P: usize = 0x304;
 const EPC1_P: usize = 0x308;
 const HALT: u32 = 0xFFFFFFFF;
-// Estimated Xtensa insns per dispatch (slice accounting only).
-const EST_PER_DISPATCH: u64 = 6;
+// Per-seg visit counters (exact dynamic-insn accounting via seglens).
+const SEGCNT_BASE: usize = 0x324;
 
 struct Hybrid {
     m: Esp32S3,
     traps: Vec<u32>,
     trap_pc: u32,
-    last_ctr: u64,
+    last_segcnt: Vec<u64>,
     uart: Vec<u8>,
     transpiled: u64,
     interp: u64,
@@ -146,11 +147,23 @@ fn sync_to_soc(store: &mut Store<Hybrid>, inst: &Instance) -> (u32, u32) {
     let (sar, sc, epc1) = (rd32(data, SAR_P), rd32(data, SCOMP_P), rd32(data, EPC1_P));
     let (reason, aux) = (rd32(data, MB_REASON), rd32(data, MB_NEXT));
     let mb_pc = rd32(data, MB_PC);
+    // MB_RET: interpreter-exact retw return ((retw_pc & top) | (a0 & low)).
+    // NEVER reconstruct from reg(0) post-slice: retw rotates wb back, so
+    // reg(0) addresses the caller's cell, not the RA cell (proven live).
+    let mb_ret = rd32(data, MB_RET);
     let sram = data[M_DRAM_OFF..M_DRAM_OFF + DRAM_SIZE as usize].to_vec();
     let iram0 = data[M_IRAM_OFF..M_IRAM_OFF + SRAM0_SIZE as usize].to_vec();
     let diram = data[M_IRAM_OFF + SRAM0_SIZE as usize..M_IRAM_OFF + SRAM0_SIZE as usize + DIRAM_SIZE]
         .to_vec();
-    let (aux_pc, trap_pc) = (if reason == 0 { mb_pc } else { aux }, store.data().trap_pc);
+    // Reason 0: fall-through MB_PC, or retw-done (MB_NEXT == HALT) -> MB_RET.
+    let (aux_pc, trap_pc) = (
+        if reason == 0 {
+            if mb_pc == HALT { mb_ret } else { mb_pc }
+        } else {
+            aux
+        },
+        store.data().trap_pc,
+    );
     {
         let h = store.data_mut();
         *h.m.cpu[0].phys_regs_mut() = phys;
@@ -183,6 +196,11 @@ fn main() {
     for (k, v) in rep["segmap"].as_object().expect("segmap").iter() {
         segmap.insert(k.parse::<u32>().expect("pc"), v.as_u64().expect("seg") as u32);
     }
+    let seglens: Vec<u64> = rep
+        .get("seglens")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|v| v.as_u64().expect("len")).collect())
+        .unwrap_or_default();
     let segpcs: Vec<u32> = rep["segpcs"]
         .as_array()
         .expect("segpcs")
@@ -202,7 +220,7 @@ fn main() {
             m: Esp32S3::new(),
             traps: Vec::new(),
             trap_pc: 0,
-            last_ctr: 0,
+            last_segcnt: vec![0u64; seglens.len().max(1)],
             uart: Vec::new(),
             transpiled: 0,
             interp: 0,
@@ -291,10 +309,24 @@ fn main() {
                     break;
                 }
                 let mem = instance.get_memory(&mut store, "mem").expect("mem");
-                let data = mem.data(&store);
-                let disp = rd32(data, DISP_CTR) as u64 - store.data().last_ctr;
-                store.data_mut().last_ctr = rd32(data, DISP_CTR) as u64;
-                let est = disp * EST_PER_DISPATCH;
+                // Exact slice insns: per-seg visit deltas x static lens
+                // (no estimates — estimates over-advance timers and fire
+                // alarms early into cache-disabled windows).
+                let segcnt: Vec<u32> = {
+                    let data = mem.data(&store);
+                    (0..seglens.len())
+                        .map(|i| rd32(data, SEGCNT_BASE + 4 * i))
+                        .collect()
+                };
+                let mut est = 0u64;
+                {
+                    let h = store.data_mut();
+                    for (i, len) in seglens.iter().enumerate() {
+                        let cur = segcnt[i] as u64;
+                        est += cur.saturating_sub(h.last_segcnt[i]) * len;
+                        h.last_segcnt[i] = cur;
+                    }
+                }
                 store.data_mut().m.soc.tick_timers(est / 2);
                 // Core1 advances the same window interpreted.
                 {
@@ -305,6 +337,20 @@ fn main() {
                     }
                 }
                 let (reason, aux) = sync_to_soc(&mut store, &instance);
+                if std::env::var("HYBRID_STATETRACE").is_ok() {
+                    let h = store.data();
+                    eprintln!(
+                        "HYBRID exit: reason={reason} aux={aux:#x} est={} wb={} ws={:#x} ps={:#x} a0={:#x} a1={:#x} a2={:#x} traps={}",
+                        est,
+                        h.m.cpu[0].windowbase(),
+                        h.m.cpu[0].sreg(SR_WINDOW_START),
+                        h.m.cpu[0].sreg(SR_PS),
+                        h.m.cpu[0].reg(0),
+                        h.m.cpu[0].reg(1),
+                        h.m.cpu[0].reg(2),
+                        h.traps.len(),
+                    );
+                }
                 {
                     let h = store.data_mut();
                     h.uart.extend(h.m.take_uart_tx(0));
@@ -329,13 +375,10 @@ fn main() {
                         store.data_mut().m.cpu[0].pc = segpcs[idx];
                     }
                     _ => {
-                        // Done: fall-through MB_PC or retw RA (full a0).
-                        if aux == HALT {
-                            let ra = store.data_mut().m.cpu[0].reg(0);
-                            store.data_mut().m.cpu[0].pc = ra;
-                        } else {
-                            store.data_mut().m.cpu[0].pc = aux;
-                        }
+                        // Done: fall-through MB_PC, or retw-done MB_RET (the
+                        // module stored the interpreter-exact RA; sync_to_soc
+                        // already selected it — aux IS the resume pc here).
+                        store.data_mut().m.cpu[0].pc = aux;
                     }
                 }
                 if store.data().uart.windows(7).any(|w| w == b"boot OK") {
@@ -352,8 +395,16 @@ fn main() {
         let pc0 = store.data().m.cpu[0].pc;
         if let StepResult::Exception { cause } = r0 {
             if !(32..=37).contains(&cause) && cause != 5 {
-                println!("\n!! core0 exception cause={cause} at pc {pc0:#010x}");
-                break;
+                // PANIC_CONTINUE semantics (run_flash): a deliberate `ill`
+                // (panic_abort tail, abort() paths) must run through the
+                // firmware handler so the panic message + reboot appear;
+                // breaking here hides the reason. Cap to avoid spin loops.
+                static PANICS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let k = PANICS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                println!("\n!! core0 exception cause={cause} at pc {pc0:#010x} (panic #{k})");
+                if k >= 5 {
+                    break;
+                }
             }
         }
         {

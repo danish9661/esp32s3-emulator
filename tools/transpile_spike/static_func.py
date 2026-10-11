@@ -18,7 +18,7 @@ from xwasm import (uleb, sleb, section, exports, funcbody, I32C, I32ADD,
                    I32SHRU, I32SHRS, I32LOAD8U, I32EQ, I32NE, I32EQZ,
                    I32GEU, I32LTS, GLG, GLS, UNREACH, END)
 from windiff import (C, wld, wst, wphys, woe_check, walu, dload, dstore,
-                     emit_dispatch_run,
+                     emit_dispatch_run, emit_segcount,
                      emit_entry, emit_retw, emit_special, wcond,
                      branch_taken_py, BRANCH2, BRANCH3, COVERED,
                      DRAM_BASE, DRAM_SIZE, IRAM_BASE, IRAM_SIZE,
@@ -235,6 +235,7 @@ def main():
         for sg in range(len(seg_list) - 1):
             lo, hi = seg_list[sg], seg_list[sg + 1]
             out = bytearray()
+            emit_segcount(out, gseg(fi, sg))  # exact dynamic-insn accounting
             litmap = {}  # reg -> literal addr (callx8 pattern; cleared on writes)
             visited = set()
             for si in range(lo, hi):
@@ -475,14 +476,16 @@ def main():
         f"consumption gap: covered={stats['covered']} xfer={stats['xfer']} "
         f"traps={len(stats['traps'])} total={n_total})")
     segpcs = []
+    seglens = []
     for fi, f in enumerate(funcs):
         for k in range(len(splits[fi]) - 1):
             segpcs.append(f["insns"][splits[fi][k]]["pc"])
+            seglens.append(splits[fi][k + 1] - splits[fi][k])
     segmap = {}
     for idx, pc in enumerate(segpcs):
         segmap.setdefault(str(pc), idx)
     rep = {"entry": sfunc["entry"], "segs": nsegs, "covered": stats["covered"],
-           "segmap": segmap, "segpcs": segpcs,
+           "segmap": segmap, "segpcs": segpcs, "seglens": seglens,
            "traps": [hex(p) for p in stats["traps"]], "mmio": 0,
            "mmio_rt": stats["mmio_rt"], "leaf_end_pc": leaf_end["pc"],
            "funcs": [hex(f["entry"]) for f in funcs],

@@ -45,6 +45,22 @@ ROM_BASE, ROM_SIZE = 0x40000000, 0x60000
 # params; resume starts at the start_seg global (#4). Budget K bounds core1
 # starvation (WDT) inside hot transpiled loops.
 MB_REASON, MB_PC, MB_NEXT, DISP_CTR = 0x310, 0x318, 0x31C, 0x320
+# MB_RET (0x30C): return address for HALT-done-after-retw slices. The host
+# MUST NOT reconstruct RA from reg(0) post-slice: retw rotates wb back, so
+# reg(0) addresses the caller's cell, not the RA cell (proven by hybrid
+# hit-1: RA cell phys[48]@wb12 held ->0x4037ad14 while post-slice reg(0)
+# @wb10 read phys[40] = 0x80377f32 -> wrong resume 0x40377f32, snowballing
+# every later window depth). The module stores the interpreter-exact
+# (retw_pc & 0xC0000000) | (a0 & 0x3FFFFFFF) here. Free cell: SAR 0x300,
+# SCOMP 0x304, EPC1 0x308, REASON 0x310 (0x30C unused, verified by grep).
+MB_RET = 0x30C
+# Per-seg visit counters for EXACT dynamic-insn accounting (host multiplies
+# by static seg lengths): estimates (est=6/dispatch) over-advance timers and
+# fire alarms EARLY into cache-disabled windows (proven by the hybrid
+# cache-disabled panic with only 96 transpiled insns — direction, not
+# magnitude). 2 extra ops per seg ENTRY (not per insn); straight-line segs
+# execute all their insns exactly once per visit, so visits x len is exact.
+SEGCNT_BASE = 0x324
 START_GLOB, BUDGET_K = 4, 4096
 # Static direct-memory module layout (static_func.py): AR phys [0,256),
 # then identity snapshots. Everything else -> soc imports (correct, slower).
@@ -412,6 +428,17 @@ def emit_retw(out, nxt, R, pc=None, skip_tail=False):
     # dynamic (a0) and the run ends at HALT, so only the unrotation above
     # matters; skip the reconstructed-target store + assert.
     if skip_tail:
+        assert pc is not None and pc != 0, "skip_tail needs the retw pc for MB_RET"
+        # MB_RET = (retw_pc & 0xC0000000) | (a0 & 0x3FFFFFFF): interpreter-exact
+        # RETW target (exec.rs: pc-top + a0-low). Stored BEFORE ssp_pop by the
+        # caller (this helper returns with rotation done, stack []).
+        top = (pc & 0xC0000000) & 0xFFFFFFFF
+        # a0 comes from t0 (local 0), captured pre-rotation at emit entry
+        # (line `wld(0) + [LS, 0]`); re-reading via wld(0) here would use the
+        # POST-rotation wb and fetch the caller's cell (proven live: stored
+        # phys[40] instead of phys[48]). Same convention as the span path.
+        out += C(MB_RET) + bytes([LG, 0]) + C(0x3FFFFFFF) + bytearray([I32AND]) + C(top) + bytearray([I32OR])
+        out += bytearray(bytes([I32ST]) + uleb(2) + uleb(0))
         return
     assert nxt is not None, "span ends on control op"
     top = (nxt & 0xC0000000) & 0xFFFFFFFF
@@ -683,6 +710,15 @@ def dstore(width):
     return out
 
 
+def emit_segcount(out, segid):
+    """Per-seg visit counter bump (exact dynamic-insn accounting). Straight-
+    line only: C(addr), C(addr), LD, C(1), ADD, ST (no temps, balanced)."""
+    out += C(SEGCNT_BASE + 4 * segid) + C(SEGCNT_BASE + 4 * segid)
+    out += bytearray(bytes([I32LD]) + uleb(2) + uleb(0))
+    out += C(1) + bytearray([I32ADD])
+    out += bytearray(bytes([I32ST]) + uleb(2) + uleb(0))
+
+
 def emit_dispatch_run(preset_ops):
     """Shared hybrid dispatcher body (run + resume share it; presets differ).
     preset_ops: bytearray of preset stores (globals/AR/ssp-push-HALT).
@@ -710,10 +746,7 @@ def emit_dispatch_run(preset_ops):
     loop += bytes([0x22, 0x00])  # tee t0=nid (nets zero): [nid]
     loop += C(HALT) + bytes([I32EQ, IF, EMPTY])
     loop += bytes([0x0C, 0x02, ELSE])  # done (EQ consumed nid): br 2 exits FUNC (br-to-loop would restart!)
-    loop += C(DISP_CTR) + bytearray(bytes([I32LD]) + uleb(2) + uleb(0))
-    loop += C(1) + bytearray([I32ADD, LS, 2])
-    loop += C(DISP_CTR) + bytes([LG, 2]) + bytearray(bytes([I32ST]) + uleb(2) + uleb(0))
-    # Stack [] here (nid died in EQ; t0 keeps it). t1++ next.
+    # Stack [] here (nid died in EQ; t0 keeps it). t1++ next (budget below).
     loop += bytes([LG, 1]) + C(1) + bytearray([I32ADD, LS, 1])
     loop += bytes([LG, 1]) + C(BUDGET_K) + bytearray([I32GEU, IF, EMPTY])
     loop += C(MB_NEXT) + bytes([LG, 0]) + bytearray(bytes([I32ST]) + uleb(2) + uleb(0))

@@ -183,20 +183,40 @@ fn main() {
     let func_entry: Option<u32> = skip_arg
         .strip_prefix("func:")
         .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok());
-    let skip: usize = if func_entry.is_none() {
+    // funcN:<entry>:<n> captures the Nth dynamic hit (1-based; default 1).
+    // Needed when the first instance is proven-clean but a later geometry
+    // (different wb/ws/ps, e.g. 559cc hit 2 at wb=12) is suspect.
+    let (funcN_entry, funcN_hit): (Option<u32>, usize) = skip_arg
+        .strip_prefix("funcN:")
+        .and_then(|s| {
+            let (a, b) = s.split_once(':')?;
+            Some((
+                u32::from_str_radix(a.trim_start_matches("0x"), 16).ok()?,
+                b.parse().unwrap_or(1).max(1),
+            ))
+        })
+        .map(|(a, b)| (Some(a), b))
+        .unwrap_or((None, 1));
+    let skip: usize = if func_entry.is_none() && funcN_entry.is_none() {
         skip_arg.parse().unwrap_or(0)
     } else {
         0
     };
-    if let Some(entry) = func_entry {
+    if let Some(entry) = func_entry.or(funcN_entry) {
         // Scan (cap 200M) until core0 pc == entry; the trace below then
         // captures that dynamic execution for static-vs-dynamic pairing.
         // Loud fail if never reached (wrong entry for this image).
+        // funcN form skips the first (hits-1) arrivals (Nth-hit capture).
+        let want_hit = if funcN_entry.is_some() { funcN_hit } else { 1 };
         let mut found = false;
+        let mut hits = 0usize;
         for _ in 0..200_000_000 {
             if m.cpu[0].pc == entry {
-                found = true;
-                break;
+                hits += 1;
+                if hits >= want_hit {
+                    found = true;
+                    break;
+                }
             }
             let _ = m.step();
         }
